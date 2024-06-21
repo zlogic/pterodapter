@@ -35,6 +35,9 @@ impl Server {
                         continue;
                     }
                 };
+                if let Err(err) = ikev2_message.validate() {
+                    warn!("Invalid IKEv2 message {}", err);
+                }
                 debug!("Received packet from {} {:?}", remote_addr, ikev2_message);
             }
         }))
@@ -116,10 +119,9 @@ struct IKEv2Message<'a> {
     data: &'a [u8],
 }
 
+// Parse and validate using spec from RFC 7296, Section 3.
 impl IKEv2Message<'_> {
     fn from_datagram<'a>(p: &'a [u8]) -> Result<IKEv2Message<'a>, IKEv2Error> {
-        // Parse and validate using spec from RFC 7296, Section 3.
-        // TODO: add a validation function.
         Ok(IKEv2Message { data: p })
     }
 
@@ -166,6 +168,32 @@ impl IKEv2Message<'_> {
         u32::from_be_bytes(result)
     }
 
+    fn validate(&self) -> Result<(), IKEv2Error> {
+        // TODO: validate all required fields.
+        if self.read_initiator_spi() == 0 {
+            return Err("Empty initiator SPI".into());
+        }
+        if self.read_responder_spi() != 0 {
+            return Err("Unexpected, non-empty responder SPI".into());
+        }
+        {
+            let (major_version, _) = self.read_version();
+            if major_version != 2 {
+                return Err("Unsupported major version".into());
+            }
+        }
+        if let Err(err) = self.read_exchange_type() {
+            return Err(err);
+        }
+        if let Err(err) = self.read_flags() {
+            return Err(err);
+        }
+        if self.data.len() != self.read_length() as usize {
+            return Err("Packet length mismatch".into());
+        }
+        Ok(())
+    }
+
     fn iter_payloads(&self) -> IKEv2PayloadIter {
         IKEv2PayloadIter {
             next_payload: self.read_next_payload(),
@@ -191,6 +219,9 @@ impl<'a> Iterator for IKEv2PayloadIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         const CRITICAL_BIT: u8 = 1 << 7;
         if self.next_payload == 0 {
+            if self.data.len() != 0 {
+                debug!("Packet has unaccounted data");
+            }
             return None;
         }
         let next_payload = self.data[0];
@@ -212,6 +243,10 @@ impl<'a> Iterator for IKEv2PayloadIter<'a> {
             }
         };
 
+        if self.data.len() < payload_length {
+            debug!("Payload overflow");
+            return None;
+        }
         let item = IKEv2Payload {
             payload_type: self.next_payload,
             critical: payload_critical,
