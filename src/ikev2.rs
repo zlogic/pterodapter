@@ -1,11 +1,6 @@
-use async_executor::LocalExecutor;
-use async_io::Async;
-use futures_lite::future;
 use log::{debug, info, warn};
-use std::{
-    error, fmt, io,
-    net::{IpAddr, UdpSocket},
-};
+use std::{error, fmt, io, net::IpAddr, time::Duration};
+use tokio::{net::UdpSocket, runtime::Runtime, signal, task::JoinHandle};
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
@@ -18,29 +13,45 @@ impl Server {
         Server { listen_ip }
     }
 
-    pub fn run(&self) -> Result<(), io::Error> {
-        let ex = LocalExecutor::new();
-        let socket = Async::<UdpSocket>::bind((self.listen_ip, 500))?;
-        info!("Started server on {}", self.listen_ip);
-        // TODO: run multiple receivers in a threadpool.
-        future::block_on(ex.run(async move {
-            let mut buf = [0u8; MAX_DATAGRAM_SIZE];
-            loop {
-                let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
-                let datagram_bytes = &mut buf[..bytes_res];
-                let ikev2_message = match IKEv2Message::from_datagram(datagram_bytes) {
-                    Ok(message) => message,
-                    Err(err) => {
-                        warn!("Failed to parse message {}", err);
-                        continue;
-                    }
-                };
-                if let Err(err) = ikev2_message.validate() {
-                    warn!("Invalid IKEv2 message {}", err);
+    async fn listen_socket(listen_ip: IpAddr) -> Result<(), IKEv2Error> {
+        let socket = UdpSocket::bind((listen_ip, 500)).await?;
+        info!("Started server on {}", listen_ip);
+        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
+        loop {
+            let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
+            let datagram_bytes = &mut buf[..bytes_res];
+            let ikev2_message = match IKEv2Message::from_datagram(datagram_bytes) {
+                Ok(message) => message,
+                Err(err) => {
+                    warn!("Failed to parse message {}", err);
+                    continue;
                 }
-                debug!("Received packet from {} {:?}", remote_addr, ikev2_message);
+            };
+            if let Err(err) = ikev2_message.validate() {
+                warn!("Invalid IKEv2 message {}", err);
             }
-        }))
+            debug!("Received packet from {} {:?}", remote_addr, ikev2_message);
+        }
+    }
+
+    async fn wait_termination(
+        handle: JoinHandle<Result<(), IKEv2Error>>,
+    ) -> Result<(), IKEv2Error> {
+        signal::ctrl_c().await?;
+        handle.abort();
+        Ok(())
+    }
+
+    pub fn run(&self) -> Result<(), IKEv2Error> {
+        let rt = Runtime::new()?;
+        // TODO: run multiple receivers in a threadpool.
+        let listen_ip = self.listen_ip;
+        let handle = rt.spawn(Server::listen_socket(listen_ip));
+        rt.block_on(Server::wait_termination(handle))?;
+        rt.shutdown_timeout(Duration::from_secs(60));
+
+        info!("Stopped server");
+        Ok(())
     }
 }
 
@@ -301,12 +312,18 @@ impl fmt::Debug for IKEv2Message<'_> {
 #[derive(Debug)]
 pub enum IKEv2Error {
     Internal(&'static str),
+    Join(tokio::task::JoinError),
+    Io(io::Error),
 }
 
 impl fmt::Display for IKEv2Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             IKEv2Error::Internal(msg) => f.write_str(msg),
+            IKEv2Error::Join(ref e) => write!(f, "Tokio join error: {}", e),
+            IKEv2Error::Io(ref e) => {
+                write!(f, "IO error: {}", e)
+            }
         }
     }
 }
@@ -315,6 +332,8 @@ impl error::Error for IKEv2Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             IKEv2Error::Internal(_msg) => None,
+            IKEv2Error::Join(ref err) => Some(err),
+            IKEv2Error::Io(ref err) => Some(err),
         }
     }
 }
@@ -322,5 +341,17 @@ impl error::Error for IKEv2Error {
 impl From<&'static str> for IKEv2Error {
     fn from(msg: &'static str) -> IKEv2Error {
         IKEv2Error::Internal(msg)
+    }
+}
+
+impl From<tokio::task::JoinError> for IKEv2Error {
+    fn from(err: tokio::task::JoinError) -> IKEv2Error {
+        IKEv2Error::Join(err)
+    }
+}
+
+impl From<io::Error> for IKEv2Error {
+    fn from(err: io::Error) -> IKEv2Error {
+        IKEv2Error::Io(err)
     }
 }
