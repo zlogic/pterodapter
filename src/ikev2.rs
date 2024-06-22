@@ -1,20 +1,26 @@
 use log::{debug, info, warn};
 use std::{error, fmt, io, net::IpAddr, time::Duration};
-use tokio::{net::UdpSocket, runtime::Runtime, signal, task::JoinHandle};
+use tokio::{net::UdpSocket, signal, task::JoinHandle};
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
 pub struct Server {
-    listen_ip: IpAddr,
+    listen_ips: Vec<IpAddr>,
 }
 
 impl Server {
-    pub fn new(listen_ip: IpAddr) -> Server {
-        Server { listen_ip }
+    pub fn new(listen_ips: Vec<IpAddr>) -> Server {
+        Server { listen_ips }
     }
 
     async fn listen_socket(listen_ip: IpAddr) -> Result<(), IKEv2Error> {
-        let socket = UdpSocket::bind((listen_ip, 500)).await?;
+        let socket = match UdpSocket::bind((listen_ip, 500)).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                log::error!("Failed to open listener on {}: {}", listen_ip, err);
+                return Err(err.into());
+            }
+        };
         info!("Started server on {}", listen_ip);
         let mut buf = [0u8; MAX_DATAGRAM_SIZE];
         loop {
@@ -30,19 +36,23 @@ impl Server {
     }
 
     async fn wait_termination(
-        handle: JoinHandle<Result<(), IKEv2Error>>,
+        handles: Vec<JoinHandle<Result<(), IKEv2Error>>>,
     ) -> Result<(), IKEv2Error> {
         signal::ctrl_c().await?;
-        handle.abort();
+        handles.iter().for_each(|handle| handle.abort());
         Ok(())
     }
 
     pub fn run(&self) -> Result<(), IKEv2Error> {
-        let rt = Runtime::new()?;
-        // TODO: run multiple receivers in a threadpool.
-        let listen_ip = self.listen_ip;
-        let handle = rt.spawn(Server::listen_socket(listen_ip));
-        rt.block_on(Server::wait_termination(handle))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()?;
+        let handles = self
+            .listen_ips
+            .iter()
+            .map(|listen_ip| rt.spawn(Server::listen_socket(listen_ip.to_owned())))
+            .collect::<Vec<_>>();
+        rt.block_on(Server::wait_termination(handles))?;
         rt.shutdown_timeout(Duration::from_secs(60));
 
         info!("Stopped server");

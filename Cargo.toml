@@ -9,7 +9,7 @@ rust-version = "1.77"
 
 [dependencies]
 log = { version = "0.4", default-features = false }
-tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "io-util", "signal", "net", "time"] }
+tokio = { version = "1.38", features = ["rt", "io-util", "signal", "net", "time"] }
 
 [profile.release]
 strip = true
