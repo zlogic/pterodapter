@@ -20,15 +20,10 @@ impl Server {
         loop {
             let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
             let datagram_bytes = &mut buf[..bytes_res];
-            let ikev2_message = match IKEv2Message::from_datagram(datagram_bytes) {
-                Ok(message) => message,
-                Err(err) => {
-                    warn!("Failed to parse message {}", err);
-                    continue;
-                }
-            };
-            if let Err(err) = ikev2_message.validate() {
-                warn!("Invalid IKEv2 message {}", err);
+            let ikev2_message = IKEv2Message::from_datagram(datagram_bytes);
+            if !ikev2_message.is_valid() {
+                warn!("Invalid IKEv2 message from {}", remote_addr);
+                continue;
             }
             debug!("Received packet from {} {:?}", remote_addr, ikev2_message);
         }
@@ -64,7 +59,7 @@ impl IKEExchangeType {
     const CREATE_CHILD_SA: IKEExchangeType = IKEExchangeType(36);
     const INFORMATIONAL: IKEExchangeType = IKEExchangeType(37);
 
-    fn from_u8(value: u8) -> Result<IKEExchangeType, IKEv2Error> {
+    fn from_u8(value: u8) -> Result<IKEExchangeType, FormatError> {
         match value {
             34 | 35 | 36 | 37 => Ok(IKEExchangeType(value)),
             _ => {
@@ -96,7 +91,7 @@ impl IKEFlags {
     const VERSION: IKEFlags = IKEFlags(1 << 4);
     const RESPONSE: IKEFlags = IKEFlags(1 << 5);
 
-    fn from_u8(value: u8) -> Result<IKEFlags, IKEv2Error> {
+    fn from_u8(value: u8) -> Result<IKEFlags, FormatError> {
         const RESERVED_MASK: u8 =
             0xff & !IKEFlags::INITIATOR.0 & !IKEFlags::VERSION.0 & !IKEFlags::RESPONSE.0;
         if value & RESERVED_MASK != 0x00 {
@@ -132,8 +127,8 @@ struct IKEv2Message<'a> {
 
 // Parse and validate using spec from RFC 7296, Section 3.
 impl IKEv2Message<'_> {
-    fn from_datagram<'a>(p: &'a [u8]) -> Result<IKEv2Message<'a>, IKEv2Error> {
-        Ok(IKEv2Message { data: p })
+    fn from_datagram<'a>(p: &'a [u8]) -> IKEv2Message<'a> {
+        IKEv2Message { data: p }
     }
 
     fn read_initiator_spi(&self) -> u64 {
@@ -159,11 +154,11 @@ impl IKEv2Message<'_> {
         (major_version, minor_version)
     }
 
-    fn read_exchange_type(&self) -> Result<IKEExchangeType, IKEv2Error> {
+    fn read_exchange_type(&self) -> Result<IKEExchangeType, FormatError> {
         IKEExchangeType::from_u8(self.data[18])
     }
 
-    fn read_flags(&self) -> Result<IKEFlags, IKEv2Error> {
+    fn read_flags(&self) -> Result<IKEFlags, FormatError> {
         IKEFlags::from_u8(self.data[19])
     }
 
@@ -179,30 +174,48 @@ impl IKEv2Message<'_> {
         u32::from_be_bytes(result)
     }
 
-    fn validate(&self) -> Result<(), IKEv2Error> {
+    fn is_valid(&self) -> bool {
         // TODO: validate all required fields.
+        // TODO: return status in notification (e.g. INVALID_MAJOR_VERSION).
+        let mut valid = true;
         if self.read_initiator_spi() == 0 {
-            return Err("Empty initiator SPI".into());
+            debug!("Empty initiator SPI");
+            valid = false;
         }
         if self.read_responder_spi() != 0 {
-            return Err("Unexpected, non-empty responder SPI".into());
+            debug!("Unexpected, non-empty responder SPI");
+            valid = false;
         }
         {
-            let (major_version, _) = self.read_version();
+            let (major_version, minor_version) = self.read_version();
             if major_version != 2 {
-                return Err("Unsupported major version".into());
+                debug!(
+                    "Unsupported major version {}.{}",
+                    major_version, minor_version
+                );
+                valid = false;
             }
         }
         if let Err(err) = self.read_exchange_type() {
-            return Err(err);
+            debug!("Error parsing exchange type {}", err);
+            valid = false;
         }
         if let Err(err) = self.read_flags() {
-            return Err(err);
+            debug!("Error parsing flags {}", err);
+            valid = false;
         }
-        if self.data.len() != self.read_length() as usize {
-            return Err("Packet length mismatch".into());
+        {
+            let client_length = self.read_length();
+            if self.data.len() != client_length as usize {
+                debug!(
+                    "Packet length mismatch (received {} bytes, client specified {} bytes)",
+                    self.data.len(),
+                    client_length
+                );
+                valid = false;
+            }
         }
-        Ok(())
+        valid
     }
 
     fn iter_payloads(&self) -> IKEv2PayloadIter {
@@ -306,6 +319,23 @@ impl fmt::Debug for IKEv2Message<'_> {
             writeln!(f, "    Data {:?}", pl.data)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct FormatError {
+    msg: &'static str,
+}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.msg)
+    }
+}
+
+impl From<&'static str> for FormatError {
+    fn from(msg: &'static str) -> FormatError {
+        FormatError { msg }
     }
 }
 
