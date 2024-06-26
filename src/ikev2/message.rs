@@ -441,9 +441,14 @@ impl TransformType {
     const ENCR_AES_CBC: TransformType = TransformType(1, 12);
     const ENCR_AES_CTR: TransformType = TransformType(1, 13);
 
+    const ENCR_AES_GCM_16: TransformType = TransformType(1, 20);
+
     const PRF_HMAC_MD5: TransformType = TransformType(2, 1);
     const PRF_HMAC_SHA1: TransformType = TransformType(2, 2);
     const PRF_HMAC_TIGER: TransformType = TransformType(2, 3);
+
+    const PRF_HMAC_SHA2_256: TransformType = TransformType(2, 5);
+    const PRF_HMAC_SHA2_384: TransformType = TransformType(2, 6);
 
     const AUTH_NONE: TransformType = TransformType(3, 0);
     const AUTH_HMAC_MD5_96: TransformType = TransformType(3, 1);
@@ -452,15 +457,20 @@ impl TransformType {
     const AUTH_KPDK_MD5: TransformType = TransformType(3, 4);
     const AUTH_AES_XCBC_96: TransformType = TransformType(3, 5);
 
+    const AUTH_HMAC_SHA2_256_128: TransformType = TransformType(3, 12);
+    const AUTH_HMAC_SHA2_384_192: TransformType = TransformType(3, 13);
+
     const DH_NONE: TransformType = TransformType(4, 0);
-    const DH_768: TransformType = TransformType(4, 1);
-    const DH_1024: TransformType = TransformType(4, 2);
-    const DH_1536: TransformType = TransformType(4, 5);
-    const DH_2048: TransformType = TransformType(4, 14);
-    const DH_3072: TransformType = TransformType(4, 15);
-    const DH_4096: TransformType = TransformType(4, 16);
-    const DH_6144: TransformType = TransformType(4, 17);
-    const DH_8192: TransformType = TransformType(4, 18);
+    const DH_768_MODP: TransformType = TransformType(4, 1);
+    const DH_1024_MODP: TransformType = TransformType(4, 2);
+    const DH_1536_MODP: TransformType = TransformType(4, 5);
+    const DH_2048_MODP: TransformType = TransformType(4, 14);
+    const DH_3072_MODP: TransformType = TransformType(4, 15);
+    const DH_4096_MODP: TransformType = TransformType(4, 16);
+    const DH_6144_MODP: TransformType = TransformType(4, 17);
+    const DH_8192_MODP: TransformType = TransformType(4, 18);
+
+    const DH_256_ECP: TransformType = TransformType(4, 19);
 
     const NO_ESN: TransformType = TransformType(5, 0);
     const ESN: TransformType = TransformType(5, 1);
@@ -493,24 +503,30 @@ impl fmt::Display for TransformType {
             Self::ENCR_NULL => write!(f, "ENCR_NULL")?,
             Self::ENCR_AES_CBC => write!(f, "ENCR_AES_CBC")?,
             Self::ENCR_AES_CTR => write!(f, "ENCR_AES_CTR")?,
+            Self::ENCR_AES_GCM_16 => write!(f, "ENCR_AES_GCM_16")?,
             Self::PRF_HMAC_MD5 => write!(f, "PRF_HMAC_MD5")?,
             Self::PRF_HMAC_SHA1 => write!(f, "PRF_HMAC_SHA1")?,
             Self::PRF_HMAC_TIGER => write!(f, "PRF_HMAC_TIGER")?,
+            Self::PRF_HMAC_SHA2_256 => write!(f, "PRF_HMAC_SHA2_256")?,
+            Self::PRF_HMAC_SHA2_384 => write!(f, "PRF_HMAC_SHA2_384")?,
             Self::AUTH_NONE => write!(f, "AUTH_NONE")?,
             Self::AUTH_HMAC_MD5_96 => write!(f, "AUTH_HMAC_MD5_96")?,
             Self::AUTH_HMAC_SHA1_96 => write!(f, "AUTH_HMAC_SHA1_96")?,
             Self::AUTH_DES_MAC => write!(f, "AUTH_DES_MAC")?,
             Self::AUTH_KPDK_MD5 => write!(f, "AUTH_KPDK_MD5")?,
             Self::AUTH_AES_XCBC_96 => write!(f, "AUTH_AES_XCBC_96")?,
+            Self::AUTH_HMAC_SHA2_256_128 => write!(f, "AUTH_HMAC_SHA2_256_128")?,
+            Self::AUTH_HMAC_SHA2_384_192 => write!(f, "AUTH_HMAC_SHA2_384_192")?,
             Self::DH_NONE => write!(f, "DH_NONE")?,
-            Self::DH_768 => write!(f, "DH_768")?,
-            Self::DH_1024 => write!(f, "DH_1024")?,
-            Self::DH_1536 => write!(f, "DH_1536")?,
-            Self::DH_2048 => write!(f, "DH_2048")?,
-            Self::DH_3072 => write!(f, "DH_3072")?,
-            Self::DH_4096 => write!(f, "DH_4096")?,
-            Self::DH_6144 => write!(f, "DH_6144")?,
-            Self::DH_8192 => write!(f, "DH_8192")?,
+            Self::DH_768_MODP => write!(f, "DH_768_MODP")?,
+            Self::DH_1024_MODP => write!(f, "DH_1024_MODP")?,
+            Self::DH_1536_MODP => write!(f, "DH_1536_MODP")?,
+            Self::DH_2048_MODP => write!(f, "DH_2048_MODP")?,
+            Self::DH_3072_MODP => write!(f, "DH_3072_MODP")?,
+            Self::DH_4096_MODP => write!(f, "DH_4096_MODP")?,
+            Self::DH_6144_MODP => write!(f, "DH_6144_MODP")?,
+            Self::DH_8192_MODP => write!(f, "DH_8192_MODP")?,
+            Self::DH_256_ECP => write!(f, "DH_256_ECP")?,
             Self::NO_ESN => write!(f, "NO_ESN")?,
             Self::ESN => write!(f, "ESN")?,
             _ => write!(f, "Unknown transform type {} id {}", self.0, self.1)?,
