@@ -1,84 +1,19 @@
-use log::{debug, info, warn};
-use rand::Rng;
-use std::{
-    collections::HashMap,
-    error, fmt,
-    hash::{Hash, Hasher},
-    io,
-    net::{IpAddr, SocketAddr},
-    time::Duration,
-};
-use tokio::{net::UdpSocket, signal, task::JoinHandle};
+use std::{error, fmt};
 
-const MAX_DATAGRAM_SIZE: usize = 1500;
-
-pub struct Server {
-    listen_ips: Vec<IpAddr>,
-}
-
-impl Server {
-    pub fn new(listen_ips: Vec<IpAddr>) -> Server {
-        Server { listen_ips }
-    }
-
-    async fn listen_socket(listen_ip: IpAddr) -> Result<(), IKEv2Error> {
-        let socket = match UdpSocket::bind((listen_ip, 500)).await {
-            Ok(socket) => socket,
-            Err(err) => {
-                log::error!("Failed to open listener on {}: {}", listen_ip, err);
-                return Err(err.into());
-            }
-        };
-        info!("Started server on {}", listen_ip);
-        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
-        // TODO: share sessions between all threads: either using an async mutex, or by forwarding all messages to the same mpsc channel.
-        let mut sessions = Sessions::new();
-        loop {
-            let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
-            let datagram_bytes = &mut buf[..bytes_res];
-            sessions
-                .process_message(datagram_bytes, remote_addr)
-                .await?;
-        }
-    }
-
-    async fn wait_termination(
-        handles: Vec<JoinHandle<Result<(), IKEv2Error>>>,
-    ) -> Result<(), IKEv2Error> {
-        signal::ctrl_c().await?;
-        handles.iter().for_each(|handle| handle.abort());
-        Ok(())
-    }
-
-    pub fn run(&self) -> Result<(), IKEv2Error> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()?;
-        let handles = self
-            .listen_ips
-            .iter()
-            .map(|listen_ip| rt.spawn(Server::listen_socket(listen_ip.to_owned())))
-            .collect::<Vec<_>>();
-        rt.block_on(Server::wait_termination(handles))?;
-        rt.shutdown_timeout(Duration::from_secs(60));
-
-        info!("Stopped server");
-        Ok(())
-    }
-}
+use log::debug;
 
 #[derive(PartialEq, Eq)]
-struct IKEExchangeType(u8);
+pub struct ExchangeType(u8);
 
-impl IKEExchangeType {
-    const IKE_SA_INIT: IKEExchangeType = IKEExchangeType(34);
-    const IKE_AUTH: IKEExchangeType = IKEExchangeType(35);
-    const CREATE_CHILD_SA: IKEExchangeType = IKEExchangeType(36);
-    const INFORMATIONAL: IKEExchangeType = IKEExchangeType(37);
+impl ExchangeType {
+    pub const IKE_SA_INIT: ExchangeType = ExchangeType(34);
+    pub const IKE_AUTH: ExchangeType = ExchangeType(35);
+    pub const CREATE_CHILD_SA: ExchangeType = ExchangeType(36);
+    pub const INFORMATIONAL: ExchangeType = ExchangeType(37);
 
-    fn from_u8(value: u8) -> Result<IKEExchangeType, FormatError> {
+    fn from_u8(value: u8) -> Result<ExchangeType, FormatError> {
         if value >= Self::IKE_SA_INIT.0 && value <= Self::INFORMATIONAL.0 {
-            Ok(IKEExchangeType(value))
+            Ok(ExchangeType(value))
         } else {
             debug!("Unsupported IKEv2 Exchange Type {}", value);
             Err("Unsupported IKEv2 Exchange Type".into())
@@ -86,7 +21,7 @@ impl IKEExchangeType {
     }
 }
 
-impl fmt::Display for IKEExchangeType {
+impl fmt::Display for ExchangeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::IKE_SA_INIT => write!(f, "IKE_SA_INIT")?,
@@ -100,60 +35,60 @@ impl fmt::Display for IKEExchangeType {
 }
 
 #[derive(PartialEq, Eq)]
-struct IKEFlags(u8);
+struct Flags(u8);
 
-impl IKEFlags {
-    const INITIATOR: IKEFlags = IKEFlags(1 << 3);
-    const VERSION: IKEFlags = IKEFlags(1 << 4);
-    const RESPONSE: IKEFlags = IKEFlags(1 << 5);
+impl Flags {
+    const INITIATOR: Flags = Flags(1 << 3);
+    const VERSION: Flags = Flags(1 << 4);
+    const RESPONSE: Flags = Flags(1 << 5);
 
-    fn from_u8(value: u8) -> Result<IKEFlags, FormatError> {
+    fn from_u8(value: u8) -> Result<Flags, FormatError> {
         const RESERVED_MASK: u8 =
-            0xff & !IKEFlags::INITIATOR.0 & !IKEFlags::VERSION.0 & !IKEFlags::RESPONSE.0;
+            0xff & !Flags::INITIATOR.0 & !Flags::VERSION.0 & !Flags::RESPONSE.0;
         if value & RESERVED_MASK != 0x00 {
             debug!("IKEv2 reserved flags are set {}", value & RESERVED_MASK);
             return Err("IKEv2 reserved flags are set".into());
         }
-        Ok(IKEFlags(value))
+        Ok(Flags(value))
     }
 
-    fn has(&self, flag: IKEFlags) -> bool {
+    fn has(&self, flag: Flags) -> bool {
         self.0 & flag.0 != 0
     }
 }
 
-impl fmt::Display for IKEFlags {
+impl fmt::Display for Flags {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.has(IKEFlags::INITIATOR) {
+        if self.has(Flags::INITIATOR) {
             f.write_str("Initiator")?;
         }
-        if self.has(IKEFlags::VERSION) {
+        if self.has(Flags::VERSION) {
             f.write_str("Version")?;
         }
-        if self.has(IKEFlags::RESPONSE) {
+        if self.has(Flags::RESPONSE) {
             f.write_str("Response")?;
         }
         Ok(())
     }
 }
 
-struct IKEv2Message<'a> {
+pub struct Message<'a> {
     data: &'a [u8],
 }
 
 // Parse and validate using spec from RFC 7296, Section 3.
-impl IKEv2Message<'_> {
-    fn from_datagram<'a>(p: &'a [u8]) -> IKEv2Message<'a> {
-        IKEv2Message { data: p }
+impl Message<'_> {
+    pub fn from_datagram<'a>(p: &'a [u8]) -> Message<'a> {
+        Message { data: p }
     }
 
-    fn read_initiator_spi(&self) -> u64 {
+    pub fn read_initiator_spi(&self) -> u64 {
         let mut result = [0u8; 8];
         result.copy_from_slice(&self.data[0..8]);
         u64::from_be_bytes(result)
     }
 
-    fn read_responder_spi(&self) -> u64 {
+    pub fn read_responder_spi(&self) -> u64 {
         let mut result = [0u8; 8];
         result.copy_from_slice(&self.data[8..16]);
         u64::from_be_bytes(result)
@@ -170,12 +105,12 @@ impl IKEv2Message<'_> {
         (major_version, minor_version)
     }
 
-    fn read_exchange_type(&self) -> Result<IKEExchangeType, FormatError> {
-        IKEExchangeType::from_u8(self.data[18])
+    pub fn read_exchange_type(&self) -> Result<ExchangeType, FormatError> {
+        ExchangeType::from_u8(self.data[18])
     }
 
-    fn read_flags(&self) -> Result<IKEFlags, FormatError> {
-        IKEFlags::from_u8(self.data[19])
+    fn read_flags(&self) -> Result<Flags, FormatError> {
+        Flags::from_u8(self.data[19])
     }
 
     fn read_message_id(&self) -> u32 {
@@ -190,7 +125,7 @@ impl IKEv2Message<'_> {
         u32::from_be_bytes(result)
     }
 
-    fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         // TODO: validate all required fields.
         // TODO: return status in notification (e.g. INVALID_MAJOR_VERSION).
         let mut valid = true;
@@ -234,37 +169,37 @@ impl IKEv2Message<'_> {
         valid
     }
 
-    fn iter_payloads(&self) -> IKEv2PayloadIter {
-        IKEv2PayloadIter {
+    fn iter_payloads(&self) -> PayloadIter {
+        PayloadIter {
             next_payload: self.read_next_payload(),
             data: &self.data[28..],
         }
     }
 }
 
-struct IKEv2Payload<'a> {
-    payload_type: IKEv2PayloadType,
+struct Payload<'a> {
+    payload_type: PayloadType,
     critical: bool,
     data: &'a [u8],
 }
 
-impl IKEv2Payload<'_> {
-    fn to_security_association(&self) -> Option<IKEv2PayloadSecurityAssociation> {
-        if self.payload_type == IKEv2PayloadType::SECURITY_ASSOCIATION {
-            Some(IKEv2PayloadSecurityAssociation { data: self.data })
+impl Payload<'_> {
+    fn to_security_association(&self) -> Option<PayloadSecurityAssociation> {
+        if self.payload_type == PayloadType::SECURITY_ASSOCIATION {
+            Some(PayloadSecurityAssociation { data: self.data })
         } else {
             None
         }
     }
 }
 
-struct IKEv2PayloadIter<'a> {
+struct PayloadIter<'a> {
     next_payload: u8,
     data: &'a [u8],
 }
 
-impl<'a> Iterator for IKEv2PayloadIter<'a> {
-    type Item = Result<IKEv2Payload<'a>, FormatError>;
+impl<'a> Iterator for PayloadIter<'a> {
+    type Item = Result<Payload<'a>, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         const CRITICAL_BIT: u8 = 1 << 7;
@@ -301,11 +236,11 @@ impl<'a> Iterator for IKEv2PayloadIter<'a> {
             debug!("Payload overflow");
             return None;
         }
-        let payload_type = match IKEv2PayloadType::from_u8(self.next_payload) {
+        let payload_type = match PayloadType::from_u8(self.next_payload) {
             Ok(payload_type) => payload_type,
             Err(err) => return Some(Err(err)),
         };
-        let item = IKEv2Payload {
+        let item = Payload {
             payload_type,
             critical,
             data: &self.data[4..payload_length],
@@ -317,32 +252,32 @@ impl<'a> Iterator for IKEv2PayloadIter<'a> {
 }
 
 #[derive(PartialEq, Eq)]
-struct IKEv2PayloadType(u8);
+struct PayloadType(u8);
 
-impl IKEv2PayloadType {
-    const NONE: IKEv2PayloadType = IKEv2PayloadType(0);
-    const SECURITY_ASSOCIATION: IKEv2PayloadType = IKEv2PayloadType(33);
-    const KEY_EXCHANGE: IKEv2PayloadType = IKEv2PayloadType(34);
-    const ID_INITIATOR: IKEv2PayloadType = IKEv2PayloadType(35);
-    const ID_RESPONDER: IKEv2PayloadType = IKEv2PayloadType(36);
-    const CERTIFICATE: IKEv2PayloadType = IKEv2PayloadType(37);
-    const CERTIFICATE_REQUEST: IKEv2PayloadType = IKEv2PayloadType(38);
-    const AUTHENTICATION: IKEv2PayloadType = IKEv2PayloadType(39);
-    const NONCE: IKEv2PayloadType = IKEv2PayloadType(40);
-    const NOTIFY: IKEv2PayloadType = IKEv2PayloadType(41);
-    const DELETE: IKEv2PayloadType = IKEv2PayloadType(42);
-    const VENDOR_ID: IKEv2PayloadType = IKEv2PayloadType(43);
-    const TRAFFIC_SELECTOR_INITIATOR: IKEv2PayloadType = IKEv2PayloadType(44);
-    const TRAFFIC_SELECTOR_RESPONSER: IKEv2PayloadType = IKEv2PayloadType(45);
-    const ENCRYPTED_AND_AUTHENTICATED: IKEv2PayloadType = IKEv2PayloadType(46);
-    const CONFIGURATION: IKEv2PayloadType = IKEv2PayloadType(47);
-    const EXTENSIBLE_AUTHENTICATION: IKEv2PayloadType = IKEv2PayloadType(48);
+impl PayloadType {
+    const NONE: PayloadType = PayloadType(0);
+    const SECURITY_ASSOCIATION: PayloadType = PayloadType(33);
+    const KEY_EXCHANGE: PayloadType = PayloadType(34);
+    const ID_INITIATOR: PayloadType = PayloadType(35);
+    const ID_RESPONDER: PayloadType = PayloadType(36);
+    const CERTIFICATE: PayloadType = PayloadType(37);
+    const CERTIFICATE_REQUEST: PayloadType = PayloadType(38);
+    const AUTHENTICATION: PayloadType = PayloadType(39);
+    const NONCE: PayloadType = PayloadType(40);
+    const NOTIFY: PayloadType = PayloadType(41);
+    const DELETE: PayloadType = PayloadType(42);
+    const VENDOR_ID: PayloadType = PayloadType(43);
+    const TRAFFIC_SELECTOR_INITIATOR: PayloadType = PayloadType(44);
+    const TRAFFIC_SELECTOR_RESPONSER: PayloadType = PayloadType(45);
+    const ENCRYPTED_AND_AUTHENTICATED: PayloadType = PayloadType(46);
+    const CONFIGURATION: PayloadType = PayloadType(47);
+    const EXTENSIBLE_AUTHENTICATION: PayloadType = PayloadType(48);
 
-    fn from_u8(value: u8) -> Result<IKEv2PayloadType, FormatError> {
+    fn from_u8(value: u8) -> Result<PayloadType, FormatError> {
         if (value >= Self::SECURITY_ASSOCIATION.0 && value <= Self::EXTENSIBLE_AUTHENTICATION.0)
             || value == Self::NONE.0
         {
-            Ok(IKEv2PayloadType(value))
+            Ok(PayloadType(value))
         } else {
             debug!("Unsupported IKEv2 Payload Type {}", value);
             Err("Unsupported IKEv2 Payload Type".into())
@@ -350,7 +285,7 @@ impl IKEv2PayloadType {
     }
 }
 
-impl fmt::Display for IKEv2PayloadType {
+impl fmt::Display for PayloadType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::NONE => write!(f, "No Next Payload")?,
@@ -376,13 +311,13 @@ impl fmt::Display for IKEv2PayloadType {
     }
 }
 
-struct IKEv2PayloadSecurityAssociation<'a> {
+struct PayloadSecurityAssociation<'a> {
     data: &'a [u8],
 }
 
-impl<'a> IKEv2PayloadSecurityAssociation<'a> {
-    fn iter_proposals(&self) -> IKEv2SecurityAssociationIter {
-        IKEv2SecurityAssociationIter { data: self.data }
+impl<'a> PayloadSecurityAssociation<'a> {
+    fn iter_proposals(&self) -> SecurityAssociationIter {
+        SecurityAssociationIter { data: self.data }
     }
 }
 
@@ -416,12 +351,12 @@ impl fmt::Display for IPSecProtocolID {
     }
 }
 
-struct IKEv2SecurityAssociationIter<'a> {
+struct SecurityAssociationIter<'a> {
     data: &'a [u8],
 }
 
-impl<'a> Iterator for IKEv2SecurityAssociationIter<'a> {
-    type Item = Result<IKEv2SecurityAssociationProposal<'a>, FormatError>;
+impl<'a> Iterator for SecurityAssociationIter<'a> {
+    type Item = Result<SecurityAssociationProposal<'a>, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.data.is_empty() {
@@ -459,7 +394,7 @@ impl<'a> Iterator for IKEv2SecurityAssociationIter<'a> {
         let spi_size = self.data[6] as usize;
         let num_transforms = self.data[7] as usize;
         let spi = &self.data[8..8 + spi_size];
-        let item = IKEv2SecurityAssociationProposal {
+        let item = SecurityAssociationProposal {
             proposal_num,
             protocol_id,
             num_transforms,
@@ -471,7 +406,7 @@ impl<'a> Iterator for IKEv2SecurityAssociationIter<'a> {
     }
 }
 
-struct IKEv2SecurityAssociationProposal<'a> {
+struct SecurityAssociationProposal<'a> {
     proposal_num: u8,
     protocol_id: IPSecProtocolID,
     num_transforms: usize,
@@ -479,9 +414,9 @@ struct IKEv2SecurityAssociationProposal<'a> {
     data: &'a [u8],
 }
 
-impl<'a> IKEv2SecurityAssociationProposal<'a> {
-    fn iter_transforms(&self) -> IKEv2SecurityAssociationTransformIter {
-        IKEv2SecurityAssociationTransformIter {
+impl<'a> SecurityAssociationProposal<'a> {
+    fn iter_transforms(&self) -> SecurityAssociationTransformIter {
+        SecurityAssociationTransformIter {
             num_transforms: self.num_transforms,
             data: self.data,
         }
@@ -489,50 +424,50 @@ impl<'a> IKEv2SecurityAssociationProposal<'a> {
 }
 
 #[derive(PartialEq, Eq)]
-struct IKEv2TransformType(u8, u16);
+struct TransformType(u8, u16);
 
 // See http://www.iana.org/assignments/ikev2-parameters/ for additional values.
-impl IKEv2TransformType {
-    const ENCR_DES_IV64: IKEv2TransformType = IKEv2TransformType(1, 1);
-    const ENCR_DES: IKEv2TransformType = IKEv2TransformType(1, 2);
-    const ENCR_3DES: IKEv2TransformType = IKEv2TransformType(1, 3);
-    const ENCR_RC5: IKEv2TransformType = IKEv2TransformType(1, 4);
-    const ENCR_IDEA: IKEv2TransformType = IKEv2TransformType(1, 5);
-    const ENCR_CAST: IKEv2TransformType = IKEv2TransformType(1, 6);
-    const ENCR_BLOWFISH: IKEv2TransformType = IKEv2TransformType(1, 7);
-    const ENCR_3IDEA: IKEv2TransformType = IKEv2TransformType(1, 8);
-    const ENCR_DES_IV32: IKEv2TransformType = IKEv2TransformType(1, 9);
-    const ENCR_NULL: IKEv2TransformType = IKEv2TransformType(1, 11);
-    const ENCR_AES_CBC: IKEv2TransformType = IKEv2TransformType(1, 12);
-    const ENCR_AES_CTR: IKEv2TransformType = IKEv2TransformType(1, 13);
+impl TransformType {
+    const ENCR_DES_IV64: TransformType = TransformType(1, 1);
+    const ENCR_DES: TransformType = TransformType(1, 2);
+    const ENCR_3DES: TransformType = TransformType(1, 3);
+    const ENCR_RC5: TransformType = TransformType(1, 4);
+    const ENCR_IDEA: TransformType = TransformType(1, 5);
+    const ENCR_CAST: TransformType = TransformType(1, 6);
+    const ENCR_BLOWFISH: TransformType = TransformType(1, 7);
+    const ENCR_3IDEA: TransformType = TransformType(1, 8);
+    const ENCR_DES_IV32: TransformType = TransformType(1, 9);
+    const ENCR_NULL: TransformType = TransformType(1, 11);
+    const ENCR_AES_CBC: TransformType = TransformType(1, 12);
+    const ENCR_AES_CTR: TransformType = TransformType(1, 13);
 
-    const PRF_HMAC_MD5: IKEv2TransformType = IKEv2TransformType(2, 1);
-    const PRF_HMAC_SHA1: IKEv2TransformType = IKEv2TransformType(2, 2);
-    const PRF_HMAC_TIGER: IKEv2TransformType = IKEv2TransformType(2, 3);
+    const PRF_HMAC_MD5: TransformType = TransformType(2, 1);
+    const PRF_HMAC_SHA1: TransformType = TransformType(2, 2);
+    const PRF_HMAC_TIGER: TransformType = TransformType(2, 3);
 
-    const AUTH_NONE: IKEv2TransformType = IKEv2TransformType(3, 0);
-    const AUTH_HMAC_MD5_96: IKEv2TransformType = IKEv2TransformType(3, 1);
-    const AUTH_HMAC_SHA1_96: IKEv2TransformType = IKEv2TransformType(3, 2);
-    const AUTH_DES_MAC: IKEv2TransformType = IKEv2TransformType(3, 3);
-    const AUTH_KPDK_MD5: IKEv2TransformType = IKEv2TransformType(3, 4);
-    const AUTH_AES_XCBC_96: IKEv2TransformType = IKEv2TransformType(3, 5);
+    const AUTH_NONE: TransformType = TransformType(3, 0);
+    const AUTH_HMAC_MD5_96: TransformType = TransformType(3, 1);
+    const AUTH_HMAC_SHA1_96: TransformType = TransformType(3, 2);
+    const AUTH_DES_MAC: TransformType = TransformType(3, 3);
+    const AUTH_KPDK_MD5: TransformType = TransformType(3, 4);
+    const AUTH_AES_XCBC_96: TransformType = TransformType(3, 5);
 
-    const DH_NONE: IKEv2TransformType = IKEv2TransformType(4, 0);
-    const DH_768: IKEv2TransformType = IKEv2TransformType(4, 1);
-    const DH_1024: IKEv2TransformType = IKEv2TransformType(4, 2);
-    const DH_1536: IKEv2TransformType = IKEv2TransformType(4, 5);
-    const DH_2048: IKEv2TransformType = IKEv2TransformType(4, 14);
-    const DH_3072: IKEv2TransformType = IKEv2TransformType(4, 15);
-    const DH_4096: IKEv2TransformType = IKEv2TransformType(4, 16);
-    const DH_6144: IKEv2TransformType = IKEv2TransformType(4, 17);
-    const DH_8192: IKEv2TransformType = IKEv2TransformType(4, 18);
+    const DH_NONE: TransformType = TransformType(4, 0);
+    const DH_768: TransformType = TransformType(4, 1);
+    const DH_1024: TransformType = TransformType(4, 2);
+    const DH_1536: TransformType = TransformType(4, 5);
+    const DH_2048: TransformType = TransformType(4, 14);
+    const DH_3072: TransformType = TransformType(4, 15);
+    const DH_4096: TransformType = TransformType(4, 16);
+    const DH_6144: TransformType = TransformType(4, 17);
+    const DH_8192: TransformType = TransformType(4, 18);
 
-    const NO_ESN: IKEv2TransformType = IKEv2TransformType(5, 0);
-    const ESN: IKEv2TransformType = IKEv2TransformType(5, 1);
+    const NO_ESN: TransformType = TransformType(5, 0);
+    const ESN: TransformType = TransformType(5, 1);
 
-    fn from_raw(transform_type: u8, transform_id: u16) -> Result<IKEv2TransformType, FormatError> {
+    fn from_raw(transform_type: u8, transform_id: u16) -> Result<TransformType, FormatError> {
         if transform_type >= 1 && transform_type <= 5 {
-            Ok(IKEv2TransformType(transform_type, transform_id))
+            Ok(TransformType(transform_type, transform_id))
         } else {
             debug!(
                 "Unsupported IKEv2 Transform Type {} ID {}",
@@ -543,7 +478,7 @@ impl IKEv2TransformType {
     }
 }
 
-impl fmt::Display for IKEv2TransformType {
+impl fmt::Display for TransformType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::ENCR_DES_IV64 => write!(f, "ENCR_DES_IV64")?,
@@ -584,13 +519,13 @@ impl fmt::Display for IKEv2TransformType {
     }
 }
 
-struct IKEv2SecurityAssociationTransformIter<'a> {
+struct SecurityAssociationTransformIter<'a> {
     num_transforms: usize,
     data: &'a [u8],
 }
 
-impl<'a> Iterator for IKEv2SecurityAssociationTransformIter<'a> {
-    type Item = Result<IKEv2SecurityAssociationTransform<'a>, FormatError>;
+impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
+    type Item = Result<SecurityAssociationTransform<'a>, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.data.is_empty() {
@@ -623,7 +558,7 @@ impl<'a> Iterator for IKEv2SecurityAssociationTransformIter<'a> {
         let mut transform_id = [0u8; 2];
         transform_id.copy_from_slice(&self.data[6..8]);
         let transform_id = u16::from_be_bytes(transform_id);
-        let transform_type = match IKEv2TransformType::from_raw(transform_type, transform_id) {
+        let transform_type = match TransformType::from_raw(transform_type, transform_id) {
             Ok(transform_type) => transform_type,
             Err(err) => {
                 debug!("Unsupported transform type: {}", err);
@@ -631,7 +566,7 @@ impl<'a> Iterator for IKEv2SecurityAssociationTransformIter<'a> {
                 return Some(Err("Unsupported transform type".into()));
             }
         };
-        let item = IKEv2SecurityAssociationTransform {
+        let item = SecurityAssociationTransform {
             transform_type,
             data: &self.data[8..transform_length],
         };
@@ -645,23 +580,23 @@ impl<'a> Iterator for IKEv2SecurityAssociationTransformIter<'a> {
     }
 }
 
-struct IKEv2SecurityAssociationTransform<'a> {
-    transform_type: IKEv2TransformType,
+struct SecurityAssociationTransform<'a> {
+    transform_type: TransformType,
     data: &'a [u8],
 }
 
-impl<'a> IKEv2SecurityAssociationTransform<'a> {
-    fn iter_attributes(&self) -> IKEv2SecurityAssociationTransformAttributesIter {
-        IKEv2SecurityAssociationTransformAttributesIter { data: self.data }
+impl<'a> SecurityAssociationTransform<'a> {
+    fn iter_attributes(&self) -> SecurityAssociationTransformAttributesIter {
+        SecurityAssociationTransformAttributesIter { data: self.data }
     }
 }
 
-struct IKEv2SecurityAssociationTransformAttributesIter<'a> {
+struct SecurityAssociationTransformAttributesIter<'a> {
     data: &'a [u8],
 }
 
-impl<'a> Iterator for IKEv2SecurityAssociationTransformAttributesIter<'a> {
-    type Item = IKEv2SecurityAssociationTransformAttribute<'a>;
+impl<'a> Iterator for SecurityAssociationTransformAttributesIter<'a> {
+    type Item = SecurityAssociationTransformAttribute<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         const ATTRIBUTE_FORMAT_TV: u16 = 1 << 15;
@@ -678,7 +613,7 @@ impl<'a> Iterator for IKEv2SecurityAssociationTransformAttributesIter<'a> {
         let attribute_type = u16::from_be_bytes(attribute_type);
         if attribute_type & ATTRIBUTE_FORMAT_TV != 0 {
             let attribute_type = attribute_type & ATTRIBUTE_TYPE_MASK;
-            let item = IKEv2SecurityAssociationTransformAttribute {
+            let item = SecurityAssociationTransformAttribute {
                 attribute_type,
                 data: &self.data[2..4],
             };
@@ -692,7 +627,7 @@ impl<'a> Iterator for IKEv2SecurityAssociationTransformAttributesIter<'a> {
                 debug!("Transform attribute overflow");
                 return None;
             }
-            let item = IKEv2SecurityAssociationTransformAttribute {
+            let item = SecurityAssociationTransformAttribute {
                 attribute_type,
                 data: &self.data[4..attribute_length],
             };
@@ -702,102 +637,12 @@ impl<'a> Iterator for IKEv2SecurityAssociationTransformAttributesIter<'a> {
     }
 }
 
-struct IKEv2SecurityAssociationTransformAttribute<'a> {
+struct SecurityAssociationTransformAttribute<'a> {
     attribute_type: u16,
     data: &'a [u8],
 }
 
-struct SessionID {
-    remote_spi: u64,
-    local_spi: u64,
-}
-
-impl PartialEq for SessionID {
-    fn eq(&self, other: &Self) -> bool {
-        self.remote_spi == other.remote_spi && self.local_spi == other.local_spi
-    }
-}
-
-impl Eq for SessionID {}
-
-impl Hash for SessionID {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.remote_spi.hash(state);
-        self.local_spi.hash(state);
-    }
-}
-
-impl SessionID {
-    fn from_message(message: &IKEv2Message) -> Result<SessionID, FormatError> {
-        let local_spi = if message.read_exchange_type()? == IKEExchangeType::IKE_SA_INIT {
-            rand::thread_rng().gen::<u64>()
-        } else {
-            message.read_responder_spi()
-        };
-        let remote_spi = message.read_initiator_spi();
-        Ok(SessionID {
-            remote_spi,
-            local_spi,
-        })
-    }
-}
-
-struct Sessions {
-    sessions: HashMap<SessionID, IKEv2Session>,
-}
-
-impl Sessions {
-    fn new() -> Sessions {
-        Sessions {
-            sessions: HashMap::new(),
-        }
-    }
-
-    fn get(
-        &mut self,
-        message: &IKEv2Message,
-        remote_addr: SocketAddr,
-    ) -> Result<&mut IKEv2Session, FormatError> {
-        let id = SessionID::from_message(message)?;
-        Ok(self
-            .sessions
-            .entry(id)
-            .or_insert_with(|| IKEv2Session::new(remote_addr)))
-    }
-
-    async fn process_message(
-        &mut self,
-        datagram_bytes: &[u8],
-        remote_addr: SocketAddr,
-    ) -> Result<(), IKEv2Error> {
-        let ikev2_message = IKEv2Message::from_datagram(datagram_bytes);
-        if !ikev2_message.is_valid() {
-            warn!("Invalid IKEv2 message from {}", remote_addr);
-            return Err("Invalid message received".into());
-        }
-        let session = self.get(&ikev2_message, remote_addr)?;
-        session.process_message(&ikev2_message);
-        Ok(())
-    }
-}
-
-struct IKEv2Session {
-    remote_addr: SocketAddr,
-}
-
-impl IKEv2Session {
-    fn new(remote_addr: SocketAddr) -> IKEv2Session {
-        IKEv2Session { remote_addr }
-    }
-
-    fn process_message(&mut self, message: &IKEv2Message) {
-        debug!("Received packet from {} {:?}", self.remote_addr, message);
-        // TODO: process message if exchange type is supported
-        // TODO: return error if payload type is critical but not recognized
-    }
-}
-
-impl fmt::Debug for IKEv2Message<'_> {
+impl fmt::Debug for Message<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "IKEv2 message")?;
         writeln!(f, "  Initiator SPI {:x}", self.read_initiator_spi())?;
@@ -891,61 +736,5 @@ impl error::Error for FormatError {
 impl From<&'static str> for FormatError {
     fn from(msg: &'static str) -> FormatError {
         FormatError { msg }
-    }
-}
-
-#[derive(Debug)]
-pub enum IKEv2Error {
-    Internal(&'static str),
-    Format(FormatError),
-    Join(tokio::task::JoinError),
-    Io(io::Error),
-}
-
-impl fmt::Display for IKEv2Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            IKEv2Error::Internal(msg) => f.write_str(msg),
-            IKEv2Error::Format(ref e) => write!(f, "Format error: {}", e),
-            IKEv2Error::Join(ref e) => write!(f, "Tokio join error: {}", e),
-            IKEv2Error::Io(ref e) => {
-                write!(f, "IO error: {}", e)
-            }
-        }
-    }
-}
-
-impl error::Error for IKEv2Error {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            IKEv2Error::Internal(_msg) => None,
-            IKEv2Error::Format(ref err) => Some(err),
-            IKEv2Error::Join(ref err) => Some(err),
-            IKEv2Error::Io(ref err) => Some(err),
-        }
-    }
-}
-
-impl From<&'static str> for IKEv2Error {
-    fn from(msg: &'static str) -> IKEv2Error {
-        IKEv2Error::Internal(msg)
-    }
-}
-
-impl From<FormatError> for IKEv2Error {
-    fn from(err: FormatError) -> IKEv2Error {
-        IKEv2Error::Format(err)
-    }
-}
-
-impl From<tokio::task::JoinError> for IKEv2Error {
-    fn from(err: tokio::task::JoinError) -> IKEv2Error {
-        IKEv2Error::Join(err)
-    }
-}
-
-impl From<io::Error> for IKEv2Error {
-    fn from(err: io::Error) -> IKEv2Error {
-        IKEv2Error::Io(err)
     }
 }
