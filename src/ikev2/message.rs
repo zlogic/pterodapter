@@ -78,8 +78,13 @@ pub struct Message<'a> {
 
 // Parse and validate using spec from RFC 7296, Section 3.
 impl Message<'_> {
-    pub fn from_datagram<'a>(p: &'a [u8]) -> Message<'a> {
-        Message { data: p }
+    pub fn from_datagram<'a>(p: &'a [u8]) -> Result<Message, FormatError> {
+        if p.len() < 29 {
+            debug!("Not enough data in message");
+            Err("Not enough data in message".into())
+        } else {
+            Ok(Message { data: p })
+        }
     }
 
     pub fn read_initiator_spi(&self) -> u64 {
@@ -184,11 +189,35 @@ struct Payload<'a> {
 }
 
 impl Payload<'_> {
-    fn to_security_association(&self) -> Option<PayloadSecurityAssociation> {
+    fn to_security_association(&self) -> Result<PayloadSecurityAssociation, FormatError> {
         if self.payload_type == PayloadType::SECURITY_ASSOCIATION {
-            Some(PayloadSecurityAssociation { data: self.data })
+            Ok(PayloadSecurityAssociation { data: self.data })
         } else {
-            None
+            Err("Payload type is not SECURITY_ASSOCIATION".into())
+        }
+    }
+
+    fn to_key_exchange(&self) -> Result<PayloadKeyExchange, FormatError> {
+        if self.payload_type == PayloadType::KEY_EXCHANGE {
+            PayloadKeyExchange::from_payload(self.data)
+        } else {
+            Err("Payload type is not KEY_EXCHANGE".into())
+        }
+    }
+
+    fn to_nonce(&self) -> Result<PayloadNonce, FormatError> {
+        if self.payload_type == PayloadType::NONCE {
+            Ok(PayloadNonce { data: self.data })
+        } else {
+            Err("Payload type is not NONCE".into())
+        }
+    }
+
+    fn to_notify(&self) -> Result<PayloadNotify, FormatError> {
+        if self.payload_type == PayloadType::NOTIFY {
+            PayloadNotify::from_payload(self.data)
+        } else {
+            Err("Payload type is not NOTIFY".into())
         }
     }
 }
@@ -321,7 +350,7 @@ impl<'a> PayloadSecurityAssociation<'a> {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct IPSecProtocolID(u8);
 
 impl IPSecProtocolID {
@@ -393,6 +422,10 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
         };
         let spi_size = self.data[6] as usize;
         let num_transforms = self.data[7] as usize;
+        if self.data.len() < 8 + spi_size {
+            debug!("Proposal SPI overflow");
+            return None;
+        }
         let spi = &self.data[8..8 + spi_size];
         let item = SecurityAssociationProposal {
             proposal_num,
@@ -658,6 +691,165 @@ struct SecurityAssociationTransformAttribute<'a> {
     data: &'a [u8],
 }
 
+struct PayloadKeyExchange<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> PayloadKeyExchange<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadKeyExchange<'a>, FormatError> {
+        if data.len() < 4 {
+            debug!("Not enough data in key exchange payload");
+            Err("Not enough data in key exchange payload".into())
+        } else {
+            Ok(PayloadKeyExchange { data })
+        }
+    }
+
+    fn read_group_num(&self) -> u16 {
+        // TODO: verify this matches SA proposal group number.
+        let mut dh_group_num = [0u8; 2];
+        dh_group_num.copy_from_slice(&self.data[0..2]);
+        u16::from_be_bytes(dh_group_num)
+    }
+
+    fn read_value(&self) -> &[u8] {
+        &self.data[4..]
+    }
+}
+
+struct PayloadNonce<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> PayloadNonce<'a> {
+    fn read_value(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct NotifyMessageType(u16);
+
+impl NotifyMessageType {
+    const UNSUPPORTED_CRITICAL_PAYLOAD: NotifyMessageType = NotifyMessageType(1);
+    const INVALID_IKE_SPI: NotifyMessageType = NotifyMessageType(4);
+    const INVALID_MAJOR_VERSION: NotifyMessageType = NotifyMessageType(5);
+    const INVALID_SYNTAX: NotifyMessageType = NotifyMessageType(7);
+    const INVALID_MESSAGE_ID: NotifyMessageType = NotifyMessageType(9);
+    const INVALID_SPI: NotifyMessageType = NotifyMessageType(11);
+    const NO_PROPOSAL_CHOSEN: NotifyMessageType = NotifyMessageType(14);
+    const INVALID_KE_PAYLOAD: NotifyMessageType = NotifyMessageType(17);
+    const AUTHENTICATION_FAILED: NotifyMessageType = NotifyMessageType(24);
+    const SINGLE_PAIR_REQUIRED: NotifyMessageType = NotifyMessageType(34);
+    const NO_ADDITIONAL_SAS: NotifyMessageType = NotifyMessageType(35);
+    const INTERNAL_ADDRESS_FAILURE: NotifyMessageType = NotifyMessageType(36);
+    const FAILED_CP_REQUIRED: NotifyMessageType = NotifyMessageType(37);
+    const TS_UNACCEPTABLE: NotifyMessageType = NotifyMessageType(38);
+    const INVALID_SELECTORS: NotifyMessageType = NotifyMessageType(39);
+    const TEMPORARY_FAILURE: NotifyMessageType = NotifyMessageType(43);
+    const CHILD_SA_NOT_FOUND: NotifyMessageType = NotifyMessageType(44);
+
+    const INITIAL_CONTACT: NotifyMessageType = NotifyMessageType(16384);
+    const SET_WINDOW_SIZE: NotifyMessageType = NotifyMessageType(16385);
+    const ADDITIONAL_TS_POSSIBLE: NotifyMessageType = NotifyMessageType(16386);
+    const IPCOMP_SUPPORTED: NotifyMessageType = NotifyMessageType(16387);
+    const NAT_DETECTION_SOURCE_IP: NotifyMessageType = NotifyMessageType(16388);
+    const NAT_DETECTION_DESTINATION_IP: NotifyMessageType = NotifyMessageType(16389);
+    const COOKIE: NotifyMessageType = NotifyMessageType(16390);
+    const USE_TRANSPORT_MODE: NotifyMessageType = NotifyMessageType(16391);
+    const HTTP_CERT_LOOKUP_SUPPORTED: NotifyMessageType = NotifyMessageType(16392);
+    const REKEY_SA: NotifyMessageType = NotifyMessageType(16393);
+    const ESP_TFC_PADDING_NOT_SUPPORTED: NotifyMessageType = NotifyMessageType(16394);
+    const NON_FIRST_FRAGMENTS_ALSO: NotifyMessageType = NotifyMessageType(16395);
+
+    const REDIRECT_SUPPORTED: NotifyMessageType = NotifyMessageType(16406);
+    const IKEV2_FRAGMENTATION_SUPPORTED: NotifyMessageType = NotifyMessageType(16430);
+
+    fn from_u16(value: u16) -> NotifyMessageType {
+        NotifyMessageType(value)
+    }
+}
+
+impl fmt::Display for NotifyMessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::UNSUPPORTED_CRITICAL_PAYLOAD => write!(f, "UNSUPPORTED_CRITICAL_PAYLOAD")?,
+            Self::INVALID_IKE_SPI => write!(f, "INVALID_IKE_SPI")?,
+            Self::INVALID_MAJOR_VERSION => write!(f, "INVALID_MAJOR_VERSION")?,
+            Self::INVALID_SYNTAX => write!(f, "INVALID_SYNTAX")?,
+            Self::INVALID_MESSAGE_ID => write!(f, "INVALID_MESSAGE_ID")?,
+            Self::INVALID_SPI => write!(f, "INVALID_SPI")?,
+            Self::NO_PROPOSAL_CHOSEN => write!(f, "NO_PROPOSAL_CHOSEN")?,
+            Self::INVALID_KE_PAYLOAD => write!(f, "INVALID_KE_PAYLOAD")?,
+            Self::AUTHENTICATION_FAILED => write!(f, "AUTHENTICATION_FAILED")?,
+            Self::SINGLE_PAIR_REQUIRED => write!(f, "SINGLE_PAIR_REQUIRED")?,
+            Self::NO_ADDITIONAL_SAS => write!(f, "NO_ADDITIONAL_SAS")?,
+            Self::INTERNAL_ADDRESS_FAILURE => write!(f, "INTERNAL_ADDRESS_FAILURE")?,
+            Self::FAILED_CP_REQUIRED => write!(f, "FAILED_CP_REQUIRED")?,
+            Self::TS_UNACCEPTABLE => write!(f, "TS_UNACCEPTABLE")?,
+            Self::INVALID_SELECTORS => write!(f, "INVALID_SELECTORS")?,
+            Self::TEMPORARY_FAILURE => write!(f, "TEMPORARY_FAILURE")?,
+            Self::CHILD_SA_NOT_FOUND => write!(f, "CHILD_SA_NOT_FOUND")?,
+            Self::INITIAL_CONTACT => write!(f, "INITIAL_CONTACT")?,
+            Self::SET_WINDOW_SIZE => write!(f, "SET_WINDOW_SIZE")?,
+            Self::ADDITIONAL_TS_POSSIBLE => write!(f, "ADDITIONAL_TS_POSSIBLE")?,
+            Self::IPCOMP_SUPPORTED => write!(f, "IPCOMP_SUPPORTED")?,
+            Self::NAT_DETECTION_SOURCE_IP => write!(f, "NAT_DETECTION_SOURCE_IP")?,
+            Self::NAT_DETECTION_DESTINATION_IP => write!(f, "NAT_DETECTION_DESTINATION_IP")?,
+            Self::COOKIE => write!(f, "COOKIE")?,
+            Self::USE_TRANSPORT_MODE => write!(f, "USE_TRANSPORT_MODE")?,
+            Self::HTTP_CERT_LOOKUP_SUPPORTED => write!(f, "HTTP_CERT_LOOKUP_SUPPORTED")?,
+            Self::REKEY_SA => write!(f, "REKEY_SA")?,
+            Self::ESP_TFC_PADDING_NOT_SUPPORTED => write!(f, "ESP_TFC_PADDING_NOT_SUPPORTED")?,
+            Self::NON_FIRST_FRAGMENTS_ALSO => write!(f, "NON_FIRST_FRAGMENTS_ALSO")?,
+            Self::REDIRECT_SUPPORTED => write!(f, "REDIRECT_SUPPORTED")?,
+            Self::IKEV2_FRAGMENTATION_SUPPORTED => write!(f, "IKEV2_FRAGMENTATION_SUPPORTED")?,
+            _ => write!(f, "Unknown Notify Message Type {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+struct PayloadNotify<'a> {
+    protocol_id: Option<IPSecProtocolID>,
+    message_type: NotifyMessageType,
+    spi: &'a [u8],
+    data: &'a [u8],
+}
+
+impl<'a> PayloadNotify<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadNotify<'a>, FormatError> {
+        if data.len() < 4 {
+            debug!("Not enough data in notify payload");
+            return Err("Not enough data in key exchange payload".into());
+        }
+        let protocol_id = data[0];
+        let protocol_id = if protocol_id != 0 {
+            Some(IPSecProtocolID::from_u8(protocol_id)?)
+        } else {
+            None
+        };
+        let spi_size = data[1] as usize;
+        if data.len() < 4 + spi_size {
+            return Err("Notify SPI oveflow".into());
+        }
+        let mut message_type = [0u8; 2];
+        message_type.copy_from_slice(&data[2..4]);
+        let message_type = u16::from_be_bytes(message_type);
+        let message_type = NotifyMessageType::from_u16(message_type);
+        let spi = &data[4..4 + spi_size];
+        Ok(PayloadNotify {
+            protocol_id,
+            message_type,
+            spi,
+            data: &data[4 + spi_size..],
+        })
+    }
+
+    fn read_value(&self) -> &[u8] {
+        self.data
+    }
+}
+
 impl fmt::Debug for Message<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "IKEv2 message")?;
@@ -692,7 +884,7 @@ impl fmt::Debug for Message<'_> {
                 "not critical"
             };
             writeln!(f, "  Payload type {}, {}", pl.payload_type, critical)?;
-            if let Some(pl_sa) = pl.to_security_association() {
+            if let Ok(pl_sa) = pl.to_security_association() {
                 for prop in pl_sa.iter_proposals() {
                     let prop = match prop {
                         Ok(prop) => prop,
@@ -724,6 +916,24 @@ impl fmt::Debug for Message<'_> {
                         }
                     }
                 }
+            } else if let Ok(pl_kex) = pl.to_key_exchange() {
+                writeln!(
+                    f,
+                    "    DH Group num {} value {:?}",
+                    pl_kex.read_group_num(),
+                    pl_kex.read_value()
+                )?;
+            } else if let Ok(pl_nonce) = pl.to_nonce() {
+                writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
+            } else if let Ok(pl_notify) = pl.to_notify() {
+                writeln!(
+                    f,
+                    "    Notify protocol ID {:?} SPI {:?} type {} value {:?}",
+                    pl_notify.protocol_id,
+                    pl_notify.spi,
+                    pl_notify.message_type,
+                    pl_notify.read_value(),
+                )?;
             } else {
                 writeln!(f, "    Data {:?}", pl.data)?;
             }

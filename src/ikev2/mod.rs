@@ -132,7 +132,7 @@ impl Sessions {
         datagram_bytes: &[u8],
         remote_addr: SocketAddr,
     ) -> Result<(), IKEv2Error> {
-        let ikev2_message = message::Message::from_datagram(datagram_bytes);
+        let ikev2_message = message::Message::from_datagram(datagram_bytes)?;
         if !ikev2_message.is_valid() {
             warn!("Invalid IKEv2 message from {}", remote_addr);
             return Err("Invalid message received".into());
