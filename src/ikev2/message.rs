@@ -12,7 +12,7 @@ impl ExchangeType {
     pub const INFORMATIONAL: ExchangeType = ExchangeType(37);
 
     fn from_u8(value: u8) -> Result<ExchangeType, FormatError> {
-        if value >= Self::IKE_SA_INIT.0 && value <= Self::INFORMATIONAL.0 {
+        if (Self::IKE_SA_INIT.0..=Self::INFORMATIONAL.0).contains(&value) {
             Ok(ExchangeType(value))
         } else {
             debug!("Unsupported IKEv2 Exchange Type {}", value);
@@ -43,8 +43,7 @@ impl Flags {
     const RESPONSE: Flags = Flags(1 << 5);
 
     fn from_u8(value: u8) -> Result<Flags, FormatError> {
-        const RESERVED_MASK: u8 =
-            0xff & !Flags::INITIATOR.0 & !Flags::VERSION.0 & !Flags::RESPONSE.0;
+        const RESERVED_MASK: u8 = !Flags::INITIATOR.0 & !Flags::VERSION.0 & !Flags::RESPONSE.0;
         if value & RESERVED_MASK != 0x00 {
             debug!("IKEv2 reserved flags are set {}", value & RESERVED_MASK);
             return Err("IKEv2 reserved flags are set".into());
@@ -78,7 +77,7 @@ pub struct Message<'a> {
 
 // Parse and validate using spec from RFC 7296, Section 3.
 impl Message<'_> {
-    pub fn from_datagram<'a>(p: &'a [u8]) -> Result<Message, FormatError> {
+    pub fn from_datagram(p: &[u8]) -> Result<Message, FormatError> {
         if p.len() < 29 {
             debug!("Not enough data in message");
             Err("Not enough data in message".into())
@@ -233,7 +232,7 @@ impl<'a> Iterator for PayloadIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         const CRITICAL_BIT: u8 = 1 << 7;
         if self.next_payload == 0 {
-            if self.data.len() != 0 {
+            if !self.data.is_empty() {
                 debug!("Packet has unaccounted data");
             }
             return None;
@@ -303,7 +302,7 @@ impl PayloadType {
     const EXTENSIBLE_AUTHENTICATION: PayloadType = PayloadType(48);
 
     fn from_u8(value: u8) -> Result<PayloadType, FormatError> {
-        if (value >= Self::SECURITY_ASSOCIATION.0 && value <= Self::EXTENSIBLE_AUTHENTICATION.0)
+        if (Self::SECURITY_ASSOCIATION.0..=Self::EXTENSIBLE_AUTHENTICATION.0).contains(&value)
             || value == Self::NONE.0
         {
             Ok(PayloadType(value))
@@ -359,7 +358,7 @@ impl IPSecProtocolID {
     const ESP: IPSecProtocolID = IPSecProtocolID(3);
 
     fn from_u8(value: u8) -> Result<IPSecProtocolID, FormatError> {
-        if value >= Self::IKE.0 && value <= Self::ESP.0 {
+        if (Self::IKE.0..=Self::ESP.0).contains(&value) {
             Ok(IPSecProtocolID(value))
         } else {
             debug!("Unsupported IKEv2 IPSec Protocol ID {}", value);
@@ -509,7 +508,7 @@ impl TransformType {
     const ESN: TransformType = TransformType(5, 1);
 
     fn from_raw(transform_type: u8, transform_id: u16) -> Result<TransformType, FormatError> {
-        if transform_type >= 1 && transform_type <= 5 {
+        if (1..=5).contains(&transform_type) {
             Ok(TransformType(transform_type, transform_id))
         } else {
             debug!(
@@ -620,11 +619,10 @@ impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
             data: &self.data[8..transform_length],
         };
         self.data = &self.data[transform_length..];
-        if self.num_transforms <= 0 {
+        if self.num_transforms == 0 && !self.data.is_empty() {
             debug!("Packet has unaccounted transforms");
-        } else {
-            self.num_transforms -= 1;
         }
+        self.num_transforms = self.num_transforms.saturating_sub(1);
         Some(Ok(item))
     }
 }
@@ -723,7 +721,7 @@ struct PayloadNonce<'a> {
 
 impl<'a> PayloadNonce<'a> {
     fn read_value(&self) -> &[u8] {
-        &self.data
+        self.data
     }
 }
 
