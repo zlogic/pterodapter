@@ -71,18 +71,18 @@ impl fmt::Display for Flags {
     }
 }
 
-pub struct Message<'a> {
+pub struct InputMessage<'a> {
     data: &'a [u8],
 }
 
 // Parse and validate using spec from RFC 7296, Section 3.
-impl Message<'_> {
-    pub fn from_datagram(p: &[u8]) -> Result<Message, FormatError> {
-        if p.len() < 29 {
+impl InputMessage<'_> {
+    pub fn from_datagram(p: &[u8]) -> Result<InputMessage, FormatError> {
+        if p.len() < 28 {
             debug!("Not enough data in message");
             Err("Not enough data in message".into())
         } else {
-            Ok(Message { data: p })
+            Ok(InputMessage { data: p })
         }
     }
 
@@ -117,7 +117,7 @@ impl Message<'_> {
         Flags::from_u8(self.data[19])
     }
 
-    fn read_message_id(&self) -> u32 {
+    pub fn read_message_id(&self) -> u32 {
         let mut result = [0u8; 4];
         result.copy_from_slice(&self.data[20..24]);
         u32::from_be_bytes(result)
@@ -178,6 +178,85 @@ impl Message<'_> {
             next_payload: self.read_next_payload(),
             data: &self.data[28..],
         }
+    }
+}
+
+pub struct MessageWriter<'a> {
+    dest: &'a mut [u8],
+    next_payload_index: usize,
+    cursor: usize,
+}
+
+impl MessageWriter<'_> {
+    pub fn new(dest: &mut [u8]) -> Result<MessageWriter, NotEnoughSpaceError> {
+        if dest.len() < 28 {
+            return Err(NotEnoughSpaceError {});
+        }
+        let next_payload_index = 16;
+        let cursor = 0;
+        Ok(MessageWriter {
+            dest,
+            next_payload_index,
+            cursor,
+        })
+    }
+
+    pub fn write_header(
+        &mut self,
+        initiator_spi: u64,
+        responder_spi: u64,
+        exchange_type: ExchangeType,
+        is_request: bool,
+        message_id: u32,
+    ) -> Result<(), NotEnoughSpaceError> {
+        if self.dest.len() < 28 {
+            return Err(NotEnoughSpaceError {});
+        }
+        self.dest[0..8].copy_from_slice(&initiator_spi.to_be_bytes());
+        self.dest[8..16].copy_from_slice(&responder_spi.to_be_bytes());
+        // Version 2.0.
+        self.dest[17] = 2 << 4;
+        self.dest[18] = exchange_type.0;
+        self.dest[19] = if is_request {
+            Flags::INITIATOR.0
+        } else {
+            Flags::RESPONSE.0
+        };
+        self.dest[20..24].copy_from_slice(&message_id.to_be_bytes());
+        self.dest[24..28].copy_from_slice(&0u32.to_be_bytes());
+
+        self.next_payload_index = 16;
+        self.cursor = 28;
+        Ok(())
+    }
+
+    fn next_payload_slice(
+        &mut self,
+        payload_type: PayloadType,
+        data_length: usize,
+    ) -> Result<&mut [u8], NotEnoughSpaceError> {
+        let next_data = self.cursor + 4..self.cursor + 4 + data_length;
+        if next_data.end > self.dest.len() {
+            return Err(NotEnoughSpaceError {});
+        }
+        {
+            let next_header = &mut self.dest[self.cursor..self.cursor + 4];
+            next_header[0] = PayloadType::NONE.0;
+            // Not critical.
+            next_header[1] = 0;
+            let full_payload_length = data_length + 4;
+            next_header[2..4].copy_from_slice(&full_payload_length.to_be_bytes());
+        }
+        self.dest[self.next_payload_index] = payload_type.0;
+        self.next_payload_index = self.cursor;
+        self.cursor = next_data.end;
+        Ok(&mut self.dest[next_data])
+    }
+
+    pub fn complete_message(&mut self) -> usize {
+        let message_length = self.cursor as u32;
+        self.dest[24..28].copy_from_slice(&message_length.to_be_bytes());
+        self.cursor
     }
 }
 
@@ -861,7 +940,7 @@ impl<'a> PayloadNotify<'a> {
     }
 }
 
-impl fmt::Debug for Message<'_> {
+impl fmt::Debug for InputMessage<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "IKEv2 message")?;
         writeln!(f, "  Initiator SPI {:x}", self.read_initiator_spi())?;
@@ -990,5 +1069,25 @@ impl From<&'static str> for FormatError {
             msg,
             error_code: None,
         }
+    }
+}
+
+pub struct NotEnoughSpaceError {}
+
+impl fmt::Display for NotEnoughSpaceError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Not enough space in buffer")
+    }
+}
+
+impl fmt::Debug for NotEnoughSpaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Not enough space in buffer")
+    }
+}
+
+impl error::Error for NotEnoughSpaceError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(self)
     }
 }
