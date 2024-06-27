@@ -91,6 +91,8 @@ impl Hash for SessionID {
 
 impl SessionID {
     fn from_message(message: &message::Message) -> Result<SessionID, message::FormatError> {
+        // As IKE_SA_INIT is unencrypted and unauthenticated, prevent sessions from being hijacked
+        // by generating a unique session ID for every packet.
         let local_spi = if message.read_exchange_type()? == message::ExchangeType::IKE_SA_INIT {
             rand::thread_rng().gen::<u64>()
         } else {
@@ -156,6 +158,8 @@ impl IKEv2Session {
         debug!("Received packet from {} {:?}", self.remote_addr, message);
         // TODO: process message if exchange type is supported
         // TODO: return error if payload type is critical but not recognized
+
+        // Response retransmisisons are initiated by client.
     }
 }
 

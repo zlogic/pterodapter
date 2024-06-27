@@ -345,7 +345,10 @@ struct PayloadSecurityAssociation<'a> {
 
 impl<'a> PayloadSecurityAssociation<'a> {
     fn iter_proposals(&self) -> SecurityAssociationIter {
-        SecurityAssociationIter { data: self.data }
+        SecurityAssociationIter {
+            data: self.data,
+            next_proposal_num: 1,
+        }
     }
 }
 
@@ -380,6 +383,7 @@ impl fmt::Display for IPSecProtocolID {
 }
 
 struct SecurityAssociationIter<'a> {
+    next_proposal_num: u8,
     data: &'a [u8],
 }
 
@@ -411,6 +415,15 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             return None;
         }
         let proposal_num = self.data[4];
+        if proposal_num != self.next_proposal_num {
+            debug!(
+                "Unexpected proposal num {} (should be {})",
+                proposal_num, self.next_proposal_num
+            );
+            self.data = &self.data[proposal_length..];
+            return Some(Err("Unexpected proposal number".into()));
+        }
+        self.next_proposal_num += 1;
         let protocol_id = match IPSecProtocolID::from_u8(self.data[5]) {
             Ok(protocol_id) => protocol_id,
             Err(err) => {
@@ -940,14 +953,28 @@ impl fmt::Debug for Message<'_> {
     }
 }
 
-#[derive(Debug)]
 pub struct FormatError {
     msg: &'static str,
+    error_code: Option<NotifyMessageType>,
 }
 
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.msg)
+        write!(f, "{}", self.msg)?;
+        if let Some(error_code) = &self.error_code {
+            write!(f, " ({})", error_code)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.msg)?;
+        if let Some(error_code) = &self.error_code {
+            write!(f, " ({})", error_code)?;
+        }
+        Ok(())
     }
 }
 
@@ -959,6 +986,9 @@ impl error::Error for FormatError {
 
 impl From<&'static str> for FormatError {
     fn from(msg: &'static str) -> FormatError {
-        FormatError { msg }
+        FormatError {
+            msg,
+            error_code: None,
+        }
     }
 }
