@@ -12,6 +12,8 @@ log = { version = "0.4", default-features = false }
 tokio = { version = "1.38", default-features = false, features = ["rt", "io-util", "signal", "net", "time"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
+sha1 = { version = "0.10", default-features = false }
+
 [profile.release]
 strip = true
 lto = true

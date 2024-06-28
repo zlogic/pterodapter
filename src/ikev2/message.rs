@@ -173,7 +173,7 @@ impl InputMessage<'_> {
         valid
     }
 
-    fn iter_payloads(&self) -> PayloadIter {
+    pub fn iter_payloads(&self) -> PayloadIter {
         PayloadIter {
             next_payload: self.read_next_payload(),
             data: &self.data[28..],
@@ -230,7 +230,47 @@ impl MessageWriter<'_> {
         Ok(())
     }
 
-    fn next_payload_slice(
+    pub fn write_notify_payload(
+        &mut self,
+        protocol_id: Option<IPSecProtocolID>,
+        spi: &[u8],
+        notify_message_type: NotifyMessageType,
+        data: &[u8],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::NOTIFY, 4 + spi.len() + data.len())?;
+        next_payload_slice[0] = if let Some(protocol_id) = protocol_id {
+            protocol_id.0
+        } else {
+            0
+        };
+        next_payload_slice[1] = spi.len() as u8;
+        next_payload_slice[2..4].copy_from_slice(&notify_message_type.0.to_be_bytes());
+        next_payload_slice[4..4 + spi.len()].copy_from_slice(spi);
+        next_payload_slice[4 + spi.len()..].copy_from_slice(data);
+        Ok(())
+    }
+
+    pub fn write_accept_proposal(
+        &mut self,
+        proposal: &SecurityAssociationProposal,
+    ) -> Result<(), NotEnoughSpaceError> {
+        let proposal_len = 8 + proposal.spi.len() + proposal.data.len();
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::SECURITY_ASSOCIATION, proposal_len)?;
+        next_payload_slice[0] = 0;
+        next_payload_slice[1] = 0;
+        next_payload_slice[2..4].copy_from_slice(&(proposal_len as u16).to_be_bytes());
+        next_payload_slice[4] = proposal.proposal_num;
+        next_payload_slice[5] = proposal.protocol_id.0;
+        next_payload_slice[6] = proposal.spi.len() as u8;
+        next_payload_slice[7] = proposal.num_transforms as u8;
+        next_payload_slice[8..8 + proposal.spi.len()].copy_from_slice(proposal.spi);
+        next_payload_slice[8 + proposal.spi.len()..].copy_from_slice(proposal.data);
+        Ok(())
+    }
+
+    pub fn next_payload_slice(
         &mut self,
         payload_type: PayloadType,
         data_length: usize,
@@ -244,7 +284,7 @@ impl MessageWriter<'_> {
             next_header[0] = PayloadType::NONE.0;
             // Not critical.
             next_header[1] = 0;
-            let full_payload_length = data_length + 4;
+            let full_payload_length = data_length as u16 + 4;
             next_header[2..4].copy_from_slice(&full_payload_length.to_be_bytes());
         }
         self.dest[self.next_payload_index] = payload_type.0;
@@ -260,14 +300,18 @@ impl MessageWriter<'_> {
     }
 }
 
-struct Payload<'a> {
+pub struct Payload<'a> {
     payload_type: PayloadType,
     critical: bool,
     data: &'a [u8],
 }
 
 impl Payload<'_> {
-    fn to_security_association(&self) -> Result<PayloadSecurityAssociation, FormatError> {
+    pub fn payload_type(&self) -> PayloadType {
+        self.payload_type
+    }
+
+    pub fn to_security_association(&self) -> Result<PayloadSecurityAssociation, FormatError> {
         if self.payload_type == PayloadType::SECURITY_ASSOCIATION {
             Ok(PayloadSecurityAssociation { data: self.data })
         } else {
@@ -300,7 +344,7 @@ impl Payload<'_> {
     }
 }
 
-struct PayloadIter<'a> {
+pub struct PayloadIter<'a> {
     next_payload: u8,
     data: &'a [u8],
 }
@@ -358,27 +402,27 @@ impl<'a> Iterator for PayloadIter<'a> {
     }
 }
 
-#[derive(PartialEq, Eq)]
-struct PayloadType(u8);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PayloadType(u8);
 
 impl PayloadType {
-    const NONE: PayloadType = PayloadType(0);
-    const SECURITY_ASSOCIATION: PayloadType = PayloadType(33);
-    const KEY_EXCHANGE: PayloadType = PayloadType(34);
-    const ID_INITIATOR: PayloadType = PayloadType(35);
-    const ID_RESPONDER: PayloadType = PayloadType(36);
-    const CERTIFICATE: PayloadType = PayloadType(37);
-    const CERTIFICATE_REQUEST: PayloadType = PayloadType(38);
-    const AUTHENTICATION: PayloadType = PayloadType(39);
-    const NONCE: PayloadType = PayloadType(40);
-    const NOTIFY: PayloadType = PayloadType(41);
-    const DELETE: PayloadType = PayloadType(42);
-    const VENDOR_ID: PayloadType = PayloadType(43);
-    const TRAFFIC_SELECTOR_INITIATOR: PayloadType = PayloadType(44);
-    const TRAFFIC_SELECTOR_RESPONSER: PayloadType = PayloadType(45);
-    const ENCRYPTED_AND_AUTHENTICATED: PayloadType = PayloadType(46);
-    const CONFIGURATION: PayloadType = PayloadType(47);
-    const EXTENSIBLE_AUTHENTICATION: PayloadType = PayloadType(48);
+    pub const NONE: PayloadType = PayloadType(0);
+    pub const SECURITY_ASSOCIATION: PayloadType = PayloadType(33);
+    pub const KEY_EXCHANGE: PayloadType = PayloadType(34);
+    pub const ID_INITIATOR: PayloadType = PayloadType(35);
+    pub const ID_RESPONDER: PayloadType = PayloadType(36);
+    pub const CERTIFICATE: PayloadType = PayloadType(37);
+    pub const CERTIFICATE_REQUEST: PayloadType = PayloadType(38);
+    pub const AUTHENTICATION: PayloadType = PayloadType(39);
+    pub const NONCE: PayloadType = PayloadType(40);
+    pub const NOTIFY: PayloadType = PayloadType(41);
+    pub const DELETE: PayloadType = PayloadType(42);
+    pub const VENDOR_ID: PayloadType = PayloadType(43);
+    pub const TRAFFIC_SELECTOR_INITIATOR: PayloadType = PayloadType(44);
+    pub const TRAFFIC_SELECTOR_RESPONSER: PayloadType = PayloadType(45);
+    pub const ENCRYPTED_AND_AUTHENTICATED: PayloadType = PayloadType(46);
+    pub const CONFIGURATION: PayloadType = PayloadType(47);
+    pub const EXTENSIBLE_AUTHENTICATION: PayloadType = PayloadType(48);
 
     fn from_u8(value: u8) -> Result<PayloadType, FormatError> {
         if (Self::SECURITY_ASSOCIATION.0..=Self::EXTENSIBLE_AUTHENTICATION.0).contains(&value)
@@ -418,12 +462,12 @@ impl fmt::Display for PayloadType {
     }
 }
 
-struct PayloadSecurityAssociation<'a> {
+pub struct PayloadSecurityAssociation<'a> {
     data: &'a [u8],
 }
 
 impl<'a> PayloadSecurityAssociation<'a> {
-    fn iter_proposals(&self) -> SecurityAssociationIter {
+    pub fn iter_proposals(&self) -> SecurityAssociationIter {
         SecurityAssociationIter {
             data: self.data,
             next_proposal_num: 1,
@@ -432,12 +476,12 @@ impl<'a> PayloadSecurityAssociation<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct IPSecProtocolID(u8);
+pub struct IPSecProtocolID(u8);
 
 impl IPSecProtocolID {
-    const IKE: IPSecProtocolID = IPSecProtocolID(1);
-    const AH: IPSecProtocolID = IPSecProtocolID(2);
-    const ESP: IPSecProtocolID = IPSecProtocolID(3);
+    pub const IKE: IPSecProtocolID = IPSecProtocolID(1);
+    pub const AH: IPSecProtocolID = IPSecProtocolID(2);
+    pub const ESP: IPSecProtocolID = IPSecProtocolID(3);
 
     fn from_u8(value: u8) -> Result<IPSecProtocolID, FormatError> {
         if (Self::IKE.0..=Self::ESP.0).contains(&value) {
@@ -461,7 +505,7 @@ impl fmt::Display for IPSecProtocolID {
     }
 }
 
-struct SecurityAssociationIter<'a> {
+pub struct SecurityAssociationIter<'a> {
     next_proposal_num: u8,
     data: &'a [u8],
 }
@@ -530,7 +574,7 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
     }
 }
 
-struct SecurityAssociationProposal<'a> {
+pub struct SecurityAssociationProposal<'a> {
     proposal_num: u8,
     protocol_id: IPSecProtocolID,
     num_transforms: usize,
@@ -539,7 +583,7 @@ struct SecurityAssociationProposal<'a> {
 }
 
 impl<'a> SecurityAssociationProposal<'a> {
-    fn iter_transforms(&self) -> SecurityAssociationTransformIter {
+    pub fn iter_transforms(&self) -> SecurityAssociationTransformIter {
         SecurityAssociationTransformIter {
             num_transforms: self.num_transforms,
             data: self.data,
@@ -547,67 +591,78 @@ impl<'a> SecurityAssociationProposal<'a> {
     }
 }
 
-#[derive(PartialEq, Eq)]
-struct TransformType(u8, u16);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TransformType {
+    Encryption(u16),
+    PseudorandomFunction(u16),
+    IntegrityAlgorithm(u16),
+    DiffieHellman(u16),
+    ExtendedSequenceNumbers(u16),
+}
 
 // See http://www.iana.org/assignments/ikev2-parameters/ for additional values.
 impl TransformType {
-    const ENCR_DES_IV64: TransformType = TransformType(1, 1);
-    const ENCR_DES: TransformType = TransformType(1, 2);
-    const ENCR_3DES: TransformType = TransformType(1, 3);
-    const ENCR_RC5: TransformType = TransformType(1, 4);
-    const ENCR_IDEA: TransformType = TransformType(1, 5);
-    const ENCR_CAST: TransformType = TransformType(1, 6);
-    const ENCR_BLOWFISH: TransformType = TransformType(1, 7);
-    const ENCR_3IDEA: TransformType = TransformType(1, 8);
-    const ENCR_DES_IV32: TransformType = TransformType(1, 9);
-    const ENCR_NULL: TransformType = TransformType(1, 11);
-    const ENCR_AES_CBC: TransformType = TransformType(1, 12);
-    const ENCR_AES_CTR: TransformType = TransformType(1, 13);
+    pub const ENCR_DES_IV64: TransformType = TransformType::Encryption(1);
+    pub const ENCR_DES: TransformType = TransformType::Encryption(2);
+    pub const ENCR_3DES: TransformType = TransformType::Encryption(3);
+    pub const ENCR_RC5: TransformType = TransformType::Encryption(4);
+    pub const ENCR_IDEA: TransformType = TransformType::Encryption(5);
+    pub const ENCR_CAST: TransformType = TransformType::Encryption(6);
+    pub const ENCR_BLOWFISH: TransformType = TransformType::Encryption(7);
+    pub const ENCR_3IDEA: TransformType = TransformType::Encryption(8);
+    pub const ENCR_DES_IV32: TransformType = TransformType::Encryption(9);
+    pub const ENCR_NULL: TransformType = TransformType::Encryption(11);
+    pub const ENCR_AES_CBC: TransformType = TransformType::Encryption(12);
+    pub const ENCR_AES_CTR: TransformType = TransformType::Encryption(13);
 
-    const ENCR_AES_GCM_16: TransformType = TransformType(1, 20);
+    pub const ENCR_AES_GCM_16: TransformType = TransformType::Encryption(20);
 
-    const PRF_HMAC_MD5: TransformType = TransformType(2, 1);
-    const PRF_HMAC_SHA1: TransformType = TransformType(2, 2);
-    const PRF_HMAC_TIGER: TransformType = TransformType(2, 3);
+    pub const PRF_HMAC_MD5: TransformType = TransformType::PseudorandomFunction(1);
+    pub const PRF_HMAC_SHA1: TransformType = TransformType::PseudorandomFunction(2);
+    pub const PRF_HMAC_TIGER: TransformType = TransformType::PseudorandomFunction(3);
 
-    const PRF_HMAC_SHA2_256: TransformType = TransformType(2, 5);
-    const PRF_HMAC_SHA2_384: TransformType = TransformType(2, 6);
+    pub const PRF_HMAC_SHA2_256: TransformType = TransformType::PseudorandomFunction(5);
+    pub const PRF_HMAC_SHA2_384: TransformType = TransformType::PseudorandomFunction(6);
 
-    const AUTH_NONE: TransformType = TransformType(3, 0);
-    const AUTH_HMAC_MD5_96: TransformType = TransformType(3, 1);
-    const AUTH_HMAC_SHA1_96: TransformType = TransformType(3, 2);
-    const AUTH_DES_MAC: TransformType = TransformType(3, 3);
-    const AUTH_KPDK_MD5: TransformType = TransformType(3, 4);
-    const AUTH_AES_XCBC_96: TransformType = TransformType(3, 5);
+    pub const AUTH_NONE: TransformType = TransformType::IntegrityAlgorithm(0);
+    pub const AUTH_HMAC_MD5_96: TransformType = TransformType::IntegrityAlgorithm(1);
+    pub const AUTH_HMAC_SHA1_96: TransformType = TransformType::IntegrityAlgorithm(2);
+    pub const AUTH_DES_MAC: TransformType = TransformType::IntegrityAlgorithm(3);
+    pub const AUTH_KPDK_MD5: TransformType = TransformType::IntegrityAlgorithm(4);
+    pub const AUTH_AES_XCBC_96: TransformType = TransformType::IntegrityAlgorithm(5);
 
-    const AUTH_HMAC_SHA2_256_128: TransformType = TransformType(3, 12);
-    const AUTH_HMAC_SHA2_384_192: TransformType = TransformType(3, 13);
+    pub const AUTH_HMAC_SHA2_256_128: TransformType = TransformType::IntegrityAlgorithm(12);
+    pub const AUTH_HMAC_SHA2_384_192: TransformType = TransformType::IntegrityAlgorithm(13);
 
-    const DH_NONE: TransformType = TransformType(4, 0);
-    const DH_768_MODP: TransformType = TransformType(4, 1);
-    const DH_1024_MODP: TransformType = TransformType(4, 2);
-    const DH_1536_MODP: TransformType = TransformType(4, 5);
-    const DH_2048_MODP: TransformType = TransformType(4, 14);
-    const DH_3072_MODP: TransformType = TransformType(4, 15);
-    const DH_4096_MODP: TransformType = TransformType(4, 16);
-    const DH_6144_MODP: TransformType = TransformType(4, 17);
-    const DH_8192_MODP: TransformType = TransformType(4, 18);
+    pub const DH_NONE: TransformType = TransformType::DiffieHellman(0);
+    pub const DH_768_MODP: TransformType = TransformType::DiffieHellman(1);
+    pub const DH_1024_MODP: TransformType = TransformType::DiffieHellman(2);
+    pub const DH_1536_MODP: TransformType = TransformType::DiffieHellman(5);
+    pub const DH_2048_MODP: TransformType = TransformType::DiffieHellman(14);
+    pub const DH_3072_MODP: TransformType = TransformType::DiffieHellman(15);
+    pub const DH_4096_MODP: TransformType = TransformType::DiffieHellman(16);
+    pub const DH_6144_MODP: TransformType = TransformType::DiffieHellman(17);
+    pub const DH_8192_MODP: TransformType = TransformType::DiffieHellman(18);
 
-    const DH_256_ECP: TransformType = TransformType(4, 19);
+    pub const DH_256_ECP: TransformType = TransformType::DiffieHellman(19);
 
-    const NO_ESN: TransformType = TransformType(5, 0);
-    const ESN: TransformType = TransformType(5, 1);
+    pub const NO_ESN: TransformType = TransformType::ExtendedSequenceNumbers(0);
+    pub const ESN: TransformType = TransformType::ExtendedSequenceNumbers(1);
 
     fn from_raw(transform_type: u8, transform_id: u16) -> Result<TransformType, FormatError> {
-        if (1..=5).contains(&transform_type) {
-            Ok(TransformType(transform_type, transform_id))
-        } else {
-            debug!(
-                "Unsupported IKEv2 Transform Type {} ID {}",
-                transform_type, transform_id
-            );
-            Err("Unsupported IKEv2 Transform Type".into())
+        match transform_type {
+            1 => Ok(Self::Encryption(transform_id)),
+            2 => Ok(Self::PseudorandomFunction(transform_id)),
+            3 => Ok(Self::IntegrityAlgorithm(transform_id)),
+            4 => Ok(Self::DiffieHellman(transform_id)),
+            5 => Ok(Self::ExtendedSequenceNumbers(transform_id)),
+            _ => {
+                debug!(
+                    "Unsupported IKEv2 Transform Type {} ID {}",
+                    transform_type, transform_id
+                );
+                Err("Unsupported IKEv2 Transform Type".into())
+            }
         }
     }
 }
@@ -653,13 +708,23 @@ impl fmt::Display for TransformType {
             Self::DH_256_ECP => write!(f, "DH_256_ECP")?,
             Self::NO_ESN => write!(f, "NO_ESN")?,
             Self::ESN => write!(f, "ESN")?,
-            _ => write!(f, "Unknown transform type {} id {}", self.0, self.1)?,
+            TransformType::Encryption(id) => write!(f, "Unknown Encryption Algorithm {}", id)?,
+            TransformType::PseudorandomFunction(id) => {
+                write!(f, "Unknown Pseudorandom Function {}", id)?
+            }
+            TransformType::IntegrityAlgorithm(id) => {
+                write!(f, "Unknown Integrity Algorithm {}", id)?
+            }
+            TransformType::DiffieHellman(id) => write!(f, "Unknown Diffie-Hellman Group {}", id)?,
+            TransformType::ExtendedSequenceNumbers(id) => {
+                write!(f, "Unknown Extended Sequence Numbers {}", id)?
+            }
         }
         Ok(())
     }
 }
 
-struct SecurityAssociationTransformIter<'a> {
+pub struct SecurityAssociationTransformIter<'a> {
     num_transforms: usize,
     data: &'a [u8],
 }
@@ -719,23 +784,53 @@ impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
     }
 }
 
-struct SecurityAssociationTransform<'a> {
+pub struct SecurityAssociationTransform<'a> {
     transform_type: TransformType,
     data: &'a [u8],
 }
 
 impl<'a> SecurityAssociationTransform<'a> {
-    fn iter_attributes(&self) -> SecurityAssociationTransformAttributesIter {
+    pub fn transform_type(&self) -> TransformType {
+        self.transform_type
+    }
+
+    pub fn iter_attributes(&self) -> SecurityAssociationTransformAttributesIter {
         SecurityAssociationTransformAttributesIter { data: self.data }
     }
 }
 
-struct SecurityAssociationTransformAttributesIter<'a> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TransformAttributeType(u16);
+
+impl TransformAttributeType {
+    pub const KEY_LENGTH: TransformAttributeType = TransformAttributeType(14);
+
+    fn from_u16(value: u16) -> Result<TransformAttributeType, FormatError> {
+        if value == Self::KEY_LENGTH.0 {
+            Ok(TransformAttributeType(value))
+        } else {
+            debug!("Unsupported IKEv2 Transform Attribute Type {}", value);
+            Err("Unsupported IKEv2 Transform Attribute Type".into())
+        }
+    }
+}
+
+impl fmt::Display for TransformAttributeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::KEY_LENGTH => write!(f, "Key Length")?,
+            _ => write!(f, "Unknown Transform Attribute Type {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+pub struct SecurityAssociationTransformAttributesIter<'a> {
     data: &'a [u8],
 }
 
 impl<'a> Iterator for SecurityAssociationTransformAttributesIter<'a> {
-    type Item = SecurityAssociationTransformAttribute<'a>;
+    type Item = Result<SecurityAssociationTransformAttribute<'a>, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         const ATTRIBUTE_FORMAT_TV: u16 = 1 << 15;
@@ -750,14 +845,11 @@ impl<'a> Iterator for SecurityAssociationTransformAttributesIter<'a> {
         let mut attribute_type = [0u8; 2];
         attribute_type.copy_from_slice(&self.data[0..2]);
         let attribute_type = u16::from_be_bytes(attribute_type);
-        if attribute_type & ATTRIBUTE_FORMAT_TV != 0 {
-            let attribute_type = attribute_type & ATTRIBUTE_TYPE_MASK;
-            let item = SecurityAssociationTransformAttribute {
-                attribute_type,
-                data: &self.data[2..4],
-            };
+        let attribute_format_tv = attribute_type & ATTRIBUTE_FORMAT_TV != 0;
+        let data = if attribute_format_tv {
+            let data = &self.data[2..4];
             self.data = &self.data[4..];
-            Some(item)
+            data
         } else {
             let mut attribute_length = [0u8; 2];
             attribute_length.copy_from_slice(&self.data[2..4]);
@@ -766,19 +858,38 @@ impl<'a> Iterator for SecurityAssociationTransformAttributesIter<'a> {
                 debug!("Transform attribute overflow");
                 return None;
             }
-            let item = SecurityAssociationTransformAttribute {
-                attribute_type,
-                data: &self.data[4..attribute_length],
-            };
+            let data = &self.data[4..attribute_length];
             self.data = &self.data[attribute_length..];
-            Some(item)
-        }
+            data
+        };
+        let attribute_type =
+            match TransformAttributeType::from_u16(attribute_type & ATTRIBUTE_TYPE_MASK) {
+                Ok(attribute_type) => attribute_type,
+                Err(err) => {
+                    debug!("Unsupported attribute type: {}", err);
+                    return Some(Err("Unsupported attribute type".into()));
+                }
+            };
+        Some(Ok(SecurityAssociationTransformAttribute {
+            attribute_type,
+            data,
+        }))
     }
 }
 
-struct SecurityAssociationTransformAttribute<'a> {
-    attribute_type: u16,
+pub struct SecurityAssociationTransformAttribute<'a> {
+    attribute_type: TransformAttributeType,
     data: &'a [u8],
+}
+
+impl<'a> SecurityAssociationTransformAttribute<'a> {
+    pub fn attribute_type(&self) -> TransformAttributeType {
+        self.attribute_type
+    }
+
+    pub fn value(&self) -> &[u8] {
+        self.data
+    }
 }
 
 struct PayloadKeyExchange<'a> {
@@ -818,39 +929,39 @@ impl<'a> PayloadNonce<'a> {
 }
 
 #[derive(PartialEq, Eq)]
-struct NotifyMessageType(u16);
+pub struct NotifyMessageType(u16);
 
 impl NotifyMessageType {
-    const UNSUPPORTED_CRITICAL_PAYLOAD: NotifyMessageType = NotifyMessageType(1);
-    const INVALID_IKE_SPI: NotifyMessageType = NotifyMessageType(4);
-    const INVALID_MAJOR_VERSION: NotifyMessageType = NotifyMessageType(5);
-    const INVALID_SYNTAX: NotifyMessageType = NotifyMessageType(7);
-    const INVALID_MESSAGE_ID: NotifyMessageType = NotifyMessageType(9);
-    const INVALID_SPI: NotifyMessageType = NotifyMessageType(11);
-    const NO_PROPOSAL_CHOSEN: NotifyMessageType = NotifyMessageType(14);
-    const INVALID_KE_PAYLOAD: NotifyMessageType = NotifyMessageType(17);
-    const AUTHENTICATION_FAILED: NotifyMessageType = NotifyMessageType(24);
-    const SINGLE_PAIR_REQUIRED: NotifyMessageType = NotifyMessageType(34);
-    const NO_ADDITIONAL_SAS: NotifyMessageType = NotifyMessageType(35);
-    const INTERNAL_ADDRESS_FAILURE: NotifyMessageType = NotifyMessageType(36);
-    const FAILED_CP_REQUIRED: NotifyMessageType = NotifyMessageType(37);
-    const TS_UNACCEPTABLE: NotifyMessageType = NotifyMessageType(38);
-    const INVALID_SELECTORS: NotifyMessageType = NotifyMessageType(39);
-    const TEMPORARY_FAILURE: NotifyMessageType = NotifyMessageType(43);
-    const CHILD_SA_NOT_FOUND: NotifyMessageType = NotifyMessageType(44);
+    pub const UNSUPPORTED_CRITICAL_PAYLOAD: NotifyMessageType = NotifyMessageType(1);
+    pub const INVALID_IKE_SPI: NotifyMessageType = NotifyMessageType(4);
+    pub const INVALID_MAJOR_VERSION: NotifyMessageType = NotifyMessageType(5);
+    pub const INVALID_SYNTAX: NotifyMessageType = NotifyMessageType(7);
+    pub const INVALID_MESSAGE_ID: NotifyMessageType = NotifyMessageType(9);
+    pub const INVALID_SPI: NotifyMessageType = NotifyMessageType(11);
+    pub const NO_PROPOSAL_CHOSEN: NotifyMessageType = NotifyMessageType(14);
+    pub const INVALID_KE_PAYLOAD: NotifyMessageType = NotifyMessageType(17);
+    pub const AUTHENTICATION_FAILED: NotifyMessageType = NotifyMessageType(24);
+    pub const SINGLE_PAIR_REQUIRED: NotifyMessageType = NotifyMessageType(34);
+    pub const NO_ADDITIONAL_SAS: NotifyMessageType = NotifyMessageType(35);
+    pub const INTERNAL_ADDRESS_FAILURE: NotifyMessageType = NotifyMessageType(36);
+    pub const FAILED_CP_REQUIRED: NotifyMessageType = NotifyMessageType(37);
+    pub const TS_UNACCEPTABLE: NotifyMessageType = NotifyMessageType(38);
+    pub const INVALID_SELECTORS: NotifyMessageType = NotifyMessageType(39);
+    pub const TEMPORARY_FAILURE: NotifyMessageType = NotifyMessageType(43);
+    pub const CHILD_SA_NOT_FOUND: NotifyMessageType = NotifyMessageType(44);
 
-    const INITIAL_CONTACT: NotifyMessageType = NotifyMessageType(16384);
-    const SET_WINDOW_SIZE: NotifyMessageType = NotifyMessageType(16385);
-    const ADDITIONAL_TS_POSSIBLE: NotifyMessageType = NotifyMessageType(16386);
-    const IPCOMP_SUPPORTED: NotifyMessageType = NotifyMessageType(16387);
-    const NAT_DETECTION_SOURCE_IP: NotifyMessageType = NotifyMessageType(16388);
-    const NAT_DETECTION_DESTINATION_IP: NotifyMessageType = NotifyMessageType(16389);
-    const COOKIE: NotifyMessageType = NotifyMessageType(16390);
-    const USE_TRANSPORT_MODE: NotifyMessageType = NotifyMessageType(16391);
-    const HTTP_CERT_LOOKUP_SUPPORTED: NotifyMessageType = NotifyMessageType(16392);
-    const REKEY_SA: NotifyMessageType = NotifyMessageType(16393);
-    const ESP_TFC_PADDING_NOT_SUPPORTED: NotifyMessageType = NotifyMessageType(16394);
-    const NON_FIRST_FRAGMENTS_ALSO: NotifyMessageType = NotifyMessageType(16395);
+    pub const INITIAL_CONTACT: NotifyMessageType = NotifyMessageType(16384);
+    pub const SET_WINDOW_SIZE: NotifyMessageType = NotifyMessageType(16385);
+    pub const ADDITIONAL_TS_POSSIBLE: NotifyMessageType = NotifyMessageType(16386);
+    pub const IPCOMP_SUPPORTED: NotifyMessageType = NotifyMessageType(16387);
+    pub const NAT_DETECTION_SOURCE_IP: NotifyMessageType = NotifyMessageType(16388);
+    pub const NAT_DETECTION_DESTINATION_IP: NotifyMessageType = NotifyMessageType(16389);
+    pub const COOKIE: NotifyMessageType = NotifyMessageType(16390);
+    pub const USE_TRANSPORT_MODE: NotifyMessageType = NotifyMessageType(16391);
+    pub const HTTP_CERT_LOOKUP_SUPPORTED: NotifyMessageType = NotifyMessageType(16392);
+    pub const REKEY_SA: NotifyMessageType = NotifyMessageType(16393);
+    pub const ESP_TFC_PADDING_NOT_SUPPORTED: NotifyMessageType = NotifyMessageType(16394);
+    pub const NON_FIRST_FRAGMENTS_ALSO: NotifyMessageType = NotifyMessageType(16395);
 
     const REDIRECT_SUPPORTED: NotifyMessageType = NotifyMessageType(16406);
     const IKEV2_FRAGMENTATION_SUPPORTED: NotifyMessageType = NotifyMessageType(16430);
@@ -998,6 +1109,13 @@ impl fmt::Debug for InputMessage<'_> {
                         };
                         writeln!(f, "      Transform type {}", tf.transform_type)?;
                         for attr in tf.iter_attributes() {
+                            let attr = match attr {
+                                Ok(attr) => attr,
+                                Err(err) => {
+                                    writeln!(f, "        Attribute type invalid {}", err)?;
+                                    continue;
+                                }
+                            };
                             writeln!(
                                 f,
                                 "        Attribute {} value {:?}",
