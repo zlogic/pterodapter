@@ -2,6 +2,8 @@ use std::{error, fmt};
 
 use log::debug;
 
+use super::crypto;
+
 #[derive(PartialEq, Eq)]
 pub struct ExchangeType(u8);
 
@@ -68,6 +70,66 @@ impl fmt::Display for Flags {
             f.write_str("Response")?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SPI {
+    None,
+    U32(u32),
+    U64(u64),
+}
+
+impl SPI {
+    fn from_slice(spi: &[u8]) -> Result<SPI, FormatError> {
+        if spi.len() == 4 {
+            let mut value = [0u8; 4];
+            value.copy_from_slice(spi);
+            let value = u32::from_be_bytes(value);
+            Ok(Self::U32(value))
+        } else if spi.len() == 4 {
+            let mut value = [0u8; 8];
+            value.copy_from_slice(spi);
+            let value = u64::from_be_bytes(value);
+            Ok(Self::U64(value))
+        } else if spi.is_empty() {
+            Ok(Self::None)
+        } else {
+            debug!("Unexpected SPI size {}", spi.len());
+            Err("Unexpected SPI size".into())
+        }
+    }
+
+    fn write_to(&self, dest: &mut [u8]) {
+        match *self {
+            Self::None => {}
+            Self::U32(val) => dest.copy_from_slice(&val.to_be_bytes()),
+            Self::U64(val) => dest.copy_from_slice(&val.to_be_bytes()),
+        }
+    }
+
+    pub fn length(&self) -> usize {
+        match *self {
+            Self::None => 0,
+            Self::U32(_) => 4,
+            Self::U64(_) => 8,
+        }
+    }
+}
+
+impl fmt::Display for SPI {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::None => Ok(()),
+            Self::U32(val) => write!(f, "{:x}", val),
+            Self::U64(val) => write!(f, "{:x}", val),
+        }
+    }
+}
+
+impl fmt::Debug for SPI {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -253,20 +315,59 @@ impl MessageWriter<'_> {
 
     pub fn write_accept_proposal(
         &mut self,
-        proposal: &SecurityAssociationProposal,
+        proposal_num: u8,
+        proposal: &crypto::TransformParameters,
     ) -> Result<(), NotEnoughSpaceError> {
-        let proposal_len = 8 + proposal.spi.len() + proposal.data.len();
+        const ATTRIBUTE_FORMAT_TV: u16 = 1 << 15;
+        const ATTRIBUTE_TYPE_KEY_LENGTH: [u8; 2] =
+            (TransformAttributeType::KEY_LENGTH.0 | ATTRIBUTE_FORMAT_TV).to_be_bytes();
+        let (num_transforms, data_len) = proposal
+            .iter_parameters()
+            .map(|param| {
+                if param.key_length().is_some() {
+                    (1, 8 + 4)
+                } else {
+                    (1, 8)
+                }
+            })
+            .fold((0, 0), |acc, e| (acc.0 + e.0, acc.1 + e.1));
+        let spi = proposal.spi();
+        let proposal_len = 8 + spi.length() + data_len;
         let next_payload_slice =
             self.next_payload_slice(PayloadType::SECURITY_ASSOCIATION, proposal_len)?;
         next_payload_slice[0] = 0;
         next_payload_slice[1] = 0;
         next_payload_slice[2..4].copy_from_slice(&(proposal_len as u16).to_be_bytes());
-        next_payload_slice[4] = proposal.proposal_num;
-        next_payload_slice[5] = proposal.protocol_id.0;
-        next_payload_slice[6] = proposal.spi.len() as u8;
-        next_payload_slice[7] = proposal.num_transforms as u8;
-        next_payload_slice[8..8 + proposal.spi.len()].copy_from_slice(proposal.spi);
-        next_payload_slice[8 + proposal.spi.len()..].copy_from_slice(proposal.data);
+        next_payload_slice[4] = proposal_num;
+        next_payload_slice[5] = proposal.protocol_id().0;
+        next_payload_slice[6] = spi.length() as u8;
+        next_payload_slice[7] = num_transforms as u8;
+        spi.write_to(&mut next_payload_slice[8..8 + spi.length()]);
+        let mut next_payload_offset = 8 + spi.length();
+        proposal
+            .iter_parameters()
+            .enumerate()
+            .for_each(|(i, param)| {
+                let transform_len = if param.key_length().is_some() {
+                    8 + 4
+                } else {
+                    8
+                };
+                let next_payload_slice = &mut next_payload_slice
+                    [next_payload_offset..next_payload_offset + transform_len];
+                next_payload_offset += transform_len;
+                next_payload_slice[0] = if i + 1 < num_transforms { 3 } else { 0 };
+                next_payload_slice[1] = 0;
+                next_payload_slice[2..4].copy_from_slice(&(transform_len as u16).to_be_bytes());
+                let (transform_type, transform_id) = param.transform_type().type_id();
+                next_payload_slice[4] = transform_type;
+                next_payload_slice[5] = 0;
+                next_payload_slice[6..8].copy_from_slice(&transform_id.to_be_bytes());
+                if let Some(key_length) = param.key_length() {
+                    next_payload_slice[8..10].copy_from_slice(&ATTRIBUTE_TYPE_KEY_LENGTH);
+                    next_payload_slice[10..12].copy_from_slice(&key_length.to_be_bytes());
+                }
+            });
         Ok(())
     }
 
@@ -475,7 +576,7 @@ impl<'a> PayloadSecurityAssociation<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IPSecProtocolID(u8);
 
 impl IPSecProtocolID {
@@ -562,6 +663,13 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             return None;
         }
         let spi = &self.data[8..8 + spi_size];
+        let spi = match SPI::from_slice(spi) {
+            Ok(spi) => spi,
+            Err(_) => {
+                self.data = &self.data[proposal_length..];
+                return Some(Err("Unsupported SPI format".into()));
+            }
+        };
         let item = SecurityAssociationProposal {
             proposal_num,
             protocol_id,
@@ -578,7 +686,7 @@ pub struct SecurityAssociationProposal<'a> {
     proposal_num: u8,
     protocol_id: IPSecProtocolID,
     num_transforms: usize,
-    spi: &'a [u8],
+    spi: SPI,
     data: &'a [u8],
 }
 
@@ -588,6 +696,18 @@ impl<'a> SecurityAssociationProposal<'a> {
             num_transforms: self.num_transforms,
             data: self.data,
         }
+    }
+
+    pub fn proposal_num(&self) -> u8 {
+        self.proposal_num
+    }
+
+    pub fn protocol_id(&self) -> IPSecProtocolID {
+        self.protocol_id
+    }
+
+    pub fn spi(&self) -> SPI {
+        self.spi
     }
 }
 
@@ -663,6 +783,16 @@ impl TransformType {
                 );
                 Err("Unsupported IKEv2 Transform Type".into())
             }
+        }
+    }
+
+    fn type_id(&self) -> (u8, u16) {
+        match *self {
+            TransformType::Encryption(id) => (1, id),
+            TransformType::PseudorandomFunction(id) => (2, id),
+            TransformType::IntegrityAlgorithm(id) => (3, id),
+            TransformType::DiffieHellman(id) => (4, id),
+            TransformType::ExtendedSequenceNumbers(id) => (5, id),
         }
     }
 }
@@ -1167,11 +1297,7 @@ impl fmt::Display for FormatError {
 
 impl fmt::Debug for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.msg)?;
-        if let Some(error_code) = &self.error_code {
-            write!(f, " ({})", error_code)?;
-        }
-        Ok(())
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -1200,7 +1326,7 @@ impl fmt::Display for NotEnoughSpaceError {
 
 impl fmt::Debug for NotEnoughSpaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Not enough space in buffer")
+        fmt::Display::fmt(self, f)
     }
 }
 

@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::{net::UdpSocket, signal, task::JoinHandle};
 
+mod crypto;
 mod message;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
@@ -222,7 +223,14 @@ impl IKEv2Session {
             };
             if payload.payload_type() == message::PayloadType::SECURITY_ASSOCIATION {
                 let sa = payload.to_security_association()?;
-                choose_sa_parameters(&sa, response)?;
+                let (prop, proposal_num) =
+                    if let Some(transform) = crypto::choose_sa_parameters(&sa) {
+                        transform
+                    } else {
+                        // TODO: return INVALID_SYNTAX notification.
+                        continue;
+                    };
+                response.write_accept_proposal(proposal_num, &prop)?;
             }
         }
 
@@ -277,120 +285,6 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     let mut hasher = Sha1::new();
     hasher.update(src_data);
     hasher.finalize().into()
-}
-
-fn choose_sa_parameters<'a>(
-    sa: &'a message::PayloadSecurityAssociation,
-    response: &mut message::MessageWriter,
-) -> Result<(), IKEv2Error> {
-    for prop in sa.iter_proposals() {
-        let prop = if let Ok(prop) = prop {
-            prop
-        } else {
-            continue;
-        };
-        let mut enc: Option<message::TransformType> = None;
-        let mut prf: Option<message::TransformType> = None;
-        let mut auth: Option<message::TransformType> = None;
-        let mut dh: Option<message::TransformType> = None;
-        let mut esn: Option<message::TransformType> = None;
-
-        let mut key_length: Option<u16> = None;
-
-        let ok = prop.iter_transforms().all(|tt| {
-            let tt = if let Ok(tt) = tt {
-                tt
-            } else {
-                return true;
-            };
-            let tt_type = tt.transform_type();
-            match tt_type {
-                message::TransformType::Encryption(_) => {
-                    if enc.is_some() {
-                        return false;
-                    }
-                    enc = Some(tt_type);
-                }
-                message::TransformType::PseudorandomFunction(_) => {
-                    if prf.is_some() {
-                        return false;
-                    }
-                    prf = Some(tt_type);
-                }
-                message::TransformType::IntegrityAlgorithm(_) => {
-                    if auth.is_some() {
-                        return false;
-                    }
-                    auth = Some(tt_type);
-                }
-                message::TransformType::DiffieHellman(_) => {
-                    if dh.is_some() {
-                        return false;
-                    }
-                    dh = Some(tt_type);
-                }
-                message::TransformType::ExtendedSequenceNumbers(_) => {
-                    if esn.is_some() {
-                        return false;
-                    }
-                    esn = Some(tt_type);
-                }
-            }
-            // TODO: attach key length to attribute.
-            tt.iter_attributes().all(|attr| {
-                let attr = if let Ok(attr) = attr {
-                    attr
-                } else {
-                    return false;
-                };
-                if attr.attribute_type() != message::TransformAttributeType::KEY_LENGTH {
-                    return false;
-                }
-                if key_length.is_some() {
-                    return false;
-                }
-                let value = attr.value();
-                if value.len() != 2 {
-                    return false;
-                }
-                let mut key_length_value = [0u8; 2];
-                key_length_value.copy_from_slice(value);
-                key_length = Some(u16::from_be_bytes(key_length_value));
-                true
-            });
-            true
-        });
-        if !ok {
-            // TODO: if multiple values are proposed, choose only one of them.
-            continue;
-        }
-
-        // TODO: support more combinations.
-        if enc == Some(message::TransformType::ENCR_AES_CBC)
-            && prf == Some(message::TransformType::PRF_HMAC_SHA2_256)
-            && auth == Some(message::TransformType::AUTH_HMAC_SHA2_256_128)
-            && dh == Some(message::TransformType::DH_1024_MODP)
-            && key_length == Some(128)
-        {
-            // Valid Windows configuration.
-            // TODO: init encryption handlers.
-            response.write_accept_proposal(&prop)?;
-            return Ok(());
-        }
-        if enc == Some(message::TransformType::ENCR_AES_GCM_16)
-            && prf == Some(message::TransformType::PRF_HMAC_SHA2_256)
-            && auth.is_none()
-            && dh == Some(message::TransformType::DH_256_ECP)
-            && key_length == Some(256)
-        {
-            // Valid macOS configuration.
-            // TODO: init encryption handlers.
-            response.write_accept_proposal(&prop)?;
-            return Ok(());
-        }
-    }
-    // TODO: return an error response if no proposal is acceptable.
-    Ok(())
 }
 
 #[derive(Debug)]
