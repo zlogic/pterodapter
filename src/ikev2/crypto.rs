@@ -1,3 +1,9 @@
+use aes::{
+    cipher::{BlockDecryptMut, BlockEncryptMut},
+    Aes256,
+};
+use aes_gcm::{aead::AeadMutInPlace, Aes256Gcm};
+use cipher::{block_padding, BlockSizeUser, InnerIvInit, IvSizeUser};
 use crypto_bigint::{
     modular::constant_mod::{self, ResidueParams},
     Encoding,
@@ -6,14 +12,20 @@ use hmac::{Hmac, Mac};
 use log::debug;
 use p256::{elliptic_curve::sec1::Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey};
 use sha2::Sha256;
-use std::{error, fmt};
+use std::{error, fmt, ops::Range};
 
 use crypto_bigint::{const_residue, impl_modulus, rand_core::OsRng, Random, U1024};
 
 use super::message;
 
-const MAX_DH_KEY_LENGTH: usize = 128;
-const MAX_PRF_KEY_LENGTH: usize = 32;
+const MAX_DH_KEY_LENGTH: usize = 1024 / 8;
+const MAX_PRF_KEY_LENGTH: usize = 256 / 8;
+const MAX_AUTH_KEY_LENGTH: usize = 256 / 8;
+const MAX_ENCRYPTION_KEY_LENGTH: usize = 256 / 8;
+const MAX_KEY_MATERIAL_LENGTH: usize = MAX_PRF_KEY_LENGTH
+    + MAX_AUTH_KEY_LENGTH * 2
+    + MAX_ENCRYPTION_KEY_LENGTH * 2
+    + MAX_PRF_KEY_LENGTH * 2;
 
 pub struct Transform {
     transform_type: message::TransformType,
@@ -41,12 +53,23 @@ pub struct TransformParameters {
 }
 
 impl TransformParameters {
-    pub fn create_dh(&self) -> Option<DHTransform> {
-        DHTransform::init(self.dh.as_ref()?.transform_type)
+    pub fn create_dh(&self) -> Result<DHTransform, InitError> {
+        DHTransform::init(
+            self.dh
+                .as_ref()
+                .ok_or_else(|| InitError::new("DH not configured"))?
+                .transform_type,
+        )
     }
 
-    pub fn create_prf(&self, key: &[u8]) -> Option<PseudorandomTransform> {
-        PseudorandomTransform::init(self.prf.as_ref()?.transform_type, key)
+    pub fn create_prf(&self, key: &[u8]) -> Result<PseudorandomTransform, InitError> {
+        PseudorandomTransform::init(
+            self.prf
+                .as_ref()
+                .ok_or_else(|| InitError::new("PRF not configured"))?
+                .transform_type,
+            key,
+        )
     }
 
     pub fn protocol_id(&self) -> message::IPSecProtocolID {
@@ -55,6 +78,33 @@ impl TransformParameters {
 
     pub fn spi(&self) -> message::SPI {
         self.spi
+    }
+
+    fn enc_key_length(&self) -> usize {
+        match self.enc {
+            Some(ref enc) => enc.key_length.unwrap_or(0) as usize,
+            None => 0,
+        }
+    }
+
+    fn prf_key_length(&self) -> usize {
+        match self.prf {
+            Some(ref prf) => match prf.transform_type {
+                message::TransformType::PRF_HMAC_SHA2_256 => 256,
+                _ => 0,
+            },
+            None => 0,
+        }
+    }
+
+    fn auth_key_length(&self) -> usize {
+        match self.auth {
+            Some(ref auth) => match auth.transform_type {
+                message::TransformType::AUTH_HMAC_SHA2_256_128 => 256,
+                _ => 0,
+            },
+            None => 0,
+        }
     }
 
     pub fn iter_parameters(&self) -> TransformParametersIter {
@@ -161,10 +211,10 @@ pub fn choose_sa_parameters<'a>(
                 match tt_type {
                     message::TransformType::PRF_HMAC_SHA2_256 => parameters.prf = Some(transform),
                     message::TransformType::NO_ESN => parameters.esn = Some(transform),
-                    // Valid macOS options.
+                    // Valid Windows options.
                     message::TransformType::ENCR_AES_CBC => parameters.enc = Some(transform),
                     message::TransformType::DH_256_ECP => parameters.dh = Some(transform),
-                    // Valid Windows options.
+                    // Valid macOS options.
                     message::TransformType::ENCR_AES_GCM_16 => parameters.enc = Some(transform),
                     message::TransformType::AUTH_HMAC_SHA2_256_128 => {
                         parameters.auth = Some(transform)
@@ -204,27 +254,6 @@ pub fn choose_sa_parameters<'a>(
         .next()
 }
 
-pub struct UnsupportedTransform {}
-
-impl fmt::Display for UnsupportedTransform {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Unsupported transform")?;
-        Ok(())
-    }
-}
-
-impl fmt::Debug for UnsupportedTransform {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
-impl error::Error for UnsupportedTransform {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(self)
-    }
-}
-
 pub struct Array<const M: usize> {
     data: [u8; M],
     len: usize,
@@ -253,21 +282,21 @@ pub enum DHTransform {
 }
 
 impl DHTransform {
-    fn init(transform_type: message::TransformType) -> Option<DHTransform> {
+    fn init(transform_type: message::TransformType) -> Result<DHTransform, InitError> {
         let (_, dh_group) = transform_type.type_id();
         match transform_type {
             message::TransformType::DH_1024_MODP => {
                 let private_key = U1024::random(&mut OsRng);
                 // This calculates DH_MODP_GENERATOR_1024^private_key mod DHModulus1024.
                 let public_key = DH_MODP_RESIDUE_1024.pow(&private_key).retrieve();
-                Some(DHTransform::MODP1024(dh_group, private_key, public_key))
+                Ok(DHTransform::MODP1024(dh_group, private_key, public_key))
             }
             message::TransformType::DH_256_ECP => {
                 let private_key = NonZeroScalar::random(&mut OsRng);
                 let public_key = PublicKey::from_secret_scalar(&private_key);
-                Some(DHTransform::ECP256(dh_group, private_key, public_key))
+                Ok(DHTransform::ECP256(dh_group, private_key, public_key))
             }
-            _ => None,
+            _ => Err("Unsupported DH".into()),
         }
     }
 
@@ -287,7 +316,7 @@ impl DHTransform {
 
     pub fn key_length_bytes(&self) -> usize {
         match self {
-            Self::MODP1024(_, _, _) => 128,
+            Self::MODP1024(_, _, _) => 1024 / 8,
             Self::ECP256(_, _, _) => 64,
         }
     }
@@ -313,7 +342,7 @@ impl DHTransform {
                 dest.copy_from_slice(&shared_key.to_be_bytes());
             }
             Self::ECP256(_, private_key, _) => {
-                let mut other_public_key_sec1 = [0u8; 65];
+                let mut other_public_key_sec1 = [0u8; 1 + 64];
                 other_public_key_sec1[0] = Tag::Uncompressed.into();
                 other_public_key_sec1[1..].copy_from_slice(other_public_key);
                 let other_public_key = match PublicKey::from_sec1_bytes(&other_public_key_sec1) {
@@ -339,13 +368,18 @@ pub enum PseudorandomTransform {
 }
 
 impl PseudorandomTransform {
-    fn init(transform_type: message::TransformType, key: &[u8]) -> Option<PseudorandomTransform> {
+    fn init(
+        transform_type: message::TransformType,
+        key: &[u8],
+    ) -> Result<PseudorandomTransform, InitError> {
         match transform_type {
             message::TransformType::PRF_HMAC_SHA2_256 => {
-                let hmac = HmacSha256::new_from_slice(key).ok()?;
-                Some(Self::HmacSha256(hmac))
+                let core_wrapper = HmacSha256::new_from_slice(key)
+                    .map_err(|_| InitError::new("Failed to init HMAC SHA256 PRF"))?;
+                let hmac = core_wrapper;
+                Ok(Self::HmacSha256(hmac))
             }
-            _ => None,
+            _ => Err("Unsupported PRF".into()),
         }
     }
 
@@ -354,14 +388,233 @@ impl PseudorandomTransform {
             Self::HmacSha256(ref mut hmac) => {
                 hmac.update(data);
                 let hash = hmac.finalize_reset().into_bytes();
-                let mut result = Array::new(32);
+                let mut result = Array::new(256 / 8);
                 result.as_mut_slice().copy_from_slice(&hash);
                 result
             }
         }
     }
 
-    fn generate_key_material(&mut self) {}
+    pub fn create_crypto_stack(
+        &mut self,
+        params: &TransformParameters,
+        data: &[u8],
+    ) -> Result<CryptoStack, InitError> {
+        let mut keys = DerivedKeys::new(params);
+        match self {
+            Self::HmacSha256(ref mut hmac) => {
+                let mut next_data = vec![0u8; data.len() + params.prf_key_length() / 8 + 1];
+                let mut cursor = 0;
+                // First T1 chunk.
+                next_data[0..data.len()].copy_from_slice(data);
+                next_data[data.len()] = 1;
+                hmac.update(&next_data[0..data.len() + 1]);
+                for t in 1..255 {
+                    let hash = hmac.finalize_reset().into_bytes();
+                    let dest_range = cursor..(cursor + hash.len()).min(keys.full_length());
+                    let src_range = ..dest_range.len();
+                    cursor = dest_range.end;
+                    keys.keys[dest_range].copy_from_slice(&hash[src_range]);
+                    if cursor >= keys.full_length() {
+                        break;
+                    }
+                    // Following T-chunks.
+                    next_data[0..hash.len()].copy_from_slice(&hash);
+                    next_data[hash.len()..hash.len() + data.len()].copy_from_slice(&data);
+                    next_data[hash.len() + data.len()] = t + 1;
+                    hmac.update(&next_data);
+                }
+                CryptoStack::new(params, &keys)
+            }
+        }
+    }
+}
+
+pub struct DerivedKeys {
+    keys: [u8; MAX_KEY_MATERIAL_LENGTH],
+    derive: Range<usize>,
+    auth_initiator: Range<usize>,
+    auth_responder: Range<usize>,
+    enc_initiator: Range<usize>,
+    enc_responder: Range<usize>,
+    prf_initiator: Range<usize>,
+    prf_responder: Range<usize>,
+}
+
+impl DerivedKeys {
+    fn new(params: &TransformParameters) -> DerivedKeys {
+        let derive_key_length = params.prf_key_length() / 8;
+        let derive = 0..derive_key_length;
+        let auth_key_length = params.auth_key_length() / 8;
+        let auth_initiator = derive.end..derive.end + auth_key_length;
+        let auth_responder = auth_initiator.end..auth_initiator.end + auth_key_length;
+        let enc_key_length = params.enc_key_length() / 8;
+        let enc_initiator = auth_responder.end..auth_responder.end + enc_key_length;
+        let enc_responder = enc_initiator.end..enc_initiator.end + enc_key_length;
+        let prf_key_length = params.prf_key_length() / 8;
+        let prf_initiator = enc_responder.end..enc_responder.end + prf_key_length;
+        let prf_responder = prf_initiator.end..prf_initiator.end + prf_key_length;
+        DerivedKeys {
+            keys: [0u8; MAX_KEY_MATERIAL_LENGTH],
+            derive,
+            auth_initiator,
+            auth_responder,
+            enc_initiator,
+            enc_responder,
+            prf_initiator,
+            prf_responder,
+        }
+    }
+
+    fn full_length(&self) -> usize {
+        self.prf_responder.end
+    }
+}
+
+pub struct CryptoStack {
+    derive_key: Array<MAX_PRF_KEY_LENGTH>,
+    enc_initiator: Encryption,
+    enc_responder: Encryption,
+}
+
+impl CryptoStack {
+    fn new(params: &TransformParameters, keys: &DerivedKeys) -> Result<CryptoStack, InitError> {
+        let mut derive_key = Array::new(keys.derive.len());
+        derive_key.data[0..keys.derive.len()].copy_from_slice(&keys.keys[keys.derive.clone()]);
+        let enc = params
+            .enc
+            .as_ref()
+            .ok_or_else(|| InitError::new("Undefined encryption parameters"))?;
+        Ok(CryptoStack {
+            derive_key,
+            enc_initiator: Encryption::init(enc, &keys.keys[keys.enc_initiator.clone()])?,
+            enc_responder: Encryption::init(enc, &keys.keys[keys.enc_responder.clone()])?,
+        })
+    }
+
+    pub fn decrypt_data<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+        self.enc_initiator.decrypt(data, msg_len)
+    }
+}
+
+type AesCbc256Decryptor = cbc::Decryptor<Aes256>;
+type AesCbc256Encryptor = cbc::Encryptor<Aes256>;
+
+pub enum Encryption {
+    AesCbc256(Aes256),
+    AesGcm256(Aes256Gcm),
+}
+
+impl Encryption {
+    fn init(transform_type: &Transform, key: &[u8]) -> Result<Encryption, InitError> {
+        match transform_type.transform_type {
+            message::TransformType::ENCR_AES_CBC => {
+                if transform_type.key_length != Some(256) {
+                    return Err("Unsupported key length".into());
+                }
+                let cipher = aes::cipher::KeyInit::new_from_slice(key)
+                    .map_err(|_| InitError::new("Failed to init AES CBC 256 cipher"))?;
+                Ok(Self::AesCbc256(cipher))
+            }
+            message::TransformType::ENCR_AES_GCM_16 => {
+                if transform_type.key_length != Some(256) {
+                    return Err("Unsupported key length".into());
+                }
+                let cipher = aes_gcm::KeyInit::new_from_slice(key)
+                    .map_err(|_| InitError::new("Failed to init AES GCM 256 cipher"))?;
+                Ok(Self::AesGcm256(cipher))
+            }
+            _ => Err("ENC not initialized".into()),
+        }
+    }
+
+    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+        match self {
+            Self::AesCbc256(ref cipher) => None,
+            Self::AesGcm256(ref cipher) => {
+                None
+                //cipher.encrypt_in_place(data, msg_len);
+            }
+        }
+    }
+
+    fn decrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+        match self {
+            Self::AesCbc256(ref cipher) => {
+                let iv_size = AesCbc256Decryptor::iv_size();
+                let block_decryptor =
+                    match AesCbc256Decryptor::inner_iv_slice_init(cipher.clone(), &data[..iv_size])
+                    {
+                        Ok(dec) => dec,
+                        Err(_) => {
+                            return None;
+                        }
+                    };
+                let data_range = &mut data[iv_size..msg_len];
+                match block_decryptor.decrypt_padded_mut::<block_padding::NoPadding>(data_range) {
+                    Ok(data) => Some(data),
+                    Err(_) => None,
+                }
+            }
+            Self::AesGcm256(ref cipher) => None,
+        }
+    }
+}
+
+pub struct UnsupportedTransform {}
+
+impl fmt::Display for UnsupportedTransform {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Unsupported transform")?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for UnsupportedTransform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl error::Error for UnsupportedTransform {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(self)
+    }
+}
+
+pub struct InitError {
+    msg: &'static str,
+}
+
+impl InitError {
+    fn new(msg: &'static str) -> InitError {
+        InitError { msg }
+    }
+}
+
+impl fmt::Display for InitError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.msg)?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for InitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl error::Error for InitError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(self)
+    }
+}
+
+impl From<&'static str> for InitError {
+    fn from(msg: &'static str) -> InitError {
+        InitError::new(msg)
+    }
 }
 
 const DH_MODP_GENERATOR_1024: U1024 = U1024::from_u8(2);

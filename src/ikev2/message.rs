@@ -195,12 +195,28 @@ impl InputMessage<'_> {
         // TODO: validate all required fields.
         // TODO: return status in notification (e.g. INVALID_MAJOR_VERSION).
         let mut valid = true;
+        let is_sa_init = match self.read_exchange_type() {
+            Ok(exchange_type) => exchange_type == ExchangeType::IKE_SA_INIT,
+            Err(err) => {
+                debug!("Error parsing exchange type {}", err);
+                valid = false;
+                false
+            }
+        };
+        let message_id = self.read_message_id();
+        if is_sa_init && message_id != 0 {
+            debug!("Message ID for IKE_SA_INIT is not 0: {}", message_id);
+            valid = false;
+        }
         if self.read_initiator_spi() == 0 {
             debug!("Empty initiator SPI");
             valid = false;
         }
-        if self.read_responder_spi() != 0 {
+        if is_sa_init && self.read_responder_spi() != 0 {
             debug!("Unexpected, non-empty responder SPI");
+            valid = false;
+        } else if !is_sa_init && self.read_responder_spi() == 0 {
+            debug!("Empty responder SPI");
             valid = false;
         }
         {
@@ -212,10 +228,6 @@ impl InputMessage<'_> {
                 );
                 valid = false;
             }
-        }
-        if let Err(err) = self.read_exchange_type() {
-            debug!("Error parsing exchange type {}", err);
-            valid = false;
         }
         if let Err(err) = self.read_flags() {
             debug!("Error parsing flags {}", err);
@@ -238,6 +250,7 @@ impl InputMessage<'_> {
     pub fn iter_payloads(&self) -> PayloadIter {
         PayloadIter {
             next_payload: self.read_next_payload(),
+            payload_encrypted: false,
             data: &self.data[28..],
         }
     }
@@ -417,6 +430,7 @@ impl MessageWriter<'_> {
 
 pub struct Payload<'a> {
     payload_type: PayloadType,
+    encrypted_next_payload: Option<u8>,
     critical: bool,
     data: &'a [u8],
 }
@@ -457,10 +471,27 @@ impl Payload<'_> {
             Err("Payload type is not NOTIFY".into())
         }
     }
+
+    pub fn encrypted_data(&self) -> Result<EncryptedMessage, FormatError> {
+        if self.payload_type == PayloadType::ENCRYPTED_AND_AUTHENTICATED {
+            let encrypted_next_payload = if let Some(next_payload) = self.encrypted_next_payload {
+                next_payload
+            } else {
+                return Err("Unspecified next encrypted payload".into());
+            };
+            Ok(EncryptedMessage::from_payload(
+                encrypted_next_payload,
+                self.data,
+            ))
+        } else {
+            Err("Payload type is not ENCRYPTED_AND_AUTHENTICATED".into())
+        }
+    }
 }
 
 pub struct PayloadIter<'a> {
     next_payload: u8,
+    payload_encrypted: bool,
     data: &'a [u8],
 }
 
@@ -469,7 +500,7 @@ impl<'a> Iterator for PayloadIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         const CRITICAL_BIT: u8 = 1 << 7;
-        if self.next_payload == 0 {
+        if self.next_payload == 0 || self.payload_encrypted {
             if !self.data.is_empty() {
                 debug!("Packet has unaccounted data");
             }
@@ -510,8 +541,15 @@ impl<'a> Iterator for PayloadIter<'a> {
                 return Some(Err(err));
             }
         };
+        self.payload_encrypted = current_payload == PayloadType::ENCRYPTED_AND_AUTHENTICATED.0;
+        let encrypted_next_payload = if payload_type == PayloadType::ENCRYPTED_AND_AUTHENTICATED {
+            Some(next_payload)
+        } else {
+            None
+        };
         let item = Payload {
             payload_type,
+            encrypted_next_payload,
             critical,
             data: &data[4..payload_length],
         };
@@ -1154,6 +1192,7 @@ impl fmt::Display for NotifyMessageType {
         Ok(())
     }
 }
+
 struct PayloadNotify<'a> {
     protocol_id: Option<IPSecProtocolID>,
     message_type: NotifyMessageType,
@@ -1195,6 +1234,102 @@ impl<'a> PayloadNotify<'a> {
     }
 }
 
+pub struct EncryptedMessage<'a> {
+    next_payload: u8,
+    data: &'a [u8],
+}
+
+impl<'a> EncryptedMessage<'a> {
+    fn from_payload(next_payload: u8, data: &'a [u8]) -> EncryptedMessage<'a> {
+        EncryptedMessage { next_payload, data }
+    }
+
+    pub fn encrypted_data(&self) -> &[u8] {
+        self.data
+    }
+
+    pub fn iter_decrypted_message<'b>(&self, decrypted_data: &'b [u8]) -> PayloadIter<'b> {
+        // TODO: process the pad_length u8 to remove padding
+        PayloadIter {
+            next_payload: self.next_payload,
+            payload_encrypted: false,
+            data: decrypted_data,
+        }
+    }
+}
+
+impl fmt::Debug for Payload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let critical = if self.critical {
+            "critical"
+        } else {
+            "not critical"
+        };
+        writeln!(f, "  Payload type {}, {}", self.payload_type, critical)?;
+        if let Ok(pl_sa) = self.to_security_association() {
+            for prop in pl_sa.iter_proposals() {
+                let prop = match prop {
+                    Ok(prop) => prop,
+                    Err(err) => {
+                        writeln!(f, "    Proposal invalid {}", err)?;
+                        continue;
+                    }
+                };
+                writeln!(
+                    f,
+                    "    Proposal {} protocol ID {} SPI {:?}",
+                    prop.proposal_num, prop.protocol_id, prop.spi
+                )?;
+                for tf in prop.iter_transforms() {
+                    let tf = match tf {
+                        Ok(tf) => tf,
+                        Err(err) => {
+                            writeln!(f, "      Transform invalid {}", err)?;
+                            continue;
+                        }
+                    };
+                    writeln!(f, "      Transform type {}", tf.transform_type)?;
+                    for attr in tf.iter_attributes() {
+                        let attr = match attr {
+                            Ok(attr) => attr,
+                            Err(err) => {
+                                writeln!(f, "        Attribute type invalid {}", err)?;
+                                continue;
+                            }
+                        };
+                        writeln!(
+                            f,
+                            "        Attribute {} value {:?}",
+                            attr.attribute_type, attr.data
+                        )?;
+                    }
+                }
+            }
+        } else if let Ok(pl_kex) = self.to_key_exchange() {
+            writeln!(
+                f,
+                "    DH Group num {} value {:?}",
+                pl_kex.read_group_num(),
+                pl_kex.read_value()
+            )?;
+        } else if let Ok(pl_nonce) = self.to_nonce() {
+            writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
+        } else if let Ok(pl_notify) = self.to_notify() {
+            writeln!(
+                f,
+                "    Notify protocol ID {:?} SPI {:?} type {} value {:?}",
+                pl_notify.protocol_id,
+                pl_notify.spi,
+                pl_notify.message_type,
+                pl_notify.read_value(),
+            )?;
+        } else {
+            writeln!(f, "    Data {:?}", self.data)?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for InputMessage<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "IKEv2 message")?;
@@ -1223,72 +1358,7 @@ impl fmt::Debug for InputMessage<'_> {
                     continue;
                 }
             };
-            let critical = if pl.critical {
-                "critical"
-            } else {
-                "not critical"
-            };
-            writeln!(f, "  Payload type {}, {}", pl.payload_type, critical)?;
-            if let Ok(pl_sa) = pl.to_security_association() {
-                for prop in pl_sa.iter_proposals() {
-                    let prop = match prop {
-                        Ok(prop) => prop,
-                        Err(err) => {
-                            writeln!(f, "    Proposal invalid {}", err)?;
-                            continue;
-                        }
-                    };
-                    writeln!(
-                        f,
-                        "    Proposal {} protocol ID {} SPI {:?}",
-                        prop.proposal_num, prop.protocol_id, prop.spi
-                    )?;
-                    for tf in prop.iter_transforms() {
-                        let tf = match tf {
-                            Ok(tf) => tf,
-                            Err(err) => {
-                                writeln!(f, "      Transform invalid {}", err)?;
-                                continue;
-                            }
-                        };
-                        writeln!(f, "      Transform type {}", tf.transform_type)?;
-                        for attr in tf.iter_attributes() {
-                            let attr = match attr {
-                                Ok(attr) => attr,
-                                Err(err) => {
-                                    writeln!(f, "        Attribute type invalid {}", err)?;
-                                    continue;
-                                }
-                            };
-                            writeln!(
-                                f,
-                                "        Attribute {} value {:?}",
-                                attr.attribute_type, attr.data
-                            )?;
-                        }
-                    }
-                }
-            } else if let Ok(pl_kex) = pl.to_key_exchange() {
-                writeln!(
-                    f,
-                    "    DH Group num {} value {:?}",
-                    pl_kex.read_group_num(),
-                    pl_kex.read_value()
-                )?;
-            } else if let Ok(pl_nonce) = pl.to_nonce() {
-                writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
-            } else if let Ok(pl_notify) = pl.to_notify() {
-                writeln!(
-                    f,
-                    "    Notify protocol ID {:?} SPI {:?} type {} value {:?}",
-                    pl_notify.protocol_id,
-                    pl_notify.spi,
-                    pl_notify.message_type,
-                    pl_notify.read_value(),
-                )?;
-            } else {
-                writeln!(f, "    Data {:?}", pl.data)?;
-            }
+            pl.fmt(f)?;
         }
         Ok(())
     }

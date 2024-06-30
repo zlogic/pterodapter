@@ -16,6 +16,7 @@ mod message;
 
 // TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
 const MAX_DATAGRAM_SIZE: usize = 4096;
+const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;
 
 pub struct Server {
     listen_ips: Vec<IpAddr>,
@@ -75,7 +76,7 @@ impl Server {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct SessionID {
     remote_spi: u64,
     local_spi: u64,
@@ -148,7 +149,7 @@ impl Sessions {
             return Err("Invalid message received".into());
         }
 
-        debug!("Received packet from {} {:?}", remote_addr, ikev2_request);
+        debug!("Received packet from {}\n{:?}", remote_addr, ikev2_request);
 
         let session_id = SessionID::from_message(&ikev2_request)?;
         let session = self.get(session_id.clone(), remote_addr)?;
@@ -162,7 +163,7 @@ impl Sessions {
         {
             // TODO: remove this debug code
             let responser_msg = message::InputMessage::from_datagram(response_bytes)?;
-            debug!("Sending response {:?} to {}", responser_msg, remote_addr);
+            debug!("Sending response to {}\n{:?}", remote_addr, responser_msg);
         }
         // Response retransmisisons are initiated by client.
         if !response_bytes.is_empty() {
@@ -176,6 +177,7 @@ impl Sessions {
 struct IKEv2Session {
     remote_addr: SocketAddr,
     params: Option<crypto::TransformParameters>,
+    crypto_stack: Option<crypto::CryptoStack>,
 }
 
 impl IKEv2Session {
@@ -183,6 +185,7 @@ impl IKEv2Session {
         IKEv2Session {
             remote_addr,
             params: None,
+            crypto_stack: None,
         }
     }
 
@@ -201,6 +204,9 @@ impl IKEv2Session {
         match exchange_type {
             message::ExchangeType::IKE_SA_INIT => {
                 self.process_sa_init_message(session_id, addr, request, response)
+            }
+            message::ExchangeType::IKE_AUTH => {
+                self.process_auth_message(session_id, addr, request, response)
             }
             message::ExchangeType::INFORMATIONAL => {
                 self.process_informational_message(session_id, request, response)
@@ -223,7 +229,7 @@ impl IKEv2Session {
 
         response.write_header(
             session_id.remote_spi,
-            0,
+            session_id.local_spi,
             message::ExchangeType::IKE_SA_INIT,
             false,
             request.read_message_id(),
@@ -247,11 +253,17 @@ impl IKEv2Session {
                         if let Some(transform) = crypto::choose_sa_parameters(&sa) {
                             transform
                         } else {
+                            debug!("No compatible SA parameters found");
                             // TODO: return INVALID_SYNTAX notification.
                             continue;
                         };
                     response.write_accept_proposal(proposal_num, &prop)?;
-                    dh_transform = prop.create_dh();
+                    match prop.create_dh() {
+                        Ok(dh) => dh_transform = Some(dh),
+                        Err(err) => {
+                            debug!("Failed to init DH {}", err)
+                        }
+                    }
                     self.params = Some(prop);
                 }
                 message::PayloadType::KEY_EXCHANGE => {
@@ -272,32 +284,63 @@ impl IKEv2Session {
                     let nonce = payload.to_nonce()?;
                     let nonce_remote = nonce.read_value();
                     // All keys are less than 256 bits.
-                    let mut nonce_local = [0u8; 32];
+                    let mut nonce_local = [0u8; 48];
                     rand::thread_rng().fill(nonce_local.as_mut_slice());
-                    let mut nonce_key = vec![0; nonce_remote.len() + nonce_local.len()];
-                    nonce_key[0..nonce_remote.len()].copy_from_slice(nonce_remote);
-                    nonce_key[nonce_remote.len()..].copy_from_slice(&nonce_local);
+                    let mut prf_key = vec![0; nonce_remote.len() + nonce_local.len() + 8 + 8];
+                    let mut prf_key_cursor = 0;
+                    prf_key[prf_key_cursor..prf_key_cursor + nonce_remote.len()]
+                        .copy_from_slice(nonce_remote);
+                    prf_key_cursor += nonce_remote.len();
+                    prf_key[prf_key_cursor..prf_key_cursor + nonce_local.len()]
+                        .copy_from_slice(&nonce_local);
+                    prf_key_cursor += nonce_local.len();
+                    prf_key[prf_key_cursor..prf_key_cursor + 8]
+                        .copy_from_slice(&session_id.remote_spi.to_be_bytes());
+                    prf_key_cursor += 8;
+                    prf_key[prf_key_cursor..prf_key_cursor + 8]
+                        .copy_from_slice(&session_id.local_spi.to_be_bytes());
 
                     let params = if let Some(params) = self.params.as_ref() {
                         params
                     } else {
+                        debug!("Unspecified transform parametes");
                         // TODO: return INVALID_SYNTAX notification.
                         continue;
                     };
-                    let mut prf_transform =
-                        if let Some(prf) = params.create_prf(nonce_key.as_slice()) {
-                            prf
-                        } else {
+                    let mut prf_transform = match params
+                        .create_prf(&prf_key[0..nonce_remote.len() + nonce_local.len()])
+                    {
+                        Ok(prf) => prf,
+                        Err(err) => {
+                            debug!("Failed to init PRF transform for SKEYSEED {}", err);
                             // TODO: return INVALID_SYNTAX notification.
                             continue;
-                        };
+                        }
+                    };
                     let shared_secret = if let Some(shared_secret) = shared_secret {
                         shared_secret
                     } else {
+                        debug!("Unspecified shared secret");
                         // TODO: return INVALID_SYNTAX notification.
                         continue;
                     };
                     let skeyseed = prf_transform.prf(&shared_secret);
+                    let mut prf_transform = match params.create_prf(skeyseed.as_slice()) {
+                        Ok(prf) => prf,
+                        Err(err) => {
+                            debug!("Failed to init PRF transform for keying material {}", err);
+                            // TODO: return INVALID_SYNTAX notification.
+                            continue;
+                        }
+                    };
+                    match prf_transform.create_crypto_stack(&params, &prf_key) {
+                        Ok(crypto_stack) => self.crypto_stack = Some(crypto_stack),
+                        Err(err) => {
+                            debug!("Failed to set up cryptography stack {}", err);
+                            // TODO: return INVALID_SYNTAX notification.
+                            continue;
+                        }
+                    };
                     let dest = response
                         .next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
                     dest.copy_from_slice(&nonce_local);
@@ -345,6 +388,67 @@ impl IKEv2Session {
         Ok(response.complete_message())
     }
 
+    fn process_auth_message(
+        &mut self,
+        session_id: SessionID,
+        addr: (SocketAddr, SocketAddr),
+        request: &message::InputMessage,
+        response: &mut message::MessageWriter,
+    ) -> Result<usize, IKEv2Error> {
+        let (_, remote_addr) = addr;
+
+        response.write_header(
+            session_id.remote_spi,
+            session_id.local_spi,
+            message::ExchangeType::IKE_AUTH,
+            false,
+            request.read_message_id(),
+        )?;
+
+        for payload in request.iter_payloads() {
+            let payload = if let Ok(payload) = payload {
+                payload
+            } else {
+                // TODO: return INVALID_SYNTAX notification.
+                continue;
+            };
+            // IKEv2 payloads need to be sent in a very specific order.
+            // By the time the Nonce is reached, SA and KE should already be processed.
+            match payload.payload_type() {
+                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
+                    let encrypted_payload = payload.encrypted_data()?;
+                    let encrypted_data = encrypted_payload.encrypted_data();
+                    let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
+                    decrypted_data[..encrypted_data.len()].copy_from_slice(encrypted_data);
+                    let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
+                        crypto_stack
+                    } else {
+                        debug!("Crypto stack not initialized");
+                        // TODO: return INVALID_SYNTAX notification.
+                        continue;
+                    };
+                    let decrypted_slice = if let Some(decrypted_data) =
+                        crypto_stack.decrypt_data(&mut decrypted_data, encrypted_data.len())
+                    {
+                        decrypted_data
+                    } else {
+                        debug!("Failed to decrypt data");
+                        // TODO: return error notification.
+                        continue;
+                    };
+                    for pl in encrypted_payload.iter_decrypted_message(decrypted_slice) {
+                        if let Ok(pl) = pl {
+                            debug!("Decrypted payload\n {:?}", pl);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(response.complete_message())
+    }
+
     fn process_informational_message(
         &mut self,
         session_id: SessionID,
@@ -353,7 +457,7 @@ impl IKEv2Session {
     ) -> Result<usize, IKEv2Error> {
         response.write_header(
             session_id.remote_spi,
-            0,
+            session_id.local_spi,
             message::ExchangeType::INFORMATIONAL,
             false,
             request.read_message_id(),
