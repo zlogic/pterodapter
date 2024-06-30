@@ -107,7 +107,7 @@ impl TransformParameters {
         }
     }
 
-    fn auth_signature_length(&self) -> usize {
+    pub fn auth_signature_length(&self) -> usize {
         match self.auth {
             Some(ref auth) => match auth.transform_type {
                 message::TransformType::AUTH_HMAC_SHA2_256_128 => 128,
@@ -625,7 +625,7 @@ impl Encryption {
                         }
                     };
                 let data_range = &mut data[iv_size..msg_len];
-                match block_decryptor.decrypt_padded_mut::<block_padding::NoPadding>(data_range) {
+                match block_decryptor.decrypt_padded_mut::<block_padding::Iso10126>(data_range) {
                     Ok(data) => Ok(data),
                     Err(err) => {
                         debug!("Failed to decode AES CBC 256 message: {}", err);

@@ -429,7 +429,7 @@ impl IKEv2Session {
                         // TODO: return error notification.
                         continue;
                     };
-                    {
+                    let signature_length = {
                         // The RFC states that the signature should be extracted from the ENCRYPTED_AND_AUTHENTICATED
                         // packet, but it's supposed to be the last payload, and there should not be any unaccounted bytes.
                         // While this will fail if a packet is slightly malformed, it's probably for the best.
@@ -440,17 +440,31 @@ impl IKEv2Session {
                             // TODO: return error notification or even ignore packet.
                             continue;
                         }
-                    }
-                    let decrypted_slice = match crypto_stack
-                        .decrypt_data(&mut decrypted_data, encrypted_data.len())
-                    {
-                        Ok(decrypted_slice) => decrypted_slice,
-                        Err(err) => {
-                            debug!("Failed to decrypt data {}", err);
+                        if let Some(params) = self.params.as_ref() {
+                            params.auth_signature_length() / 8
+                        } else {
+                            debug!("Crypto parameters not initialized");
                             // TODO: return error notification.
                             continue;
                         }
                     };
+                    let encrypted_data_len = encrypted_data.len();
+                    let encrypted_data_len = if encrypted_data_len >= signature_length {
+                        encrypted_data_len - signature_length
+                    } else {
+                        debug!("Signature is larger than encrypted data");
+                        // TODO: return error notification.
+                        continue;
+                    };
+                    let decrypted_slice =
+                        match crypto_stack.decrypt_data(&mut decrypted_data, encrypted_data_len) {
+                            Ok(decrypted_slice) => decrypted_slice,
+                            Err(err) => {
+                                debug!("Failed to decrypt data {}", err);
+                                // TODO: return error notification.
+                                continue;
+                            }
+                        };
                     for pl in encrypted_payload.iter_decrypted_message(decrypted_slice) {
                         match pl {
                             Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
