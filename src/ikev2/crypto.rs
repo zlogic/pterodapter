@@ -107,6 +107,16 @@ impl TransformParameters {
         }
     }
 
+    fn auth_signature_length(&self) -> usize {
+        match self.auth {
+            Some(ref auth) => match auth.transform_type {
+                message::TransformType::AUTH_HMAC_SHA2_256_128 => 128,
+                _ => 0,
+            },
+            None => 0,
+        }
+    }
+
     pub fn iter_parameters(&self) -> TransformParametersIter {
         TransformParametersIter {
             params: self,
@@ -331,11 +341,14 @@ impl DHTransform {
     pub fn compute_shared_secret(
         &self,
         other_public_key: &[u8],
-    ) -> Option<[u8; MAX_DH_KEY_LENGTH]> {
+    ) -> Result<[u8; MAX_DH_KEY_LENGTH], InitError> {
         let mut res = [0u8; MAX_DH_KEY_LENGTH];
         let dest = &mut res[0..self.key_length_bytes()];
         match self {
             Self::MODP1024(_, private_key, _) => {
+                if other_public_key.len() != self.key_length_bytes() {
+                    return Err("MODP 1024 key length is not valid".into());
+                }
                 let other_public_key = U1024::from_be_slice(other_public_key);
                 let other_key_residue = const_residue!(other_public_key, DHModulus1024);
                 let shared_key = other_key_residue.pow(&private_key).retrieve();
@@ -349,7 +362,7 @@ impl DHTransform {
                     Ok(key) => key,
                     Err(err) => {
                         debug!("Failed to decode other public key {}", err);
-                        return None;
+                        return Err("Failed to decode other public key".into());
                     }
                 };
                 let public_point = ProjectivePoint::from(other_public_key.as_affine());
@@ -357,7 +370,7 @@ impl DHTransform {
                 dest.copy_from_slice(&EncodedPoint::from(secret_point).as_bytes()[1..]);
             }
         }
-        Some(res)
+        Ok(res)
     }
 }
 
@@ -386,9 +399,10 @@ impl PseudorandomTransform {
     pub fn prf(&mut self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
         match self {
             Self::HmacSha256(ref mut hmac) => {
+                const BLOCK_LENGTH: usize = 256 / 8;
                 hmac.update(data);
                 let hash = hmac.finalize_reset().into_bytes();
-                let mut result = Array::new(256 / 8);
+                let mut result = Array::new(BLOCK_LENGTH);
                 result.as_mut_slice().copy_from_slice(&hash);
                 result
             }
@@ -471,8 +485,50 @@ impl DerivedKeys {
     }
 }
 
+enum Auth {
+    None,
+    HmacSha256tr128(HmacSha256),
+}
+
+impl Auth {
+    fn init(transform_type: Option<message::TransformType>, key: &[u8]) -> Result<Auth, InitError> {
+        match transform_type {
+            Some(message::TransformType::AUTH_HMAC_SHA2_256_128) => {
+                let core_wrapper = HmacSha256::new_from_slice(key)
+                    .map_err(|_| InitError::new("Failed to init HMAC SHA256-128 AUTH"))?;
+                let hmac = core_wrapper;
+                Ok(Self::HmacSha256tr128(hmac))
+            }
+            None => Ok(Self::None),
+            _ => Err("Unsupported PRF".into()),
+        }
+    }
+
+    pub fn validate(&mut self, data: &[u8]) -> bool {
+        match self {
+            Self::HmacSha256tr128(ref mut hmac) => {
+                const SIGNATURE_LENGTH: usize = 128 / 8;
+                if data.len() < SIGNATURE_LENGTH {
+                    return false;
+                }
+                let received_signature = &data[data.len() - SIGNATURE_LENGTH..];
+                let data = &data[..data.len() - SIGNATURE_LENGTH];
+                hmac.update(data);
+                let hash = hmac.finalize_reset().into_bytes();
+                hash.iter()
+                    .take(SIGNATURE_LENGTH)
+                    .zip(received_signature.iter())
+                    .all(|(expected, received)| expected == received)
+            }
+            Self::None => true,
+        }
+    }
+}
+
 pub struct CryptoStack {
     derive_key: Array<MAX_PRF_KEY_LENGTH>,
+    auth_initiator: Auth,
+    auth_responder: Auth,
     enc_initiator: Encryption,
     enc_responder: Encryption,
 }
@@ -485,15 +541,29 @@ impl CryptoStack {
             .enc
             .as_ref()
             .ok_or_else(|| InitError::new("Undefined encryption parameters"))?;
+        let auth = params
+            .auth
+            .as_ref()
+            .map(|transform| transform.transform_type);
         Ok(CryptoStack {
             derive_key,
+            auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
+            auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
             enc_initiator: Encryption::init(enc, &keys.keys[keys.enc_initiator.clone()])?,
             enc_responder: Encryption::init(enc, &keys.keys[keys.enc_responder.clone()])?,
         })
     }
 
-    pub fn decrypt_data<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+    pub fn decrypt_data<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+    ) -> Result<&'a [u8], CryptoError> {
         self.enc_initiator.decrypt(data, msg_len)
+    }
+
+    pub fn validate_signature(&mut self, data: &[u8]) -> bool {
+        self.auth_initiator.validate(data)
     }
 }
 
@@ -538,25 +608,32 @@ impl Encryption {
         }
     }
 
-    fn decrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+    fn decrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Result<&'a [u8], CryptoError> {
         match self {
             Self::AesCbc256(ref cipher) => {
                 let iv_size = AesCbc256Decryptor::iv_size();
+                if iv_size >= msg_len {
+                    return Err("Message length is too short".into());
+                }
                 let block_decryptor =
                     match AesCbc256Decryptor::inner_iv_slice_init(cipher.clone(), &data[..iv_size])
                     {
                         Ok(dec) => dec,
-                        Err(_) => {
-                            return None;
+                        Err(err) => {
+                            debug!("Failed to init AES CBC 256 IV: {}", err);
+                            return Err("Failed to init AES CBC 256 IV".into());
                         }
                     };
                 let data_range = &mut data[iv_size..msg_len];
                 match block_decryptor.decrypt_padded_mut::<block_padding::NoPadding>(data_range) {
-                    Ok(data) => Some(data),
-                    Err(_) => None,
+                    Ok(data) => Ok(data),
+                    Err(err) => {
+                        debug!("Failed to decode AES CBC 256 message: {}", err);
+                        return Err("Failed to decode AES CBC 256 message".into());
+                    }
                 }
             }
-            Self::AesGcm256(ref cipher) => None,
+            Self::AesGcm256(ref cipher) => Err("AES GCM is not yet implemented".into()),
         }
     }
 }
@@ -614,6 +691,41 @@ impl error::Error for InitError {
 impl From<&'static str> for InitError {
     fn from(msg: &'static str) -> InitError {
         InitError::new(msg)
+    }
+}
+
+pub struct CryptoError {
+    msg: &'static str,
+}
+
+impl CryptoError {
+    fn new(msg: &'static str) -> CryptoError {
+        CryptoError { msg }
+    }
+}
+
+impl fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.msg)?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for CryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl error::Error for CryptoError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(self)
+    }
+}
+
+impl From<&'static str> for CryptoError {
+    fn from(msg: &'static str) -> CryptoError {
+        CryptoError::new(msg)
     }
 }
 

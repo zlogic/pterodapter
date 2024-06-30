@@ -270,12 +270,14 @@ impl IKEv2Session {
                     let kex = payload.to_key_exchange()?;
                     if let Some(dh) = dh_transform.as_ref() {
                         let public_key = dh.read_public_key();
-                        shared_secret = dh.compute_shared_secret(kex.read_value());
-                        if shared_secret.is_none() {
-                            // TODO: return INVALID_KE_PAYLOAD notification.
-                            debug!("Failed to compute shared secret");
-                            continue;
-                        }
+                        shared_secret = match dh.compute_shared_secret(kex.read_value()) {
+                            Ok(shared_secret) => Some(shared_secret),
+                            Err(err) => {
+                                // TODO: return INVALID_KE_PAYLOAD notification.
+                                debug!("Failed to compute shared secret {}", err);
+                                continue;
+                            }
+                        };
                         response
                             .write_key_exchange_payload(dh.group_number(), public_key.as_slice())?;
                     }
@@ -284,7 +286,7 @@ impl IKEv2Session {
                     let nonce = payload.to_nonce()?;
                     let nonce_remote = nonce.read_value();
                     // All keys are less than 256 bits.
-                    let mut nonce_local = [0u8; 48];
+                    let mut nonce_local = [0u8; 32];
                     rand::thread_rng().fill(nonce_local.as_mut_slice());
                     let mut prf_key = vec![0; nonce_remote.len() + nonce_local.len() + 8 + 8];
                     let mut prf_key_cursor = 0;
@@ -420,25 +422,43 @@ impl IKEv2Session {
                     let encrypted_data = encrypted_payload.encrypted_data();
                     let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
                     decrypted_data[..encrypted_data.len()].copy_from_slice(encrypted_data);
-                    let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
+                    let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
                         crypto_stack
                     } else {
                         debug!("Crypto stack not initialized");
-                        // TODO: return INVALID_SYNTAX notification.
-                        continue;
-                    };
-                    let decrypted_slice = if let Some(decrypted_data) =
-                        crypto_stack.decrypt_data(&mut decrypted_data, encrypted_data.len())
-                    {
-                        decrypted_data
-                    } else {
-                        debug!("Failed to decrypt data");
                         // TODO: return error notification.
                         continue;
                     };
+                    {
+                        // The RFC states that the signature should be extracted from the ENCRYPTED_AND_AUTHENTICATED
+                        // packet, but it's supposed to be the last payload, and there should not be any unaccounted bytes.
+                        // While this will fail if a packet is slightly malformed, it's probably for the best.
+                        let validate_slice = request.raw_data();
+                        let valid_signature = crypto_stack.validate_signature(validate_slice);
+                        if !valid_signature {
+                            debug!("Packet has invalid signature");
+                            // TODO: return error notification or even ignore packet.
+                            continue;
+                        }
+                    }
+                    let decrypted_slice = match crypto_stack
+                        .decrypt_data(&mut decrypted_data, encrypted_data.len())
+                    {
+                        Ok(decrypted_slice) => decrypted_slice,
+                        Err(err) => {
+                            debug!("Failed to decrypt data {}", err);
+                            // TODO: return error notification.
+                            continue;
+                        }
+                    };
                     for pl in encrypted_payload.iter_decrypted_message(decrypted_slice) {
-                        if let Ok(pl) = pl {
-                            debug!("Decrypted payload\n {:?}", pl);
+                        match pl {
+                            Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
+                            Err(err) => {
+                                debug!("Failed to read decrypted payload data {}", err);
+                                // TODO: return error notification.
+                                continue;
+                            }
                         }
                     }
                 }

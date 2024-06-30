@@ -191,6 +191,11 @@ impl InputMessage<'_> {
         u32::from_be_bytes(result)
     }
 
+    pub fn raw_data(&self) -> &[u8] {
+        let data_length = self.data.len().min(self.read_length() as usize);
+        &self.data[..data_length]
+    }
+
     pub fn is_valid(&self) -> bool {
         // TODO: validate all required fields.
         // TODO: return status in notification (e.g. INVALID_MAJOR_VERSION).
