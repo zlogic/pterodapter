@@ -1,6 +1,19 @@
+use crypto_bigint::{
+    modular::constant_mod::{self, ResidueParams},
+    Encoding,
+};
+use hmac::{Hmac, Mac};
+use log::debug;
+use p256::{elliptic_curve::sec1::Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey};
+use sha2::Sha256;
 use std::{error, fmt};
 
+use crypto_bigint::{const_residue, impl_modulus, rand_core::OsRng, Random, U1024};
+
 use super::message;
+
+const MAX_DH_KEY_LENGTH: usize = 128;
+const MAX_PRF_KEY_LENGTH: usize = 32;
 
 pub struct Transform {
     transform_type: message::TransformType,
@@ -28,6 +41,14 @@ pub struct TransformParameters {
 }
 
 impl TransformParameters {
+    pub fn create_dh(&self) -> Option<DHTransform> {
+        DHTransform::init(self.dh.as_ref()?.transform_type)
+    }
+
+    pub fn create_prf(&self, key: &[u8]) -> Option<PseudorandomTransform> {
+        PseudorandomTransform::init(self.prf.as_ref()?.transform_type, key)
+    }
+
     pub fn protocol_id(&self) -> message::IPSecProtocolID {
         self.protocol_id
     }
@@ -203,3 +224,152 @@ impl error::Error for UnsupportedTransform {
         Some(self)
     }
 }
+
+pub struct Array<const M: usize> {
+    data: [u8; M],
+    len: usize,
+}
+
+impl<const M: usize> Array<M> {
+    pub fn new(len: usize) -> Array<M> {
+        Array {
+            data: [0u8; M],
+            len,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data[..self.len]
+    }
+}
+
+pub enum DHTransform {
+    MODP1024(u16, U1024, U1024),
+    ECP256(u16, NonZeroScalar, PublicKey),
+}
+
+impl DHTransform {
+    fn init(transform_type: message::TransformType) -> Option<DHTransform> {
+        let (_, dh_group) = transform_type.type_id();
+        match transform_type {
+            message::TransformType::DH_1024_MODP => {
+                let private_key = U1024::random(&mut OsRng);
+                // This calculates DH_MODP_GENERATOR_1024^private_key mod DHModulus1024.
+                let public_key = DH_MODP_RESIDUE_1024.pow(&private_key).retrieve();
+                Some(DHTransform::MODP1024(dh_group, private_key, public_key))
+            }
+            message::TransformType::DH_256_ECP => {
+                let private_key = NonZeroScalar::random(&mut OsRng);
+                let public_key = PublicKey::from_secret_scalar(&private_key);
+                Some(DHTransform::ECP256(dh_group, private_key, public_key))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
+        let mut res = Array::new(self.key_length_bytes());
+        match self {
+            Self::MODP1024(_, _, public_key) => {
+                res.as_mut_slice()
+                    .copy_from_slice(&public_key.to_be_bytes());
+            }
+            Self::ECP256(_, _, public_key) => res
+                .as_mut_slice()
+                .copy_from_slice(&EncodedPoint::from(public_key).as_bytes()[1..]),
+        }
+        res
+    }
+
+    pub fn key_length_bytes(&self) -> usize {
+        match self {
+            Self::MODP1024(_, _, _) => 128,
+            Self::ECP256(_, _, _) => 64,
+        }
+    }
+
+    pub fn group_number(&self) -> u16 {
+        match self {
+            Self::MODP1024(group, _, _) => *group,
+            Self::ECP256(group, _, _) => *group,
+        }
+    }
+
+    pub fn compute_shared_secret(
+        &self,
+        other_public_key: &[u8],
+    ) -> Option<[u8; MAX_DH_KEY_LENGTH]> {
+        let mut res = [0u8; MAX_DH_KEY_LENGTH];
+        let dest = &mut res[0..self.key_length_bytes()];
+        match self {
+            Self::MODP1024(_, private_key, _) => {
+                let other_public_key = U1024::from_be_slice(other_public_key);
+                let other_key_residue = const_residue!(other_public_key, DHModulus1024);
+                let shared_key = other_key_residue.pow(&private_key).retrieve();
+                dest.copy_from_slice(&shared_key.to_be_bytes());
+            }
+            Self::ECP256(_, private_key, _) => {
+                let mut other_public_key_sec1 = [0u8; 65];
+                other_public_key_sec1[0] = Tag::Uncompressed.into();
+                other_public_key_sec1[1..].copy_from_slice(other_public_key);
+                let other_public_key = match PublicKey::from_sec1_bytes(&other_public_key_sec1) {
+                    Ok(key) => key,
+                    Err(err) => {
+                        debug!("Failed to decode other public key {}", err);
+                        return None;
+                    }
+                };
+                let public_point = ProjectivePoint::from(other_public_key.as_affine());
+                let secret_point = (&public_point * private_key).to_affine();
+                dest.copy_from_slice(&EncodedPoint::from(secret_point).as_bytes()[1..]);
+            }
+        }
+        Some(res)
+    }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub enum PseudorandomTransform {
+    HmacSha256(HmacSha256),
+}
+
+impl PseudorandomTransform {
+    fn init(transform_type: message::TransformType, key: &[u8]) -> Option<PseudorandomTransform> {
+        match transform_type {
+            message::TransformType::PRF_HMAC_SHA2_256 => {
+                let hmac = HmacSha256::new_from_slice(key).ok()?;
+                Some(Self::HmacSha256(hmac))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn prf(&mut self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
+        match self {
+            Self::HmacSha256(ref mut hmac) => {
+                hmac.update(data);
+                let hash = hmac.finalize_reset().into_bytes();
+                let mut result = Array::new(32);
+                result.as_mut_slice().copy_from_slice(&hash);
+                result
+            }
+        }
+    }
+
+    fn generate_key_material(&mut self) {}
+}
+
+const DH_MODP_GENERATOR_1024: U1024 = U1024::from_u8(2);
+const DH_MODP_RESIDUE_1024: constant_mod::Residue<DHModulus1024, { U1024::LIMBS }> =
+    const_residue!(DH_MODP_GENERATOR_1024, DHModulus1024);
+
+impl_modulus!(
+    DHModulus1024,
+    U1024,
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF"
+);

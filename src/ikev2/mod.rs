@@ -14,7 +14,8 @@ use tokio::{net::UdpSocket, signal, task::JoinHandle};
 mod crypto;
 mod message;
 
-const MAX_DATAGRAM_SIZE: usize = 1500;
+// TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
+const MAX_DATAGRAM_SIZE: usize = 4096;
 
 pub struct Server {
     listen_ips: Vec<IpAddr>,
@@ -37,6 +38,7 @@ impl Server {
         info!("Started server on {}", listen_addr);
         let mut buf = [0u8; MAX_DATAGRAM_SIZE];
         // TODO: share sessions between all threads: either using an async mutex, or by forwarding all messages to the same mpsc channel.
+        // TODO: check source of Tokio's join! macro to listen on multiple addresses.
         let mut sessions = Sessions::new();
         loop {
             let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
@@ -173,11 +175,15 @@ impl Sessions {
 
 struct IKEv2Session {
     remote_addr: SocketAddr,
+    params: Option<crypto::TransformParameters>,
 }
 
 impl IKEv2Session {
     fn new(remote_addr: SocketAddr) -> IKEv2Session {
-        IKEv2Session { remote_addr }
+        IKEv2Session {
+            remote_addr,
+            params: None,
+        }
     }
 
     fn process_message(
@@ -189,11 +195,20 @@ impl IKEv2Session {
     ) -> Result<usize, IKEv2Error> {
         // TODO: process message if exchange type is supported
         // TODO: return error if payload type is critical but not recognized
+        // TODO: keep track of message numbers and replies - only send response if message ID is up to date.
 
-        if request.read_exchange_type()? == message::ExchangeType::IKE_SA_INIT {
-            self.process_sa_init_message(session_id, addr, request, response)
-        } else {
-            Ok(0)
+        let exchange_type = request.read_exchange_type()?;
+        match exchange_type {
+            message::ExchangeType::IKE_SA_INIT => {
+                self.process_sa_init_message(session_id, addr, request, response)
+            }
+            message::ExchangeType::INFORMATIONAL => {
+                self.process_informational_message(session_id, request, response)
+            }
+            _ => {
+                debug!("Unimplemented handler for message {}", exchange_type);
+                Err("Unimplemented message".into())
+            }
         }
     }
 
@@ -214,6 +229,8 @@ impl IKEv2Session {
             request.read_message_id(),
         )?;
 
+        let mut dh_transform = None;
+        let mut shared_secret = None;
         for payload in request.iter_payloads() {
             let payload = if let Ok(payload) = payload {
                 payload
@@ -221,18 +238,81 @@ impl IKEv2Session {
                 // TODO: return INVALID_SYNTAX notification.
                 continue;
             };
-            if payload.payload_type() == message::PayloadType::SECURITY_ASSOCIATION {
-                let sa = payload.to_security_association()?;
-                let (prop, proposal_num) =
-                    if let Some(transform) = crypto::choose_sa_parameters(&sa) {
-                        transform
+            // IKEv2 payloads need to be sent in a very specific order.
+            // By the time the Nonce is reached, SA and KE should already be processed.
+            match payload.payload_type() {
+                message::PayloadType::SECURITY_ASSOCIATION => {
+                    let sa = payload.to_security_association()?;
+                    let (prop, proposal_num) =
+                        if let Some(transform) = crypto::choose_sa_parameters(&sa) {
+                            transform
+                        } else {
+                            // TODO: return INVALID_SYNTAX notification.
+                            continue;
+                        };
+                    response.write_accept_proposal(proposal_num, &prop)?;
+                    dh_transform = prop.create_dh();
+                    self.params = Some(prop);
+                }
+                message::PayloadType::KEY_EXCHANGE => {
+                    let kex = payload.to_key_exchange()?;
+                    if let Some(dh) = dh_transform.as_ref() {
+                        let public_key = dh.read_public_key();
+                        shared_secret = dh.compute_shared_secret(kex.read_value());
+                        if shared_secret.is_none() {
+                            // TODO: return INVALID_KE_PAYLOAD notification.
+                            debug!("Failed to compute shared secret");
+                            continue;
+                        }
+                        response
+                            .write_key_exchange_payload(dh.group_number(), public_key.as_slice())?;
+                    }
+                }
+                message::PayloadType::NONCE => {
+                    let nonce = payload.to_nonce()?;
+                    let nonce_remote = nonce.read_value();
+                    // All keys are less than 256 bits.
+                    let mut nonce_local = [0u8; 32];
+                    rand::thread_rng().fill(nonce_local.as_mut_slice());
+                    let mut nonce_key = vec![0; nonce_remote.len() + nonce_local.len()];
+                    nonce_key[0..nonce_remote.len()].copy_from_slice(nonce_remote);
+                    nonce_key[nonce_remote.len()..].copy_from_slice(&nonce_local);
+
+                    let params = if let Some(params) = self.params.as_ref() {
+                        params
                     } else {
                         // TODO: return INVALID_SYNTAX notification.
                         continue;
                     };
-                response.write_accept_proposal(proposal_num, &prop)?;
+                    let mut prf_transform =
+                        if let Some(prf) = params.create_prf(nonce_key.as_slice()) {
+                            prf
+                        } else {
+                            // TODO: return INVALID_SYNTAX notification.
+                            continue;
+                        };
+                    let shared_secret = if let Some(shared_secret) = shared_secret {
+                        shared_secret
+                    } else {
+                        // TODO: return INVALID_SYNTAX notification.
+                        continue;
+                    };
+                    let skeyseed = prf_transform.prf(&shared_secret);
+                    let dest = response
+                        .next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
+                    dest.copy_from_slice(&nonce_local);
+                }
+                _ => {}
             }
         }
+
+        /*
+        response.write_notify_payload(
+            None,
+            &[],
+            message::NotifyMessageType::IKEV2_FRAGMENTATION_SUPPORTED,
+            &[],
+        )?;
 
         // Simulate that the host is behind a NAT - same as StrongSwan's encap=yes does it.
         let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 500);
@@ -259,6 +339,24 @@ impl IKEv2Session {
             &[],
             message::NotifyMessageType::NAT_DETECTION_DESTINATION_IP,
             &nat_ip,
+        )?;
+        */
+
+        Ok(response.complete_message())
+    }
+
+    fn process_informational_message(
+        &mut self,
+        session_id: SessionID,
+        request: &message::InputMessage,
+        response: &mut message::MessageWriter,
+    ) -> Result<usize, IKEv2Error> {
+        response.write_header(
+            session_id.remote_spi,
+            0,
+            message::ExchangeType::INFORMATIONAL,
+            false,
+            request.read_message_id(),
         )?;
 
         Ok(response.complete_message())

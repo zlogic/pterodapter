@@ -371,6 +371,20 @@ impl MessageWriter<'_> {
         Ok(())
     }
 
+    pub fn write_key_exchange_payload(
+        &mut self,
+        dh_group: u16,
+        public_key: &[u8],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::KEY_EXCHANGE, 4 + public_key.len())?;
+        next_payload_slice[0..2].copy_from_slice(&dh_group.to_be_bytes());
+        next_payload_slice[2] = 0;
+        next_payload_slice[3] = 0;
+        next_payload_slice[4..].copy_from_slice(public_key);
+        Ok(())
+    }
+
     pub fn next_payload_slice(
         &mut self,
         payload_type: PayloadType,
@@ -420,7 +434,7 @@ impl Payload<'_> {
         }
     }
 
-    fn to_key_exchange(&self) -> Result<PayloadKeyExchange, FormatError> {
+    pub fn to_key_exchange(&self) -> Result<PayloadKeyExchange, FormatError> {
         if self.payload_type == PayloadType::KEY_EXCHANGE {
             PayloadKeyExchange::from_payload(self.data)
         } else {
@@ -428,7 +442,7 @@ impl Payload<'_> {
         }
     }
 
-    fn to_nonce(&self) -> Result<PayloadNonce, FormatError> {
+    pub fn to_nonce(&self) -> Result<PayloadNonce, FormatError> {
         if self.payload_type == PayloadType::NONCE {
             Ok(PayloadNonce { data: self.data })
         } else {
@@ -465,11 +479,15 @@ impl<'a> Iterator for PayloadIter<'a> {
             debug!("Not enough data in payload");
             return None;
         }
+        let current_payload = self.next_payload;
+        let data = &self.data[..];
         let next_payload = self.data[0];
+        self.next_payload = next_payload;
         let payload_flags = self.data[1];
         let mut payload_length = [0u8; 2];
         payload_length.copy_from_slice(&self.data[2..4]);
         let payload_length = u16::from_be_bytes(payload_length) as usize;
+        self.data = &self.data[payload_length..];
         let critical = match payload_flags {
             0x00 => false,
             CRITICAL_BIT => true,
@@ -478,27 +496,25 @@ impl<'a> Iterator for PayloadIter<'a> {
                     "Unsupported payload {} reserved flags: {}",
                     self.next_payload, payload_flags
                 );
-                self.next_payload = next_payload;
-                self.data = &self.data[payload_length..];
                 return Some(Err("Unsupported payload reserved flags".into()));
             }
         };
 
-        if self.data.len() < payload_length {
+        if data.len() < payload_length {
             debug!("Payload overflow");
             return None;
         }
-        let payload_type = match PayloadType::from_u8(self.next_payload) {
+        let payload_type = match PayloadType::from_u8(current_payload) {
             Ok(payload_type) => payload_type,
-            Err(err) => return Some(Err(err)),
+            Err(err) => {
+                return Some(Err(err));
+            }
         };
         let item = Payload {
             payload_type,
             critical,
-            data: &self.data[4..payload_length],
+            data: &data[4..payload_length],
         };
-        self.next_payload = next_payload;
-        self.data = &self.data[payload_length..];
         Some(Ok(item))
     }
 }
@@ -638,35 +654,34 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             debug!("Proposal overflow");
             return None;
         }
-        let proposal_num = self.data[4];
+        let data = &self.data[..];
+        self.data = &self.data[proposal_length..];
+        let proposal_num = data[4];
         if proposal_num != self.next_proposal_num {
             debug!(
                 "Unexpected proposal num {} (should be {})",
                 proposal_num, self.next_proposal_num
             );
-            self.data = &self.data[proposal_length..];
             return Some(Err("Unexpected proposal number".into()));
         }
         self.next_proposal_num += 1;
-        let protocol_id = match IPSecProtocolID::from_u8(self.data[5]) {
+        let protocol_id = match IPSecProtocolID::from_u8(data[5]) {
             Ok(protocol_id) => protocol_id,
             Err(err) => {
                 debug!("Unsupported protocol ID: {}", err);
-                self.data = &self.data[proposal_length..];
                 return Some(Err("Unsupported protocol ID".into()));
             }
         };
-        let spi_size = self.data[6] as usize;
-        let num_transforms = self.data[7] as usize;
-        if self.data.len() < 8 + spi_size {
+        let spi_size = data[6] as usize;
+        let num_transforms = data[7] as usize;
+        if data.len() < 8 + spi_size {
             debug!("Proposal SPI overflow");
             return None;
         }
-        let spi = &self.data[8..8 + spi_size];
+        let spi = &data[8..8 + spi_size];
         let spi = match SPI::from_slice(spi) {
             Ok(spi) => spi,
             Err(_) => {
-                self.data = &self.data[proposal_length..];
                 return Some(Err("Unsupported SPI format".into()));
             }
         };
@@ -675,9 +690,8 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             protocol_id,
             num_transforms,
             spi,
-            data: &self.data[8 + spi_size..proposal_length],
+            data: &data[8 + spi_size..proposal_length],
         };
-        self.data = &self.data[proposal_length..];
         Some(Ok(item))
     }
 }
@@ -786,7 +800,7 @@ impl TransformType {
         }
     }
 
-    fn type_id(&self) -> (u8, u16) {
+    pub fn type_id(&self) -> (u8, u16) {
         match *self {
             TransformType::Encryption(id) => (1, id),
             TransformType::PseudorandomFunction(id) => (2, id),
@@ -889,27 +903,27 @@ impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
             debug!("Transform overflow");
             return None;
         }
-        let transform_type = self.data[4];
-        let mut transform_id = [0u8; 2];
-        transform_id.copy_from_slice(&self.data[6..8]);
-        let transform_id = u16::from_be_bytes(transform_id);
-        let transform_type = match TransformType::from_raw(transform_type, transform_id) {
-            Ok(transform_type) => transform_type,
-            Err(err) => {
-                debug!("Unsupported transform type: {}", err);
-                self.data = &self.data[transform_length..];
-                return Some(Err("Unsupported transform type".into()));
-            }
-        };
-        let item = SecurityAssociationTransform {
-            transform_type,
-            data: &self.data[8..transform_length],
-        };
+        let data = &self.data[..];
         self.data = &self.data[transform_length..];
         if self.num_transforms == 0 && !self.data.is_empty() {
             debug!("Packet has unaccounted transforms");
         }
         self.num_transforms = self.num_transforms.saturating_sub(1);
+        let transform_type = data[4];
+        let mut transform_id = [0u8; 2];
+        transform_id.copy_from_slice(&data[6..8]);
+        let transform_id = u16::from_be_bytes(transform_id);
+        let transform_type = match TransformType::from_raw(transform_type, transform_id) {
+            Ok(transform_type) => transform_type,
+            Err(err) => {
+                debug!("Unsupported transform type: {}", err);
+                return Some(Err("Unsupported transform type".into()));
+            }
+        };
+        let item = SecurityAssociationTransform {
+            transform_type,
+            data: &data[8..transform_length],
+        };
         Some(Ok(item))
     }
 }
@@ -1022,7 +1036,7 @@ impl<'a> SecurityAssociationTransformAttribute<'a> {
     }
 }
 
-struct PayloadKeyExchange<'a> {
+pub struct PayloadKeyExchange<'a> {
     data: &'a [u8],
 }
 
@@ -1036,24 +1050,24 @@ impl<'a> PayloadKeyExchange<'a> {
         }
     }
 
-    fn read_group_num(&self) -> u16 {
+    pub fn read_group_num(&self) -> u16 {
         // TODO: verify this matches SA proposal group number.
         let mut dh_group_num = [0u8; 2];
         dh_group_num.copy_from_slice(&self.data[0..2]);
         u16::from_be_bytes(dh_group_num)
     }
 
-    fn read_value(&self) -> &[u8] {
+    pub fn read_value(&self) -> &[u8] {
         &self.data[4..]
     }
 }
 
-struct PayloadNonce<'a> {
+pub struct PayloadNonce<'a> {
     data: &'a [u8],
 }
 
 impl<'a> PayloadNonce<'a> {
-    fn read_value(&self) -> &[u8] {
+    pub fn read_value(&self) -> &[u8] {
         self.data
     }
 }
@@ -1093,8 +1107,8 @@ impl NotifyMessageType {
     pub const ESP_TFC_PADDING_NOT_SUPPORTED: NotifyMessageType = NotifyMessageType(16394);
     pub const NON_FIRST_FRAGMENTS_ALSO: NotifyMessageType = NotifyMessageType(16395);
 
-    const REDIRECT_SUPPORTED: NotifyMessageType = NotifyMessageType(16406);
-    const IKEV2_FRAGMENTATION_SUPPORTED: NotifyMessageType = NotifyMessageType(16430);
+    pub const REDIRECT_SUPPORTED: NotifyMessageType = NotifyMessageType(16406);
+    pub const IKEV2_FRAGMENTATION_SUPPORTED: NotifyMessageType = NotifyMessageType(16430);
 
     fn from_u16(value: u16) -> NotifyMessageType {
         NotifyMessageType(value)
