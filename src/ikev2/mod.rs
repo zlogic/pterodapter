@@ -456,15 +456,22 @@ impl IKEv2Session {
                         // TODO: return error notification.
                         continue;
                     };
-                    let decrypted_slice =
-                        match crypto_stack.decrypt_data(&mut decrypted_data, encrypted_data_len) {
-                            Ok(decrypted_slice) => decrypted_slice,
-                            Err(err) => {
-                                debug!("Failed to decrypt data {}", err);
-                                // TODO: return error notification.
-                                continue;
-                            }
-                        };
+                    let associated_data = {
+                        let raw_data = request.raw_data();
+                        &raw_data[..raw_data.len() - encrypted_data.len()]
+                    };
+                    let decrypted_slice = match crypto_stack.decrypt_data(
+                        &mut decrypted_data,
+                        encrypted_data_len,
+                        associated_data,
+                    ) {
+                        Ok(decrypted_slice) => decrypted_slice,
+                        Err(err) => {
+                            debug!("Failed to decrypt data {}", err);
+                            // TODO: return error notification.
+                            continue;
+                        }
+                    };
                     for pl in encrypted_payload.iter_decrypted_message(decrypted_slice) {
                         match pl {
                             Ok(pl) => debug!("Decrypted payload\n {:?}", pl),

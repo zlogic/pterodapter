@@ -578,8 +578,9 @@ impl CryptoStack {
         &self,
         data: &'a mut [u8],
         msg_len: usize,
+        associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
-        self.enc_initiator.decrypt(data, msg_len)
+        self.enc_initiator.decrypt(data, msg_len, associated_data)
     }
 
     pub fn validate_signature(&mut self, data: &[u8]) -> bool {
@@ -671,7 +672,12 @@ impl Encryption {
         }
     }
 
-    fn decrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Result<&'a [u8], CryptoError> {
+    fn decrypt<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        associated_data: &[u8],
+    ) -> Result<&'a [u8], CryptoError> {
         match self {
             Self::AesCbc256(ref cipher) => {
                 let iv_size = AesCbc256Decryptor::iv_size();
@@ -708,8 +714,11 @@ impl Encryption {
                     len: msg_len - 8,
                 };
                 let mut cipher = cipher.clone();
-                match cipher.decrypt_in_place(Nonce::from_slice(nonce.as_slice()), &[], &mut buffer)
-                {
+                match cipher.decrypt_in_place(
+                    Nonce::from_slice(nonce.as_slice()),
+                    associated_data,
+                    &mut buffer,
+                ) {
                     Ok(()) => Ok(&buffer.slice[..buffer.len]),
                     Err(err) => {
                         debug!("Failed to decode AES GCM 16 256 message: {}", err);
