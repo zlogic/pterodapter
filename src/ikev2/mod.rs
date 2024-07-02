@@ -429,36 +429,30 @@ impl IKEv2Session {
                         // TODO: return error notification.
                         continue;
                     };
-                    let signature_length = {
-                        // The RFC states that the signature should be extracted from the ENCRYPTED_AND_AUTHENTICATED
-                        // packet, but it's supposed to be the last payload, and there should not be any unaccounted bytes.
-                        // While this will fail if a packet is slightly malformed, it's probably for the best.
-                        let validate_slice = request.raw_data();
-                        let valid_signature = crypto_stack.validate_signature(validate_slice);
-                        if !valid_signature {
-                            debug!("Packet has invalid signature");
-                            // TODO: return error notification or even ignore packet.
-                            continue;
-                        }
-                        if let Some(params) = self.params.as_ref() {
-                            params.auth_signature_length() / 8
-                        } else {
-                            debug!("Crypto parameters not initialized");
-                            // TODO: return error notification.
-                            continue;
-                        }
-                    };
-                    let encrypted_data_len = encrypted_data.len();
-                    let encrypted_data_len = if encrypted_data_len >= signature_length {
-                        encrypted_data_len - signature_length
+                    let signature_length = if let Some(params) = self.params.as_ref() {
+                        params.auth_signature_length().map(|len| len / 8)
                     } else {
-                        debug!("Signature is larger than encrypted data");
+                        debug!("Crypto parameters not initialized");
                         // TODO: return error notification.
                         continue;
                     };
-                    let associated_data = {
-                        let raw_data = request.raw_data();
-                        &raw_data[..raw_data.len() - encrypted_data.len()]
+                    let validate_slice =
+                        request.signature_data(&encrypted_payload, signature_length.is_some());
+                    let valid_signature = crypto_stack.validate_signature(validate_slice);
+                    if !valid_signature {
+                        debug!("Packet has invalid signature");
+                        // TODO: return error notification or even ignore packet.
+                        continue;
+                    }
+                    let associated_data = if signature_length.is_none() {
+                        validate_slice
+                    } else {
+                        &[]
+                    };
+                    let encrypted_data_len = if let Some(signature_length) = signature_length {
+                        encrypted_data.len().saturating_sub(signature_length)
+                    } else {
+                        encrypted_data.len()
                     };
                     let decrypted_slice = match crypto_stack.decrypt_data(
                         &mut decrypted_data,

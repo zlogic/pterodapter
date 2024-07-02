@@ -120,13 +120,10 @@ impl TransformParameters {
         }
     }
 
-    pub fn auth_signature_length(&self) -> usize {
-        match self.auth {
-            Some(ref auth) => match auth.transform_type {
-                message::TransformType::AUTH_HMAC_SHA2_256_128 => 128,
-                _ => 0,
-            },
-            None => 0,
+    pub fn auth_signature_length(&self) -> Option<usize> {
+        match self.auth.as_ref()?.transform_type {
+            message::TransformType::AUTH_HMAC_SHA2_256_128 => Some(128),
+            _ => None,
         }
     }
 
@@ -580,7 +577,18 @@ impl CryptoStack {
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
-        self.enc_initiator.decrypt(data, msg_len, associated_data)
+        let decrypted_slice = self.enc_initiator.decrypt(data, msg_len, associated_data)?;
+        let padding_length = if !decrypted_slice.is_empty() {
+            decrypted_slice[decrypted_slice.len() - 1] as usize + 1
+        } else {
+            0
+        };
+        let decrypted_slice = if decrypted_slice.len() >= padding_length {
+            &decrypted_slice[..decrypted_slice.len() - padding_length]
+        } else {
+            &decrypted_slice
+        };
+        Ok(decrypted_slice)
     }
 
     pub fn validate_signature(&mut self, data: &[u8]) -> bool {
@@ -694,7 +702,7 @@ impl Encryption {
                         }
                     };
                 let data_range = &mut data[iv_size..msg_len];
-                match block_decryptor.decrypt_padded_mut::<block_padding::Iso10126>(data_range) {
+                match block_decryptor.decrypt_padded_mut::<block_padding::NoPadding>(data_range) {
                     Ok(data) => Ok(data),
                     Err(err) => {
                         debug!("Failed to decode AES CBC 256 message: {}", err);

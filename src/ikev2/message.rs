@@ -191,11 +191,6 @@ impl InputMessage<'_> {
         u32::from_be_bytes(result)
     }
 
-    pub fn raw_data(&self) -> &[u8] {
-        let data_length = self.data.len().min(self.read_length() as usize);
-        &self.data[..data_length]
-    }
-
     pub fn is_valid(&self) -> bool {
         // TODO: validate all required fields.
         // TODO: return status in notification (e.g. INVALID_MAJOR_VERSION).
@@ -254,10 +249,28 @@ impl InputMessage<'_> {
 
     pub fn iter_payloads(&self) -> PayloadIter {
         PayloadIter {
+            start_offset: 28,
             next_payload: self.read_next_payload(),
             payload_encrypted: false,
             data: &self.data[28..],
         }
+    }
+
+    pub fn signature_data(
+        &self,
+        encrypted_message: &EncryptedMessage,
+        include_encrypted: bool,
+    ) -> &[u8] {
+        let signed_length = 4 + if include_encrypted {
+            // Separate integrity checksum.
+            encrypted_message.data.len()
+        } else {
+            // AEAD message - include payload header in signature.
+            0
+        };
+        let signature_range =
+            ..(encrypted_message.start_offset + signed_length).min(self.data.len());
+        &self.data[signature_range]
     }
 }
 
@@ -438,6 +451,7 @@ pub struct Payload<'a> {
     encrypted_next_payload: Option<u8>,
     critical: bool,
     data: &'a [u8],
+    start_offset: usize,
 }
 
 impl Payload<'_> {
@@ -484,10 +498,7 @@ impl Payload<'_> {
             } else {
                 return Err("Unspecified next encrypted payload".into());
             };
-            Ok(EncryptedMessage::from_payload(
-                encrypted_next_payload,
-                self.data,
-            ))
+            Ok(EncryptedMessage::from_payload(encrypted_next_payload, self))
         } else {
             Err("Payload type is not ENCRYPTED_AND_AUTHENTICATED".into())
         }
@@ -495,6 +506,7 @@ impl Payload<'_> {
 }
 
 pub struct PayloadIter<'a> {
+    start_offset: usize,
     next_payload: u8,
     payload_encrypted: bool,
     data: &'a [u8],
@@ -516,6 +528,7 @@ impl<'a> Iterator for PayloadIter<'a> {
             return None;
         }
         let current_payload = self.next_payload;
+        let start_offset = self.start_offset;
         let data = &self.data[..];
         let next_payload = self.data[0];
         self.next_payload = next_payload;
@@ -523,7 +536,12 @@ impl<'a> Iterator for PayloadIter<'a> {
         let mut payload_length = [0u8; 2];
         payload_length.copy_from_slice(&self.data[2..4]);
         let payload_length = u16::from_be_bytes(payload_length) as usize;
+        if data.len() < payload_length {
+            debug!("Payload overflow");
+            return None;
+        }
         self.data = &self.data[payload_length..];
+        self.start_offset += payload_length;
         let critical = match payload_flags {
             0x00 => false,
             CRITICAL_BIT => true,
@@ -535,11 +553,6 @@ impl<'a> Iterator for PayloadIter<'a> {
                 return Some(Err("Unsupported payload reserved flags".into()));
             }
         };
-
-        if data.len() < payload_length {
-            debug!("Payload overflow");
-            return None;
-        }
         let payload_type = match PayloadType::from_u8(current_payload) {
             Ok(payload_type) => payload_type,
             Err(err) => {
@@ -557,6 +570,7 @@ impl<'a> Iterator for PayloadIter<'a> {
             encrypted_next_payload,
             critical,
             data: &data[4..payload_length],
+            start_offset,
         };
         Some(Ok(item))
     }
@@ -1152,6 +1166,7 @@ impl NotifyMessageType {
 
     pub const REDIRECT_SUPPORTED: NotifyMessageType = NotifyMessageType(16406);
     pub const IKEV2_FRAGMENTATION_SUPPORTED: NotifyMessageType = NotifyMessageType(16430);
+    pub const MOBIKE_SUPPORTED: NotifyMessageType = NotifyMessageType(16396);
 
     fn from_u16(value: u16) -> NotifyMessageType {
         NotifyMessageType(value)
@@ -1192,6 +1207,7 @@ impl fmt::Display for NotifyMessageType {
             Self::NON_FIRST_FRAGMENTS_ALSO => write!(f, "NON_FIRST_FRAGMENTS_ALSO")?,
             Self::REDIRECT_SUPPORTED => write!(f, "REDIRECT_SUPPORTED")?,
             Self::IKEV2_FRAGMENTATION_SUPPORTED => write!(f, "IKEV2_FRAGMENTATION_SUPPORTED")?,
+            Self::MOBIKE_SUPPORTED => write!(f, "MOBIKE_SUPPORTED")?,
             _ => write!(f, "Unknown Notify Message Type {}", self.0)?,
         }
         Ok(())
@@ -1242,11 +1258,16 @@ impl<'a> PayloadNotify<'a> {
 pub struct EncryptedMessage<'a> {
     next_payload: u8,
     data: &'a [u8],
+    start_offset: usize,
 }
 
 impl<'a> EncryptedMessage<'a> {
-    fn from_payload(next_payload: u8, data: &'a [u8]) -> EncryptedMessage<'a> {
-        EncryptedMessage { next_payload, data }
+    fn from_payload(next_payload: u8, payload: &'a Payload) -> EncryptedMessage<'a> {
+        EncryptedMessage {
+            next_payload,
+            data: payload.data,
+            start_offset: payload.start_offset,
+        }
     }
 
     pub fn encrypted_data(&self) -> &[u8] {
@@ -1259,6 +1280,7 @@ impl<'a> EncryptedMessage<'a> {
             next_payload: self.next_payload,
             payload_encrypted: false,
             data: decrypted_data,
+            start_offset: 0,
         }
     }
 }
