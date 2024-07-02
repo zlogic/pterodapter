@@ -2,8 +2,11 @@ use aes::{
     cipher::{BlockDecryptMut, BlockEncryptMut},
     Aes256,
 };
-use aes_gcm::{aead::AeadMutInPlace, Aes256Gcm};
-use cipher::{block_padding, BlockSizeUser, InnerIvInit, IvSizeUser};
+use aes_gcm::{
+    aead::{AeadMutInPlace, Buffer},
+    Aes256Gcm, Nonce,
+};
+use cipher::{block_padding, InnerIvInit, IvSizeUser};
 use crypto_bigint::{
     modular::constant_mod::{self, ResidueParams},
     Encoding,
@@ -83,6 +86,16 @@ impl TransformParameters {
     fn enc_key_length(&self) -> usize {
         match self.enc {
             Some(ref enc) => enc.key_length.unwrap_or(0) as usize,
+            None => 0,
+        }
+    }
+
+    fn enc_key_salt_length(&self) -> usize {
+        match self.enc {
+            Some(ref prf) => match prf.transform_type {
+                message::TransformType::ENCR_AES_GCM_16 => 32,
+                _ => 0,
+            },
             None => 0,
         }
     }
@@ -221,11 +234,11 @@ pub fn choose_sa_parameters<'a>(
                 match tt_type {
                     message::TransformType::PRF_HMAC_SHA2_256 => parameters.prf = Some(transform),
                     message::TransformType::NO_ESN => parameters.esn = Some(transform),
-                    // Valid Windows options.
-                    message::TransformType::ENCR_AES_CBC => parameters.enc = Some(transform),
-                    message::TransformType::DH_256_ECP => parameters.dh = Some(transform),
                     // Valid macOS options.
                     message::TransformType::ENCR_AES_GCM_16 => parameters.enc = Some(transform),
+                    message::TransformType::DH_256_ECP => parameters.dh = Some(transform),
+                    // Valid macOS options.
+                    message::TransformType::ENCR_AES_CBC => parameters.enc = Some(transform),
                     message::TransformType::AUTH_HMAC_SHA2_256_128 => {
                         parameters.auth = Some(transform)
                     }
@@ -313,10 +326,9 @@ impl DHTransform {
     pub fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
         let mut res = Array::new(self.key_length_bytes());
         match self {
-            Self::MODP1024(_, _, public_key) => {
-                res.as_mut_slice()
-                    .copy_from_slice(&public_key.to_be_bytes());
-            }
+            Self::MODP1024(_, _, public_key) => res
+                .as_mut_slice()
+                .copy_from_slice(&public_key.to_be_bytes()),
             Self::ECP256(_, _, public_key) => res
                 .as_mut_slice()
                 .copy_from_slice(&EncodedPoint::from(public_key).as_bytes()[1..]),
@@ -327,7 +339,14 @@ impl DHTransform {
     pub fn key_length_bytes(&self) -> usize {
         match self {
             Self::MODP1024(_, _, _) => 1024 / 8,
-            Self::ECP256(_, _, _) => 64,
+            Self::ECP256(_, _, _) => 2 * 256 / 8,
+        }
+    }
+
+    fn shared_key_length_bytes(&self) -> usize {
+        match self {
+            Self::MODP1024(_, _, _) => self.key_length_bytes(),
+            Self::ECP256(_, _, _) => 256 / 8,
         }
     }
 
@@ -341,9 +360,8 @@ impl DHTransform {
     pub fn compute_shared_secret(
         &self,
         other_public_key: &[u8],
-    ) -> Result<[u8; MAX_DH_KEY_LENGTH], InitError> {
-        let mut res = [0u8; MAX_DH_KEY_LENGTH];
-        let dest = &mut res[0..self.key_length_bytes()];
+    ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
+        let mut res = Array::new(self.shared_key_length_bytes());
         match self {
             Self::MODP1024(_, private_key, _) => {
                 if other_public_key.len() != self.key_length_bytes() {
@@ -352,7 +370,8 @@ impl DHTransform {
                 let other_public_key = U1024::from_be_slice(other_public_key);
                 let other_key_residue = const_residue!(other_public_key, DHModulus1024);
                 let shared_key = other_key_residue.pow(&private_key).retrieve();
-                dest.copy_from_slice(&shared_key.to_be_bytes());
+                res.as_mut_slice()
+                    .copy_from_slice(&shared_key.to_be_bytes());
             }
             Self::ECP256(_, private_key, _) => {
                 let mut other_public_key_sec1 = [0u8; 1 + 64];
@@ -367,7 +386,8 @@ impl DHTransform {
                 };
                 let public_point = ProjectivePoint::from(other_public_key.as_affine());
                 let secret_point = (&public_point * private_key).to_affine();
-                dest.copy_from_slice(&EncodedPoint::from(secret_point).as_bytes()[1..]);
+                res.as_mut_slice()
+                    .copy_from_slice(&EncodedPoint::from(secret_point).compress().as_bytes()[1..]);
             }
         }
         Ok(res)
@@ -462,7 +482,7 @@ impl DerivedKeys {
         let auth_key_length = params.auth_key_length() / 8;
         let auth_initiator = derive.end..derive.end + auth_key_length;
         let auth_responder = auth_initiator.end..auth_initiator.end + auth_key_length;
-        let enc_key_length = params.enc_key_length() / 8;
+        let enc_key_length = (params.enc_key_length() + params.enc_key_salt_length()) / 8;
         let enc_initiator = auth_responder.end..auth_responder.end + enc_key_length;
         let enc_responder = enc_initiator.end..enc_initiator.end + enc_key_length;
         let prf_key_length = params.prf_key_length() / 8;
@@ -572,7 +592,48 @@ type AesCbc256Encryptor = cbc::Encryptor<Aes256>;
 
 pub enum Encryption {
     AesCbc256(Aes256),
-    AesGcm256(Aes256Gcm),
+    AesGcm256(Aes256Gcm, [u8; 4]),
+}
+
+struct SliceBuffer<'a> {
+    slice: &'a mut [u8],
+    len: usize,
+}
+
+impl AsRef<[u8]> for SliceBuffer<'_> {
+    fn as_ref(&self) -> &[u8] {
+        &self.slice[..self.len]
+    }
+}
+
+impl AsMut<[u8]> for SliceBuffer<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.slice[..self.len]
+    }
+}
+
+impl Buffer for SliceBuffer<'_> {
+    fn extend_from_slice(&mut self, other: &[u8]) -> aes_gcm::aead::Result<()> {
+        if self.len + other.len() <= self.slice.len() {
+            self.slice[self.len..self.len + other.len()].copy_from_slice(other);
+            self.len += other.len();
+            Ok(())
+        } else {
+            Err(aes_gcm::aead::Error)
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = len;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl Encryption {
@@ -590,9 +651,11 @@ impl Encryption {
                 if transform_type.key_length != Some(256) {
                     return Err("Unsupported key length".into());
                 }
-                let cipher = aes_gcm::KeyInit::new_from_slice(key)
+                let cipher = aes_gcm::KeyInit::new_from_slice(&key[..32])
                     .map_err(|_| InitError::new("Failed to init AES GCM 256 cipher"))?;
-                Ok(Self::AesGcm256(cipher))
+                let mut salt = [0u8; 4];
+                salt.copy_from_slice(&key[32..]);
+                Ok(Self::AesGcm256(cipher, salt))
             }
             _ => Err("ENC not initialized".into()),
         }
@@ -601,7 +664,7 @@ impl Encryption {
     fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
         match self {
             Self::AesCbc256(ref cipher) => None,
-            Self::AesGcm256(ref cipher) => {
+            Self::AesGcm256(ref cipher, salt) => {
                 None
                 //cipher.encrypt_in_place(data, msg_len);
             }
@@ -612,7 +675,7 @@ impl Encryption {
         match self {
             Self::AesCbc256(ref cipher) => {
                 let iv_size = AesCbc256Decryptor::iv_size();
-                if iv_size >= msg_len {
+                if msg_len <= iv_size {
                     return Err("Message length is too short".into());
                 }
                 let block_decryptor =
@@ -633,7 +696,27 @@ impl Encryption {
                     }
                 }
             }
-            Self::AesGcm256(ref cipher) => Err("AES GCM is not yet implemented".into()),
+            Self::AesGcm256(ref cipher, salt) => {
+                if msg_len <= 8 {
+                    return Err("Message length is too short".into());
+                }
+                let mut nonce = [0u8; 12];
+                nonce[..4].copy_from_slice(salt);
+                nonce[4..].copy_from_slice(&data[..8]);
+                let mut buffer = SliceBuffer {
+                    slice: &mut data[8..],
+                    len: msg_len - 8,
+                };
+                let mut cipher = cipher.clone();
+                match cipher.decrypt_in_place(Nonce::from_slice(nonce.as_slice()), &[], &mut buffer)
+                {
+                    Ok(()) => Ok(&buffer.slice[..buffer.len]),
+                    Err(err) => {
+                        debug!("Failed to decode AES GCM 16 256 message: {}", err);
+                        return Err("Failed to decode AES GCM 16 256 message".into());
+                    }
+                }
+            }
         }
     }
 }

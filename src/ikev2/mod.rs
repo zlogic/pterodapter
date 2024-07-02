@@ -196,9 +196,9 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
-        // TODO: process message if exchange type is supported
         // TODO: return error if payload type is critical but not recognized
         // TODO: keep track of message numbers and replies - only send response if message ID is up to date.
+        // TODO: for all exchange types except IKE_SA_INIT check that the session already exists.
 
         let exchange_type = request.read_exchange_type()?;
         match exchange_type {
@@ -319,14 +319,14 @@ impl IKEv2Session {
                             continue;
                         }
                     };
-                    let shared_secret = if let Some(shared_secret) = shared_secret {
+                    let shared_secret = if let Some(ref shared_secret) = shared_secret {
                         shared_secret
                     } else {
                         debug!("Unspecified shared secret");
                         // TODO: return INVALID_SYNTAX notification.
                         continue;
                     };
-                    let skeyseed = prf_transform.prf(&shared_secret);
+                    let skeyseed = prf_transform.prf(shared_secret.as_slice());
                     let mut prf_transform = match params.create_prf(skeyseed.as_slice()) {
                         Ok(prf) => prf,
                         Err(err) => {
