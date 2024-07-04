@@ -14,6 +14,8 @@ use tokio::{net::UdpSocket, signal, task::JoinHandle};
 mod crypto;
 mod message;
 
+use crypto::DHTransform;
+
 // TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
 const MAX_DATAGRAM_SIZE: usize = 4096;
 const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;

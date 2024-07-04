@@ -56,8 +56,8 @@ pub struct TransformParameters {
 }
 
 impl TransformParameters {
-    pub fn create_dh(&self) -> Result<DHTransform, InitError> {
-        DHTransform::init(
+    pub fn create_dh(&self) -> Result<DHTransformType, InitError> {
+        DHTransformType::init(
             self.dh
                 .as_ref()
                 .ok_or_else(|| InitError::new("DH not configured"))?
@@ -296,97 +296,177 @@ impl<const M: usize> Array<M> {
     }
 }
 
-pub enum DHTransform {
-    MODP1024(u16, U1024, U1024),
-    ECP256(u16, NonZeroScalar, PublicKey),
+pub enum DHTransformType {
+    MODP1024(DHTransformMODP1024),
+    ECP256(DHTransformECP256),
 }
 
-impl DHTransform {
-    fn init(transform_type: message::TransformType) -> Result<DHTransform, InitError> {
-        let (_, dh_group) = transform_type.type_id();
+pub trait DHTransform {
+    fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH>;
+
+    fn key_length_bytes(&self) -> usize;
+
+    fn shared_key_length_bytes(&self) -> usize;
+
+    fn group_number(&self) -> u16;
+
+    fn compute_shared_secret(
+        &self,
+        other_public_key: &[u8],
+    ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError>;
+}
+
+impl DHTransformType {
+    fn init(transform_type: message::TransformType) -> Result<DHTransformType, InitError> {
         match transform_type {
             message::TransformType::DH_1024_MODP => {
                 let private_key = U1024::random(&mut OsRng);
                 // This calculates DH_MODP_GENERATOR_1024^private_key mod DHModulus1024.
                 let public_key = DH_MODP_RESIDUE_1024.pow(&private_key).retrieve();
-                Ok(DHTransform::MODP1024(dh_group, private_key, public_key))
+                Ok(DHTransformType::MODP1024(DHTransformMODP1024 {
+                    private_key,
+                    public_key,
+                }))
             }
             message::TransformType::DH_256_ECP => {
                 let private_key = NonZeroScalar::random(&mut OsRng);
                 let public_key = PublicKey::from_secret_scalar(&private_key);
-                Ok(DHTransform::ECP256(dh_group, private_key, public_key))
+                Ok(DHTransformType::ECP256(DHTransformECP256 {
+                    private_key,
+                    public_key,
+                }))
             }
             _ => Err("Unsupported DH".into()),
         }
     }
+}
 
-    pub fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
-        let mut res = Array::new(self.key_length_bytes());
+impl DHTransform for DHTransformType {
+    fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
         match self {
-            Self::MODP1024(_, _, public_key) => res
-                .as_mut_slice()
-                .copy_from_slice(&public_key.to_be_bytes()),
-            Self::ECP256(_, _, public_key) => res
-                .as_mut_slice()
-                .copy_from_slice(&EncodedPoint::from(public_key).as_bytes()[1..]),
+            Self::MODP1024(ref dh) => dh.read_public_key(),
+            Self::ECP256(ref dh) => dh.read_public_key(),
         }
-        res
     }
 
-    pub fn key_length_bytes(&self) -> usize {
+    fn key_length_bytes(&self) -> usize {
         match self {
-            Self::MODP1024(_, _, _) => 1024 / 8,
-            Self::ECP256(_, _, _) => 2 * 256 / 8,
+            Self::MODP1024(ref dh) => dh.key_length_bytes(),
+            Self::ECP256(ref dh) => dh.key_length_bytes(),
         }
     }
 
     fn shared_key_length_bytes(&self) -> usize {
         match self {
-            Self::MODP1024(_, _, _) => self.key_length_bytes(),
-            Self::ECP256(_, _, _) => 256 / 8,
+            Self::MODP1024(ref dh) => dh.shared_key_length_bytes(),
+            Self::ECP256(ref dh) => dh.shared_key_length_bytes(),
         }
     }
 
-    pub fn group_number(&self) -> u16 {
+    fn group_number(&self) -> u16 {
         match self {
-            Self::MODP1024(group, _, _) => *group,
-            Self::ECP256(group, _, _) => *group,
+            Self::MODP1024(ref dh) => dh.group_number(),
+            Self::ECP256(ref dh) => dh.group_number(),
         }
     }
 
-    pub fn compute_shared_secret(
+    fn compute_shared_secret(
+        &self,
+        other_public_key: &[u8],
+    ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
+        match self {
+            Self::MODP1024(ref dh) => dh.compute_shared_secret(other_public_key),
+            Self::ECP256(ref dh) => dh.compute_shared_secret(other_public_key),
+        }
+    }
+}
+
+pub struct DHTransformMODP1024 {
+    public_key: U1024,
+    private_key: U1024,
+}
+
+impl DHTransform for DHTransformMODP1024 {
+    fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
+        let mut res = Array::new(self.key_length_bytes());
+        res.as_mut_slice()
+            .copy_from_slice(&self.public_key.to_be_bytes());
+        res
+    }
+
+    fn key_length_bytes(&self) -> usize {
+        1024 / 8
+    }
+
+    fn shared_key_length_bytes(&self) -> usize {
+        self.key_length_bytes()
+    }
+
+    fn group_number(&self) -> u16 {
+        message::TransformType::DH_1024_MODP.type_id().1
+    }
+
+    fn compute_shared_secret(
         &self,
         other_public_key: &[u8],
     ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
         let mut res = Array::new(self.shared_key_length_bytes());
-        match self {
-            Self::MODP1024(_, private_key, _) => {
-                if other_public_key.len() != self.key_length_bytes() {
-                    return Err("MODP 1024 key length is not valid".into());
-                }
-                let other_public_key = U1024::from_be_slice(other_public_key);
-                let other_key_residue = const_residue!(other_public_key, DHModulus1024);
-                let shared_key = other_key_residue.pow(&private_key).retrieve();
-                res.as_mut_slice()
-                    .copy_from_slice(&shared_key.to_be_bytes());
-            }
-            Self::ECP256(_, private_key, _) => {
-                let mut other_public_key_sec1 = [0u8; 1 + 64];
-                other_public_key_sec1[0] = Tag::Uncompressed.into();
-                other_public_key_sec1[1..].copy_from_slice(other_public_key);
-                let other_public_key = match PublicKey::from_sec1_bytes(&other_public_key_sec1) {
-                    Ok(key) => key,
-                    Err(err) => {
-                        debug!("Failed to decode other public key {}", err);
-                        return Err("Failed to decode other public key".into());
-                    }
-                };
-                let public_point = ProjectivePoint::from(other_public_key.as_affine());
-                let secret_point = (&public_point * private_key).to_affine();
-                res.as_mut_slice()
-                    .copy_from_slice(&EncodedPoint::from(secret_point).compress().as_bytes()[1..]);
-            }
+        if other_public_key.len() != self.key_length_bytes() {
+            return Err("MODP 1024 key length is not valid".into());
         }
+        let other_public_key = U1024::from_be_slice(other_public_key);
+        let other_key_residue = const_residue!(other_public_key, DHModulus1024);
+        let shared_key = other_key_residue.pow(&self.private_key).retrieve();
+        res.as_mut_slice()
+            .copy_from_slice(&shared_key.to_be_bytes());
+        Ok(res)
+    }
+}
+
+pub struct DHTransformECP256 {
+    private_key: NonZeroScalar,
+    public_key: PublicKey,
+}
+
+impl DHTransform for DHTransformECP256 {
+    fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
+        let mut res = Array::new(self.key_length_bytes());
+        res.as_mut_slice()
+            .copy_from_slice(&EncodedPoint::from(&self.public_key).as_bytes()[1..]);
+        res
+    }
+
+    fn key_length_bytes(&self) -> usize {
+        2 * 256 / 8
+    }
+
+    fn shared_key_length_bytes(&self) -> usize {
+        256 / 8
+    }
+
+    fn group_number(&self) -> u16 {
+        message::TransformType::DH_256_ECP.type_id().1
+    }
+
+    fn compute_shared_secret(
+        &self,
+        other_public_key: &[u8],
+    ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
+        let mut res = Array::new(self.shared_key_length_bytes());
+        let mut other_public_key_sec1 = [0u8; 1 + 64];
+        other_public_key_sec1[0] = Tag::Uncompressed.into();
+        other_public_key_sec1[1..].copy_from_slice(other_public_key);
+        let other_public_key = match PublicKey::from_sec1_bytes(&other_public_key_sec1) {
+            Ok(key) => key,
+            Err(err) => {
+                debug!("Failed to decode other public key {}", err);
+                return Err("Failed to decode other public key".into());
+            }
+        };
+        let public_point = ProjectivePoint::from(other_public_key.as_affine());
+        let secret_point = (&public_point * &self.private_key).to_affine();
+        res.as_mut_slice()
+            .copy_from_slice(&EncodedPoint::from(secret_point).compress().as_bytes()[1..]);
         Ok(res)
     }
 }
@@ -546,8 +626,8 @@ pub struct CryptoStack {
     derive_key: Array<MAX_PRF_KEY_LENGTH>,
     auth_initiator: Auth,
     auth_responder: Auth,
-    enc_initiator: Encryption,
-    enc_responder: Encryption,
+    enc_initiator: EncryptionType,
+    enc_responder: EncryptionType,
 }
 
 impl CryptoStack {
@@ -566,8 +646,8 @@ impl CryptoStack {
             derive_key,
             auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
             auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
-            enc_initiator: Encryption::init(enc, &keys.keys[keys.enc_initiator.clone()])?,
-            enc_responder: Encryption::init(enc, &keys.keys[keys.enc_responder.clone()])?,
+            enc_initiator: EncryptionType::init(enc, &keys.keys[keys.enc_initiator.clone()])?,
+            enc_responder: EncryptionType::init(enc, &keys.keys[keys.enc_responder.clone()])?,
         })
     }
 
@@ -594,14 +674,6 @@ impl CryptoStack {
     pub fn validate_signature(&mut self, data: &[u8]) -> bool {
         self.auth_initiator.validate(data)
     }
-}
-
-type AesCbc256Decryptor = cbc::Decryptor<Aes256>;
-type AesCbc256Encryptor = cbc::Encryptor<Aes256>;
-
-pub enum Encryption {
-    AesCbc256(Aes256),
-    AesGcm256(Aes256Gcm, [u8; 4]),
 }
 
 struct SliceBuffer<'a> {
@@ -645,8 +717,24 @@ impl Buffer for SliceBuffer<'_> {
     }
 }
 
-impl Encryption {
-    fn init(transform_type: &Transform, key: &[u8]) -> Result<Encryption, InitError> {
+pub trait Encryption {
+    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]>;
+
+    fn decrypt<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        associated_data: &[u8],
+    ) -> Result<&'a [u8], CryptoError>;
+}
+
+pub enum EncryptionType {
+    AesCbc256(EncryptionAesCbc256),
+    AesGcm256(EncryptionAesGcm256),
+}
+
+impl EncryptionType {
+    fn init(transform_type: &Transform, key: &[u8]) -> Result<EncryptionType, InitError> {
         match transform_type.transform_type {
             message::TransformType::ENCR_AES_CBC => {
                 if transform_type.key_length != Some(256) {
@@ -654,7 +742,7 @@ impl Encryption {
                 }
                 let cipher = aes::cipher::KeyInit::new_from_slice(key)
                     .map_err(|_| InitError::new("Failed to init AES CBC 256 cipher"))?;
-                Ok(Self::AesCbc256(cipher))
+                Ok(Self::AesCbc256(EncryptionAesCbc256 { cipher }))
             }
             message::TransformType::ENCR_AES_GCM_16 => {
                 if transform_type.key_length != Some(256) {
@@ -664,7 +752,7 @@ impl Encryption {
                     .map_err(|_| InitError::new("Failed to init AES GCM 256 cipher"))?;
                 let mut salt = [0u8; 4];
                 salt.copy_from_slice(&key[32..]);
-                Ok(Self::AesGcm256(cipher, salt))
+                Ok(Self::AesGcm256(EncryptionAesGcm256 { cipher, salt }))
             }
             _ => Err("ENC not initialized".into()),
         }
@@ -672,11 +760,8 @@ impl Encryption {
 
     fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
         match self {
-            Self::AesCbc256(ref cipher) => None,
-            Self::AesGcm256(ref cipher, salt) => {
-                None
-                //cipher.encrypt_in_place(data, msg_len);
-            }
+            Self::AesCbc256(ref enc) => enc.encrypt(data, msg_len),
+            Self::AesGcm256(ref enc) => enc.encrypt(data, msg_len),
         }
     }
 
@@ -687,52 +772,91 @@ impl Encryption {
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
         match self {
-            Self::AesCbc256(ref cipher) => {
-                let iv_size = AesCbc256Decryptor::iv_size();
-                if msg_len <= iv_size {
-                    return Err("Message length is too short".into());
+            Self::AesCbc256(ref dec) => dec.decrypt(data, msg_len, associated_data),
+            Self::AesGcm256(ref dec) => dec.decrypt(data, msg_len, associated_data),
+        }
+    }
+}
+
+type AesCbc256Decryptor = cbc::Decryptor<Aes256>;
+type AesCbc256Encryptor = cbc::Encryptor<Aes256>;
+
+pub struct EncryptionAesCbc256 {
+    cipher: Aes256,
+}
+
+impl Encryption for EncryptionAesCbc256 {
+    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+        //cipher.encrypt_in_place(data, msg_len);
+        None
+    }
+
+    fn decrypt<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        _: &[u8],
+    ) -> Result<&'a [u8], CryptoError> {
+        let iv_size = AesCbc256Decryptor::iv_size();
+        if msg_len <= iv_size {
+            return Err("Message length is too short".into());
+        }
+        let block_decryptor =
+            match AesCbc256Decryptor::inner_iv_slice_init(self.cipher.clone(), &data[..iv_size]) {
+                Ok(dec) => dec,
+                Err(err) => {
+                    debug!("Failed to init AES CBC 256 IV: {}", err);
+                    return Err("Failed to init AES CBC 256 IV".into());
                 }
-                let block_decryptor =
-                    match AesCbc256Decryptor::inner_iv_slice_init(cipher.clone(), &data[..iv_size])
-                    {
-                        Ok(dec) => dec,
-                        Err(err) => {
-                            debug!("Failed to init AES CBC 256 IV: {}", err);
-                            return Err("Failed to init AES CBC 256 IV".into());
-                        }
-                    };
-                let data_range = &mut data[iv_size..msg_len];
-                match block_decryptor.decrypt_padded_mut::<block_padding::NoPadding>(data_range) {
-                    Ok(data) => Ok(data),
-                    Err(err) => {
-                        debug!("Failed to decode AES CBC 256 message: {}", err);
-                        return Err("Failed to decode AES CBC 256 message".into());
-                    }
-                }
+            };
+        let data_range = &mut data[iv_size..msg_len];
+        match block_decryptor.decrypt_padded_mut::<block_padding::NoPadding>(data_range) {
+            Ok(data) => Ok(data),
+            Err(err) => {
+                debug!("Failed to decode AES CBC 256 message: {}", err);
+                return Err("Failed to decode AES CBC 256 message".into());
             }
-            Self::AesGcm256(ref cipher, salt) => {
-                if msg_len <= 8 {
-                    return Err("Message length is too short".into());
-                }
-                let mut nonce = [0u8; 12];
-                nonce[..4].copy_from_slice(salt);
-                nonce[4..].copy_from_slice(&data[..8]);
-                let mut buffer = SliceBuffer {
-                    slice: &mut data[8..],
-                    len: msg_len - 8,
-                };
-                let mut cipher = cipher.clone();
-                match cipher.decrypt_in_place(
-                    Nonce::from_slice(nonce.as_slice()),
-                    associated_data,
-                    &mut buffer,
-                ) {
-                    Ok(()) => Ok(&buffer.slice[..buffer.len]),
-                    Err(err) => {
-                        debug!("Failed to decode AES GCM 16 256 message: {}", err);
-                        return Err("Failed to decode AES GCM 16 256 message".into());
-                    }
-                }
+        }
+    }
+}
+
+pub struct EncryptionAesGcm256 {
+    cipher: Aes256Gcm,
+    salt: [u8; 4],
+}
+
+impl Encryption for EncryptionAesGcm256 {
+    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+        //cipher.encrypt_in_place(data, msg_len);
+        None
+    }
+
+    fn decrypt<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        associated_data: &[u8],
+    ) -> Result<&'a [u8], CryptoError> {
+        if msg_len <= 8 {
+            return Err("Message length is too short".into());
+        }
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&self.salt);
+        nonce[4..].copy_from_slice(&data[..8]);
+        let mut buffer = SliceBuffer {
+            slice: &mut data[8..],
+            len: msg_len - 8,
+        };
+        let mut cipher = self.cipher.clone();
+        match cipher.decrypt_in_place(
+            Nonce::from_slice(nonce.as_slice()),
+            associated_data,
+            &mut buffer,
+        ) {
+            Ok(()) => Ok(&buffer.slice[..buffer.len]),
+            Err(err) => {
+                debug!("Failed to decode AES GCM 16 256 message: {}", err);
+                return Err("Failed to decode AES GCM 16 256 message".into());
             }
         }
     }
