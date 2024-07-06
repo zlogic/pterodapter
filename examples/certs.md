@@ -18,6 +18,8 @@ openssl req -new -x509 -key vpn-root.key.pem -out vpn-root.cert.pem -days 730 -s
 To import root CA in Windows, rename `vpn-root.cert.pem` to `vpn-root.cert.crt` and import it into the machine's _Trusted Root Certification Authorities_.
 Although importing a PFX bundle would import both the root and client certs into the right keystore.
 
+To generate elliptic curve public keys, use `-newkey ec -pkeyopt ec_paramgen_curve:prime256v1`
+
 ## Server certificate
 
 Generate server key

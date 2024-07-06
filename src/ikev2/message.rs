@@ -4,7 +4,7 @@ use log::debug;
 
 use super::crypto;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ExchangeType(u8);
 
 impl ExchangeType {

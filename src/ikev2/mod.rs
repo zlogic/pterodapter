@@ -170,6 +170,8 @@ impl SessionID {
         // As IKE_SA_INIT is unencrypted and unauthenticated, prevent sessions from being hijacked
         // by generating a unique session ID for every packet.
         let local_spi = if message.read_exchange_type()? == message::ExchangeType::IKE_SA_INIT {
+            // TODO: for retransmitted IKE_SA_INIT requests, keep a short-lived lookup cache with local SPI values.
+            // Use checksum of original message (e.g. std::hash::DefaultHasher) as lookup key (or remote SPI + remote address).
             rand::thread_rng().gen::<u64>()
         } else {
             message.read_responder_spi()
@@ -217,6 +219,7 @@ impl UdpDatagram {
 
 enum SessionMessage {
     UdpDatagram(UdpDatagram),
+    // TODO: add more messages like a cleanup timer or message from bridge.
 }
 
 struct Sessions {
@@ -241,16 +244,14 @@ impl Sessions {
         self.tx.clone()
     }
 
-    fn get(
-        &mut self,
-        id: SessionID,
-        remote_addr: SocketAddr,
-    ) -> Result<&mut IKEv2Session, message::FormatError> {
-        // TODO: only insert new sessions from IKE_SA_INIT.
-        Ok(self
-            .sessions
+    fn get_or_create(&mut self, id: SessionID, remote_addr: SocketAddr) -> &mut IKEv2Session {
+        self.sessions
             .entry(id)
-            .or_insert_with(|| IKEv2Session::new(remote_addr)))
+            .or_insert_with(|| IKEv2Session::new(remote_addr))
+    }
+
+    fn get(&mut self, id: SessionID) -> Option<&mut IKEv2Session> {
+        self.sessions.get_mut(&id)
     }
 
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
@@ -289,7 +290,13 @@ impl Sessions {
         );
 
         let session_id = SessionID::from_message(&ikev2_request)?;
-        let session = self.get(session_id.clone(), datagram.remote_addr)?;
+        let session = if ikev2_request.read_exchange_type()? == message::ExchangeType::IKE_SA_INIT {
+            self.get_or_create(session_id.clone(), datagram.remote_addr)
+        } else if let Some(session) = self.get(session_id.clone()) {
+            session
+        } else {
+            return Err("Session not found".into());
+        };
         let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
         let mut ikev2_response = message::MessageWriter::new(response_bytes.as_mut_slice())?;
 
@@ -348,6 +355,15 @@ impl IKEv2Session {
         // TODO: for all exchange types except IKE_SA_INIT check that the session already exists.
 
         let exchange_type = request.read_exchange_type()?;
+
+        response.write_header(
+            session_id.remote_spi,
+            session_id.local_spi,
+            exchange_type.clone(),
+            false,
+            request.read_message_id(),
+        )?;
+
         match exchange_type {
             message::ExchangeType::IKE_SA_INIT => {
                 self.process_sa_init_message(session_id, remote_addr, request, response)
@@ -361,6 +377,52 @@ impl IKEv2Session {
             _ => {
                 debug!("Unimplemented handler for message {}", exchange_type);
                 Err("Unimplemented message".into())
+            }
+        }
+    }
+
+    fn process_encrypted_payload<'a>(
+        &mut self,
+        request: &message::InputMessage,
+        encrypted_payload: &message::EncryptedMessage,
+        decrypted_data: &'a mut [u8],
+    ) -> Result<&'a [u8], IKEv2Error> {
+        let encrypted_data = encrypted_payload.encrypted_data();
+        decrypted_data[..encrypted_data.len()].copy_from_slice(encrypted_data);
+        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
+            crypto_stack
+        } else {
+            // TODO: return error notification.
+            return Err("Crypto stack not initialized".into());
+        };
+        let signature_length = if let Some(params) = self.params.as_ref() {
+            params.auth_signature_length().map(|len| len / 8)
+        } else {
+            // TODO: return error notification.
+            return Err("Crypto parameters not initialized".into());
+        };
+        let validate_slice = request.signature_data(&encrypted_payload, signature_length.is_some());
+        let valid_signature = crypto_stack.validate_signature(validate_slice);
+        if !valid_signature {
+            // TODO: return error notification or even ignore packet.
+            return Err("Packet has invalid signature".into());
+        }
+        let associated_data = if signature_length.is_none() {
+            validate_slice
+        } else {
+            &[]
+        };
+        let encrypted_data_len = if let Some(signature_length) = signature_length {
+            encrypted_data.len().saturating_sub(signature_length)
+        } else {
+            encrypted_data.len()
+        };
+        match crypto_stack.decrypt_data(decrypted_data, encrypted_data_len, associated_data) {
+            Ok(decrypted_slice) => Ok(decrypted_slice),
+            Err(err) => {
+                // TODO: return error notification.
+                debug!("Failed to decrypt data {}", err);
+                Err("Failed to decrypt data {}".into())
             }
         }
     }
@@ -532,13 +594,8 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
-        response.write_header(
-            session_id.remote_spi,
-            session_id.local_spi,
-            message::ExchangeType::IKE_AUTH,
-            false,
-            request.read_message_id(),
-        )?;
+        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
+        let mut decrypted_iter = None;
 
         for payload in request.iter_payloads() {
             let payload = if let Ok(payload) = payload {
@@ -547,74 +604,40 @@ impl IKEv2Session {
                 // TODO: return INVALID_SYNTAX notification.
                 continue;
             };
-            // IKEv2 payloads need to be sent in a very specific order.
-            // By the time the Nonce is reached, SA and KE should already be processed.
             match payload.payload_type() {
                 message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
                     let encrypted_payload = payload.encrypted_data()?;
-                    let encrypted_data = encrypted_payload.encrypted_data();
-                    let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
-                    decrypted_data[..encrypted_data.len()].copy_from_slice(encrypted_data);
-                    let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
-                        crypto_stack
-                    } else {
-                        debug!("Crypto stack not initialized");
-                        // TODO: return error notification.
-                        continue;
-                    };
-                    let signature_length = if let Some(params) = self.params.as_ref() {
-                        params.auth_signature_length().map(|len| len / 8)
-                    } else {
-                        debug!("Crypto parameters not initialized");
-                        // TODO: return error notification.
-                        continue;
-                    };
-                    let validate_slice =
-                        request.signature_data(&encrypted_payload, signature_length.is_some());
-                    let valid_signature = crypto_stack.validate_signature(validate_slice);
-                    if !valid_signature {
-                        debug!("Packet has invalid signature");
-                        // TODO: return error notification or even ignore packet.
-                        continue;
-                    }
-                    let associated_data = if signature_length.is_none() {
-                        validate_slice
-                    } else {
-                        &[]
-                    };
-                    let encrypted_data_len = if let Some(signature_length) = signature_length {
-                        encrypted_data.len().saturating_sub(signature_length)
-                    } else {
-                        encrypted_data.len()
-                    };
-                    let decrypted_slice = match crypto_stack.decrypt_data(
+                    let decrypted_slice = self.process_encrypted_payload(
+                        request,
+                        &encrypted_payload,
                         &mut decrypted_data,
-                        encrypted_data_len,
-                        associated_data,
-                    ) {
-                        Ok(decrypted_slice) => decrypted_slice,
-                        Err(err) => {
-                            debug!("Failed to decrypt data {}", err);
-                            // TODO: return error notification.
-                            continue;
-                        }
-                    };
-                    for pl in encrypted_payload.iter_decrypted_message(decrypted_slice) {
-                        match pl {
-                            Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
-                            Err(err) => {
-                                debug!("Failed to read decrypted payload data {}", err);
-                                // TODO: return error notification.
-                                continue;
-                            }
-                        }
-                    }
+                    )?;
+                    decrypted_iter =
+                        Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
                 }
                 _ => {}
             }
         }
 
-        Ok(response.complete_message())
+        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
+            decrypted_iter
+        } else {
+            // TODO: return AUTHENTICATION_FAILED notification.
+            // AUTH payload is supposed to have an encrypted payload.
+            return Ok(response.complete_message());
+        };
+        for pl in decrypted_iter {
+            match pl {
+                Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
+                Err(err) => {
+                    debug!("Failed to read decrypted payload data {}", err);
+                    // TODO: return error notification.
+                    continue;
+                }
+            }
+        }
+
+        return Ok(response.complete_message());
     }
 
     fn process_informational_message(
@@ -623,13 +646,48 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
-        response.write_header(
-            session_id.remote_spi,
-            session_id.local_spi,
-            message::ExchangeType::INFORMATIONAL,
-            false,
-            request.read_message_id(),
-        )?;
+        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
+        let mut decrypted_iter = None;
+
+        for payload in request.iter_payloads() {
+            let payload = if let Ok(payload) = payload {
+                payload
+            } else {
+                // TODO: return INVALID_SYNTAX notification.
+                continue;
+            };
+            match payload.payload_type() {
+                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
+                    let encrypted_payload = payload.encrypted_data()?;
+                    let decrypted_slice = self.process_encrypted_payload(
+                        request,
+                        &encrypted_payload,
+                        &mut decrypted_data,
+                    )?;
+                    decrypted_iter =
+                        Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
+                }
+                _ => {}
+            }
+        }
+
+        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
+            decrypted_iter
+        } else {
+            // TODO: return INVALID_SYNTAX notification.
+            // AUTH payload is supposed to have an encrypted payload.
+            return Ok(response.complete_message());
+        };
+        for pl in decrypted_iter {
+            match pl {
+                Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
+                Err(err) => {
+                    debug!("Failed to read decrypted payload data {}", err);
+                    // TODO: return error notification.
+                    continue;
+                }
+            }
+        }
 
         Ok(response.complete_message())
     }
