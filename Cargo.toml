@@ -9,7 +9,7 @@ rust-version = "1.77"
 
 [dependencies]
 log = { version = "0.4", default-features = false }
-tokio = { version = "1.38", default-features = false, features = ["rt", "io-util", "signal", "net", "time"] }
+tokio = { version = "1.38", default-features = false, features = ["rt", "io-util", "signal", "net", "time", "sync"] }
 
 sha1 = { version = "0.10", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }

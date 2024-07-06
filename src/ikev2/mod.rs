@@ -2,19 +2,22 @@ use log::{debug, info, warn};
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use std::{
-    collections::HashMap,
+    collections::{self, HashMap},
     error, fmt,
     hash::{Hash, Hasher},
     io,
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
-use tokio::{net::UdpSocket, signal, task::JoinHandle};
+use tokio::{net::UdpSocket, signal, sync::mpsc, task::JoinHandle};
 
 mod crypto;
 mod message;
 
 use crypto::DHTransform;
+
+const IKEV2_LISTEN_PORTS: [u16; 2] = [500, 4500];
 
 // TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
 const MAX_DATAGRAM_SIZE: usize = 4096;
@@ -29,27 +32,28 @@ impl Server {
         Server { listen_ips }
     }
 
-    async fn listen_socket(listen_ip: IpAddr) -> Result<(), IKEv2Error> {
-        let socket = match UdpSocket::bind((listen_ip, 500)).await {
-            Ok(socket) => socket,
-            Err(err) => {
-                log::error!("Failed to open listener on {}: {}", listen_ip, err);
-                return Err(err.into());
-            }
-        };
-        let listen_addr = socket.local_addr()?;
-        info!("Started server on {}", listen_addr);
-        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
-        // TODO: share sessions between all threads: either using an async mutex, or by forwarding all messages to the same mpsc channel.
-        // TODO: check source of Tokio's join! macro to listen on multiple addresses.
-        let mut sessions = Sessions::new();
+    async fn listen_socket(
+        socket: Arc<UdpSocket>,
+        listen_addr: SocketAddr,
+        dest: mpsc::Sender<SessionMessage>,
+    ) -> Result<(), IKEv2Error> {
         loop {
+            // Theoretically the allocator should be smart enough to recycle memory.
+            // In the unlikely case this becomes a problem, switching to stack-allocated
+            // arrays would reduce memory usage, but increase number of copy operations.
+            // As mpsc uses a queue internally, memory will be allocated for the queue elements
+            // in any case.
+            let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
             let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
-            let datagram_bytes = &mut buf[..bytes_res];
-            let addr = (listen_addr, remote_addr);
-            sessions
-                .process_message(datagram_bytes, &socket, addr)
-                .await?;
+            buf.truncate(bytes_res);
+            let msg = SessionMessage::UdpDatagram(UdpDatagram {
+                remote_addr,
+                local_addr: listen_addr,
+                request: buf,
+            });
+            dest.send(msg)
+                .await
+                .map_err(|_| IKEv2Error::Internal("Channel closed"))?;
         }
     }
 
@@ -65,16 +69,78 @@ impl Server {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()?;
-        let handles = self
-            .listen_ips
-            .iter()
-            .map(|listen_ip| rt.spawn(Server::listen_socket(listen_ip.to_owned())))
+        let sockets = rt.block_on(Sockets::new(&self.listen_ips))?;
+        let sessions = Sessions::new(sockets.clone());
+        let mut handles = sockets
+            .iter_sockets()
+            .map(|(listen_addr, socket)| {
+                rt.spawn(Server::listen_socket(
+                    socket.clone(),
+                    *listen_addr,
+                    sessions.create_sender(),
+                ))
+            })
             .collect::<Vec<_>>();
+        handles.push(rt.spawn(async move {
+            let mut sessions = sessions;
+            sessions.process_messages().await
+        }));
         rt.block_on(Server::wait_termination(handles))?;
         rt.shutdown_timeout(Duration::from_secs(60));
 
         info!("Stopped server");
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct Sockets {
+    sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
+}
+
+impl Sockets {
+    async fn new(listen_ips: &[IpAddr]) -> Result<Sockets, IKEv2Error> {
+        let mut sockets = HashMap::new();
+        for listen_ip in listen_ips {
+            for listen_port in IKEV2_LISTEN_PORTS {
+                let socket = match UdpSocket::bind((*listen_ip, listen_port)).await {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        log::error!("Failed to open listener on {}: {}", listen_ip, err);
+                        return Err(err.into());
+                    }
+                };
+                let listen_addr = socket.local_addr()?;
+                info!("Started server on {}", listen_addr);
+                sockets.insert(listen_addr, Arc::new(socket));
+            }
+        }
+        Ok(Sockets { sockets })
+    }
+
+    fn iter_sockets(&self) -> collections::hash_map::Iter<SocketAddr, Arc<UdpSocket>> {
+        self.sockets.iter()
+    }
+
+    async fn send_datagram(
+        &self,
+        send_from: &SocketAddr,
+        send_to: &SocketAddr,
+        data: &[u8],
+    ) -> Result<(), IKEv2Error> {
+        match self.sockets.get(&send_from) {
+            Some(ref socket) => {
+                socket.send_to(data, send_to).await?;
+                Ok(())
+            }
+            None => {
+                warn!(
+                    "No open sockets for source address {} (destination {})",
+                    send_from, send_to
+                );
+                Err("No open sockets for source address".into())
+            }
+        }
     }
 }
 
@@ -116,15 +182,63 @@ impl SessionID {
     }
 }
 
+struct UdpDatagram {
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+    request: Vec<u8>,
+}
+
+impl UdpDatagram {
+    fn is_non_esp(&self) -> bool {
+        self.request.len() >= 4
+            && self.request[0] == 0x00
+            && self.request[1] == 0x00
+            && self.request[2] == 0x00
+            && self.request[3] == 0x00
+    }
+
+    fn is_ikev2(&self) -> bool {
+        self.local_addr.port() == 500 || self.is_non_esp()
+    }
+
+    fn ikev2_data(&self) -> &[u8] {
+        if self.local_addr.port() == 500 {
+            // Regular IKEv2 message sent to port 500.
+            self.request.as_slice()
+        } else if self.is_non_esp() {
+            // Shared IKEv2/ESP-in-UDP port, marked as an IKEv2 message.
+            &self.request[4..]
+        } else {
+            // Shared IKEv2/ESP-in-UDP port, an ESP-in-UDP message.
+            &[]
+        }
+    }
+}
+
+enum SessionMessage {
+    UdpDatagram(UdpDatagram),
+}
+
 struct Sessions {
+    sockets: Sockets,
     sessions: HashMap<SessionID, IKEv2Session>,
+    tx: mpsc::Sender<SessionMessage>,
+    rx: mpsc::Receiver<SessionMessage>,
 }
 
 impl Sessions {
-    fn new() -> Sessions {
+    fn new(sockets: Sockets) -> Sessions {
+        let (tx, rx) = mpsc::channel(100);
         Sessions {
+            sockets,
             sessions: HashMap::new(),
+            tx,
+            rx,
         }
+    }
+
+    fn create_sender(&self) -> mpsc::Sender<SessionMessage> {
+        self.tx.clone()
     }
 
     fn get(
@@ -132,44 +246,75 @@ impl Sessions {
         id: SessionID,
         remote_addr: SocketAddr,
     ) -> Result<&mut IKEv2Session, message::FormatError> {
+        // TODO: only insert new sessions from IKE_SA_INIT.
         Ok(self
             .sessions
             .entry(id)
             .or_insert_with(|| IKEv2Session::new(remote_addr)))
     }
 
-    async fn process_message(
-        &mut self,
-        datagram_bytes: &[u8],
-        local_socket: &UdpSocket,
-        addr: (SocketAddr, SocketAddr),
-    ) -> Result<(), IKEv2Error> {
-        let ikev2_request = message::InputMessage::from_datagram(datagram_bytes)?;
-        let (_, remote_addr) = addr;
+    async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
+        while let Some(message) = self.rx.recv().await {
+            match message {
+                SessionMessage::UdpDatagram(mut datagram) => {
+                    if let Err(err) = self.process_message(&mut datagram).await {
+                        warn!(
+                            "Failed to process message from {}: {}",
+                            datagram.remote_addr, err
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_message(&mut self, datagram: &mut UdpDatagram) -> Result<(), IKEv2Error> {
+        if !datagram.is_ikev2() {
+            debug!(
+                "Received ESP packet from {}\n{:?}",
+                datagram.remote_addr, datagram.request
+            );
+            return Ok(());
+        }
+        let request_bytes = datagram.ikev2_data();
+        let ikev2_request = message::InputMessage::from_datagram(request_bytes)?;
         if !ikev2_request.is_valid() {
-            warn!("Invalid IKEv2 message from {}", remote_addr);
             return Err("Invalid message received".into());
         }
 
-        debug!("Received packet from {}\n{:?}", remote_addr, ikev2_request);
+        debug!(
+            "Received packet from {}\n{:?}",
+            datagram.remote_addr, ikev2_request
+        );
 
         let session_id = SessionID::from_message(&ikev2_request)?;
-        let session = self.get(session_id.clone(), remote_addr)?;
+        let session = self.get(session_id.clone(), datagram.remote_addr)?;
         let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
         let mut ikev2_response = message::MessageWriter::new(response_bytes.as_mut_slice())?;
 
-        let response_len =
-            session.process_message(session_id, addr, &ikev2_request, &mut ikev2_response)?;
+        let response_len = session.process_message(
+            session_id,
+            datagram.remote_addr,
+            &ikev2_request,
+            &mut ikev2_response,
+        )?;
+
         let response_bytes = &response_bytes[..response_len];
 
         {
             // TODO: remove this debug code
             let responser_msg = message::InputMessage::from_datagram(response_bytes)?;
-            debug!("Sending response to {}\n{:?}", remote_addr, responser_msg);
+            debug!(
+                "Sending response to {}\n{:?}",
+                datagram.remote_addr, responser_msg
+            );
         }
         // Response retransmisisons are initiated by client.
         if !response_bytes.is_empty() {
-            local_socket.send_to(response_bytes, remote_addr).await?;
+            self.sockets
+                .send_datagram(&datagram.local_addr, &datagram.remote_addr, response_bytes)
+                .await?;
         }
 
         Ok(())
@@ -194,7 +339,7 @@ impl IKEv2Session {
     fn process_message(
         &mut self,
         session_id: SessionID,
-        addr: (SocketAddr, SocketAddr),
+        remote_addr: SocketAddr,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
@@ -205,10 +350,10 @@ impl IKEv2Session {
         let exchange_type = request.read_exchange_type()?;
         match exchange_type {
             message::ExchangeType::IKE_SA_INIT => {
-                self.process_sa_init_message(session_id, addr, request, response)
+                self.process_sa_init_message(session_id, remote_addr, request, response)
             }
             message::ExchangeType::IKE_AUTH => {
-                self.process_auth_message(session_id, addr, request, response)
+                self.process_auth_message(session_id, request, response)
             }
             message::ExchangeType::INFORMATIONAL => {
                 self.process_informational_message(session_id, request, response)
@@ -223,12 +368,10 @@ impl IKEv2Session {
     fn process_sa_init_message(
         &mut self,
         session_id: SessionID,
-        addr: (SocketAddr, SocketAddr),
+        remote_addr: SocketAddr,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
-        let (_, remote_addr) = addr;
-
         response.write_header(
             session_id.remote_spi,
             session_id.local_spi,
@@ -353,14 +496,6 @@ impl IKEv2Session {
             }
         }
 
-        /*
-        response.write_notify_payload(
-            None,
-            &[],
-            message::NotifyMessageType::IKEV2_FRAGMENTATION_SUPPORTED,
-            &[],
-        )?;
-
         // Simulate that the host is behind a NAT - same as StrongSwan's encap=yes does it.
         let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 500);
         let nat_ip = nat_detection_ip(
@@ -387,7 +522,6 @@ impl IKEv2Session {
             message::NotifyMessageType::NAT_DETECTION_DESTINATION_IP,
             &nat_ip,
         )?;
-        */
 
         Ok(response.complete_message())
     }
@@ -395,12 +529,9 @@ impl IKEv2Session {
     fn process_auth_message(
         &mut self,
         session_id: SessionID,
-        addr: (SocketAddr, SocketAddr),
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
-        let (_, remote_addr) = addr;
-
         response.write_header(
             session_id.remote_spi,
             session_id.local_spi,
