@@ -17,7 +17,9 @@ mod message;
 
 use crypto::DHTransform;
 
-const IKEV2_LISTEN_PORTS: [u16; 2] = [500, 4500];
+const IKEV2_PORT: u16 = 500;
+const IKEV2_NAT_PORT: u16 = 4500;
+const IKEV2_LISTEN_PORTS: [u16; 2] = [IKEV2_PORT, IKEV2_NAT_PORT];
 
 // TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
 const MAX_DATAGRAM_SIZE: usize = 4096;
@@ -200,11 +202,11 @@ impl UdpDatagram {
     }
 
     fn is_ikev2(&self) -> bool {
-        self.local_addr.port() == 500 || self.is_non_esp()
+        self.local_addr.port() == IKEV2_PORT || self.is_non_esp()
     }
 
     fn ikev2_data(&self) -> &[u8] {
-        if self.local_addr.port() == 500 {
+        if self.local_addr.port() == IKEV2_PORT {
             // Regular IKEv2 message sent to port 500.
             self.request.as_slice()
         } else if self.is_non_esp() {
@@ -298,7 +300,8 @@ impl Sessions {
             return Err("Session not found".into());
         };
         let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
-        let mut ikev2_response = message::MessageWriter::new(response_bytes.as_mut_slice())?;
+        let start_offset = if datagram.is_non_esp() { 4 } else { 0 };
+        let mut ikev2_response = message::MessageWriter::new(&mut response_bytes[start_offset..])?;
 
         let response_len = session.process_message(
             session_id,
@@ -307,11 +310,12 @@ impl Sessions {
             &mut ikev2_response,
         )?;
 
-        let response_bytes = &response_bytes[..response_len];
+        let response_bytes = &response_bytes[..response_len + start_offset];
 
         {
             // TODO: remove this debug code
-            let responser_msg = message::InputMessage::from_datagram(response_bytes)?;
+            let responser_msg =
+                message::InputMessage::from_datagram(&response_bytes[start_offset..])?;
             debug!(
                 "Sending response to {}\n{:?}",
                 datagram.remote_addr, responser_msg
@@ -392,19 +396,16 @@ impl IKEv2Session {
         let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
             crypto_stack
         } else {
-            // TODO: return error notification.
             return Err("Crypto stack not initialized".into());
         };
         let signature_length = if let Some(params) = self.params.as_ref() {
             params.auth_signature_length().map(|len| len / 8)
         } else {
-            // TODO: return error notification.
             return Err("Crypto parameters not initialized".into());
         };
         let validate_slice = request.signature_data(&encrypted_payload, signature_length.is_some());
         let valid_signature = crypto_stack.validate_signature(validate_slice);
         if !valid_signature {
-            // TODO: return error notification or even ignore packet.
             return Err("Packet has invalid signature".into());
         }
         let associated_data = if signature_length.is_none() {
@@ -420,11 +421,63 @@ impl IKEv2Session {
         match crypto_stack.decrypt_data(decrypted_data, encrypted_data_len, associated_data) {
             Ok(decrypted_slice) => Ok(decrypted_slice),
             Err(err) => {
-                // TODO: return error notification.
                 debug!("Failed to decrypt data {}", err);
                 Err("Failed to decrypt data {}".into())
             }
         }
+    }
+
+    fn complete_encrypted_payload(
+        &mut self,
+        response: &mut message::MessageWriter,
+    ) -> Result<usize, IKEv2Error> {
+        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
+            crypto_stack
+        } else {
+            return Err("Crypto stack not initialized".into());
+        };
+        let add_signature = if let Some(params) = self.params.as_ref() {
+            params.auth_signature_length().is_some()
+        } else {
+            return Err("Crypto parameters not initialized".into());
+        };
+
+        let encrypted_data_len = if let Some(len) = response.encrypted_data_length() {
+            len
+        } else {
+            return Err("Encrypted payload is not started".into());
+        };
+        let full_encrypted_length = crypto_stack.encrypted_payload_length(encrypted_data_len);
+        response.set_encrypted_payload_length(full_encrypted_length);
+        let full_message_len = response.complete_message();
+
+        let raw_data = response.raw_data_mut();
+        {
+            let (associated_data, encrypt_data) =
+                raw_data.split_at_mut(full_message_len - full_encrypted_length);
+            let associated_data = if !add_signature {
+                associated_data.as_ref()
+            } else {
+                &[]
+            };
+
+            crypto_stack
+                .encrypt_data(encrypt_data, encrypted_data_len, associated_data)
+                .map_err(|err| {
+                    // TODO: return error notification.
+                    debug!("Failed to encrypt data {}", err);
+                    "Failed to encrypt data"
+                })?;
+        }
+
+        crypto_stack
+            .sign(&mut raw_data[..full_message_len])
+            .map_err(|err| {
+                debug!("Failed to sign data {}", err);
+                "Failed to sign data"
+            })?;
+
+        Ok(full_message_len)
     }
 
     fn process_sa_init_message(
@@ -559,7 +612,7 @@ impl IKEv2Session {
         }
 
         // Simulate that the host is behind a NAT - same as StrongSwan's encap=yes does it.
-        let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 500);
+        let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), IKEV2_PORT);
         let nat_ip = nat_detection_ip(
             request.read_initiator_spi(),
             request.read_responder_spi(),
@@ -594,7 +647,7 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
-        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
+        let mut decrypted_request = [0u8; MAX_ENCRYPTED_DATA_SIZE];
         let mut decrypted_iter = None;
 
         for payload in request.iter_payloads() {
@@ -607,10 +660,11 @@ impl IKEv2Session {
             match payload.payload_type() {
                 message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
                     let encrypted_payload = payload.encrypted_data()?;
+                    // TODO: return AUTHENTICATION_FAILED notification on error.
                     let decrypted_slice = self.process_encrypted_payload(
                         request,
                         &encrypted_payload,
-                        &mut decrypted_data,
+                        &mut decrypted_request,
                     )?;
                     decrypted_iter =
                         Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
@@ -627,17 +681,28 @@ impl IKEv2Session {
             return Ok(response.complete_message());
         };
         for pl in decrypted_iter {
-            match pl {
-                Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
+            let pl = match pl {
+                Ok(pl) => pl,
                 Err(err) => {
                     debug!("Failed to read decrypted payload data {}", err);
                     // TODO: return error notification.
                     continue;
                 }
-            }
+            };
+            debug!("Decrypted payload\n {:?}", pl);
         }
 
-        return Ok(response.complete_message());
+        response.start_encrypted_payload()?;
+
+        // Just for test
+        response.write_notify_payload(
+            None,
+            &[],
+            message::NotifyMessageType::AUTHENTICATION_FAILED,
+            &[],
+        )?;
+
+        self.complete_encrypted_payload(response)
     }
 
     fn process_informational_message(

@@ -6,14 +6,17 @@ use aes_gcm::{
     aead::{AeadMutInPlace, Buffer},
     Aes256Gcm, Nonce,
 };
-use cipher::{block_padding, InnerIvInit, IvSizeUser};
+use cipher::{block_padding, BlockSizeUser, InnerIvInit, Iv, IvSizeUser};
 use crypto_bigint::{
     modular::constant_mod::{self, ResidueParams},
     Encoding,
 };
 use hmac::{Hmac, Mac};
 use log::debug;
-use p256::{elliptic_curve::sec1::Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey};
+use p256::{
+    elliptic_curve::sec1::Tag as P256Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey,
+};
+use rand::Rng;
 use sha2::Sha256;
 use std::{error, fmt, ops::Range};
 
@@ -234,7 +237,7 @@ pub fn choose_sa_parameters<'a>(
                     // Valid macOS options.
                     message::TransformType::ENCR_AES_GCM_16 => parameters.enc = Some(transform),
                     message::TransformType::DH_256_ECP => parameters.dh = Some(transform),
-                    // Valid macOS options.
+                    // Valid Windows options.
                     message::TransformType::ENCR_AES_CBC => parameters.enc = Some(transform),
                     message::TransformType::AUTH_HMAC_SHA2_256_128 => {
                         parameters.auth = Some(transform)
@@ -267,8 +270,6 @@ pub fn choose_sa_parameters<'a>(
             parameters.prf.as_ref()?;
             parameters.dh.as_ref()?;
 
-            // TODO: support more combinations.
-            // TODO: init encryption handlers.
             Some((parameters, prop.proposal_num()))
         })
         .next()
@@ -454,7 +455,7 @@ impl DHTransform for DHTransformECP256 {
     ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
         let mut res = Array::new(self.shared_key_length_bytes());
         let mut other_public_key_sec1 = [0u8; 1 + 64];
-        other_public_key_sec1[0] = Tag::Uncompressed.into();
+        other_public_key_sec1[0] = P256Tag::Uncompressed.into();
         other_public_key_sec1[1..].copy_from_slice(other_public_key);
         let other_public_key = match PublicKey::from_sec1_bytes(&other_public_key_sec1) {
             Ok(key) => key,
@@ -601,23 +602,53 @@ impl Auth {
         }
     }
 
-    pub fn validate(&mut self, data: &[u8]) -> bool {
+    pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
         match self {
-            Self::HmacSha256tr128(ref mut hmac) => {
-                const SIGNATURE_LENGTH: usize = 128 / 8;
-                if data.len() < SIGNATURE_LENGTH {
+            Self::HmacSha256tr128(ref hmac) => {
+                let signature_length = self.signature_length();
+                if data.len() < signature_length {
+                    return Err("Not enough space to add signature".into());
+                }
+                let data_length = data.len() - signature_length;
+                let hash = {
+                    let sign_data = &data[..data_length];
+                    let mut hmac = hmac.clone();
+                    hmac.update(sign_data);
+                    hmac.finalize().into_bytes()
+                };
+                let dest = &mut data[data_length..];
+                dest.copy_from_slice(&hash[..signature_length]);
+                Ok(())
+            }
+            Self::None => Ok(()),
+        }
+    }
+
+    pub fn validate(&self, data: &[u8]) -> bool {
+        match self {
+            Self::HmacSha256tr128(ref hmac) => {
+                let signature_length = self.signature_length();
+                if data.len() < signature_length {
                     return false;
                 }
-                let received_signature = &data[data.len() - SIGNATURE_LENGTH..];
-                let data = &data[..data.len() - SIGNATURE_LENGTH];
+                let received_signature = &data[data.len() - signature_length..];
+                let data = &data[..data.len() - signature_length];
+                let mut hmac = hmac.clone();
                 hmac.update(data);
-                let hash = hmac.finalize_reset().into_bytes();
+                let hash = hmac.finalize().into_bytes();
                 hash.iter()
-                    .take(SIGNATURE_LENGTH)
+                    .take(signature_length)
                     .zip(received_signature.iter())
                     .all(|(expected, received)| expected == received)
             }
             Self::None => true,
+        }
+    }
+
+    pub fn signature_length(&self) -> usize {
+        match self {
+            Self::HmacSha256tr128(_) => 128 / 8,
+            Self::None => 0,
         }
     }
 }
@@ -651,6 +682,20 @@ impl CryptoStack {
         })
     }
 
+    pub fn encrypted_payload_length(&self, msg_len: usize) -> usize {
+        self.enc_responder.encrypted_payload_length(msg_len)
+            + self.auth_responder.signature_length()
+    }
+
+    pub fn encrypt_data<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        associated_data: &[u8],
+    ) -> Result<(), CryptoError> {
+        self.enc_responder.encrypt(data, msg_len, associated_data)
+    }
+
     pub fn decrypt_data<'a>(
         &self,
         data: &'a mut [u8],
@@ -669,6 +714,10 @@ impl CryptoStack {
             &decrypted_slice
         };
         Ok(decrypted_slice)
+    }
+
+    pub fn sign(&mut self, data: &mut [u8]) -> Result<(), CryptoError> {
+        self.auth_responder.sign(data)
     }
 
     pub fn validate_signature(&mut self, data: &[u8]) -> bool {
@@ -718,7 +767,12 @@ impl Buffer for SliceBuffer<'_> {
 }
 
 pub trait Encryption {
-    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]>;
+    fn encrypt<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        associated_data: &[u8],
+    ) -> Result<(), CryptoError>;
 
     fn decrypt<'a>(
         &self,
@@ -726,6 +780,8 @@ pub trait Encryption {
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError>;
+
+    fn encrypted_payload_length(&self, msg_len: usize) -> usize;
 }
 
 pub enum EncryptionType {
@@ -758,10 +814,22 @@ impl EncryptionType {
         }
     }
 
-    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
+    fn encrypted_payload_length(&self, msg_len: usize) -> usize {
         match self {
-            Self::AesCbc256(ref enc) => enc.encrypt(data, msg_len),
-            Self::AesGcm256(ref enc) => enc.encrypt(data, msg_len),
+            Self::AesCbc256(ref enc) => enc.encrypted_payload_length(msg_len),
+            Self::AesGcm256(ref enc) => enc.encrypted_payload_length(msg_len),
+        }
+    }
+
+    fn encrypt<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        associated_data: &[u8],
+    ) -> Result<(), CryptoError> {
+        match self {
+            Self::AesCbc256(ref enc) => enc.encrypt(data, msg_len, associated_data),
+            Self::AesGcm256(ref enc) => enc.encrypt(data, msg_len, associated_data),
         }
     }
 
@@ -786,9 +854,33 @@ pub struct EncryptionAesCbc256 {
 }
 
 impl Encryption for EncryptionAesCbc256 {
-    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
-        //cipher.encrypt_in_place(data, msg_len);
-        None
+    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize, _: &[u8]) -> Result<(), CryptoError> {
+        let iv_size = AesCbc256Encryptor::iv_size();
+        let encrypted_payload_length = self.encrypted_payload_length(msg_len);
+        if data.len() < encrypted_payload_length {
+            return Err("Message length is too short".into());
+        }
+        let mut iv = Iv::<AesCbc256Encryptor>::default();
+        // Move message to the right to make space for the IV.
+        data.copy_within(..msg_len, iv_size);
+        let padded_msg_len = encrypted_payload_length - iv_size;
+        data[encrypted_payload_length - 1] = (padded_msg_len - 1 - msg_len) as u8;
+        rand::thread_rng()
+            .try_fill(iv.as_mut_slice())
+            .map_err(|err| {
+                debug!("Failed to generate IV for AES CBC 256: {}", err);
+                "Failed to generate IV for AES CBC 256"
+            })?;
+        data[..iv_size].copy_from_slice(iv.as_slice());
+        let block_encryptor = AesCbc256Encryptor::inner_iv_init(self.cipher.clone(), &iv);
+        let data_range = &mut data[iv_size..encrypted_payload_length];
+        block_encryptor
+            .encrypt_padded_mut::<block_padding::NoPadding>(data_range, padded_msg_len)
+            .map_err(|err| {
+                debug!("Failed to encode AES CBC 256 message: {}", err);
+                "Failed to encode AES CBC 256 message"
+            })?;
+        Ok(())
     }
 
     fn decrypt<'a>(
@@ -818,6 +910,13 @@ impl Encryption for EncryptionAesCbc256 {
             }
         }
     }
+
+    fn encrypted_payload_length(&self, msg_len: usize) -> usize {
+        let iv_size = AesCbc256Encryptor::iv_size();
+        let block_size = AesCbc256Encryptor::block_size();
+        let encrypted_size = (1 + msg_len / block_size) * block_size;
+        iv_size + encrypted_size
+    }
 }
 
 pub struct EncryptionAesGcm256 {
@@ -826,9 +925,45 @@ pub struct EncryptionAesGcm256 {
 }
 
 impl Encryption for EncryptionAesGcm256 {
-    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize) -> Option<&'a [u8]> {
-        //cipher.encrypt_in_place(data, msg_len);
-        None
+    fn encrypt<'a>(
+        &self,
+        data: &'a mut [u8],
+        msg_len: usize,
+        associated_data: &[u8],
+    ) -> Result<(), CryptoError> {
+        if data.len() < self.encrypted_payload_length(msg_len) {
+            return Err("Message length is too short".into());
+        }
+        // Pad length.
+        data[msg_len] = 0;
+        let msg_len = msg_len + 1;
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&self.salt);
+        // Move message to the right to make space for the explicit nonce.
+        data.copy_within(..msg_len, 8);
+        rand::thread_rng()
+            .try_fill(&mut nonce[4..])
+            .map_err(|err| {
+                debug!("Failed to generate nonce for AES GCM 16 256: {}", err);
+                "Failed to generate nonce for AES GCM 16 256"
+            })?;
+        data[..8].copy_from_slice(&nonce[4..]);
+        let mut buffer = SliceBuffer {
+            slice: &mut data[8..],
+            len: msg_len,
+        };
+        let mut cipher = self.cipher.clone();
+        cipher
+            .encrypt_in_place(
+                Nonce::from_slice(nonce.as_slice()),
+                associated_data,
+                &mut buffer,
+            )
+            .map_err(|err| {
+                debug!("Failed to encode AES GCM 16 256 message: {}", err);
+                "Failed to encode AES GCM 16 256 message"
+            })?;
+        Ok(())
     }
 
     fn decrypt<'a>(
@@ -859,6 +994,13 @@ impl Encryption for EncryptionAesGcm256 {
                 return Err("Failed to decode AES GCM 16 256 message".into());
             }
         }
+    }
+
+    fn encrypted_payload_length(&self, msg_len: usize) -> usize {
+        const TAG_SIZE: usize = 16;
+        // AES GCM is a stream cipher, encrypted payload will contain
+        // IV + message (with padding=1) + tag.
+        8 + msg_len + 1 + TAG_SIZE
     }
 }
 

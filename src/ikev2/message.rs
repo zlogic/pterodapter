@@ -277,6 +277,7 @@ impl InputMessage<'_> {
 pub struct MessageWriter<'a> {
     dest: &'a mut [u8],
     next_payload_index: usize,
+    encrypted_payload_start: Option<usize>,
     cursor: usize,
 }
 
@@ -286,10 +287,11 @@ impl MessageWriter<'_> {
             return Err(NotEnoughSpaceError {});
         }
         let next_payload_index = 16;
-        let cursor = 0;
+        let cursor = 28;
         Ok(MessageWriter {
             dest,
             next_payload_index,
+            encrypted_payload_start: None,
             cursor,
         })
     }
@@ -416,6 +418,12 @@ impl MessageWriter<'_> {
         Ok(())
     }
 
+    pub fn start_encrypted_payload(&mut self) -> Result<(), NotEnoughSpaceError> {
+        self.encrypted_payload_start = Some(self.cursor);
+        self.next_payload_slice(PayloadType::ENCRYPTED_AND_AUTHENTICATED, 0)?;
+        Ok(())
+    }
+
     pub fn next_payload_slice(
         &mut self,
         payload_type: PayloadType,
@@ -439,10 +447,31 @@ impl MessageWriter<'_> {
         Ok(&mut self.dest[next_data])
     }
 
+    pub fn encrypted_data_length(&self) -> Option<usize> {
+        Some(self.cursor - self.encrypted_payload_start? - 4)
+    }
+
+    pub fn set_encrypted_payload_length(&mut self, payload_len: usize) {
+        let encrypted_payload_start =
+            if let Some(encrypted_payload_start) = self.encrypted_payload_start {
+                encrypted_payload_start
+            } else {
+                return;
+            };
+        let payload_len = payload_len + 4;
+        self.dest[encrypted_payload_start + 2..encrypted_payload_start + 4]
+            .copy_from_slice(&(payload_len as u16).to_be_bytes());
+        self.cursor = encrypted_payload_start + payload_len;
+    }
+
     pub fn complete_message(&mut self) -> usize {
         let message_length = self.cursor as u32;
         self.dest[24..28].copy_from_slice(&message_length.to_be_bytes());
         self.cursor
+    }
+
+    pub fn raw_data_mut(&mut self) -> &mut [u8] {
+        self.dest
     }
 }
 
@@ -1275,7 +1304,6 @@ impl<'a> EncryptedMessage<'a> {
     }
 
     pub fn iter_decrypted_message<'b>(&self, decrypted_data: &'b [u8]) -> PayloadIter<'b> {
-        // TODO: process the pad_length u8 to remove padding
         PayloadIter {
             next_payload: self.next_payload,
             payload_encrypted: false,
