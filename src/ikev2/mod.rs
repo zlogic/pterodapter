@@ -8,7 +8,7 @@ use std::{
     io,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, signal, sync::mpsc, task::JoinHandle};
 
@@ -24,6 +24,10 @@ const IKEV2_LISTEN_PORTS: [u16; 2] = [IKEV2_PORT, IKEV2_NAT_PORT];
 // TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
 const MAX_DATAGRAM_SIZE: usize = 4096;
 const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;
+
+const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
+const IKE_SESSION_EXPIRATION: Duration = Duration::from_secs(60 * 15);
+const IKE_RESPONSE_EXPIRATION: Duration = Duration::from_secs(60);
 
 pub struct Server {
     listen_ips: Vec<IpAddr>,
@@ -59,6 +63,19 @@ impl Server {
         }
     }
 
+    async fn send_timer_ticks(
+        duration: Duration,
+        dest: mpsc::Sender<SessionMessage>,
+    ) -> Result<(), IKEv2Error> {
+        let mut interval = tokio::time::interval(duration);
+        loop {
+            interval.tick().await;
+            dest.send(SessionMessage::CleanupTimer)
+                .await
+                .map_err(|_| IKEv2Error::Internal("Channel closed"))?;
+        }
+    }
+
     async fn wait_termination(
         handles: Vec<JoinHandle<Result<(), IKEv2Error>>>,
     ) -> Result<(), IKEv2Error> {
@@ -70,6 +87,7 @@ impl Server {
     pub fn run(&self) -> Result<(), IKEv2Error> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()?;
         let sockets = rt.block_on(Sockets::new(&self.listen_ips))?;
         let sessions = Sessions::new(sockets.clone());
@@ -83,6 +101,10 @@ impl Server {
                 ))
             })
             .collect::<Vec<_>>();
+        handles.push(rt.spawn(Server::send_timer_ticks(
+            Duration::from_secs(15),
+            sessions.create_sender(),
+        )));
         handles.push(rt.spawn(async move {
             let mut sessions = sessions;
             sessions.process_messages().await
@@ -169,16 +191,8 @@ impl Hash for SessionID {
 
 impl SessionID {
     fn from_message(message: &message::InputMessage) -> Result<SessionID, message::FormatError> {
-        // As IKE_SA_INIT is unencrypted and unauthenticated, prevent sessions from being hijacked
-        // by generating a unique session ID for every packet.
-        let local_spi = if message.read_exchange_type()? == message::ExchangeType::IKE_SA_INIT {
-            // TODO: for retransmitted IKE_SA_INIT requests, keep a short-lived lookup cache with local SPI values.
-            // Use checksum of original message (e.g. std::hash::DefaultHasher) as lookup key (or remote SPI + remote address).
-            rand::thread_rng().gen::<u64>()
-        } else {
-            message.read_responder_spi()
-        };
         let remote_spi = message.read_initiator_spi();
+        let local_spi = message.read_responder_spi();
         Ok(SessionID {
             remote_spi,
             local_spi,
@@ -221,12 +235,13 @@ impl UdpDatagram {
 
 enum SessionMessage {
     UdpDatagram(UdpDatagram),
-    // TODO: add more messages like a cleanup timer or message from bridge.
+    CleanupTimer,
 }
 
 struct Sessions {
     sockets: Sockets,
     sessions: HashMap<SessionID, IKEv2Session>,
+    half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
     tx: mpsc::Sender<SessionMessage>,
     rx: mpsc::Receiver<SessionMessage>,
 }
@@ -237,6 +252,7 @@ impl Sessions {
         Sessions {
             sockets,
             sessions: HashMap::new(),
+            half_sessions: HashMap::new(),
             tx,
             rx,
         }
@@ -246,14 +262,64 @@ impl Sessions {
         self.tx.clone()
     }
 
-    fn get_or_create(&mut self, id: SessionID, remote_addr: SocketAddr) -> &mut IKEv2Session {
+    fn get_init_session(&mut self, remote_spi: u64, remote_addr: SocketAddr) -> SessionID {
+        let now = Instant::now();
+        let half_key = (remote_addr, remote_spi);
+        let new_session_id = (rand::thread_rng().gen::<u64>(), now);
+        let existing_half_session = self
+            .half_sessions
+            .entry(half_key)
+            .and_modify(|existing| {
+                if existing.1 + IKE_SESSION_EXPIRATION < now {
+                    // Already expired, should switch to new generated session ID.
+                    *existing = new_session_id
+                }
+            })
+            .or_insert_with(|| new_session_id);
+        let session_id = SessionID {
+            remote_spi,
+            local_spi: existing_half_session.0,
+        };
         self.sessions
-            .entry(id)
-            .or_insert_with(|| IKEv2Session::new(remote_addr))
+            .entry(session_id)
+            .or_insert_with(|| IKEv2Session::new(remote_addr));
+        session_id
     }
 
     fn get(&mut self, id: SessionID) -> Option<&mut IKEv2Session> {
         self.sessions.get_mut(&id)
+    }
+
+    fn cleanup(&mut self) {
+        let now = Instant::now();
+        self.half_sessions
+            .retain(|(remote_addr, remote_spi), (_, expires_at)| {
+                if *expires_at + IKE_INIT_SA_EXPIRATION < now {
+                    debug!(
+                        "Deleting expired init session {} (SPI {:x})",
+                        remote_addr, remote_spi
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+        self.sessions.retain(|session_id, session| {
+            if session.last_update + IKE_SESSION_EXPIRATION < now {
+                debug!(
+                    "Deleting expired session with SPI {:x}-{:x}",
+                    session_id.remote_spi, session_id.local_spi
+                );
+                false
+            } else {
+                true
+            }
+        });
+        self.sessions.values_mut().for_each(|session| {
+            if session.last_update + IKE_RESPONSE_EXPIRATION < now {
+                session.last_response = None;
+            }
+        });
     }
 
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
@@ -266,6 +332,9 @@ impl Sessions {
                             datagram.remote_addr, err
                         );
                     }
+                }
+                SessionMessage::CleanupTimer => {
+                    self.cleanup();
                 }
             }
         }
@@ -291,10 +360,15 @@ impl Sessions {
             datagram.remote_addr, ikev2_request
         );
 
-        let session_id = SessionID::from_message(&ikev2_request)?;
-        let session = if ikev2_request.read_exchange_type()? == message::ExchangeType::IKE_SA_INIT {
-            self.get_or_create(session_id.clone(), datagram.remote_addr)
-        } else if let Some(session) = self.get(session_id.clone()) {
+        let session_id = if ikev2_request.read_exchange_type()?
+            == message::ExchangeType::IKE_SA_INIT
+            && ikev2_request.read_message_id() == 0
+        {
+            self.get_init_session(ikev2_request.read_initiator_spi(), datagram.remote_addr)
+        } else {
+            SessionID::from_message(&ikev2_request)?
+        };
+        let session = if let Some(session) = self.get(session_id) {
             session
         } else {
             return Err("Session not found".into());
@@ -321,7 +395,7 @@ impl Sessions {
                 datagram.remote_addr, responser_msg
             );
         }
-        // Response retransmisisons are initiated by client.
+        // Response retransmissions are initiated by client.
         if !response_bytes.is_empty() {
             self.sockets
                 .send_datagram(&datagram.local_addr, &datagram.remote_addr, response_bytes)
@@ -336,6 +410,9 @@ struct IKEv2Session {
     remote_addr: SocketAddr,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
+    last_update: Instant,
+    last_message_id: u32,
+    last_response: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
 }
 
 impl IKEv2Session {
@@ -344,6 +421,9 @@ impl IKEv2Session {
             remote_addr,
             params: None,
             crypto_stack: None,
+            last_update: Instant::now(),
+            last_message_id: 0,
+            last_response: None,
         }
     }
 
@@ -355,8 +435,21 @@ impl IKEv2Session {
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
         // TODO: return error if payload type is critical but not recognized
-        // TODO: keep track of message numbers and replies - only send response if message ID is up to date.
-        // TODO: for all exchange types except IKE_SA_INIT check that the session already exists.
+
+        self.last_update = Instant::now();
+        let message_id = request.read_message_id();
+        if message_id < self.last_message_id {
+            // This is an outdated retransmission, nothing to do.
+            return Ok(0);
+        }
+        if message_id == self.last_message_id {
+            // Retransmit last response if available.
+            if let Some(last_response) = self.last_response {
+                let len = last_response.1;
+                response.raw_data_mut()[..len].copy_from_slice(&last_response.0[..len]);
+                return Ok(len);
+            }
+        }
 
         let exchange_type = request.read_exchange_type()?;
 
@@ -368,7 +461,7 @@ impl IKEv2Session {
             request.read_message_id(),
         )?;
 
-        match exchange_type {
+        let response_length = match exchange_type {
             message::ExchangeType::IKE_SA_INIT => {
                 self.process_sa_init_message(session_id, remote_addr, request, response)
             }
@@ -382,7 +475,21 @@ impl IKEv2Session {
                 debug!("Unimplemented handler for message {}", exchange_type);
                 Err("Unimplemented message".into())
             }
-        }
+        }?;
+
+        if let Some(mut last_response) = self.last_response {
+            last_response.0[..response_length]
+                .copy_from_slice(&response.raw_data_mut()[..response_length]);
+            last_response.1 = response_length;
+        } else {
+            let mut last_response = ([0u8; MAX_DATAGRAM_SIZE], response_length);
+            last_response.0[..response_length]
+                .copy_from_slice(&response.raw_data_mut()[..response_length]);
+            self.last_response = Some(last_response);
+        };
+        self.last_message_id = message_id;
+
+        Ok(response_length)
     }
 
     fn process_encrypted_payload<'a>(
