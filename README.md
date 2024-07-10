@@ -1,5 +1,7 @@
 # Pterodapter
 
+![Build status](https://github.com/zlogic/pterodapter/actions/workflows/cargo-build.yml/badge.svg)
+
 Pterodapter is a userspace VPN adapter that acts as an open/industry standard VPN server, and forwards traffic to 
 
 No drivers to install or root access to create tun/utun devices.

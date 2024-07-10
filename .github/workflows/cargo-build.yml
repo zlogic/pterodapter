@@ -1,0 +1,96 @@
+name: Cargo build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Get current Rust version
+      id: get-rust-version
+      run: echo VERSION=$(rustc --version | sed s/\ /_/g) >> "$GITHUB_OUTPUT"
+
+    - name: Cache Rust dependencies and artifacts
+      id: cache-rust
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ${{ github.workspace }}/target
+        key: lint-${{ runner.os }}-${{ steps.get-rust-version.outputs.VERSION }}-${{ hashFiles('Cargo.*') }}
+
+    - name: Validate Rust code with clippy
+      run: cargo clippy
+
+    - name: Install cargo-edit
+      run: cargo install cargo-edit
+
+    - name: Check for new dependency versions
+      run: cargo upgrade --dry-run
+
+  build-linux:
+    # Older Ubuntu versions will link with an older GLIBC and provide better compatibility
+    runs-on: ubuntu-20.04
+    needs: validate
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+        - arch: x86_64
+          os: ubuntu
+        - arch: aarch64
+          os: ubuntu
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Get current Rust version
+      id: get-rust-version
+      run: echo VERSION=$(rustc --version | sed s/\ /_/g) >> "$GITHUB_OUTPUT"
+
+    - name: Cache Rust dependencies and artifacts
+      id: cache-rust
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ${{ github.workspace }}/target
+        key: rust-${{ runner.os }}-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.get-rust-version.outputs.VERSION }}-${{ hashFiles('Cargo.*') }}
+
+    - name: Install compiler and prepare for cross-compilation
+      if: matrix.arch == 'aarch64'
+      run: |
+        rustup target add ${{ matrix.arch }}-unknown-linux-gnu
+        sudo apt-get update
+        sudo apt-get install -y crossbuild-essential-arm64 qemu-user-static
+        echo "LD_LIBRARY_PATH=/usr/aarch64-linux-gnu/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+        echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+        echo "CC=/usr/bin/aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+        echo "CXX=/usr/bin/aarch64-linux-gnu-g++" >> $GITHUB_ENV
+        echo "CFLAGS=-march=armv8.2-a" >> $GITHUB_ENV
+        echo "CXXFLAGS=-march=armv8.2-a" >> $GITHUB_ENV
+
+    - name: Build
+      run: cargo build --target=${{ matrix.arch }}-unknown-linux-gnu --release
+
+    - name: Package application
+      run: tar -cvjf pterodapter-${{ matrix.os }}-${{ matrix.arch }}.tar.bz2 -C target/${{ matrix.arch }}-unknown-linux-gnu/release pterodapter
+
+    - name: Upload application
+      uses: actions/upload-artifact@v4
+      with:
+        name: pterodapter-${{ matrix.os }}-${{ matrix.arch }}
+        path: pterodapter-*.tar.bz2
+
