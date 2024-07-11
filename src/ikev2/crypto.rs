@@ -103,7 +103,7 @@ impl TransformParameters {
         }
     }
 
-    fn prf_key_length(&self) -> usize {
+    pub fn prf_key_length(&self) -> usize {
         match self.prf {
             Some(ref prf) => match prf.transform_type {
                 message::TransformType::PRF_HMAC_SHA2_256 => 256,
@@ -494,12 +494,13 @@ impl PseudorandomTransform {
         }
     }
 
-    pub fn prf(&mut self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
+    pub fn prf(&self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
         match self {
-            Self::HmacSha256(ref mut hmac) => {
+            Self::HmacSha256(ref hmac) => {
                 const BLOCK_LENGTH: usize = 256 / 8;
+                let mut hmac = hmac.clone();
                 hmac.update(data);
-                let hash = hmac.finalize_reset().into_bytes();
+                let hash = hmac.finalize().into_bytes();
                 let mut result = Array::new(BLOCK_LENGTH);
                 result.as_mut_slice().copy_from_slice(&hash);
                 result
@@ -508,13 +509,14 @@ impl PseudorandomTransform {
     }
 
     pub fn create_crypto_stack(
-        &mut self,
+        &self,
         params: &TransformParameters,
         data: &[u8],
     ) -> Result<CryptoStack, InitError> {
         let mut keys = DerivedKeys::new(params);
         match self {
-            Self::HmacSha256(ref mut hmac) => {
+            Self::HmacSha256(ref hmac) => {
+                let mut hmac = hmac.clone();
                 let mut next_data = vec![0u8; data.len() + params.prf_key_length() / 8 + 1];
                 let mut cursor = 0;
                 // First T1 chunk.
@@ -636,10 +638,7 @@ impl Auth {
                 let mut hmac = hmac.clone();
                 hmac.update(data);
                 let hash = hmac.finalize().into_bytes();
-                hash.iter()
-                    .take(signature_length)
-                    .zip(received_signature.iter())
-                    .all(|(expected, received)| expected == received)
+                &hash[..signature_length] == received_signature
             }
             Self::None => true,
         }
@@ -659,6 +658,8 @@ pub struct CryptoStack {
     auth_responder: Auth,
     enc_initiator: EncryptionType,
     enc_responder: EncryptionType,
+    prf_initiator: PseudorandomTransform,
+    prf_responder: PseudorandomTransform,
 }
 
 impl CryptoStack {
@@ -673,12 +674,25 @@ impl CryptoStack {
             .auth
             .as_ref()
             .map(|transform| transform.transform_type);
+        let prf = params
+            .prf
+            .as_ref()
+            .ok_or_else(|| InitError::new("Undefined pseudorandom transform parameters"))?
+            .transform_type;
         Ok(CryptoStack {
             derive_key,
             auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
             auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
             enc_initiator: EncryptionType::init(enc, &keys.keys[keys.enc_initiator.clone()])?,
             enc_responder: EncryptionType::init(enc, &keys.keys[keys.enc_responder.clone()])?,
+            prf_initiator: PseudorandomTransform::init(
+                prf,
+                &keys.keys[keys.prf_initiator.clone()],
+            )?,
+            prf_responder: PseudorandomTransform::init(
+                prf,
+                &keys.keys[keys.prf_responder.clone()],
+            )?,
         })
     }
 
@@ -716,12 +730,20 @@ impl CryptoStack {
         Ok(decrypted_slice)
     }
 
-    pub fn sign(&mut self, data: &mut [u8]) -> Result<(), CryptoError> {
+    pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
         self.auth_responder.sign(data)
     }
 
-    pub fn validate_signature(&mut self, data: &[u8]) -> bool {
+    pub fn validate_signature(&self, data: &[u8]) -> bool {
         self.auth_initiator.validate(data)
+    }
+
+    pub fn authenticate_id_initiator(&self, id_initiator: &[u8], dest: &mut [u8]) {
+        dest.copy_from_slice(self.prf_initiator.prf(id_initiator).as_slice())
+    }
+
+    pub fn authenticate_id_responder(&self, id_responder: &[u8], dest: &mut [u8]) {
+        dest.copy_from_slice(self.prf_responder.prf(id_responder).as_slice())
     }
 }
 

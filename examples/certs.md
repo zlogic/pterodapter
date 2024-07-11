@@ -31,6 +31,13 @@ openssl req -new -x509 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-se
   -addext "subjectAltName = DNS:${SERVER_HOST}" -addext "extendedKeyUsage = serverAuth, 1.3.6.1.5.5.8.2.2"
 ```
 
+Convert server certificate to unencrypted form
+
+```shell
+openssl pkcs8 -nocrypt -topk8 -in vpn-server.key.pem -out vpn-server.pkcs8.pem
+mv vpn-server.pkcs8.pem vpn-server.key.pem
+```
+
 ## Client certificates
 
 Generate client key
@@ -64,3 +71,5 @@ openssl pkcs12 -export -legacy -out vpn-client.pfx -inkey vpn-client.key.pem -in
 ```
 
 When importing the certificate, use the Keychain access app, and select the System keychain as the destination.
+
+To grant access, go to _My Certificates_ and grant `/System/Library/Frameworks/NetworkExtension.framework/Plugins/NEIKEv2Provider.appex/Contents/MacOS/NEIKEv2Provider.appex` access to the private cert's private key.

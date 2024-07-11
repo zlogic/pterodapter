@@ -14,6 +14,7 @@ use tokio::{net::UdpSocket, signal, sync::mpsc, task::JoinHandle};
 
 mod crypto;
 mod message;
+mod pki;
 
 use crypto::DHTransform;
 
@@ -24,18 +25,39 @@ const IKEV2_LISTEN_PORTS: [u16; 2] = [IKEV2_PORT, IKEV2_NAT_PORT];
 // TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
 const MAX_DATAGRAM_SIZE: usize = 4096;
 const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;
+// All keys are less than 256 bits, but mathching the client nonce size is a good idea.
+const MAX_NONCE: usize = 384 / 8;
 
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 const IKE_SESSION_EXPIRATION: Duration = Duration::from_secs(60 * 15);
 const IKE_RESPONSE_EXPIRATION: Duration = Duration::from_secs(60);
 
+pub struct Config {
+    pub listen_ips: Vec<IpAddr>,
+    pub hostname: Option<String>,
+    pub root_ca: Option<String>,
+    pub server_cert: Option<(String, String)>,
+}
+
 pub struct Server {
     listen_ips: Vec<IpAddr>,
+    pki_processing: Arc<pki::PkiProcessing>,
 }
 
 impl Server {
-    pub fn new(listen_ips: Vec<IpAddr>) -> Server {
-        Server { listen_ips }
+    pub fn new(config: Config) -> Result<Server, IKEv2Error> {
+        let pki_processing = pki::PkiProcessing::new(
+            config.hostname.as_ref().map(|hostname| hostname.as_str()),
+            config.root_ca.as_ref().map(|root_ca| root_ca.as_str()),
+            config
+                .server_cert
+                .as_ref()
+                .map(|(public_cert, private_key)| (public_cert.as_str(), private_key.as_str())),
+        )?;
+        Ok(Server {
+            listen_ips: config.listen_ips,
+            pki_processing: Arc::new(pki_processing),
+        })
     }
 
     async fn listen_socket(
@@ -90,7 +112,7 @@ impl Server {
             .enable_time()
             .build()?;
         let sockets = rt.block_on(Sockets::new(&self.listen_ips))?;
-        let sessions = Sessions::new(sockets.clone());
+        let sessions = Sessions::new(self.pki_processing.clone(), sockets.clone());
         let mut handles = sockets
             .iter_sockets()
             .map(|(listen_addr, socket)| {
@@ -239,6 +261,7 @@ enum SessionMessage {
 }
 
 struct Sessions {
+    pki_processing: Arc<pki::PkiProcessing>,
     sockets: Sockets,
     sessions: HashMap<SessionID, IKEv2Session>,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
@@ -247,9 +270,10 @@ struct Sessions {
 }
 
 impl Sessions {
-    fn new(sockets: Sockets) -> Sessions {
+    fn new(pki_processing: Arc<pki::PkiProcessing>, sockets: Sockets) -> Sessions {
         let (tx, rx) = mpsc::channel(100);
         Sessions {
+            pki_processing,
             sockets,
             sessions: HashMap::new(),
             half_sessions: HashMap::new(),
@@ -282,7 +306,7 @@ impl Sessions {
         };
         self.sessions
             .entry(session_id)
-            .or_insert_with(|| IKEv2Session::new(remote_addr));
+            .or_insert_with(|| IKEv2Session::new(remote_addr, self.pki_processing.clone()));
         session_id
     }
 
@@ -307,8 +331,8 @@ impl Sessions {
         self.sessions.retain(|session_id, session| {
             if session.last_update + IKE_SESSION_EXPIRATION < now {
                 debug!(
-                    "Deleting expired session with SPI {:x}-{:x}",
-                    session_id.remote_spi, session_id.local_spi
+                    "Deleting expired session with SPI {:x}-{:x} {:?}",
+                    session_id.remote_spi, session_id.local_spi, session.user_id
                 );
                 false
             } else {
@@ -406,21 +430,41 @@ impl Sessions {
     }
 }
 
+#[derive(Clone)]
+struct InitSAContext {
+    message_initiator: Vec<u8>,
+    message_responder: Vec<u8>,
+    nonce_initiator: Vec<u8>,
+    nonce_responder: Vec<u8>,
+}
+
+enum SessionState {
+    Empty,
+    InitSA(InitSAContext),
+    Established,
+}
+
 struct IKEv2Session {
     remote_addr: SocketAddr,
+    state: SessionState,
+    pki_processing: Arc<pki::PkiProcessing>,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
+    user_id: Option<String>,
     last_update: Instant,
     last_message_id: u32,
     last_response: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
 }
 
 impl IKEv2Session {
-    fn new(remote_addr: SocketAddr) -> IKEv2Session {
+    fn new(remote_addr: SocketAddr, pki_processing: Arc<pki::PkiProcessing>) -> IKEv2Session {
         IKEv2Session {
             remote_addr,
+            state: SessionState::Empty,
+            pki_processing,
             params: None,
             crypto_stack: None,
+            user_id: None,
             last_update: Instant::now(),
             last_message_id: 0,
             last_response: None,
@@ -479,12 +523,12 @@ impl IKEv2Session {
 
         if let Some(mut last_response) = self.last_response {
             last_response.0[..response_length]
-                .copy_from_slice(&response.raw_data_mut()[..response_length]);
+                .copy_from_slice(&response.raw_data()[..response_length]);
             last_response.1 = response_length;
         } else {
             let mut last_response = ([0u8; MAX_DATAGRAM_SIZE], response_length);
             last_response.0[..response_length]
-                .copy_from_slice(&response.raw_data_mut()[..response_length]);
+                .copy_from_slice(&response.raw_data()[..response_length]);
             self.last_response = Some(last_response);
         };
         self.last_message_id = message_id;
@@ -493,14 +537,14 @@ impl IKEv2Session {
     }
 
     fn process_encrypted_payload<'a>(
-        &mut self,
+        &self,
         request: &message::InputMessage,
         encrypted_payload: &message::EncryptedMessage,
         decrypted_data: &'a mut [u8],
     ) -> Result<&'a [u8], IKEv2Error> {
         let encrypted_data = encrypted_payload.encrypted_data();
         decrypted_data[..encrypted_data.len()].copy_from_slice(encrypted_data);
-        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
+        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
             crypto_stack
         } else {
             return Err("Crypto stack not initialized".into());
@@ -535,10 +579,10 @@ impl IKEv2Session {
     }
 
     fn complete_encrypted_payload(
-        &mut self,
+        &self,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
-        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
+        let crypto_stack = if let Some(crypto_stack) = &self.crypto_stack {
             crypto_stack
         } else {
             return Err("Crypto stack not initialized".into());
@@ -604,6 +648,8 @@ impl IKEv2Session {
 
         let mut dh_transform = None;
         let mut shared_secret = None;
+        let mut nonce_responder = None;
+        let mut nonce_initiator = None;
         for payload in request.iter_payloads() {
             let payload = if let Ok(payload) = payload {
                 payload
@@ -652,9 +698,19 @@ impl IKEv2Session {
                 message::PayloadType::NONCE => {
                     let nonce = payload.to_nonce()?;
                     let nonce_remote = nonce.read_value();
-                    // All keys are less than 256 bits.
-                    let mut nonce_local = [0u8; 32];
-                    rand::thread_rng().fill(nonce_local.as_mut_slice());
+                    nonce_initiator = {
+                        let mut nonce_initiator = vec![0; nonce_remote.len()];
+                        nonce_initiator.copy_from_slice(nonce_remote);
+                        Some(nonce_initiator)
+                    };
+                    let mut nonce_local = [0u8; MAX_NONCE];
+                    let nonce_local = &mut nonce_local[..nonce_remote.len()];
+                    rand::thread_rng().fill(nonce_local);
+                    nonce_responder = {
+                        let mut nonce_responder = vec![0; nonce_local.len()];
+                        nonce_responder.copy_from_slice(nonce_local);
+                        Some(nonce_responder)
+                    };
                     let mut prf_key = vec![0; nonce_remote.len() + nonce_local.len() + 8 + 8];
                     let mut prf_key_cursor = 0;
                     prf_key[prf_key_cursor..prf_key_cursor + nonce_remote.len()]
@@ -676,7 +732,7 @@ impl IKEv2Session {
                         // TODO: return INVALID_SYNTAX notification.
                         continue;
                     };
-                    let mut prf_transform = match params
+                    let prf_transform = match params
                         .create_prf(&prf_key[0..nonce_remote.len() + nonce_local.len()])
                     {
                         Ok(prf) => prf,
@@ -694,7 +750,7 @@ impl IKEv2Session {
                         continue;
                     };
                     let skeyseed = prf_transform.prf(shared_secret.as_slice());
-                    let mut prf_transform = match params.create_prf(skeyseed.as_slice()) {
+                    let prf_transform = match params.create_prf(skeyseed.as_slice()) {
                         Ok(prf) => prf,
                         Err(err) => {
                             debug!("Failed to init PRF transform for keying material {}", err);
@@ -716,6 +772,13 @@ impl IKEv2Session {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(root_ca) = self.pki_processing.root_ca_request() {
+            response.write_certificate_request_payload(
+                message::CertificateEncoding::X509_SIGNATURE,
+                root_ca,
+            )?;
         }
 
         // Simulate that the host is behind a NAT - same as StrongSwan's encap=yes does it.
@@ -745,7 +808,35 @@ impl IKEv2Session {
             &nat_ip,
         )?;
 
-        Ok(response.complete_message())
+        let nonce_initiator = if let Some(nonce) = nonce_initiator {
+            nonce
+        } else {
+            // TODO: return INVALID_SYNTAX notification.
+            return Err("Initiator didn't provide nonce".into());
+        };
+        let nonce_responder = if let Some(nonce) = nonce_responder {
+            nonce
+        } else {
+            // TODO: return INVALID_SYNTAX notification.
+            return Err("No nonce provided in response".into());
+        };
+
+        let response_length = response.complete_message();
+        let response_data = &response.raw_data()[..response_length];
+        let mut message_responder = vec![0; response_data.len()];
+        message_responder.copy_from_slice(response_data);
+
+        let initiator_data = request.raw_data();
+        let mut message_initiator = vec![0; initiator_data.len()];
+        message_initiator.copy_from_slice(initiator_data);
+        self.state = SessionState::InitSA(InitSAContext {
+            message_initiator,
+            message_responder,
+            nonce_initiator,
+            nonce_responder,
+        });
+
+        Ok(response_length)
     }
 
     fn process_auth_message(
@@ -754,6 +845,23 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
+        let ctx = match self.state {
+            SessionState::InitSA(ref ctx) => ctx.clone(),
+            _ => {
+                return self
+                    .process_auth_failed_response(response, "Session is not in init state".into());
+            }
+        };
+        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
+            crypto_stack
+        } else {
+            return Err("Crypto stack not initialized".into());
+        };
+        let prf_key_len = if let Some(params) = self.params.as_ref() {
+            params.prf_key_length() / 8
+        } else {
+            return Err("Crypto parameters not initialized".into());
+        };
         let mut decrypted_request = [0u8; MAX_ENCRYPTED_DATA_SIZE];
         let mut decrypted_iter = None;
 
@@ -787,21 +895,173 @@ impl IKEv2Session {
             // AUTH payload is supposed to have an encrypted payload.
             return Ok(response.complete_message());
         };
-        for pl in decrypted_iter {
-            let pl = match pl {
-                Ok(pl) => pl,
+
+        let mut client_cert = None;
+        let mut client_auth = None;
+        let mut server_cert = self.pki_processing.default_server_cert();
+        let mut id_initiator = None;
+
+        for payload in decrypted_iter {
+            let payload = match payload {
+                Ok(payload) => payload,
                 Err(err) => {
                     debug!("Failed to read decrypted payload data {}", err);
                     // TODO: return error notification.
                     continue;
                 }
             };
-            debug!("Decrypted payload\n {:?}", pl);
+            debug!("Decrypted payload\n {:?}", payload);
+            match payload.payload_type() {
+                message::PayloadType::CERTIFICATE => {
+                    let certificate = payload.to_certificate()?;
+                    if certificate.encoding() != message::CertificateEncoding::X509_SIGNATURE {
+                        debug!(
+                            "Certificate encoding {} is unsupported",
+                            certificate.encoding()
+                        );
+                        return self.process_auth_failed_response(
+                            response,
+                            "Certificate encoding is unsupported".into(),
+                        );
+                    }
+                    match self
+                        .pki_processing
+                        .verify_client_cert(certificate.read_value())
+                    {
+                        Ok(cert) => client_cert = Some(cert),
+                        Err(err) => {
+                            debug!("Certificate is not valid: {}", err);
+                        }
+                    };
+                }
+                message::PayloadType::CERTIFICATE_REQUEST => {
+                    let certreq = payload.to_certificate_request()?;
+                    if certreq.read_encoding() != message::CertificateEncoding::X509_SIGNATURE {
+                        debug!(
+                            "Certificate request encoding {} is unsupported",
+                            certreq.read_encoding()
+                        );
+                        return self.process_auth_failed_response(
+                            response,
+                            "Certificate request encoding is unsupported".into(),
+                        );
+                    }
+                    match self.pki_processing.server_cert(certreq.read_value()) {
+                        Some(cert) => server_cert = Some(cert),
+                        None => {
+                            debug!("No certificates found for client's certificate request",);
+                        }
+                    };
+                }
+                message::PayloadType::ID_INITIATOR => {
+                    let id = payload.to_identification()?;
+                    id_initiator = Some(id.raw_value().to_vec());
+                }
+                message::PayloadType::AUTHENTICATION => {
+                    let auth = payload.to_authentication()?;
+                    if auth.read_method() != message::AuthMethod::RSA_DIGITAL_SIGNATURE {
+                        debug!(
+                            "Authentication method {} is unsupported",
+                            auth.read_method()
+                        );
+                        return self.process_auth_failed_response(
+                            response,
+                            "Authentication method is unsupported".into(),
+                        );
+                    }
+                    client_auth = Some(auth.read_value().to_vec());
+                }
+                _ => {}
+            }
         }
 
+        let client_cert = if let Some(cert) = client_cert {
+            cert
+        } else {
+            return self.process_auth_failed_response(response, "Client provided no cert".into());
+        };
+        let client_auth = if let Some(auth) = client_auth {
+            auth
+        } else {
+            return self.process_auth_failed_response(response, "Client provided no auth".into());
+        };
+        let id_initiator = if let Some(id) = id_initiator {
+            id
+        } else {
+            return self.process_auth_failed_response(response, "Client provided no ID".into());
+        };
+
+        let initiator_signed_len =
+            ctx.message_initiator.len() + ctx.nonce_responder.len() + prf_key_len;
+        let mut initiator_signed = [0u8; MAX_DATAGRAM_SIZE];
+        initiator_signed[..ctx.message_initiator.len()].copy_from_slice(&ctx.message_initiator);
+        initiator_signed
+            [ctx.message_initiator.len()..ctx.message_initiator.len() + ctx.nonce_responder.len()]
+            .copy_from_slice(&ctx.nonce_responder);
+        crypto_stack.authenticate_id_initiator(
+            &id_initiator,
+            &mut initiator_signed
+                [ctx.message_initiator.len() + ctx.nonce_responder.len()..initiator_signed_len],
+        );
+        if let Err(err) =
+            client_cert.verify_signature(&initiator_signed[..initiator_signed_len], &client_auth)
+        {
+            debug!("Client authentication failed: {}", err);
+            return Err("Client authentication failed".into());
+        }
+
+        // At this point the client identity has been successfully verified, proceed with sending a successful response.
+        self.user_id = Some(client_cert.subject().into());
+        self.state = SessionState::Established;
+        response.start_encrypted_payload()?;
+        if let Some(id_responder) = self.pki_processing.server_id() {
+            {
+                let write_slice = response
+                    .next_payload_slice(message::PayloadType::ID_RESPONDER, id_responder.len())?;
+                write_slice.copy_from_slice(&id_responder);
+            }
+
+            if let Some(cert) = server_cert {
+                response.write_certificate_payload(
+                    message::CertificateEncoding::X509_SIGNATURE,
+                    cert,
+                )?;
+            }
+
+            let responder_signed_len =
+                ctx.message_responder.len() + ctx.nonce_initiator.len() + prf_key_len;
+            let mut responder_signed = [0u8; MAX_DATAGRAM_SIZE];
+            responder_signed[..ctx.message_responder.len()].copy_from_slice(&ctx.message_responder);
+            responder_signed[ctx.message_responder.len()
+                ..ctx.message_responder.len() + ctx.nonce_initiator.len()]
+                .copy_from_slice(&ctx.nonce_initiator);
+            crypto_stack.authenticate_id_responder(
+                &id_responder,
+                &mut responder_signed
+                    [ctx.message_responder.len() + ctx.nonce_initiator.len()..responder_signed_len],
+            );
+
+            let write_slice = response.write_authentication_payload_slice(
+                message::AuthMethod::RSA_DIGITAL_SIGNATURE,
+                self.pki_processing.signature_length(),
+            )?;
+            self.pki_processing
+                .sign_auth(&responder_signed[..responder_signed_len], write_slice)?;
+        } else if let Some(cert) = server_cert {
+            response
+                .write_certificate_payload(message::CertificateEncoding::X509_SIGNATURE, cert)?;
+        };
+
+        self.complete_encrypted_payload(response)
+    }
+
+    fn process_auth_failed_response(
+        &self,
+        response: &mut message::MessageWriter,
+        _err: IKEv2Error,
+    ) -> Result<usize, IKEv2Error> {
         response.start_encrypted_payload()?;
 
-        // Just for test
         response.write_notify_payload(
             None,
             &[],
@@ -847,7 +1107,7 @@ impl IKEv2Session {
             decrypted_iter
         } else {
             // TODO: return INVALID_SYNTAX notification.
-            // AUTH payload is supposed to have an encrypted payload.
+            // INFORMATIONAL payload is supposed to have an encrypted payload.
             return Ok(response.complete_message());
         };
         for pl in decrypted_iter {
@@ -892,6 +1152,7 @@ pub enum IKEv2Error {
     Internal(&'static str),
     Format(message::FormatError),
     NotEnoughSpace(message::NotEnoughSpaceError),
+    CertError(pki::CertError),
     Join(tokio::task::JoinError),
     Io(io::Error),
 }
@@ -899,11 +1160,12 @@ pub enum IKEv2Error {
 impl fmt::Display for IKEv2Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            IKEv2Error::Internal(msg) => f.write_str(msg),
-            IKEv2Error::Format(ref e) => write!(f, "Format error: {}", e),
-            IKEv2Error::NotEnoughSpace(_) => write!(f, "Not enough space error"),
-            IKEv2Error::Join(ref e) => write!(f, "Tokio join error: {}", e),
-            IKEv2Error::Io(ref e) => {
+            Self::Internal(msg) => f.write_str(msg),
+            Self::Format(ref e) => write!(f, "Format error: {}", e),
+            Self::NotEnoughSpace(_) => write!(f, "Not enough space error"),
+            Self::CertError(ref e) => write!(f, "PKI cert error: {}", e),
+            Self::Join(ref e) => write!(f, "Tokio join error: {}", e),
+            Self::Io(ref e) => {
                 write!(f, "IO error: {}", e)
             }
         }
@@ -913,41 +1175,48 @@ impl fmt::Display for IKEv2Error {
 impl error::Error for IKEv2Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
-            IKEv2Error::Internal(_msg) => None,
-            IKEv2Error::Format(ref err) => Some(err),
-            IKEv2Error::NotEnoughSpace(ref err) => Some(err),
-            IKEv2Error::Join(ref err) => Some(err),
-            IKEv2Error::Io(ref err) => Some(err),
+            Self::Internal(_msg) => None,
+            Self::Format(ref err) => Some(err),
+            Self::NotEnoughSpace(ref err) => Some(err),
+            Self::CertError(ref err) => Some(err),
+            Self::Join(ref err) => Some(err),
+            Self::Io(ref err) => Some(err),
         }
     }
 }
 
 impl From<&'static str> for IKEv2Error {
     fn from(msg: &'static str) -> IKEv2Error {
-        IKEv2Error::Internal(msg)
+        Self::Internal(msg)
     }
 }
 
 impl From<message::FormatError> for IKEv2Error {
     fn from(err: message::FormatError) -> IKEv2Error {
-        IKEv2Error::Format(err)
+        Self::Format(err)
     }
 }
 
 impl From<message::NotEnoughSpaceError> for IKEv2Error {
     fn from(err: message::NotEnoughSpaceError) -> IKEv2Error {
-        IKEv2Error::NotEnoughSpace(err)
+        Self::NotEnoughSpace(err)
+    }
+}
+
+impl From<pki::CertError> for IKEv2Error {
+    fn from(err: pki::CertError) -> IKEv2Error {
+        Self::CertError(err)
     }
 }
 
 impl From<tokio::task::JoinError> for IKEv2Error {
     fn from(err: tokio::task::JoinError) -> IKEv2Error {
-        IKEv2Error::Join(err)
+        Self::Join(err)
     }
 }
 
 impl From<io::Error> for IKEv2Error {
     fn from(err: io::Error) -> IKEv2Error {
-        IKEv2Error::Io(err)
+        Self::Io(err)
     }
 }

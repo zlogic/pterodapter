@@ -272,6 +272,10 @@ impl InputMessage<'_> {
             ..(encrypted_message.start_offset + signed_length).min(self.data.len());
         &self.data[signature_range]
     }
+
+    pub fn raw_data(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 pub struct MessageWriter<'a> {
@@ -322,27 +326,6 @@ impl MessageWriter<'_> {
 
         self.next_payload_index = 16;
         self.cursor = 28;
-        Ok(())
-    }
-
-    pub fn write_notify_payload(
-        &mut self,
-        protocol_id: Option<IPSecProtocolID>,
-        spi: &[u8],
-        notify_message_type: NotifyMessageType,
-        data: &[u8],
-    ) -> Result<(), NotEnoughSpaceError> {
-        let next_payload_slice =
-            self.next_payload_slice(PayloadType::NOTIFY, 4 + spi.len() + data.len())?;
-        next_payload_slice[0] = if let Some(protocol_id) = protocol_id {
-            protocol_id.0
-        } else {
-            0
-        };
-        next_payload_slice[1] = spi.len() as u8;
-        next_payload_slice[2..4].copy_from_slice(&notify_message_type.0.to_be_bytes());
-        next_payload_slice[4..4 + spi.len()].copy_from_slice(spi);
-        next_payload_slice[4 + spi.len()..].copy_from_slice(data);
         Ok(())
     }
 
@@ -418,6 +401,62 @@ impl MessageWriter<'_> {
         Ok(())
     }
 
+    pub fn write_certificate_payload(
+        &mut self,
+        certificate_encoding: CertificateEncoding,
+        certificate_data: &[u8],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::CERTIFICATE, 1 + certificate_data.len())?;
+        next_payload_slice[0] = certificate_encoding.0;
+        next_payload_slice[1..].copy_from_slice(certificate_data);
+        Ok(())
+    }
+
+    pub fn write_certificate_request_payload(
+        &mut self,
+        certificate_encoding: CertificateEncoding,
+        certificate_data: &[u8],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::CERTIFICATE_REQUEST, 1 + certificate_data.len())?;
+        next_payload_slice[0] = certificate_encoding.0;
+        next_payload_slice[1..].copy_from_slice(certificate_data);
+        Ok(())
+    }
+
+    pub fn write_authentication_payload_slice(
+        &mut self,
+        auth_method: AuthMethod,
+        signature_length: usize,
+    ) -> Result<&mut [u8], NotEnoughSpaceError> {
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::AUTHENTICATION, 4 + signature_length)?;
+        next_payload_slice[0] = auth_method.0;
+        Ok(&mut next_payload_slice[4..])
+    }
+
+    pub fn write_notify_payload(
+        &mut self,
+        protocol_id: Option<IPSecProtocolID>,
+        spi: &[u8],
+        notify_message_type: NotifyMessageType,
+        data: &[u8],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::NOTIFY, 4 + spi.len() + data.len())?;
+        next_payload_slice[0] = if let Some(protocol_id) = protocol_id {
+            protocol_id.0
+        } else {
+            0
+        };
+        next_payload_slice[1] = spi.len() as u8;
+        next_payload_slice[2..4].copy_from_slice(&notify_message_type.0.to_be_bytes());
+        next_payload_slice[4..4 + spi.len()].copy_from_slice(spi);
+        next_payload_slice[4 + spi.len()..].copy_from_slice(data);
+        Ok(())
+    }
+
     pub fn start_encrypted_payload(&mut self) -> Result<(), NotEnoughSpaceError> {
         self.encrypted_payload_start = Some(self.cursor);
         self.next_payload_slice(PayloadType::ENCRYPTED_AND_AUTHENTICATED, 0)?;
@@ -473,6 +512,10 @@ impl MessageWriter<'_> {
     pub fn raw_data_mut(&mut self) -> &mut [u8] {
         self.dest
     }
+
+    pub fn raw_data(&mut self) -> &[u8] {
+        self.dest
+    }
 }
 
 pub struct Payload<'a> {
@@ -501,6 +544,40 @@ impl Payload<'_> {
             PayloadKeyExchange::from_payload(self.data)
         } else {
             Err("Payload type is not KEY_EXCHANGE".into())
+        }
+    }
+
+    pub fn to_identification(&self) -> Result<PayloadIdentification, FormatError> {
+        if self.payload_type == PayloadType::ID_INITIATOR
+            || self.payload_type == PayloadType::ID_RESPONDER
+        {
+            PayloadIdentification::from_payload(self.data)
+        } else {
+            Err("Payload type is not ID".into())
+        }
+    }
+
+    pub fn to_certificate(&self) -> Result<PayloadCertificate, FormatError> {
+        if self.payload_type == PayloadType::CERTIFICATE {
+            PayloadCertificate::from_payload(self.data)
+        } else {
+            Err("Payload type is not CERTIFICATE".into())
+        }
+    }
+
+    pub fn to_certificate_request(&self) -> Result<PayloadCertificateRequest, FormatError> {
+        if self.payload_type == PayloadType::CERTIFICATE_REQUEST {
+            PayloadCertificateRequest::from_payload(self.data)
+        } else {
+            Err("Payload type is not CERTIFICATE_REQUEST".into())
+        }
+    }
+
+    pub fn to_authentication(&self) -> Result<PayloadAuthentication, FormatError> {
+        if self.payload_type == PayloadType::AUTHENTICATION {
+            PayloadAuthentication::from_payload(self.data)
+        } else {
+            Err("Payload type is not AUTHENTICATION".into())
         }
     }
 
@@ -1148,6 +1225,213 @@ impl<'a> PayloadKeyExchange<'a> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct IdentificationType(u8);
+
+impl IdentificationType {
+    pub const ID_IPV4_ADDR: IdentificationType = IdentificationType(1);
+    pub const ID_FQDN: IdentificationType = IdentificationType(2);
+    pub const ID_RFC822_ADDR: IdentificationType = IdentificationType(3);
+    pub const ID_IPV6_ADDR: IdentificationType = IdentificationType(5);
+    pub const ID_DER_ASN1_DN: IdentificationType = IdentificationType(9);
+    pub const ID_DER_ASN1_GN: IdentificationType = IdentificationType(10);
+    pub const ID_KEY_ID: IdentificationType = IdentificationType(11);
+
+    fn from_u8(value: u8) -> IdentificationType {
+        IdentificationType(value)
+    }
+
+    pub fn type_id(&self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for IdentificationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::ID_IPV4_ADDR => write!(f, "ID_IPV4_ADDR")?,
+            Self::ID_FQDN => write!(f, "ID_FQDN")?,
+            Self::ID_RFC822_ADDR => write!(f, "ID_RFC822_ADDR")?,
+            Self::ID_IPV6_ADDR => write!(f, "ID_IPV6_ADDR")?,
+            Self::ID_DER_ASN1_DN => write!(f, "ID_DER_ASN1_DN")?,
+            Self::ID_DER_ASN1_GN => write!(f, "ID_DER_ASN1_GN")?,
+            Self::ID_KEY_ID => write!(f, "ID_KEY_ID")?,
+            _ => write!(f, "Unknown Identification Type {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+pub struct PayloadIdentification<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> PayloadIdentification<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadIdentification<'a>, FormatError> {
+        if data.len() < 4 {
+            debug!("Not enough data in identification payload");
+            Err("Not enough data in identification payload".into())
+        } else {
+            Ok(PayloadIdentification { data })
+        }
+    }
+
+    pub fn read_identification_type(&self) -> IdentificationType {
+        IdentificationType::from_u8(self.data[0])
+    }
+
+    pub fn raw_value(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn read_value(&self) -> &[u8] {
+        &self.data[4..]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CertificateEncoding(u8);
+
+impl CertificateEncoding {
+    pub const PKCS7: CertificateEncoding = CertificateEncoding(1);
+    pub const PGP: CertificateEncoding = CertificateEncoding(2);
+    pub const DNS_SIGNED_KEY: CertificateEncoding = CertificateEncoding(3);
+    pub const X509_SIGNATURE: CertificateEncoding = CertificateEncoding(4);
+    pub const KERBEROS_TOKEN: CertificateEncoding = CertificateEncoding(6);
+    pub const CRL: CertificateEncoding = CertificateEncoding(7);
+    pub const ARL: CertificateEncoding = CertificateEncoding(8);
+    pub const SPKI: CertificateEncoding = CertificateEncoding(9);
+    pub const X509_ATTRIBUTE: CertificateEncoding = CertificateEncoding(10);
+    pub const DEPRECATED_RAW_RSA: CertificateEncoding = CertificateEncoding(11);
+    pub const HASH_URL_X509_CERTIFICATE: CertificateEncoding = CertificateEncoding(12);
+    pub const HASH_URL_X509_BUNDLE: CertificateEncoding = CertificateEncoding(13);
+
+    fn from_u8(value: u8) -> CertificateEncoding {
+        CertificateEncoding(value)
+    }
+}
+
+impl fmt::Display for CertificateEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::PKCS7 => write!(f, "PKCS #7 wrapped X.509 certificate")?,
+            Self::PGP => write!(f, "PGP Certificate")?,
+            Self::DNS_SIGNED_KEY => write!(f, "DNS Signed Key")?,
+            Self::X509_SIGNATURE => write!(f, "X.509 Certificate - Signature")?,
+            Self::KERBEROS_TOKEN => write!(f, "Kerberos Token")?,
+            Self::CRL => write!(f, "Certificate Revocation List (CRL)")?,
+            Self::ARL => write!(f, "Authority Revocation List (ARL)")?,
+            Self::SPKI => write!(f, "SPKI Certificate")?,
+            Self::X509_ATTRIBUTE => write!(f, "X.509 Certificate - Attribute")?,
+            Self::DEPRECATED_RAW_RSA => write!(f, "Deprecated (was Raw RSA Key)")?,
+            Self::HASH_URL_X509_CERTIFICATE => write!(f, "Hash and URL of X.509 certificate")?,
+            Self::HASH_URL_X509_BUNDLE => write!(f, "Hash and URL of X.509 bundle")?,
+            _ => write!(f, "Unknown Certificate Encoding {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+pub struct PayloadCertificate<'a> {
+    encoding: CertificateEncoding,
+    data: &'a [u8],
+}
+
+impl<'a> PayloadCertificate<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadCertificate<'a>, FormatError> {
+        if data.len() < 1 {
+            debug!("Not enough data in certificate payload");
+            return Err("Not enough data in certificate payload".into());
+        }
+
+        let encoding = CertificateEncoding::from_u8(data[0]);
+
+        Ok(PayloadCertificate {
+            encoding,
+            data: &data[1..],
+        })
+    }
+
+    pub fn encoding(&self) -> CertificateEncoding {
+        self.encoding
+    }
+
+    pub fn read_value(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+pub struct PayloadCertificateRequest<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> PayloadCertificateRequest<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadCertificateRequest<'a>, FormatError> {
+        if data.len() < 1 {
+            debug!("Not enough data in certificate request payload");
+            Err("Not enough data in certificate request payload".into())
+        } else {
+            Ok(PayloadCertificateRequest { data })
+        }
+    }
+
+    pub fn read_encoding(&self) -> CertificateEncoding {
+        CertificateEncoding::from_u8(self.data[0])
+    }
+
+    pub fn read_value(&self) -> &[u8] {
+        &self.data[1..]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuthMethod(u8);
+
+impl AuthMethod {
+    pub const RSA_DIGITAL_SIGNATURE: AuthMethod = AuthMethod(1);
+    pub const SHARED_MESSAGE_INTEGRITY_CODE: AuthMethod = AuthMethod(2);
+    pub const DSS_DIGITAL_SIGNATURE: AuthMethod = AuthMethod(3);
+
+    fn from_u8(value: u8) -> AuthMethod {
+        AuthMethod(value)
+    }
+}
+
+impl fmt::Display for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::RSA_DIGITAL_SIGNATURE => write!(f, "RSA Digital Signature")?,
+            Self::SHARED_MESSAGE_INTEGRITY_CODE => write!(f, "Shared Key Message Integrity Code")?,
+            Self::DSS_DIGITAL_SIGNATURE => write!(f, "DSS Digital Signature")?,
+            _ => write!(f, "Unknown Authentication Method {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+pub struct PayloadAuthentication<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> PayloadAuthentication<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadAuthentication<'a>, FormatError> {
+        if data.len() < 1 {
+            debug!("Not enough data in authentication payload");
+            return Err("Not enough data in certificate payload".into());
+        }
+
+        Ok(PayloadAuthentication { data })
+    }
+
+    pub fn read_method(&self) -> AuthMethod {
+        AuthMethod::from_u8(self.data[0])
+    }
+
+    pub fn read_value(&self) -> &[u8] {
+        &self.data[4..]
+    }
+}
+
 pub struct PayloadNonce<'a> {
     data: &'a [u8],
 }
@@ -1366,6 +1650,35 @@ impl fmt::Debug for Payload<'_> {
                 "    DH Group num {} value {:?}",
                 pl_kex.read_group_num(),
                 pl_kex.read_value()
+            )?;
+        } else if let Ok(pl_id) = self.to_identification() {
+            let identification_type = pl_id.read_identification_type();
+            writeln!(
+                f,
+                "    Identification type {} value {:?}",
+                identification_type,
+                pl_id.read_value()
+            )?;
+        } else if let Ok(pl_cert) = self.to_certificate() {
+            writeln!(
+                f,
+                "    Certificate format {} data {:?}",
+                pl_cert.encoding(),
+                pl_cert.read_value()
+            )?;
+        } else if let Ok(pl_certreq) = self.to_certificate_request() {
+            writeln!(
+                f,
+                "    Certificate request format {} data {:?}",
+                pl_certreq.read_encoding(),
+                pl_certreq.read_value()
+            )?;
+        } else if let Ok(pl_auth) = self.to_authentication() {
+            writeln!(
+                f,
+                "    Authentication method {} data {:?}",
+                pl_auth.read_method(),
+                pl_auth.read_value()
             )?;
         } else if let Ok(pl_nonce) = self.to_nonce() {
             writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
