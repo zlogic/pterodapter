@@ -29,7 +29,7 @@ Options:\
 
 impl Args {
     fn parse() -> Args {
-        let fail_with_error = |name: &str, value: &str, err: fmt::Arguments| -> () {
+        let fail_with_error = |name: &str, value: &str, err: fmt::Arguments| {
             eprintln!(
                 "Argument {} has an unsupported value {}: {}",
                 name, value, err

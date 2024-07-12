@@ -19,12 +19,12 @@ impl PkiProcessing {
         server_cert: Option<(&str, &str)>,
     ) -> Result<PkiProcessing, CertError> {
         let client_validation = if let Some(root_ca) = root_ca {
-            Some(ClientValidation::new(&root_ca)?)
+            Some(ClientValidation::new(root_ca)?)
         } else {
             None
         };
         let server_identity = if let Some((public_cert, private_key)) = server_cert {
-            Some(ServerIdentity::new(&public_cert, &private_key)?)
+            Some(ServerIdentity::new(public_cert, private_key)?)
         } else {
             None
         };
@@ -76,9 +76,7 @@ impl PkiProcessing {
     }
 
     pub fn server_id(&self) -> Option<&[u8]> {
-        self.server_id
-            .as_ref()
-            .map(|server_id| server_id.as_slice())
+        self.server_id.as_deref()
     }
 
     pub fn verify_client_cert(
@@ -159,7 +157,7 @@ pub struct ClientCertificate {
 
 impl ClientCertificate {
     pub fn subject(&self) -> Option<&str> {
-        self.subject.as_ref().map(|subject| subject.as_str())
+        self.subject.as_deref()
     }
 
     pub fn verify_signature(&self, msg: &[u8], signature: &[u8]) -> Result<(), CertError> {

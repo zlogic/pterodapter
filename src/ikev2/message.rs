@@ -77,14 +77,14 @@ impl fmt::Display for Flags {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SPI {
+pub enum Spi {
     None,
     U32(u32),
     U64(u64),
 }
 
-impl SPI {
-    fn from_slice(spi: &[u8]) -> Result<SPI, FormatError> {
+impl Spi {
+    fn from_slice(spi: &[u8]) -> Result<Spi, FormatError> {
         if spi.len() == 4 {
             let mut value = [0u8; 4];
             value.copy_from_slice(spi);
@@ -120,7 +120,7 @@ impl SPI {
     }
 }
 
-impl fmt::Display for SPI {
+impl fmt::Display for Spi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::None => Ok(()),
@@ -130,7 +130,7 @@ impl fmt::Display for SPI {
     }
 }
 
-impl fmt::Debug for SPI {
+impl fmt::Debug for Spi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
@@ -277,7 +277,7 @@ impl InputMessage<'_> {
     }
 
     pub fn raw_data(&self) -> &[u8] {
-        &self.data
+        self.data
     }
 }
 
@@ -656,7 +656,7 @@ impl<'a> Iterator for PayloadIter<'a> {
         }
         let current_payload = self.next_payload;
         let start_offset = self.start_offset;
-        let data = &self.data[..];
+        let data = self.data;
         let next_payload = self.data[0];
         self.next_payload = next_payload;
         let payload_flags = self.data[1];
@@ -838,7 +838,7 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             debug!("Proposal overflow");
             return None;
         }
-        let data = &self.data[..];
+        let data = self.data;
         self.data = &self.data[proposal_length..];
         let proposal_num = data[4];
         if proposal_num != self.next_proposal_num {
@@ -863,7 +863,7 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             return None;
         }
         let spi = &data[8..8 + spi_size];
-        let spi = match SPI::from_slice(spi) {
+        let spi = match Spi::from_slice(spi) {
             Ok(spi) => spi,
             Err(_) => {
                 return Some(Err("Unsupported SPI format".into()));
@@ -884,7 +884,7 @@ pub struct SecurityAssociationProposal<'a> {
     proposal_num: u8,
     protocol_id: IPSecProtocolID,
     num_transforms: usize,
-    spi: SPI,
+    spi: Spi,
     data: &'a [u8],
 }
 
@@ -904,7 +904,7 @@ impl<'a> SecurityAssociationProposal<'a> {
         self.protocol_id
     }
 
-    pub fn spi(&self) -> SPI {
+    pub fn spi(&self) -> Spi {
         self.spi
     }
 }
@@ -1087,7 +1087,7 @@ impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
             debug!("Transform overflow");
             return None;
         }
-        let data = &self.data[..];
+        let data = self.data;
         self.data = &self.data[transform_length..];
         if self.num_transforms == 0 && !self.data.is_empty() {
             debug!("Packet has unaccounted transforms");
@@ -1302,7 +1302,7 @@ impl<'a> PayloadIdentification<'a> {
     }
 
     pub fn raw_value(&self) -> &[u8] {
-        &self.data
+        self.data
     }
 
     pub fn read_value(&self) -> &[u8] {
@@ -1360,7 +1360,7 @@ pub struct PayloadCertificate<'a> {
 
 impl<'a> PayloadCertificate<'a> {
     fn from_payload(data: &'a [u8]) -> Result<PayloadCertificate<'a>, FormatError> {
-        if data.len() < 1 {
+        if data.is_empty() {
             debug!("Not enough data in certificate payload");
             return Err("Not enough data in certificate payload".into());
         }
@@ -1378,7 +1378,7 @@ impl<'a> PayloadCertificate<'a> {
     }
 
     pub fn read_value(&self) -> &[u8] {
-        &self.data
+        self.data
     }
 }
 
@@ -1388,7 +1388,7 @@ pub struct PayloadCertificateRequest<'a> {
 
 impl<'a> PayloadCertificateRequest<'a> {
     fn from_payload(data: &'a [u8]) -> Result<PayloadCertificateRequest<'a>, FormatError> {
-        if data.len() < 1 {
+        if data.is_empty() {
             debug!("Not enough data in certificate request payload");
             Err("Not enough data in certificate request payload".into())
         } else {
@@ -1436,7 +1436,7 @@ pub struct PayloadAuthentication<'a> {
 
 impl<'a> PayloadAuthentication<'a> {
     fn from_payload(data: &'a [u8]) -> Result<PayloadAuthentication<'a>, FormatError> {
-        if data.len() < 1 {
+        if data.is_empty() {
             debug!("Not enough data in authentication payload");
             return Err("Not enough data in certificate payload".into());
         }
@@ -1757,7 +1757,7 @@ impl<'a> Iterator for TrafficSelectorIter<'a> {
             return None;
         }
 
-        let data = &self.data[..];
+        let data = self.data;
         self.data = &self.data[selector_length..];
         self.num_selectors = self.num_selectors.saturating_sub(1);
         let ts_type = match TrafficSelectorType::from_u8(data[0]) {
@@ -1921,7 +1921,7 @@ impl<'a> Iterator for ConfigurationAttributesIter<'a> {
             debug!("Attribute overflow");
             return None;
         }
-        let data = &self.data[..];
+        let data = self.data;
         self.data = &self.data[4 + attribute_length..];
 
         let mut attribute_type = [0u8; 2];

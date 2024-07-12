@@ -35,24 +35,19 @@ pub struct TransformParameters {
     dh: Option<Transform>,
     esn: Option<Transform>,
     protocol_id: message::IPSecProtocolID,
-    spi: message::SPI,
+    spi: message::Spi,
 }
 
 impl TransformParameters {
     pub fn create_dh(&self) -> Result<DHTransformType, InitError> {
-        DHTransformType::init(
-            self.dh
-                .as_ref()
-                .ok_or_else(|| "DH not configured")?
-                .transform_type,
-        )
+        DHTransformType::init(self.dh.as_ref().ok_or("DH not configured")?.transform_type)
     }
 
     pub fn create_prf(&self, key: &[u8]) -> Result<PseudorandomTransform, InitError> {
         PseudorandomTransform::init(
             self.prf
                 .as_ref()
-                .ok_or_else(|| "PRF not configured")?
+                .ok_or("PRF not configured")?
                 .transform_type,
             key,
         )
@@ -62,7 +57,7 @@ impl TransformParameters {
         self.protocol_id
     }
 
-    pub fn spi(&self) -> message::SPI {
+    pub fn spi(&self) -> message::Spi {
         self.spi
     }
 
@@ -147,8 +142,8 @@ impl<'a> Iterator for TransformParametersIter<'a> {
     }
 }
 
-pub fn choose_sa_parameters<'a>(
-    sa: &'a message::PayloadSecurityAssociation,
+pub fn choose_sa_parameters(
+    sa: &message::PayloadSecurityAssociation,
 ) -> Option<(TransformParameters, u8)> {
     sa.iter_proposals()
         .flat_map(|prop| {
@@ -553,7 +548,7 @@ impl PseudorandomTransform {
                     }
                     // Following T-chunks.
                     next_data[0..hash.len()].copy_from_slice(&hash);
-                    next_data[hash.len()..hash.len() + data.len()].copy_from_slice(&data);
+                    next_data[hash.len()..hash.len() + data.len()].copy_from_slice(data);
                     next_data[hash.len() + data.len()] = t + 1;
                     let mut signer = new_hmac_sha256(key).map_err(|err| {
                         debug!("Failed to init SHA256 HMAC signer: {}", err);
@@ -785,7 +780,7 @@ impl CryptoStack {
         let enc = params
             .enc
             .as_ref()
-            .ok_or_else(|| "Undefined encryption parameters")?;
+            .ok_or("Undefined encryption parameters")?;
         let auth = params
             .auth
             .as_ref()
@@ -793,7 +788,7 @@ impl CryptoStack {
         let prf = params
             .prf
             .as_ref()
-            .ok_or_else(|| "Undefined pseudorandom transform parameters")?
+            .ok_or("Undefined pseudorandom transform parameters")?
             .transform_type;
         Ok(CryptoStack {
             derive_key,
@@ -817,9 +812,9 @@ impl CryptoStack {
             + self.auth_responder.signature_length()
     }
 
-    pub fn encrypt_data<'a>(
+    pub fn encrypt_data(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<(), CryptoError> {
@@ -841,7 +836,7 @@ impl CryptoStack {
         let decrypted_slice = if decrypted_slice.len() >= padding_length {
             &decrypted_slice[..decrypted_slice.len() - padding_length]
         } else {
-            &decrypted_slice
+            decrypted_slice
         };
         Ok(decrypted_slice)
     }
@@ -864,9 +859,9 @@ impl CryptoStack {
 }
 
 pub trait Encryption {
-    fn encrypt<'a>(
+    fn encrypt(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<(), CryptoError>;
@@ -918,9 +913,9 @@ impl EncryptionType {
         }
     }
 
-    fn encrypt<'a>(
+    fn encrypt(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<(), CryptoError> {
@@ -948,7 +943,7 @@ pub struct EncryptionAesCbc256 {
 }
 
 impl Encryption for EncryptionAesCbc256 {
-    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize, _: &[u8]) -> Result<(), CryptoError> {
+    fn encrypt(&self, data: &mut [u8], msg_len: usize, _: &[u8]) -> Result<(), CryptoError> {
         let aes_cbc_cipher = cipher::Cipher::aes_256_cbc();
         let mut ctx = cipher_ctx::CipherCtx::new().map_err(|err| {
             debug!("Failed to init cipher context: {}", err);
@@ -968,7 +963,7 @@ impl Encryption for EncryptionAesCbc256 {
             debug!("Failed to generate IV for AES CBC 256: {}", err);
             "Failed to generate IV for AES CBC 256"
         })?;
-        ctx.encrypt_init(Some(&aes_cbc_cipher), Some(&self.cipher_key), Some(iv))
+        ctx.encrypt_init(Some(aes_cbc_cipher), Some(&self.cipher_key), Some(iv))
             .map_err(|err| {
                 debug!("Failed to init AES CBC 256 encryptor: {}", err);
                 "Failed to init AES CBC 256 encryptor"
@@ -1006,7 +1001,7 @@ impl Encryption for EncryptionAesCbc256 {
             return Err("Message length is too short".into());
         }
         let iv = &data[..iv_size];
-        ctx.decrypt_init(Some(&aes_cbc_cipher), Some(&self.cipher_key), Some(iv))
+        ctx.decrypt_init(Some(aes_cbc_cipher), Some(&self.cipher_key), Some(iv))
             .map_err(|err| {
                 debug!("Failed to init AES CBC 256 decryptor: {}", err);
                 "Failed to init AES CBC 256 decryptor"
@@ -1044,9 +1039,9 @@ pub struct EncryptionAesGcm256 {
 }
 
 impl Encryption for EncryptionAesGcm256 {
-    fn encrypt<'a>(
+    fn encrypt(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<(), CryptoError> {
@@ -1072,7 +1067,7 @@ impl Encryption for EncryptionAesGcm256 {
             debug!("Failed to init cipher context: {}", err);
             "Failed to init cipher context"
         })?;
-        match ctx.encrypt_init(Some(&aes_gcm_cipher), Some(&self.cipher_key), Some(&nonce)) {
+        match ctx.encrypt_init(Some(aes_gcm_cipher), Some(&self.cipher_key), Some(&nonce)) {
             Ok(dec) => dec,
             Err(err) => {
                 debug!("Failed to init AES GCM 16 256: {}", err);
@@ -1122,7 +1117,7 @@ impl Encryption for EncryptionAesGcm256 {
             debug!("Failed to init cipher context: {}", err);
             "Failed to init cipher context"
         })?;
-        ctx.decrypt_init(Some(&aes_gcm_cipher), Some(&self.cipher_key), Some(&nonce))
+        ctx.decrypt_init(Some(aes_gcm_cipher), Some(&self.cipher_key), Some(&nonce))
             .map_err(|err| {
                 debug!("Failed to init AES GCM 16 256: {}", err);
                 "Failed to init AES GCM 16 256"
@@ -1164,7 +1159,7 @@ impl Encryption for EncryptionAesGcm256 {
 fn new_hmac_sha256(
     key: &pkey::PKey<pkey::Private>,
 ) -> Result<sign::Signer, openssl::error::ErrorStack> {
-    sign::Signer::new(hash::MessageDigest::sha256(), &key)
+    sign::Signer::new(hash::MessageDigest::sha256(), key)
 }
 
 pub fn hash_sha1(data: &[u8]) -> Result<[u8; 160 / 8], CryptoError> {

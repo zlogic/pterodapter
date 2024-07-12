@@ -46,8 +46,8 @@ pub struct Server {
 impl Server {
     pub fn new(config: Config) -> Result<Server, IKEv2Error> {
         let pki_processing = pki::PkiProcessing::new(
-            config.hostname.as_ref().map(|hostname| hostname.as_str()),
-            config.root_ca.as_ref().map(|root_ca| root_ca.as_str()),
+            config.hostname.as_deref(),
+            config.root_ca.as_deref(),
             config
                 .server_cert
                 .as_ref()
@@ -173,8 +173,8 @@ impl Sockets {
         send_to: &SocketAddr,
         data: &[u8],
     ) -> Result<(), IKEv2Error> {
-        match self.sockets.get(&send_from) {
-            Some(ref socket) => {
+        match self.sockets.get(send_from) {
+            Some(socket) => {
                 socket.send_to(data, send_to).await?;
                 Ok(())
             }
@@ -499,7 +499,7 @@ impl IKEv2Session {
         response.write_header(
             session_id.remote_spi,
             session_id.local_spi,
-            exchange_type.clone(),
+            exchange_type,
             false,
             request.read_message_id(),
         )?;
@@ -553,7 +553,7 @@ impl IKEv2Session {
         } else {
             return Err("Crypto parameters not initialized".into());
         };
-        let validate_slice = request.signature_data(&encrypted_payload, signature_length.is_some());
+        let validate_slice = request.signature_data(encrypted_payload, signature_length.is_some());
         let valid_signature = crypto_stack.validate_signature(validate_slice);
         if !valid_signature {
             return Err("Packet has invalid signature".into());
@@ -606,9 +606,9 @@ impl IKEv2Session {
             let (associated_data, encrypt_data) =
                 raw_data.split_at_mut(full_message_len - full_encrypted_length);
             let associated_data = if !add_signature {
-                associated_data.as_ref()
+                associated_data
             } else {
-                &[]
+                &mut [0u8; 0]
             };
 
             crypto_stack
@@ -715,7 +715,7 @@ impl IKEv2Session {
                         .copy_from_slice(nonce_remote);
                     prf_key_cursor += nonce_remote.len();
                     prf_key[prf_key_cursor..prf_key_cursor + nonce_local.len()]
-                        .copy_from_slice(&nonce_local);
+                        .copy_from_slice(nonce_local);
                     prf_key_cursor += nonce_local.len();
                     prf_key[prf_key_cursor..prf_key_cursor + 8]
                         .copy_from_slice(&session_id.remote_spi.to_be_bytes());
@@ -763,7 +763,7 @@ impl IKEv2Session {
                             continue;
                         }
                     };
-                    match prf_transform.create_crypto_stack(&params, &prf_key) {
+                    match prf_transform.create_crypto_stack(params, &prf_key) {
                         Ok(crypto_stack) => self.crypto_stack = Some(crypto_stack),
                         Err(err) => {
                             debug!("Failed to set up cryptography stack {}", err);
@@ -773,7 +773,7 @@ impl IKEv2Session {
                     };
                     let dest = response
                         .next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
-                    dest.copy_from_slice(&nonce_local);
+                    dest.copy_from_slice(nonce_local);
                 }
                 _ => {}
             }
@@ -877,19 +877,15 @@ impl IKEv2Session {
                 // TODO: return INVALID_SYNTAX notification.
                 continue;
             };
-            match payload.payload_type() {
-                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
-                    let encrypted_payload = payload.encrypted_data()?;
-                    // TODO: return AUTHENTICATION_FAILED notification on error.
-                    let decrypted_slice = self.process_encrypted_payload(
-                        request,
-                        &encrypted_payload,
-                        &mut decrypted_request,
-                    )?;
-                    decrypted_iter =
-                        Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
-                }
-                _ => {}
+            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
+                let encrypted_payload = payload.encrypted_data()?;
+                // TODO: return AUTHENTICATION_FAILED notification on error.
+                let decrypted_slice = self.process_encrypted_payload(
+                    request,
+                    &encrypted_payload,
+                    &mut decrypted_request,
+                )?;
+                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
             }
         }
 
@@ -1045,7 +1041,7 @@ impl IKEv2Session {
             {
                 let write_slice = response
                     .next_payload_slice(message::PayloadType::ID_RESPONDER, id_responder.len())?;
-                write_slice.copy_from_slice(&id_responder);
+                write_slice.copy_from_slice(id_responder);
             }
         }
 
@@ -1063,7 +1059,7 @@ impl IKEv2Session {
             responder_signed[ctx.message_responder.len()
                 ..ctx.message_responder.len() + ctx.nonce_initiator.len()]
                 .copy_from_slice(&ctx.nonce_initiator);
-            match crypto_stack.authenticate_id_responder(&id_responder) {
+            match crypto_stack.authenticate_id_responder(id_responder) {
                 Ok(signature) => responder_signed
                     [ctx.message_responder.len() + ctx.nonce_initiator.len()..responder_signed_len]
                     .copy_from_slice(&signature),
@@ -1119,18 +1115,14 @@ impl IKEv2Session {
                 // TODO: return INVALID_SYNTAX notification.
                 continue;
             };
-            match payload.payload_type() {
-                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
-                    let encrypted_payload = payload.encrypted_data()?;
-                    let decrypted_slice = self.process_encrypted_payload(
-                        request,
-                        &encrypted_payload,
-                        &mut decrypted_data,
-                    )?;
-                    decrypted_iter =
-                        Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
-                }
-                _ => {}
+            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
+                let encrypted_payload = payload.encrypted_data()?;
+                let decrypted_slice = self.process_encrypted_payload(
+                    request,
+                    &encrypted_payload,
+                    &mut decrypted_data,
+                )?;
+                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
             }
         }
 
@@ -1173,7 +1165,7 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     src_data[16 + addr_len..16 + addr_len + 2].copy_from_slice(&port.to_be_bytes());
     let src_data = &src_data[..16 + addr_len + 2];
 
-    crypto::hash_sha1(&src_data).unwrap_or([0u8; 20])
+    crypto::hash_sha1(src_data).unwrap_or([0u8; 20])
 }
 
 #[derive(Debug)]
