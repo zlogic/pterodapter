@@ -1,6 +1,5 @@
 use log::{debug, info, warn};
 use rand::Rng;
-use sha1::{Digest, Sha1};
 use std::{
     collections::{self, HashMap},
     error, fmt,
@@ -691,8 +690,7 @@ impl IKEv2Session {
                                 continue;
                             }
                         };
-                        response
-                            .write_key_exchange_payload(dh.group_number(), public_key.as_slice())?;
+                        response.write_key_exchange_payload(dh.group_number(), public_key)?;
                     }
                 }
                 message::PayloadType::NONCE => {
@@ -749,7 +747,14 @@ impl IKEv2Session {
                         // TODO: return INVALID_SYNTAX notification.
                         continue;
                     };
-                    let skeyseed = prf_transform.prf(shared_secret.as_slice());
+                    let skeyseed = match prf_transform.prf(shared_secret.as_slice()) {
+                        Ok(skeyseed) => skeyseed,
+                        Err(err) => {
+                            debug!("Failed to create SKEYSEED for keying material {}", err);
+                            // TODO: return INVALID_SYNTAX notification.
+                            continue;
+                        }
+                    };
                     let prf_transform = match params.create_prf(skeyseed.as_slice()) {
                         Ok(prf) => prf,
                         Err(err) => {
@@ -998,11 +1003,17 @@ impl IKEv2Session {
         initiator_signed
             [ctx.message_initiator.len()..ctx.message_initiator.len() + ctx.nonce_responder.len()]
             .copy_from_slice(&ctx.nonce_responder);
-        crypto_stack.authenticate_id_initiator(
-            &id_initiator,
-            &mut initiator_signed
-                [ctx.message_initiator.len() + ctx.nonce_responder.len()..initiator_signed_len],
-        );
+        match crypto_stack.authenticate_id_initiator(&id_initiator) {
+            Ok(signature) => initiator_signed
+                [ctx.message_initiator.len() + ctx.nonce_responder.len()..initiator_signed_len]
+                .copy_from_slice(&signature),
+            Err(_) => {
+                return self.process_auth_failed_response(
+                    response,
+                    "Failed to prepare initiator message to verify signature".into(),
+                )
+            }
+        }
         if let Err(err) =
             client_cert.verify_signature(&initiator_signed[..initiator_signed_len], &client_auth)
         {
@@ -1011,7 +1022,7 @@ impl IKEv2Session {
         }
 
         // At this point the client identity has been successfully verified, proceed with sending a successful response.
-        self.user_id = Some(client_cert.subject().into());
+        self.user_id = client_cert.subject().map(|subject| subject.to_string());
         self.state = SessionState::Established;
         response.start_encrypted_payload()?;
         if let Some(id_responder) = self.pki_processing.server_id() {
@@ -1035,11 +1046,17 @@ impl IKEv2Session {
             responder_signed[ctx.message_responder.len()
                 ..ctx.message_responder.len() + ctx.nonce_initiator.len()]
                 .copy_from_slice(&ctx.nonce_initiator);
-            crypto_stack.authenticate_id_responder(
-                &id_responder,
-                &mut responder_signed
-                    [ctx.message_responder.len() + ctx.nonce_initiator.len()..responder_signed_len],
-            );
+            match crypto_stack.authenticate_id_responder(&id_responder) {
+                Ok(signature) => responder_signed
+                    [ctx.message_responder.len() + ctx.nonce_initiator.len()..responder_signed_len]
+                    .copy_from_slice(&signature),
+                Err(_) => {
+                    return self.process_auth_failed_response(
+                        response,
+                        "Failed to prepare responder message to sign".into(),
+                    )
+                }
+            }
 
             let write_slice = response.write_authentication_payload_slice(
                 message::AuthMethod::RSA_DIGITAL_SIGNATURE,
@@ -1142,9 +1159,7 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     src_data[16 + addr_len..16 + addr_len + 2].copy_from_slice(&port.to_be_bytes());
     let src_data = &src_data[..16 + addr_len + 2];
 
-    let mut hasher = Sha1::new();
-    hasher.update(src_data);
-    hasher.finalize().into()
+    crypto::hash_sha1(&src_data).unwrap_or([0u8; 20])
 }
 
 #[derive(Debug)]
