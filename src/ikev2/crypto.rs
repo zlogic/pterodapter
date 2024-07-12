@@ -97,6 +97,7 @@ impl TransformParameters {
         match self.auth {
             Some(ref auth) => match auth.transform_type {
                 message::TransformType::AUTH_HMAC_SHA2_256_128 => 256,
+                message::TransformType::AUTH_HMAC_SHA1_96 => 160,
                 _ => 0,
             },
             None => 0,
@@ -106,6 +107,7 @@ impl TransformParameters {
     pub fn auth_signature_length(&self) -> Option<usize> {
         match self.auth.as_ref()?.transform_type {
             message::TransformType::AUTH_HMAC_SHA2_256_128 => Some(128),
+            message::TransformType::AUTH_HMAC_SHA1_96 => Some(96),
             _ => None,
         }
     }
@@ -222,6 +224,7 @@ pub fn choose_sa_parameters<'a>(
                     message::TransformType::AUTH_HMAC_SHA2_256_128 => {
                         parameters.auth = Some(transform)
                     }
+                    message::TransformType::AUTH_HMAC_SHA1_96 => parameters.auth = Some(transform),
                     message::TransformType::DH_1024_MODP => parameters.dh = Some(transform),
                     _ => return false,
                 }
@@ -240,15 +243,15 @@ pub fn choose_sa_parameters<'a>(
             }
             // Windows compatibility.
             if enc.transform_type == message::TransformType::ENCR_AES_CBC
-                && (enc.key_length? != 256
-                    || parameters.auth.as_ref()?.transform_type
-                        != message::TransformType::AUTH_HMAC_SHA2_256_128)
+                && (enc.key_length? != 256 || parameters.auth.is_none())
             {
                 return None;
             }
 
-            parameters.prf.as_ref()?;
-            parameters.dh.as_ref()?;
+            if parameters.protocol_id == message::IPSecProtocolID::IKE {
+                parameters.prf.as_ref()?;
+                parameters.dh.as_ref()?;
+            }
 
             Some((parameters, prop.proposal_num()))
         })
@@ -610,7 +613,8 @@ impl DerivedKeys {
 
 enum Auth {
     None,
-    HmacSha256tr128(pkey::PKey<pkey::Private>),
+    HmacSha256tr128(AuthHmacSha256tr128),
+    HmacSha1tr96(AuthHmacSha1tr96),
 }
 
 impl Auth {
@@ -621,7 +625,14 @@ impl Auth {
                     debug!("Failed to init SHA256-128 HMAC key: {}", err);
                     "Failed to init SHA256-128 HMAC key"
                 })?;
-                Ok(Self::HmacSha256tr128(key))
+                Ok(Self::HmacSha256tr128(AuthHmacSha256tr128 { key }))
+            }
+            Some(message::TransformType::AUTH_HMAC_SHA1_96) => {
+                let key = pkey::PKey::hmac(key).map_err(|err| {
+                    debug!("Failed to init SHA1-96 HMAC key: {}", err);
+                    "Failed to init SHA1-96 HMAC key"
+                })?;
+                Ok(Self::HmacSha1tr96(AuthHmacSha1tr96 { key }))
             }
             None => Ok(Self::None),
             _ => Err("Unsupported PRF".into()),
@@ -630,60 +641,130 @@ impl Auth {
 
     pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
         match self {
-            Self::HmacSha256tr128(ref key) => {
-                let signature_length = self.signature_length();
-                if data.len() < signature_length {
-                    return Err("Not enough space to add signature".into());
-                }
-                let data_length = data.len() - signature_length;
-                let hash = {
-                    let sign_data = &data[..data_length];
-                    let mut signer = new_hmac_sha256(key).map_err(|err| {
-                        debug!("Failed to init SHA256-128 HMAC signer: {}", err);
-                        "Failed to init SHA256-128 HMAC signer"
-                    })?;
-                    signer.sign_oneshot_to_vec(sign_data).map_err(|err| {
-                        debug!("Failed to sign data with SHA256-128 HMAC: {}", err);
-                        "Failed to sign data with SHA256-128 HMAC"
-                    })?
-                };
-                let dest = &mut data[data_length..];
-                dest.copy_from_slice(&hash[..signature_length]);
-                Ok(())
-            }
+            Self::HmacSha256tr128(ref auth) => auth.sign(data),
+            Self::HmacSha1tr96(ref auth) => auth.sign(data),
             Self::None => Ok(()),
         }
     }
 
     pub fn validate(&self, data: &[u8]) -> bool {
         match self {
-            Self::HmacSha256tr128(ref key) => {
-                let signature_length = self.signature_length();
-                if data.len() < signature_length {
-                    return false;
-                }
-                let received_signature = &data[data.len() - signature_length..];
-                let data = &data[..data.len() - signature_length];
-                let mut signer = if let Ok(signer) = new_hmac_sha256(key) {
-                    signer
-                } else {
-                    return false;
-                };
-                let mut hash = [0u8; 256 / 8];
-                if signer.sign_oneshot(&mut hash, data).is_err() {
-                    return false;
-                };
-                &hash[..signature_length] == received_signature
-            }
+            Self::HmacSha256tr128(ref auth) => auth.validate(data),
+            Self::HmacSha1tr96(ref auth) => auth.validate(data),
             Self::None => true,
         }
     }
 
     pub fn signature_length(&self) -> usize {
         match self {
-            Self::HmacSha256tr128(_) => 128 / 8,
+            Self::HmacSha256tr128(ref auth) => auth.signature_length(),
+            Self::HmacSha1tr96(ref auth) => auth.signature_length(),
             Self::None => 0,
         }
+    }
+}
+
+struct AuthHmacSha256tr128 {
+    key: pkey::PKey<pkey::Private>,
+}
+
+impl AuthHmacSha256tr128 {
+    pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
+        let signature_length = self.signature_length();
+        if data.len() < signature_length {
+            return Err("Not enough space to add signature".into());
+        }
+        let data_length = data.len() - signature_length;
+        let hash = {
+            let sign_data = &data[..data_length];
+            let mut signer = new_hmac_sha256(&self.key).map_err(|err| {
+                debug!("Failed to init SHA256-128 HMAC signer: {}", err);
+                "Failed to init SHA256-128 HMAC signer"
+            })?;
+            signer.sign_oneshot_to_vec(sign_data).map_err(|err| {
+                debug!("Failed to sign data with SHA256-128 HMAC: {}", err);
+                "Failed to sign data with SHA256-128 HMAC"
+            })?
+        };
+        let dest = &mut data[data_length..];
+        dest.copy_from_slice(&hash[..signature_length]);
+        Ok(())
+    }
+
+    pub fn validate(&self, data: &[u8]) -> bool {
+        let signature_length = self.signature_length();
+        if data.len() < signature_length {
+            return false;
+        }
+        let received_signature = &data[data.len() - signature_length..];
+        let data = &data[..data.len() - signature_length];
+        let mut signer = if let Ok(signer) = new_hmac_sha256(&self.key) {
+            signer
+        } else {
+            return false;
+        };
+        let mut hash = [0u8; 256 / 8];
+        if signer.sign_oneshot(&mut hash, data).is_err() {
+            return false;
+        };
+        &hash[..signature_length] == received_signature
+    }
+
+    pub fn signature_length(&self) -> usize {
+        128 / 8
+    }
+}
+
+struct AuthHmacSha1tr96 {
+    key: pkey::PKey<pkey::Private>,
+}
+
+impl AuthHmacSha1tr96 {
+    pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
+        let signature_length = self.signature_length();
+        if data.len() < signature_length {
+            return Err("Not enough space to add signature".into());
+        }
+        let data_length = data.len() - signature_length;
+        let hash = {
+            let sign_data = &data[..data_length];
+            let mut signer =
+                sign::Signer::new(hash::MessageDigest::sha1(), &self.key).map_err(|err| {
+                    debug!("Failed to init SHA1-96 HMAC signer: {}", err);
+                    "Failed to init SHA1-96 HMAC signer"
+                })?;
+            signer.sign_oneshot_to_vec(sign_data).map_err(|err| {
+                debug!("Failed to sign data with SHA1-96 HMAC: {}", err);
+                "Failed to sign data with SHA1-96 HMAC"
+            })?
+        };
+        let dest = &mut data[data_length..];
+        dest.copy_from_slice(&hash[..signature_length]);
+        Ok(())
+    }
+
+    pub fn validate(&self, data: &[u8]) -> bool {
+        let signature_length = self.signature_length();
+        if data.len() < signature_length {
+            return false;
+        }
+        let received_signature = &data[data.len() - signature_length..];
+        let data = &data[..data.len() - signature_length];
+        let mut signer =
+            if let Ok(signer) = sign::Signer::new(hash::MessageDigest::sha1(), &self.key) {
+                signer
+            } else {
+                return false;
+            };
+        let mut hash = [0u8; 160 / 8];
+        if signer.sign_oneshot(&mut hash, data).is_err() {
+            return false;
+        };
+        &hash[..signature_length] == received_signature
+    }
+
+    pub fn signature_length(&self) -> usize {
+        96 / 8
     }
 }
 

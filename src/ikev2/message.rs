@@ -1,4 +1,7 @@
-use std::{error, fmt};
+use std::{
+    error, fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use log::debug;
 
@@ -597,6 +600,24 @@ impl Payload<'_> {
         }
     }
 
+    fn to_traffic_selector(&self) -> Result<PayloadTrafficSelector, FormatError> {
+        if self.payload_type == PayloadType::TRAFFIC_SELECTOR_INITIATOR
+            || self.payload_type == PayloadType::TRAFFIC_SELECTOR_RESPONDER
+        {
+            PayloadTrafficSelector::from_payload(self.data)
+        } else {
+            Err("Payload type is not TRAFFIC_SELECTOR".into())
+        }
+    }
+
+    fn to_configuration(&self) -> Result<PayloadConfiguration, FormatError> {
+        if self.payload_type == PayloadType::CONFIGURATION {
+            PayloadConfiguration::from_payload(self.data)
+        } else {
+            Err("Payload type is not CONFIGURATION".into())
+        }
+    }
+
     pub fn encrypted_data(&self) -> Result<EncryptedMessage, FormatError> {
         if self.payload_type == PayloadType::ENCRYPTED_AND_AUTHENTICATED {
             let encrypted_next_payload = if let Some(next_payload) = self.encrypted_next_payload {
@@ -699,7 +720,7 @@ impl PayloadType {
     pub const DELETE: PayloadType = PayloadType(42);
     pub const VENDOR_ID: PayloadType = PayloadType(43);
     pub const TRAFFIC_SELECTOR_INITIATOR: PayloadType = PayloadType(44);
-    pub const TRAFFIC_SELECTOR_RESPONSER: PayloadType = PayloadType(45);
+    pub const TRAFFIC_SELECTOR_RESPONDER: PayloadType = PayloadType(45);
     pub const ENCRYPTED_AND_AUTHENTICATED: PayloadType = PayloadType(46);
     pub const CONFIGURATION: PayloadType = PayloadType(47);
     pub const EXTENSIBLE_AUTHENTICATION: PayloadType = PayloadType(48);
@@ -732,7 +753,7 @@ impl fmt::Display for PayloadType {
             Self::DELETE => write!(f, "Delete")?,
             Self::VENDOR_ID => write!(f, "Vendor ID")?,
             Self::TRAFFIC_SELECTOR_INITIATOR => write!(f, "Traffic Selector - Initiator")?,
-            Self::TRAFFIC_SELECTOR_RESPONSER => write!(f, "Traffic Selector - Responder")?,
+            Self::TRAFFIC_SELECTOR_RESPONDER => write!(f, "Traffic Selector - Responder")?,
             Self::ENCRYPTED_AND_AUTHENTICATED => write!(f, "Encrypted and Authenticated")?,
             Self::CONFIGURATION => write!(f, "Configuration")?,
             Self::EXTENSIBLE_AUTHENTICATION => write!(f, "Extensible Authentication")?,
@@ -1568,6 +1589,360 @@ impl<'a> PayloadNotify<'a> {
     }
 }
 
+pub struct PayloadTrafficSelector<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> PayloadTrafficSelector<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadTrafficSelector<'a>, FormatError> {
+        if data.len() < 4 {
+            debug!("Not enough data in traffic selector payload");
+            Err("Not enough data in traffic selector payload".into())
+        } else {
+            Ok(PayloadTrafficSelector { data })
+        }
+    }
+
+    pub fn iter_traffic_selectors(&self) -> TrafficSelectorIter {
+        TrafficSelectorIter {
+            num_selectors: self.data[0] as usize,
+            data: &self.data[4..],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TrafficSelectorType(u8);
+
+impl TrafficSelectorType {
+    pub const TS_IPV4_ADDR_RANGE: TrafficSelectorType = TrafficSelectorType(7);
+    pub const TS_IPV6_ADDR_RANGE: TrafficSelectorType = TrafficSelectorType(8);
+
+    fn from_u8(value: u8) -> Result<TrafficSelectorType, FormatError> {
+        if (Self::TS_IPV4_ADDR_RANGE.0..=Self::TS_IPV6_ADDR_RANGE.0).contains(&value) {
+            Ok(TrafficSelectorType(value))
+        } else {
+            debug!("Unsupported IKEv2 Traffic Selector type {}", value);
+            Err("Unsupported IKEv2 Traffic Selector type".into())
+        }
+    }
+}
+
+impl fmt::Display for TrafficSelectorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::TS_IPV4_ADDR_RANGE => write!(f, "TS_IPV4_ADDR_RANGE")?,
+            Self::TS_IPV6_ADDR_RANGE => write!(f, "TS_IPV6_ADDR_RANGE")?,
+            _ => write!(f, "Unknown Traffic Select Type {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct IPProtocolType(u8);
+
+impl IPProtocolType {
+    pub const ANY: IPProtocolType = IPProtocolType(0);
+    pub const ICMP: IPProtocolType = IPProtocolType(1);
+    pub const TCP: IPProtocolType = IPProtocolType(6);
+    pub const UDP: IPProtocolType = IPProtocolType(17);
+
+    fn from_u8(value: u8) -> IPProtocolType {
+        IPProtocolType(value)
+    }
+}
+
+impl fmt::Display for IPProtocolType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::ANY => write!(f, "ANY")?,
+            Self::ICMP => write!(f, "ICMP")?,
+            Self::TCP => write!(f, "TCP")?,
+            Self::UDP => write!(f, "UDP")?,
+            _ => write!(f, "Unknown IP Protocol Type {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+pub struct TrafficSelector<'a> {
+    ts_type: TrafficSelectorType,
+    ip_protocol: IPProtocolType,
+    data: &'a [u8],
+}
+
+impl<'a> TrafficSelector<'a> {
+    pub fn read_start_port(&self) -> u16 {
+        let mut port = [0u8; 2];
+        port.copy_from_slice(&self.data[0..2]);
+        u16::from_be_bytes(port)
+    }
+
+    pub fn read_end_port(&self) -> u16 {
+        let mut port = [0u8; 2];
+        port.copy_from_slice(&self.data[2..4]);
+        u16::from_be_bytes(port)
+    }
+
+    pub fn read_start_address(&self) -> Result<IpAddr, FormatError> {
+        match self.ts_type {
+            TrafficSelectorType::TS_IPV4_ADDR_RANGE => {
+                if self.data.len() != 4 + 4 + 4 {
+                    return Err("Invalid IPv4 address data".into());
+                }
+                let mut addr = [0u8; 4];
+                addr.copy_from_slice(&self.data[4..8]);
+                Ok(IpAddr::V4(Ipv4Addr::from(addr)))
+            }
+            TrafficSelectorType::TS_IPV6_ADDR_RANGE => {
+                if self.data.len() != 4 + 16 + 16 {
+                    return Err("Invalid IPv6 address data".into());
+                }
+                let mut addr = [0u8; 16];
+                addr.copy_from_slice(&self.data[4..20]);
+                Ok(IpAddr::V6(Ipv6Addr::from(addr)))
+            }
+            _ => Err("Unsupported traffic selector type".into()),
+        }
+    }
+
+    pub fn read_end_address(&self) -> Result<IpAddr, FormatError> {
+        match self.ts_type {
+            TrafficSelectorType::TS_IPV4_ADDR_RANGE => {
+                if self.data.len() != 4 + 4 + 4 {
+                    return Err("Invalid IPv4 address data".into());
+                }
+                let mut addr = [0u8; 4];
+                addr.copy_from_slice(&self.data[8..12]);
+                Ok(IpAddr::V4(Ipv4Addr::from(addr)))
+            }
+            TrafficSelectorType::TS_IPV6_ADDR_RANGE => {
+                if self.data.len() != 4 + 16 + 16 {
+                    return Err("Invalid IPv6 address data".into());
+                }
+                let mut addr = [0u8; 16];
+                addr.copy_from_slice(&self.data[20..36]);
+                Ok(IpAddr::V6(Ipv6Addr::from(addr)))
+            }
+            _ => Err("Unsupported traffic selector type".into()),
+        }
+    }
+}
+
+pub struct TrafficSelectorIter<'a> {
+    num_selectors: usize,
+    data: &'a [u8],
+}
+
+impl<'a> Iterator for TrafficSelectorIter<'a> {
+    type Item = Result<TrafficSelector<'a>, FormatError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data.is_empty() {
+            if self.num_selectors != 0 {
+                debug!("Packet is missing {} selectors", self.num_selectors);
+            }
+            return None;
+        }
+        if self.data.len() < 6 {
+            debug!("Not enough data in traffic selector");
+            return None;
+        }
+        let mut selector_length = [0u8; 2];
+        selector_length.copy_from_slice(&self.data[2..4]);
+        let selector_length = u16::from_be_bytes(selector_length) as usize;
+        if self.data.len() < selector_length {
+            debug!("Selector overflow");
+            return None;
+        }
+
+        let data = &self.data[..];
+        self.data = &self.data[selector_length..];
+        self.num_selectors = self.num_selectors.saturating_sub(1);
+        let ts_type = match TrafficSelectorType::from_u8(data[0]) {
+            Ok(ts_type) => ts_type,
+            Err(err) => return Some(Err(err)),
+        };
+        let ip_protocol = IPProtocolType::from_u8(data[1]);
+
+        let selector = TrafficSelector {
+            ts_type,
+            ip_protocol,
+            data: &data[4..selector_length],
+        };
+
+        Some(Ok(selector))
+    }
+}
+
+pub struct PayloadConfiguration<'a> {
+    configuration_type: ConfigurationType,
+    data: &'a [u8],
+}
+
+impl<'a> PayloadConfiguration<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadConfiguration<'a>, FormatError> {
+        if data.len() < 4 {
+            debug!("Not enough data in configuration payload");
+            return Err("Not enough data in configuration payload".into());
+        }
+
+        let configuration_type = ConfigurationType::from_u8(data[0])?;
+        Ok(PayloadConfiguration {
+            configuration_type,
+            data: &data[4..],
+        })
+    }
+
+    pub fn configuration_type(&self) -> ConfigurationType {
+        self.configuration_type
+    }
+
+    pub fn iter_attributes(&self) -> ConfigurationAttributesIter {
+        ConfigurationAttributesIter { data: self.data }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ConfigurationType(u8);
+
+impl ConfigurationType {
+    pub const CFG_REQUEST: ConfigurationType = ConfigurationType(1);
+    pub const CFG_REPLY: ConfigurationType = ConfigurationType(2);
+    pub const CFG_SET: ConfigurationType = ConfigurationType(3);
+    pub const CFG_ACK: ConfigurationType = ConfigurationType(4);
+
+    fn from_u8(value: u8) -> Result<ConfigurationType, FormatError> {
+        if (Self::CFG_REQUEST.0..=Self::CFG_ACK.0).contains(&value) {
+            Ok(ConfigurationType(value))
+        } else {
+            debug!("Unsupported IKEv2 Configuration Type {}", value);
+            Err("Unsupported IKEv2 Configuration Type".into())
+        }
+    }
+}
+
+impl fmt::Display for ConfigurationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::CFG_REQUEST => write!(f, "CFG_REQUEST")?,
+            Self::CFG_REPLY => write!(f, "CFG_REPLY")?,
+            Self::CFG_SET => write!(f, "CFG_SET")?,
+            Self::CFG_ACK => write!(f, "CFG_ACK")?,
+            _ => write!(f, "Unknown Configuration Type {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ConfigurationAttributeType(u16);
+
+impl ConfigurationAttributeType {
+    pub const INTERNAL_IP4_ADDRESS: ConfigurationAttributeType = ConfigurationAttributeType(1);
+    pub const INTERNAL_IP4_NETMASK: ConfigurationAttributeType = ConfigurationAttributeType(2);
+    pub const INTERNAL_IP4_DNS: ConfigurationAttributeType = ConfigurationAttributeType(3);
+    pub const INTERNAL_IP4_NBNS: ConfigurationAttributeType = ConfigurationAttributeType(4);
+    pub const INTERNAL_IP4_DHCP: ConfigurationAttributeType = ConfigurationAttributeType(6);
+    pub const APPLICATION_VERSION: ConfigurationAttributeType = ConfigurationAttributeType(7);
+    pub const INTERNAL_IP6_ADDRESS: ConfigurationAttributeType = ConfigurationAttributeType(8);
+    pub const INTERNAL_IP6_DNS: ConfigurationAttributeType = ConfigurationAttributeType(10);
+    pub const INTERNAL_IP6_DHCP: ConfigurationAttributeType = ConfigurationAttributeType(12);
+    pub const INTERNAL_IP4_SUBNET: ConfigurationAttributeType = ConfigurationAttributeType(13);
+    pub const SUPPORTED_ATTRIBUTES: ConfigurationAttributeType = ConfigurationAttributeType(14);
+    pub const INTERNAL_IP6_SUBNET: ConfigurationAttributeType = ConfigurationAttributeType(15);
+
+    pub const INTERNAL_DNS_DOMAIN: ConfigurationAttributeType = ConfigurationAttributeType(25);
+
+    fn from_u16(value: u16) -> ConfigurationAttributeType {
+        ConfigurationAttributeType(value)
+    }
+}
+
+impl fmt::Display for ConfigurationAttributeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::INTERNAL_IP4_ADDRESS => write!(f, "INTERNAL_IP4_ADDRESS")?,
+            Self::INTERNAL_IP4_NETMASK => write!(f, "INTERNAL_IP4_NETMASK")?,
+            Self::INTERNAL_IP4_DNS => write!(f, "INTERNAL_IP4_DNS")?,
+            Self::INTERNAL_IP4_NBNS => write!(f, "INTERNAL_IP4_NBNS")?,
+            Self::INTERNAL_IP4_DHCP => write!(f, "INTERNAL_IP4_DHCP")?,
+            Self::APPLICATION_VERSION => write!(f, "APPLICATION_VERSION")?,
+            Self::INTERNAL_IP6_ADDRESS => write!(f, "INTERNAL_IP6_ADDRESS")?,
+            Self::INTERNAL_IP6_DNS => write!(f, "INTERNAL_IP6_DNS")?,
+            Self::INTERNAL_IP6_DHCP => write!(f, "INTERNAL_IP6_DHCP")?,
+            Self::INTERNAL_IP4_SUBNET => write!(f, "INTERNAL_IP4_SUBNET")?,
+            Self::SUPPORTED_ATTRIBUTES => write!(f, "SUPPORTED_ATTRIBUTES")?,
+            Self::INTERNAL_IP6_SUBNET => write!(f, "INTERNAL_IP6_SUBNET")?,
+            Self::INTERNAL_DNS_DOMAIN => write!(f, "INTERNAL_DNS_DOMAIN")?,
+            _ => write!(f, "Unknown Configuration Attribute Type {}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
+pub struct ConfigurationAttribute<'a> {
+    attribute_type: ConfigurationAttributeType,
+    data: &'a [u8],
+}
+
+impl<'a> ConfigurationAttribute<'a> {
+    pub fn attribute_type(&self) -> ConfigurationAttributeType {
+        self.attribute_type
+    }
+
+    pub fn read_value(&self) -> &[u8] {
+        self.data
+    }
+}
+
+pub struct ConfigurationAttributesIter<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Iterator for ConfigurationAttributesIter<'a> {
+    type Item = Result<ConfigurationAttribute<'a>, FormatError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const ATTRIBUTE_TYPE_RESERVED: u16 = 1 << 15;
+        const ATTRIBUTE_TYPE_MASK: u16 = !ATTRIBUTE_TYPE_RESERVED;
+        if self.data.is_empty() {
+            return None;
+        }
+        if self.data.len() < 4 {
+            debug!("Not enough data in configuration attribute");
+            return None;
+        }
+        let mut attribute_length = [0u8; 2];
+        attribute_length.copy_from_slice(&self.data[2..4]);
+        let attribute_length = u16::from_be_bytes(attribute_length) as usize;
+        if self.data.len() < 4 + attribute_length {
+            debug!("Attribute overflow");
+            return None;
+        }
+        let data = &self.data[..];
+        self.data = &self.data[4 + attribute_length..];
+
+        let mut attribute_type = [0u8; 2];
+        attribute_type.copy_from_slice(&data[0..2]);
+        let attribute_type = u16::from_be_bytes(attribute_type);
+        if attribute_type & ATTRIBUTE_TYPE_RESERVED != 0x0000 {
+            debug!("Attribute type reserved flag is set {:x}", attribute_type);
+            return Some(Err("Attribute type reserved flag is set".into()));
+        }
+        let attribute_type =
+            ConfigurationAttributeType::from_u16(attribute_type & ATTRIBUTE_TYPE_MASK);
+
+        let selector = ConfigurationAttribute {
+            attribute_type,
+            data: &data[4..4 + attribute_length],
+        };
+
+        Some(Ok(selector))
+    }
+}
+
 pub struct EncryptedMessage<'a> {
     next_payload: u8,
     data: &'a [u8],
@@ -1691,6 +2066,43 @@ impl fmt::Debug for Payload<'_> {
                 pl_notify.message_type,
                 pl_notify.read_value(),
             )?;
+        } else if let Ok(pl_ts) = self.to_traffic_selector() {
+            for ts in pl_ts.iter_traffic_selectors() {
+                let ts = match ts {
+                    Ok(ts) => ts,
+                    Err(err) => {
+                        writeln!(f, "    Traffic selector invalid {}", err)?;
+                        continue;
+                    }
+                };
+                writeln!(
+                    f,
+                    "    TS Type {} IP protocol {} ports {}-{} addresses {:?}-{:?}",
+                    ts.ts_type,
+                    ts.ip_protocol,
+                    ts.read_start_port(),
+                    ts.read_end_port(),
+                    ts.read_start_address(),
+                    ts.read_end_address(),
+                )?;
+            }
+        } else if let Ok(pl_ca) = self.to_configuration() {
+            writeln!(f, "    Configuration type {}", pl_ca.configuration_type())?;
+            for attr in pl_ca.iter_attributes() {
+                let attr = match attr {
+                    Ok(attr) => attr,
+                    Err(err) => {
+                        writeln!(f, "      Configuration attribute invalid {}", err)?;
+                        continue;
+                    }
+                };
+                writeln!(
+                    f,
+                    "      Attribute Type {} value {:?}",
+                    attr.attribute_type(),
+                    attr.read_value(),
+                )?;
+            }
         } else {
             writeln!(f, "    Data {:?}", self.data)?;
         }

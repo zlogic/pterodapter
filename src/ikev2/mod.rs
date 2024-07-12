@@ -666,7 +666,7 @@ impl IKEv2Session {
                             transform
                         } else {
                             debug!("No compatible SA parameters found");
-                            // TODO: return INVALID_SYNTAX notification.
+                            // TODO: return NO_PROPOSAL_CHOSEN notification.
                             continue;
                         };
                     response.write_accept_proposal(proposal_num, &prop)?;
@@ -905,6 +905,7 @@ impl IKEv2Session {
         let mut client_auth = None;
         let mut server_cert = self.pki_processing.default_server_cert();
         let mut id_initiator = None;
+        let mut transform_params = None;
 
         for payload in decrypted_iter {
             let payload = match payload {
@@ -976,6 +977,14 @@ impl IKEv2Session {
                     }
                     client_auth = Some(auth.read_value().to_vec());
                 }
+                message::PayloadType::SECURITY_ASSOCIATION => {
+                    let sa = payload.to_security_association()?;
+                    transform_params = crypto::choose_sa_parameters(&sa);
+                    if transform_params.is_none() {
+                        debug!("No compatible SA parameters found");
+                        continue;
+                    };
+                }
                 _ => {}
             }
         }
@@ -994,6 +1003,12 @@ impl IKEv2Session {
             id
         } else {
             return self.process_auth_failed_response(response, "Client provided no ID".into());
+        };
+        let (transform_params, proposal_num) = if let Some(params) = transform_params {
+            params
+        } else {
+            // TODO: return NO_PROPOSAL_CHOSEN notification.
+            return Err("Unacceptable Security Associattion proposals".into());
         };
 
         let initiator_signed_len =
@@ -1025,20 +1040,22 @@ impl IKEv2Session {
         self.user_id = client_cert.subject().map(|subject| subject.to_string());
         self.state = SessionState::Established;
         response.start_encrypted_payload()?;
+
         if let Some(id_responder) = self.pki_processing.server_id() {
             {
                 let write_slice = response
                     .next_payload_slice(message::PayloadType::ID_RESPONDER, id_responder.len())?;
                 write_slice.copy_from_slice(&id_responder);
             }
+        }
 
-            if let Some(cert) = server_cert {
-                response.write_certificate_payload(
-                    message::CertificateEncoding::X509_SIGNATURE,
-                    cert,
-                )?;
-            }
+        if let Some(cert) = server_cert {
+            response
+                .write_certificate_payload(message::CertificateEncoding::X509_SIGNATURE, cert)?;
+        }
+        response.write_accept_proposal(proposal_num, &transform_params)?;
 
+        if let Some(id_responder) = self.pki_processing.server_id() {
             let responder_signed_len =
                 ctx.message_responder.len() + ctx.nonce_initiator.len() + prf_key_len;
             let mut responder_signed = [0u8; MAX_DATAGRAM_SIZE];
@@ -1064,9 +1081,6 @@ impl IKEv2Session {
             )?;
             self.pki_processing
                 .sign_auth(&responder_signed[..responder_signed_len], write_slice)?;
-        } else if let Some(cert) = server_cert {
-            response
-                .write_certificate_payload(message::CertificateEncoding::X509_SIGNATURE, cert)?;
         };
 
         self.complete_encrypted_payload(response)
