@@ -17,6 +17,8 @@ pub struct Network<'a> {
     iface: iface::Interface,
     sockets: iface::SocketSet<'a>,
     bridges: HashMap<iface::SocketHandle, SocketTunnel>,
+    opening_connections:
+        HashMap<iface::SocketHandle, Option<oneshot::Sender<SocketConnectionResult>>>,
     cmd_sender: mpsc::Sender<Command>,
     cmd_receiver: mpsc::Receiver<Command>,
 }
@@ -54,6 +56,7 @@ impl Network<'_> {
             iface,
             sockets,
             bridges: HashMap::new(),
+            opening_connections: HashMap::new(),
             cmd_sender,
             cmd_receiver,
         })
@@ -120,6 +123,42 @@ impl Network<'_> {
                 }
             }
         }
+
+        for (handle, response) in self.opening_connections.iter_mut() {
+            let socket = self.sockets.get::<tcp::Socket>(*handle);
+            let result = match socket.state() {
+                tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing => {
+                    Some(Err("Socket is closed".into()))
+                }
+                tcp::State::SynSent | tcp::State::SynReceived => {
+                    // Not ready.
+                    None
+                }
+                _ => {
+                    let response = match socket.local_endpoint() {
+                        Some(endpoint) => {
+                            (*handle, SocketAddr::from((endpoint.addr, endpoint.port)))
+                        }
+                        None => (*handle, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+                    };
+                    Some(Ok(response))
+                }
+            };
+            let result = if let Some(result) = result {
+                result
+            } else {
+                println!("Socket state is {}", socket.state());
+                continue;
+            };
+            let response = if let Some(response) = response.take() {
+                response
+            } else {
+                continue;
+            };
+            let _ = response.send(result);
+        }
+        self.opening_connections
+            .retain(|_, response| response.is_some());
     }
 
     pub fn create_command_sender(&self) -> mpsc::Sender<Command> {
@@ -143,14 +182,9 @@ impl Network<'_> {
                     return;
                 }
 
-                let local_addr = match socket.local_endpoint() {
-                    Some(endpoint) => SocketAddr::from((endpoint.addr, endpoint.port)),
-                    None => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port),
-                };
-                // TODO: use poll_fn until connection becomes fully available.
-                // See https://github.com/embassy-rs/embassy/blob/main/embassy-net/src/tcp.rs#L233 for more details.
                 let socket_handle = self.sockets.add(socket);
-                let _ = response.send(Ok((socket_handle, local_addr)));
+                self.opening_connections
+                    .insert(socket_handle, Some(response));
             }
             Command::Bridge(socket_handle, reader, writer) => {
                 let socket_tunnel = SocketTunnel {
@@ -188,10 +222,12 @@ struct SocketTunnel {
 
 impl SocketTunnel {}
 
+type SocketConnectionResult = Result<(iface::SocketHandle, SocketAddr), NetworkError>;
+
 pub enum Command {
     Connect(
         std::net::SocketAddr,
-        oneshot::Sender<Result<(iface::SocketHandle, SocketAddr), NetworkError>>,
+        oneshot::Sender<SocketConnectionResult>,
     ),
     Bridge(
         iface::SocketHandle,

@@ -100,57 +100,7 @@ impl SocksConnection {
             Ok(_) => Ok(()),
             Err(_) => Err("Command channel closed".into()),
         }
-        //tokio::io::copy(&mut self.reader, &mut socket).await?;
-        //let (sender, receiver) = oneshot::channel();
-        //let write_command = network::Command::Write(socket.handle(), self.reader, todo!());
-        /*
-        let rt = runtime::Handle::current();
-        rt.spawn(SocksConnection::tunnel_to_destination(
-            self.command_bridge.clone(),
-            reader,
-            socket.handle(),
-        ));
-
-        let mut request = String::new();
-        while self.reader.read_line(&mut request).await? > 0 {
-            println!("Received request {}", request);
-            request.clear();
-        }
-        */
     }
-
-    /*
-    async fn tunnel_to_destination(
-        command_bridge: mpsc::Sender<network::Command>,
-        mut reader: BufReader<tcp::OwnedReadHalf>,
-        socket_handle: smoltcp::iface::SocketHandle,
-    ) -> Result<(), SocksError> {
-        let mut buffer = None;
-        const BUFFER_SIZE: usize = 1024;
-        loop {
-            let (sender, receiver) = oneshot::channel();
-            let mut buf = if let Some(buf) = buffer.take() {
-                buf
-            } else {
-                Vec::with_capacity(BUFFER_SIZE)
-            };
-            let current_size = buf.len();
-            buf.resize(buf.capacity(), 0u8);
-
-            let bytes_read = reader.read(&mut buf[current_size..]).await?;
-            buf.truncate(current_size + bytes_read);
-            let write_command = network::Command::Write(socket_handle, buf, sender);
-            let _ = command_bridge.send(write_command).await;
-            match receiver.await {
-                Ok(Ok(buf)) => buffer = Some(buf),
-                Ok(Err(_err)) => {
-                    return Err("Error writing into socket".into());
-                }
-                Err(_) => return Ok(()),
-            }
-        }
-    }
-    */
 
     async fn perform_handshake(
         &mut self,
