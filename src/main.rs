@@ -1,15 +1,15 @@
 use std::{
-    env, fmt, fs,
-    net::{IpAddr, Ipv6Addr},
+    env, fmt,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     process,
     str::FromStr,
 };
 
-mod ikev2;
 mod logger;
+mod socks;
 
 enum Action {
-    Serve(ikev2::Config),
+    Proxy(socks::Config),
 }
 
 pub struct Args {
@@ -17,15 +17,12 @@ pub struct Args {
     action: Action,
 }
 
-const USAGE_INSTRUCTIONS: &str = "Usage: pterodapter [OPTIONS] serve\n\n\
+const USAGE_INSTRUCTIONS: &str = "Usage: pterodapter [OPTIONS] proxy\n\n\
 Options:\
-\n      --log-level=<LOG_LEVEL>          Log level [default: info]\
-\n      --listen-ip=<IP>                 Listen IP address, multiple options can be provided [default: ::]\
-\n      --id-hostname=<FQDN>             Hostname for identification [default: pterodapter]\
-\n      --cacert=<FILENAME>              Path to root CA certificate (in PKCS 8 PEM format)\
-\n      --cert=<FILENAME>                Path to public certificate (in PKCS 8 PEM format)\
-\n      --key=<FILENAME>                 Path to private key (in PKCS 8 PEM format)\
-\n      --help                           Print help";
+\n      --log-level=<LOG_LEVEL>   Log level [default: info]\
+\n      --listen-address=<IP>     Listen IP address [default: :::5328]\
+\n      --destination=<IP>        Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --help                    Print help";
 
 impl Args {
     fn parse() -> Args {
@@ -39,11 +36,8 @@ impl Args {
         };
 
         let mut log_level = log::LevelFilter::Info;
-        let mut listen_ips = vec![];
-        let mut id_hostname = None;
-        let mut root_ca = None;
-        let mut private_key = None;
-        let mut public_cert = None;
+        let mut listen_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5328);
+        let mut destination = None;
 
         for arg in env::args()
             .take(env::args().len().saturating_sub(1))
@@ -74,44 +68,22 @@ impl Args {
                         process::exit(2);
                     }
                 };
-            } else if name == "--listen-ip" {
-                match IpAddr::from_str(value) {
-                    Ok(ip) => {
-                        listen_ips.push(ip);
-                    }
+            } else if name == "--listen-address" {
+                match SocketAddr::from_str(value) {
+                    Ok(addr) => listen_addr = addr,
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse IP address: {}", err),
+                        format_args!("Failed to parse listen address: {}", err),
                     ),
                 };
-            } else if name == "--id-hostname" {
-                id_hostname = Some(value.into());
-            } else if name == "--cacert" {
-                match fs::read_to_string(value) {
-                    Ok(cert) => root_ca = Some(cert),
+            } else if name == "--destination" {
+                match SocketAddr::from_str(value) {
+                    Ok(addr) => destination = Some(addr),
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to read root CA cert: {}", err),
-                    ),
-                };
-            } else if name == "--cert" {
-                match fs::read_to_string(value) {
-                    Ok(cert) => public_cert = Some(cert),
-                    Err(err) => fail_with_error(
-                        name,
-                        value,
-                        format_args!("Failed to read root CA cert: {}", err),
-                    ),
-                };
-            } else if name == "--key" {
-                match fs::read_to_string(value) {
-                    Ok(cert) => private_key = Some(cert),
-                    Err(err) => fail_with_error(
-                        name,
-                        value,
-                        format_args!("Failed to read root CA cert: {}", err),
+                        format_args!("Failed to parse destination address: {}", err),
                     ),
                 };
             } else {
@@ -128,21 +100,14 @@ impl Args {
         };
 
         match action.as_str() {
-            "serve" => {
-                let server_cert = match (public_cert.clone(), private_key.clone()) {
-                    (Some(public_cert), Some(private_key)) => Some((public_cert, private_key)),
-                    _ => None,
-                };
-                if listen_ips.is_empty() {
-                    listen_ips = vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)];
+            "proxy" => {
+                if destination.is_none() {
+                    eprintln!("No destination specified");
+                    println!("{}", USAGE_INSTRUCTIONS);
+                    process::exit(2);
                 }
 
-                let action = Action::Serve(ikev2::Config {
-                    hostname: id_hostname.clone(),
-                    listen_ips: listen_ips.clone(),
-                    root_ca: root_ca.clone(),
-                    server_cert,
-                });
+                let action = Action::Proxy(socks::Config { listen_addr });
                 Args { log_level, action }
             }
             _ => {
@@ -165,18 +130,14 @@ fn main() {
         eprintln!("Failed to set up logger, error is {}", err);
     }
     match args.action {
-        Action::Serve(config) => {
-            let server = match ikev2::Server::new(config) {
+        Action::Proxy(config) => {
+            match socks::run(config) {
                 Ok(server) => server,
                 Err(err) => {
-                    println!("Failed to create server, error is {}", err);
+                    println!("Failed to run server, error is {}", err);
                     std::process::exit(1)
                 }
             };
-            if let Err(err) = server.run() {
-                println!("Failed to run server, error is {}", err);
-                std::process::exit(1);
-            }
         }
     }
 }
