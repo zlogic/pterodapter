@@ -3,9 +3,14 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     process,
     str::FromStr,
+    time::Duration,
 };
 
+use log::info;
+use tokio::signal;
+
 mod logger;
+mod network;
 mod socks;
 
 enum Action {
@@ -119,6 +124,51 @@ impl Args {
     }
 }
 
+pub fn serve(config: socks::Config) -> Result<(), i32> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|err| {
+            eprintln!("Failed to start runtime: {}", err);
+            1
+        })?;
+
+    let mut client = network::Network::new().map_err(|err| {
+        eprintln!("Failed to start virtual network interface: {}", err);
+        1
+    })?;
+    let command_bridge = client.create_command_sender();
+
+    let server = socks::Server::new(config, command_bridge).map_err(|err| {
+        eprintln!("Failed to start SOCKS5 server: {}", err);
+        1
+    })?;
+
+    let client_handle = rt.spawn(async move {
+        if let Err(err) = client.run().await {
+            eprintln!("Network failed to run: {}", err);
+        }
+    });
+    let server_handle = rt.spawn(async move {
+        if let Err(err) = server.run().await {
+            eprintln!("Server failed to run: {}", err);
+        }
+    });
+
+    rt.block_on(async {
+        if let Err(err) = signal::ctrl_c().await {
+            eprintln!("Failed to wait for CTRL+C signal: {}", err);
+        }
+    });
+    server_handle.abort();
+    client_handle.abort();
+    rt.shutdown_timeout(Duration::from_secs(60));
+
+    info!("Stopped server");
+    Ok(())
+}
+
 fn main() {
     println!(
         "Pterodapter version {}",
@@ -131,13 +181,9 @@ fn main() {
     }
     match args.action {
         Action::Proxy(config) => {
-            match socks::run(config) {
-                Ok(server) => server,
-                Err(err) => {
-                    println!("Failed to run server, error is {}", err);
-                    std::process::exit(1)
-                }
-            };
+            if let Err(exitcode) = serve(config) {
+                process::exit(exitcode);
+            }
         }
     }
 }

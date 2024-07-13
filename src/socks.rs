@@ -1,52 +1,39 @@
 use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
 };
 
 use log::{debug, info, warn};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp, TcpListener, TcpStream},
-    runtime, signal,
-    sync::mpsc,
-    task::JoinHandle,
+    runtime,
+    sync::{mpsc, oneshot},
 };
+
+use crate::network;
 
 pub struct Config {
     pub listen_addr: SocketAddr,
 }
-pub fn run(config: Config) -> Result<(), SocksError> {
-    let server = Server::new(config)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
-    let (accept_sender, accept_receiver) = mpsc::channel(10);
-    let handles = vec![rt.spawn(async move { server.listen_socket(accept_sender).await })];
-
-    rt.block_on(Server::wait_termination(handles))?;
-    rt.shutdown_timeout(Duration::from_secs(60));
-
-    info!("Stopped server");
-    Ok(())
-}
 
 pub struct Server {
     listen_addr: SocketAddr,
+    command_bridge: mpsc::Sender<network::Command>,
 }
 
 impl Server {
-    pub fn new(config: Config) -> Result<Server, SocksError> {
+    pub fn new(
+        config: Config,
+        command_bridge: mpsc::Sender<network::Command>,
+    ) -> Result<Server, SocksError> {
         Ok(Server {
             listen_addr: config.listen_addr,
+            command_bridge,
         })
     }
 
-    async fn listen_socket(
-        &self,
-        offload_connections: mpsc::Sender<TcpStream>,
-    ) -> Result<(), SocksError> {
+    pub async fn run(&self) -> Result<(), SocksError> {
         let listener = match TcpListener::bind(&self.listen_addr).await {
             Ok(listener) => listener,
             Err(err) => {
@@ -59,7 +46,7 @@ impl Server {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     debug!("Received connection from {}", addr);
-                    let mut handler = SocksConnection::new(socket);
+                    let mut handler = SocksConnection::new(socket, self.command_bridge.clone());
                     let rt = runtime::Handle::current();
                     rt.spawn(async move {
                         if let Err(err) = handler.handle_connection().await {
@@ -71,83 +58,149 @@ impl Server {
             }
         }
     }
-
-    async fn wait_termination(
-        handles: Vec<JoinHandle<Result<(), SocksError>>>,
-    ) -> Result<(), SocksError> {
-        signal::ctrl_c().await?;
-        handles.iter().for_each(|handle| handle.abort());
-        Ok(())
-    }
 }
 
 struct SocksConnection {
-    reader: BufReader<tcp::OwnedReadHalf>,
-    writer: BufWriter<tcp::OwnedWriteHalf>,
+    reader: Option<tcp::OwnedReadHalf>,
+    writer: Option<tcp::OwnedWriteHalf>,
+    command_bridge: mpsc::Sender<network::Command>,
 }
 
 impl SocksConnection {
-    fn new<'a>(socket: TcpStream) -> SocksConnection {
+    fn new<'a>(
+        socket: TcpStream,
+        command_bridge: mpsc::Sender<network::Command>,
+    ) -> SocksConnection {
         let (reader, writer) = socket.into_split();
-        let reader = BufReader::new(reader);
-        let writer = BufWriter::new(writer);
-        SocksConnection { reader, writer }
+        SocksConnection {
+            reader: Some(reader),
+            writer: Some(writer),
+            command_bridge,
+        }
     }
 
     async fn handle_connection(&mut self) -> Result<(), SocksError> {
-        self.perform_handshake().await?;
-        self.read_request().await?;
+        let mut reader = match self.reader.take() {
+            Some(reader) => reader,
+            None => return Err("Reader already consumed".into()),
+        };
+        let mut writer = match self.writer.take() {
+            Some(writer) => writer,
+            None => return Err("Writer already consumed".into()),
+        };
+        self.perform_handshake(&mut reader, &mut writer).await?;
+        let socket = self.read_request(&mut reader, &mut writer).await?;
+
+        // TODO: don't forget to close socket!
+        match self
+            .command_bridge
+            .send(network::Command::Bridge(socket, reader, writer))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => Err("Command channel closed".into()),
+        }
+        //tokio::io::copy(&mut self.reader, &mut socket).await?;
+        //let (sender, receiver) = oneshot::channel();
+        //let write_command = network::Command::Write(socket.handle(), self.reader, todo!());
+        /*
+        let rt = runtime::Handle::current();
+        rt.spawn(SocksConnection::tunnel_to_destination(
+            self.command_bridge.clone(),
+            reader,
+            socket.handle(),
+        ));
 
         let mut request = String::new();
         while self.reader.read_line(&mut request).await? > 0 {
             println!("Received request {}", request);
             request.clear();
         }
-
-        Ok(())
+        */
     }
 
-    async fn perform_handshake(&mut self) -> Result<(), SocksError> {
-        let version = self.reader.read_u8().await?;
+    /*
+    async fn tunnel_to_destination(
+        command_bridge: mpsc::Sender<network::Command>,
+        mut reader: BufReader<tcp::OwnedReadHalf>,
+        socket_handle: smoltcp::iface::SocketHandle,
+    ) -> Result<(), SocksError> {
+        let mut buffer = None;
+        const BUFFER_SIZE: usize = 1024;
+        loop {
+            let (sender, receiver) = oneshot::channel();
+            let mut buf = if let Some(buf) = buffer.take() {
+                buf
+            } else {
+                Vec::with_capacity(BUFFER_SIZE)
+            };
+            let current_size = buf.len();
+            buf.resize(buf.capacity(), 0u8);
+
+            let bytes_read = reader.read(&mut buf[current_size..]).await?;
+            buf.truncate(current_size + bytes_read);
+            let write_command = network::Command::Write(socket_handle, buf, sender);
+            let _ = command_bridge.send(write_command).await;
+            match receiver.await {
+                Ok(Ok(buf)) => buffer = Some(buf),
+                Ok(Err(_err)) => {
+                    return Err("Error writing into socket".into());
+                }
+                Err(_) => return Ok(()),
+            }
+        }
+    }
+    */
+
+    async fn perform_handshake(
+        &mut self,
+        reader: &mut tcp::OwnedReadHalf,
+        writer: &mut tcp::OwnedWriteHalf,
+    ) -> Result<(), SocksError> {
+        let version = reader.read_u8().await?;
         if version != SOCKS5_VERSION {
             return Err("Unsupported SOCKS version".into());
         }
-        let nmethods = self.reader.read_u8().await?;
+        let nmethods = reader.read_u8().await?;
         let mut selected_method = AuthenticationMethod::NO_ACCEPTABLE_METHODS;
         for _ in 0..nmethods {
-            let method = AuthenticationMethod::from_u8(self.reader.read_u8().await?);
+            let method = AuthenticationMethod::from_u8(reader.read_u8().await?);
             if method == AuthenticationMethod::NO_AUTHENTICATION_REQUIRED {
                 selected_method = method;
             }
         }
-        self.writer.write_u8(SOCKS5_VERSION).await?;
-        self.writer.write_u8(selected_method.0).await?;
-        self.writer.flush().await?;
+        writer.write_u8(SOCKS5_VERSION).await?;
+        writer.write_u8(selected_method.0).await?;
+        writer.flush().await?;
         Ok(())
     }
 
-    async fn read_request(&mut self) -> Result<(), SocksError> {
+    async fn read_request(
+        &mut self,
+        reader: &mut tcp::OwnedReadHalf,
+        writer: &mut tcp::OwnedWriteHalf,
+    ) -> Result<smoltcp::iface::SocketHandle, SocksError> {
         println!("Prepating to read request");
-        let version = self.reader.read_u8().await?;
+        let version = reader.read_u8().await?;
         println!("Read to read request");
         if version != SOCKS5_VERSION {
             return Err("Unsupported SOCKS version".into());
         }
-        let cmd = SocksCommand::from_u8(self.reader.read_u8().await?);
-        let _ = self.reader.read_u8().await?; // Reserved byte.
-        let addr_type = SocksAddressType::from_u8(self.reader.read_u8().await?);
+        let cmd = SocksCommand::from_u8(reader.read_u8().await?);
+        let _ = reader.read_u8().await?; // Reserved byte.
+        let addr_type = SocksAddressType::from_u8(reader.read_u8().await?);
         let addr = match addr_type {
             SocksAddressType::IPV4 => {
                 let mut octets = [0u8; 4];
-                self.reader.read_exact(&mut octets).await?;
+                reader.read_exact(&mut octets).await?;
                 Some(DestinationAddress::IpAddr(IpAddr::V4(Ipv4Addr::from(
                     octets,
                 ))))
             }
             SocksAddressType::DOMAINNAME => {
-                let len = self.reader.read_u8().await?;
+                let len = reader.read_u8().await?;
                 let mut dest = vec![0; len as usize];
-                self.reader.read_exact(dest.as_mut_slice()).await?;
+                reader.read_exact(dest.as_mut_slice()).await?;
                 let domain = match String::from_utf8(dest) {
                     Ok(domain) => Ok(domain),
                     Err(err) => {
@@ -159,60 +212,96 @@ impl SocksConnection {
             }
             SocksAddressType::IPV6 => {
                 let mut octets = [0u8; 16];
-                self.reader.read_exact(&mut octets).await?;
+                reader.read_exact(&mut octets).await?;
                 Some(DestinationAddress::IpAddr(IpAddr::V6(Ipv6Addr::from(
                     octets,
                 ))))
             }
             _ => None,
         };
-        let port = self.reader.read_u16().await?;
+        let port = reader.read_u16().await?;
 
-        self.writer.write_u8(SOCKS5_VERSION).await?;
+        writer.write_u8(SOCKS5_VERSION).await?;
         if cmd != SocksCommand::CONNECT {
-            self.write_error_response(CommandResponse::COMMAND_NOT_SUPPORTED)
+            SocksConnection::write_error_response(writer, CommandResponse::COMMAND_NOT_SUPPORTED)
                 .await?;
             debug!("Command {} is not supported", cmd);
             return Err("Command is not supported".into());
         }
-        let addr = if let Some(addr) = addr {
-            addr
-        } else {
-            self.write_error_response(CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED)
+        let addr = match addr {
+            Some(DestinationAddress::IpAddr(ip)) => ip,
+            _ => {
+                // DNS lookups are not yet supported.
+                SocksConnection::write_error_response(
+                    writer,
+                    CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
+                )
                 .await?;
-            debug!("Address type {} is not supported", addr_type);
-            return Err("Address type is not supported".into());
+                debug!("Address type {} is not supported", addr_type);
+                return Err("Address type is not supported".into());
+            }
         };
 
-        self.connect_to_host(addr, port).await?;
-        Ok(())
+        Ok(self.connect_to_host(writer, addr, port).await?)
     }
 
     async fn connect_to_host(
         &mut self,
-        addr: DestinationAddress,
+        writer: &mut tcp::OwnedWriteHalf,
+        addr: IpAddr,
         port: u16,
-    ) -> Result<(), SocksError> {
-        // TODO: open SmolTCP/FortiVPN connection here.
-        let bnd_addr = Ipv4Addr::LOCALHOST;
-        let bnd_port = port;
+    ) -> Result<smoltcp::iface::SocketHandle, SocksError> {
+        let (sender, receiver) = oneshot::channel();
+        let connect_command = network::Command::Connect((addr, port).into(), sender);
+        if self.command_bridge.send(connect_command).await.is_err() {
+            SocksConnection::write_error_response(writer, CommandResponse::GENERAL_FAILURE).await?;
+            return Err("Command channel closed".into());
+        }
+        let (socket_handle, local_addr) = match receiver.await {
+            Ok(Ok(socket)) => socket,
+            Ok(Err(err)) => {
+                debug!("Failed to connect to host: {}", err);
+                SocksConnection::write_error_response(writer, CommandResponse::NETWORK_UNREACHABLE)
+                    .await?;
+                return Err("Failed to connect to host".into());
+            }
+            Err(_) => {
+                SocksConnection::write_error_response(writer, CommandResponse::GENERAL_FAILURE)
+                    .await?;
+                return Err("Channel closed".into());
+            }
+        };
 
-        self.writer.write_u8(CommandResponse::SUCCEDED.0).await?;
-        self.writer.write_u8(0).await?; // Reserved byte.
-        self.writer.write_u8(SocksAddressType::IPV4.0).await?;
-        self.writer.write_all(&bnd_addr.octets()).await?;
-        self.writer.write_u16(bnd_port).await?;
-        self.writer.flush().await?;
-        Ok(())
+        let bnd_addr = local_addr.ip();
+        let bnd_port = local_addr.port();
+
+        writer.write_u8(CommandResponse::SUCCEDED.0).await?;
+        writer.write_u8(0).await?; // Reserved byte.
+        match bnd_addr {
+            IpAddr::V4(ref ip) => {
+                writer.write_u8(SocksAddressType::IPV4.0).await?;
+                writer.write_all(&ip.octets()).await?;
+            }
+            IpAddr::V6(ref ip) => {
+                writer.write_u8(SocksAddressType::IPV6.0).await?;
+                writer.write_all(&ip.octets()).await?;
+            }
+        }
+        writer.write_u16(bnd_port).await?;
+        writer.flush().await?;
+        Ok(socket_handle)
     }
 
-    async fn write_error_response(&mut self, response: CommandResponse) -> Result<(), SocksError> {
-        self.writer.write_u8(response.0).await?;
-        self.writer.write_u8(0).await?; // Reserved byte.
-        self.writer.write_u8(SocksAddressType::DOMAINNAME.0).await?;
-        self.writer.write_u8(0).await?; // Empty domain name.
-        self.writer.write_u16(0).await?;
-        self.writer.flush().await?;
+    async fn write_error_response(
+        writer: &mut tcp::OwnedWriteHalf,
+        response: CommandResponse,
+    ) -> Result<(), SocksError> {
+        writer.write_u8(response.0).await?;
+        writer.write_u8(0).await?; // Reserved byte.
+        writer.write_u8(SocksAddressType::DOMAINNAME.0).await?;
+        writer.write_u8(0).await?; // Empty domain name.
+        writer.write_u16(0).await?;
+        writer.flush().await?;
         Ok(())
     }
 }
