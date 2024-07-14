@@ -12,6 +12,7 @@ log = { version = "0.4", default-features = false }
 tokio = { version = "1.38", default-features = false, features = ["rt", "io-util", "signal", "net", "time", "sync"] }
 tokio-native-tls = { version = "0.3", default-features = false }
 smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+hdlc = { version = "0.2", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 [profile.release]

@@ -167,7 +167,7 @@ fn serve(config: Config) -> Result<(), i32> {
             1
         })?;
 
-    let mut forti_client = rt
+    let forti_client = rt
         .block_on(fortivpn::FortiVPNTunnel::new(
             &config.fortivpn,
             sslvpn_cookie,
@@ -176,7 +176,7 @@ fn serve(config: Config) -> Result<(), i32> {
             eprintln!("Failed to connect to VPN service: {}", err);
             1
         })?;
-    let mut client = network::Network::new().map_err(|err| {
+    let mut client = network::Network::new(forti_client).map_err(|err| {
         eprintln!("Failed to start virtual network interface: {}", err);
         1
     })?;
