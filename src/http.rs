@@ -23,7 +23,7 @@ where
 {
     let mut result = vec![];
     loop {
-        let chunk = socket.read_peek().await?;
+        let chunk = socket.read_peek(result.len() + 1).await?;
         let result_len = result.len();
         let found = if let Some(header_end) = find_chunk_end(separator, result.as_slice(), chunk) {
             result.resize(result.len() + header_end, 0u8);
@@ -189,7 +189,7 @@ impl<const S: usize> Buffer<S> {
         dest[..source_range.len()].copy_from_slice(&self.data[source_range.clone()]);
         self.read_start = source_range.end;
         if self.read_start > self.move_threshold {
-            // This is not the best ring buffer implementation, hope this trick avoids copying too much data.
+            // This is not the best circular buffer implementation, hope this trick avoids copying too much data.
             // Only do a memmove if a smaller portion of data needs to be relocated.
             // This means that the buffer's capacity needs to be larger than usual.
             self.data.copy_within(self.read_start..self.write_start, 0);
@@ -232,10 +232,10 @@ where
         }
     }
 
-    pub async fn read_peek(&mut self) -> Result<&[u8], HttpError> {
-        let read_buffer_empty = self.buffer.peek().is_empty();
+    pub async fn read_peek(&mut self, need_bytes: usize) -> Result<&[u8], HttpError> {
+        let need_more_data = self.buffer.peek().len() < need_bytes;
         let write_slice = self.buffer.write_slice();
-        if read_buffer_empty && !write_slice.is_empty() {
+        if need_more_data && !write_slice.is_empty() {
             let bytes_read = self.stream.read(write_slice).await?;
             self.buffer.advance_write(bytes_read);
         }

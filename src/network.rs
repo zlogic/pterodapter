@@ -7,7 +7,12 @@ use std::{
 
 use log::{debug, warn};
 use smoltcp::{iface, phy, socket, wire};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    runtime,
+    sync::{mpsc, oneshot},
+};
+
+use crate::fortivpn::FortiVPNTunnel;
 
 const MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 4096;
@@ -24,20 +29,14 @@ pub struct Network<'a> {
 }
 
 impl Network<'_> {
-    pub fn new<'a>() -> Result<Network<'a>, NetworkError> {
-        // TODO: this should block until the device is ready and the network connection is up and running.
-        let mut device = PPPDevice {
-            mtu: MTU_SIZE,
-            buf: [0u8; MTU_SIZE],
-        };
+    pub fn new<'a>(vpn: FortiVPNTunnel) -> Result<Network<'a>, NetworkError> {
+        // TODO: how to choose the CIDR?
+        let ip_cidr = wire::IpCidr::new(vpn.ip_addr().into(), 24);
 
+        let mut device = PPPDevice::new(vpn);
         let mut config = iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
         let mut iface = iface::Interface::new(config, &mut device, smoltcp::time::Instant::now());
-
-        // TODO: use IP address provided by the VPN server.
-        let local_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 8, 1));
-        let ip_cidr = wire::IpCidr::new(local_addr.into(), 24);
 
         iface.update_ip_addrs(|ip_addrs| {
             if let Err(err) = ip_addrs.push(ip_cidr) {
@@ -68,6 +67,8 @@ impl Network<'_> {
             self.copy_all_data();
             self.iface
                 .poll(timestamp, &mut self.device, &mut self.sockets);
+            self.device.receive_data().await?;
+            self.device.send_data().await?;
             match self.iface.poll_delay(timestamp, &self.sockets) {
                 Some(poll_delay) => {
                     let timeout_at = tokio::time::Instant::now()
@@ -187,11 +188,7 @@ impl Network<'_> {
                     .insert(socket_handle, Some(response));
             }
             Command::Bridge(socket_handle, reader, writer) => {
-                let socket_tunnel = SocketTunnel {
-                    socket_handle,
-                    reader,
-                    writer,
-                };
+                let socket_tunnel = SocketTunnel { reader, writer };
                 self.bridges.insert(socket_handle, socket_tunnel);
             }
         }
@@ -215,7 +212,6 @@ impl Network<'_> {
 }
 
 struct SocketTunnel {
-    socket_handle: iface::SocketHandle,
     reader: tokio::net::tcp::OwnedReadHalf,
     writer: tokio::net::tcp::OwnedWriteHalf,
 }
@@ -237,8 +233,47 @@ pub enum Command {
 }
 
 struct PPPDevice {
-    mtu: usize,
-    buf: [u8; 1500],
+    vpn: FortiVPNTunnel,
+    read_packet: [u8; MTU_SIZE],
+    write_packet: [u8; MTU_SIZE],
+    read_packet_size: usize,
+    write_packet_size: usize,
+}
+
+impl PPPDevice {
+    fn new(vpn: FortiVPNTunnel) -> PPPDevice {
+        PPPDevice {
+            vpn,
+            read_packet: [0u8; MTU_SIZE],
+            write_packet: [0u8; MTU_SIZE],
+            read_packet_size: 0,
+            write_packet_size: 0,
+        }
+    }
+}
+
+impl PPPDevice {
+    async fn receive_data(&mut self) -> Result<(), NetworkError> {
+        if self.read_packet_size > 0 {
+            // Data is not consumed yet.
+            return Ok(());
+        }
+        self.read_packet_size = self.vpn.read_packet(&mut self.read_packet).await?;
+        Ok(())
+    }
+
+    async fn send_data(&mut self) -> Result<(), NetworkError> {
+        if self.write_packet_size == 0 {
+            // No data to send.
+            return Ok(());
+        }
+
+        let buf = &self.write_packet[..self.write_packet_size];
+        self.write_packet_size = 0;
+
+        self.vpn.send_packet(buf).await?;
+        Ok(())
+    }
 }
 
 impl phy::Device for PPPDevice {
@@ -252,27 +287,35 @@ impl phy::Device for PPPDevice {
 
     fn receive(
         &mut self,
-        timestamp: smoltcp::time::Instant,
+        _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // TODO: set buffer size to match MTU.
-        // TODO: check if new data is available, copy into a buffer and return TX/RS tokens.
-        // See https://docs.rs/smoltcp/latest/src/smoltcp/phy/raw_socket.rs.html for more information.
-        None
-        /*
+        if self.read_packet_size == 0 || self.write_packet_size != 0 {
+            return None;
+        }
         Some((
-            PPPDeviceRxToken { buf: &self.buf },
-            PPPDeviceTxToken { buf: &self.buf },
+            PPPDeviceRxToken {
+                read_packet: &mut self.read_packet[..self.read_packet_size],
+            },
+            PPPDeviceTxToken {
+                write_packet: &mut self.write_packet,
+                write_packet_size: &mut self.write_packet_size,
+            },
         ))
-        */
     }
 
-    fn transmit(&mut self, timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        Some(PPPDeviceTxToken { buf: &self.buf })
+    fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        if self.write_packet_size != 0 {
+            return None;
+        }
+        Some(PPPDeviceTxToken {
+            write_packet: &mut self.write_packet,
+            write_packet_size: &mut self.write_packet_size,
+        })
     }
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut caps = phy::DeviceCapabilities::default();
-        caps.max_transmission_unit = self.mtu;
+        caps.max_transmission_unit = MTU_SIZE;
         caps.max_burst_size = Some(1);
         caps.medium = phy::Medium::Ip;
         caps
@@ -280,23 +323,23 @@ impl phy::Device for PPPDevice {
 }
 
 struct PPPDeviceRxToken<'a> {
-    buf: &'a [u8],
+    read_packet: &'a mut [u8],
 }
 
 impl<'a> phy::RxToken for PPPDeviceRxToken<'a> {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = [0u8; 1500];
-        let result = f(&mut buf);
-        //println!("Received packet {:?}", buf);
+        let result = f(&mut self.read_packet);
+        println!("Received packet {:?}", self.read_packet);
         result
     }
 }
 
 struct PPPDeviceTxToken<'a> {
-    buf: &'a [u8],
+    write_packet: &'a mut [u8],
+    write_packet_size: &'a mut usize,
 }
 
 impl<'a> phy::TxToken for PPPDeviceTxToken<'a> {
@@ -304,10 +347,9 @@ impl<'a> phy::TxToken for PPPDeviceTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = [0u8; 1500];
-        let result = f(&mut buf[..len]);
-        println!("About to send packet {:?}", &buf[..len]);
-        result
+        // f will copy data into a provided buffer (avoid allocations).
+        *self.write_packet_size = len;
+        f(&mut self.write_packet[..len])
     }
 }
 
@@ -316,6 +358,7 @@ pub enum NetworkError {
     Internal(&'static str),
     Connect(socket::tcp::ConnectError),
     Io(io::Error),
+    Forti(crate::fortivpn::FortiError),
 }
 
 impl fmt::Display for NetworkError {
@@ -328,6 +371,9 @@ impl fmt::Display for NetworkError {
             Self::Io(ref e) => {
                 write!(f, "IO error: {}", e)
             }
+            Self::Forti(ref e) => {
+                write!(f, "VPN error: {}", e)
+            }
         }
     }
 }
@@ -338,6 +384,7 @@ impl error::Error for NetworkError {
             Self::Internal(_msg) => None,
             Self::Connect(ref err) => Some(err),
             Self::Io(ref err) => Some(err),
+            Self::Forti(ref err) => Some(err),
         }
     }
 }
@@ -357,5 +404,11 @@ impl From<socket::tcp::ConnectError> for NetworkError {
 impl From<io::Error> for NetworkError {
     fn from(err: io::Error) -> NetworkError {
         Self::Io(err)
+    }
+}
+
+impl From<crate::fortivpn::FortiError> for NetworkError {
+    fn from(err: crate::fortivpn::FortiError) -> NetworkError {
+        Self::Forti(err)
     }
 }
