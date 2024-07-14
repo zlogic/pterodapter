@@ -10,6 +10,7 @@ use log::info;
 use tokio::signal;
 
 mod fortivpn;
+mod http;
 mod logger;
 mod network;
 mod socks;
@@ -166,6 +167,15 @@ fn serve(config: Config) -> Result<(), i32> {
             1
         })?;
 
+    let mut forti_client = rt
+        .block_on(fortivpn::FortiVPNTunnel::new(
+            &config.fortivpn,
+            sslvpn_cookie,
+        ))
+        .map_err(|err| {
+            eprintln!("Failed to connect to VPN service: {}", err);
+            1
+        })?;
     let mut client = network::Network::new().map_err(|err| {
         eprintln!("Failed to start virtual network interface: {}", err);
         1
