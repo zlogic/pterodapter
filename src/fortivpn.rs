@@ -4,11 +4,12 @@ use std::{
 };
 
 use log::{debug, warn};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_native_tls::native_tls;
+
+use crate::http::{
+    build_http_request, read_content, read_http_headers, write_http_response, BufferedTlsStream,
+};
 
 pub struct Config {
     pub destination_addr: SocketAddr,
@@ -81,6 +82,8 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
                 build_http_request(
                     format!("GET /remote/saml/auth_id?id={}", token_id).as_str(),
                     domain,
+                    None,
+                    0,
                 )
                 .as_bytes(),
             )
@@ -88,10 +91,11 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         let mut cookie = None;
         debug!("Reading cookie response");
         let headers = read_http_headers(&mut socket).await?;
+        println!("Cookie headers are {}", headers);
         for line in headers.lines() {
             if cookie.is_none() && line.starts_with("Set-Cookie: SVPNCOOKIE=") {
-                if let Some(start_index) = line.find("=") {
-                    let line = &line[start_index + 1..];
+                if let Some(start_index) = line.find(":") {
+                    let line = &line[start_index + 2..];
                     if let Some(end_index) = line.find("; ") {
                         cookie = Some((&line[..end_index]).to_string());
                     }
@@ -113,203 +117,77 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     Ok(cookie)
 }
 
-struct Buffer<const S: usize> {
-    data: [u8; S],
-    read_start: usize,
-    write_start: usize,
-    move_threshold: usize,
-}
+pub struct FortiVPNTunnel {}
 
-impl<const S: usize> Buffer<S> {
-    fn new() -> Buffer<S> {
-        Buffer {
-            data: [0u8; S],
-            read_start: 0,
-            write_start: 0,
-            move_threshold: 3 * S / 4,
-        }
-    }
-
-    fn read(&mut self, dest: &mut [u8]) -> usize {
-        let source_range = if self.read_start + dest.len() > self.write_start {
-            self.read_start..self.write_start
+impl FortiVPNTunnel {
+    pub async fn new(config: &Config, cookie: String) -> Result<FortiVPNTunnel, FortiError> {
+        let domain = if let Some(separator) = config.destination_hostport.find(":") {
+            &config.destination_hostport[..separator]
         } else {
-            self.read_start..(self.read_start + dest.len()).min(self.data.len())
+            &config.destination_hostport
         };
-        dest[..source_range.len()].copy_from_slice(&self.data[source_range.clone()]);
-        self.read_start = source_range.end;
-        if self.read_start > self.move_threshold {
-            // This is not the best ring buffer implementation, hope this trick avoids copying too much data.
-            // Only do a memmove if a smaller portion of data needs to be relocated.
-            // This means that the buffer's capacity needs to be larger than usual.
-            self.data.copy_within(self.read_start..self.write_start, 0);
-            self.write_start -= self.read_start;
-            self.read_start = 0;
+        let mut socket = FortiVPNTunnel::connect(&config.destination_hostport, domain).await?;
+        FortiVPNTunnel::request_vpn_allocation(domain, &mut socket, &cookie).await?;
+        FortiVPNTunnel::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
+        Ok(FortiVPNTunnel {})
+    }
+
+    async fn connect(hostport: &str, domain: &str) -> Result<FortiTlsStream, FortiError> {
+        let socket = TcpStream::connect(hostport).await?;
+        let connector = native_tls::TlsConnector::builder().build()?;
+        let connector = tokio_native_tls::TlsConnector::from(connector);
+        let socket = connector.connect(domain, socket).await?;
+        let socket = BufferedTlsStream::new(socket);
+        debug!("Connected to VPN host host");
+
+        Ok(socket)
+    }
+
+    async fn request_vpn_allocation(
+        domain: &str,
+        socket: &mut FortiTlsStream,
+        cookie: &str,
+    ) -> Result<(), FortiError> {
+        let req = build_http_request("GET /remote/fortisslvpn_xml", domain, Some(cookie), 0);
+        println!("Requesrt is {}", req);
+        socket.write_all(req.as_bytes()).await?;
+
+        let headers = read_http_headers(socket).await?;
+        println!("Headers = {}", headers);
+        let content = read_content(socket, headers.as_str()).await?;
+        println!("Content = {}", content);
+
+        Ok(())
+    }
+
+    async fn start_vpn_tunnel(
+        domain: &str,
+        socket: &mut FortiTlsStream,
+        cookie: &str,
+    ) -> Result<(), FortiError> {
+        let req = build_http_request("GET /remote/sslvpn-tunnel", domain, Some(cookie), 0);
+        println!("Starting VPN is {}", req);
+        socket.write_all(req.as_bytes()).await?;
+
+        let mut buf = [0u8; 16];
+        loop {
+            let data_read = socket.read(&mut buf).await?;
+
+            println!("Received packet from FortiVPN {:?}", &buf[..data_read]);
         }
 
-        source_range.len()
-    }
-
-    fn peek(&self) -> &[u8] {
-        &self.data[self.read_start..self.write_start]
-    }
-
-    fn write_slice(&mut self) -> &mut [u8] {
-        &mut self.data[self.write_start..]
-    }
-
-    fn advance_write(&mut self, bytes: usize) {
-        self.write_start += bytes
+        Ok(())
     }
 }
 
-struct BufferedTlsStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    stream: S,
-    buffer: Buffer<4096>,
-}
-
-impl<S> BufferedTlsStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    fn new(stream: S) -> BufferedTlsStream<S> {
-        BufferedTlsStream {
-            stream,
-            buffer: Buffer::new(),
-        }
-    }
-
-    async fn read_peek(&mut self) -> Result<&[u8], FortiError> {
-        let write_slice = self.buffer.write_slice();
-        if !write_slice.is_empty() {
-            let bytes_read = self.stream.read(write_slice).await?;
-            self.buffer.advance_write(bytes_read);
-        }
-        Ok(self.buffer.peek())
-    }
-
-    async fn read(&mut self, dest: &mut [u8]) -> Result<usize, FortiError> {
-        if self.buffer.peek().is_empty() {
-            let write_slice = self.buffer.write_slice();
-            if !write_slice.is_empty() {
-                let bytes_read = self.stream.read(write_slice).await?;
-                self.buffer.advance_write(bytes_read);
-            }
-        }
-        Ok(self.buffer.read(dest))
-    }
-
-    async fn write_all(&mut self, data: &[u8]) -> Result<(), FortiError> {
-        Ok(self.stream.write_all(data).await?)
-    }
-
-    async fn flush(&mut self) -> Result<(), FortiError> {
-        Ok(self.stream.flush().await?)
-    }
-}
-
-struct FortiVPNTunnel {}
-
-async fn read_http_headers<S>(socket: &mut BufferedTlsStream<S>) -> Result<String, FortiError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut result = vec![];
-    loop {
-        let headers = socket.read_peek().await?;
-        let result_len = result.len();
-        let found = if let Some(header_end) = find_header_end(result.as_slice(), headers) {
-            result.resize(result.len() + header_end, 0u8);
-            true
-        } else {
-            result.resize(result.len() + headers.len(), 0u8);
-            false
-        };
-        socket.read(&mut result[result_len..]).await?;
-        if found {
-            break;
-        }
-    }
-    Ok(String::from_utf8(result).map_err(|err| {
-        warn!("Failed to decode headers as UTF-8: {}", err);
-        "Failed to decode headers as UTF-8"
-    })?)
-}
-
-fn find_header_end(previous_chunk: &[u8], data: &[u8]) -> Option<usize> {
-    const HEADER_END_MARKER: &[u8] = "\r\n\r\n".as_bytes();
-    // First character doesn't count, only extras are relevant.
-    for i in 0..data.len() {
-        if i < 3 {
-            let mut merged_chunk = [0u8; 4];
-            let previous_bytes = 3 - i;
-            if previous_chunk.len() < previous_bytes {
-                continue;
-            }
-            merged_chunk[..previous_bytes]
-                .copy_from_slice(&previous_chunk[previous_chunk.len() - previous_bytes..]);
-            merged_chunk[previous_bytes..].copy_from_slice(&data[..=i]);
-            if &merged_chunk == HEADER_END_MARKER {
-                return Some(i + 1);
-            }
-        } else {
-            if &data[i - 3..=i] == HEADER_END_MARKER {
-                return Some(i + 1);
-            }
-        }
-    }
-    None
-}
-
-async fn write_http_response<S>(
-    writer: &mut BufferedTlsStream<S>,
-    data: &[u8],
-) -> Result<(), FortiError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    writer
-        .write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\n\
-            Content-Type: text/html\r\n\
-            Content-Length: {}\r\n\
-            \r\n",
-                data.len()
-            )
-            .as_bytes(),
-        )
-        .await?;
-    writer.write_all(data).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-fn build_http_request(verb: &str, host: &str) -> String {
-    format!(
-        "{} HTTP/1.1\r\n\
-            Host: {}\r\n\
-            User-Agent: Mozilla/5.0 SV1\r\n\
-            Accent: */*\r\n\
-            Accept-Encoding: identity\r\n\
-            Pragma: no-cache\r\n\
-            Cache-Control: no-store, no-cache, must-revalidate\r\n\
-            If-Modified-Since: Sat, 1 Jan 2000 00:00:00 GMT\r\n\
-            Content-Type: application/x-www-form-urlencoded\r\n\
-            Content-Length: 0\r\n\
-            \r\n",
-        verb, host
-    )
-}
+type FortiTlsStream = BufferedTlsStream<tokio_native_tls::TlsStream<TcpStream>>;
 
 #[derive(Debug)]
 pub enum FortiError {
     Internal(&'static str),
     Io(io::Error),
     Tls(native_tls::Error),
+    Http(crate::http::HttpError),
 }
 
 impl fmt::Display for FortiError {
@@ -322,6 +200,9 @@ impl fmt::Display for FortiError {
             Self::Tls(ref e) => {
                 write!(f, "TLS error: {}", e)
             }
+            Self::Http(ref e) => {
+                write!(f, "HTTP error: {}", e)
+            }
         }
     }
 }
@@ -332,6 +213,7 @@ impl error::Error for FortiError {
             Self::Internal(_msg) => None,
             Self::Io(ref err) => Some(err),
             Self::Tls(ref err) => Some(err),
+            Self::Http(ref err) => Some(err),
         }
     }
 }
@@ -351,5 +233,11 @@ impl From<io::Error> for FortiError {
 impl From<native_tls::Error> for FortiError {
     fn from(err: native_tls::Error) -> FortiError {
         Self::Tls(err)
+    }
+}
+
+impl From<crate::http::HttpError> for FortiError {
+    fn from(err: crate::http::HttpError) -> FortiError {
+        Self::Http(err)
     }
 }
