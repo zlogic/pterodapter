@@ -1,6 +1,6 @@
 use std::{
     env, fmt,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     process,
     str::FromStr,
     time::Duration,
@@ -9,15 +9,16 @@ use std::{
 use log::info;
 use tokio::signal;
 
+mod fortivpn;
 mod logger;
 mod network;
 mod socks;
 
 enum Action {
-    Proxy(socks::Config),
+    Proxy(Config),
 }
 
-pub struct Args {
+struct Args {
     log_level: log::LevelFilter,
     action: Action,
 }
@@ -26,8 +27,13 @@ const USAGE_INSTRUCTIONS: &str = "Usage: pterodapter [OPTIONS] proxy\n\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>   Log level [default: info]\
 \n      --listen-address=<IP>     Listen IP address [default: :::5328]\
-\n      --destination=<IP>        Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --help                    Print help";
+
+struct Config {
+    socks: socks::Config,
+    fortivpn: fortivpn::Config,
+}
 
 impl Args {
     fn parse() -> Args {
@@ -42,7 +48,8 @@ impl Args {
 
         let mut log_level = log::LevelFilter::Info;
         let mut listen_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5328);
-        let mut destination = None;
+        let mut destination_addr = None;
+        let mut destination_hostport = None;
 
         for arg in env::args()
             .take(env::args().len().saturating_sub(1))
@@ -83,8 +90,11 @@ impl Args {
                     ),
                 };
             } else if name == "--destination" {
-                match SocketAddr::from_str(value) {
-                    Ok(addr) => destination = Some(addr),
+                match value.to_socket_addrs() {
+                    Ok(mut addr) => {
+                        destination_addr = addr.next();
+                        destination_hostport = Some(value.to_string());
+                    }
                     Err(err) => fail_with_error(
                         name,
                         value,
@@ -106,13 +116,28 @@ impl Args {
 
         match action.as_str() {
             "proxy" => {
-                if destination.is_none() {
-                    eprintln!("No destination specified");
-                    println!("{}", USAGE_INSTRUCTIONS);
-                    process::exit(2);
-                }
+                let (destination_addr, destination_hostport) =
+                    match (destination_addr, destination_hostport) {
+                        (Some(destination_addr), Some(destination_hostport)) => {
+                            (destination_addr, destination_hostport)
+                        }
+                        _ => {
+                            eprintln!("No destination specified");
+                            println!("{}", USAGE_INSTRUCTIONS);
+                            process::exit(2);
+                        }
+                    };
 
-                let action = Action::Proxy(socks::Config { listen_addr });
+                let socks_config = socks::Config { listen_addr };
+                let fortivpn_config = fortivpn::Config {
+                    destination_addr,
+                    destination_hostport,
+                };
+
+                let action = Action::Proxy(Config {
+                    socks: socks_config,
+                    fortivpn: fortivpn_config,
+                });
                 Args { log_level, action }
             }
             _ => {
@@ -124,7 +149,7 @@ impl Args {
     }
 }
 
-pub fn serve(config: socks::Config) -> Result<(), i32> {
+fn serve(config: Config) -> Result<(), i32> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -134,13 +159,20 @@ pub fn serve(config: socks::Config) -> Result<(), i32> {
             1
         })?;
 
+    let sslvpn_cookie = rt
+        .block_on(fortivpn::get_oauth_cookie(&config.fortivpn))
+        .map_err(|err| {
+            eprintln!("Failed to get SSLVPN cookie: {}", err);
+            1
+        })?;
+
     let mut client = network::Network::new().map_err(|err| {
         eprintln!("Failed to start virtual network interface: {}", err);
         1
     })?;
     let command_bridge = client.create_command_sender();
 
-    let server = socks::Server::new(config, command_bridge).map_err(|err| {
+    let server = socks::Server::new(config.socks, command_bridge).map_err(|err| {
         eprintln!("Failed to start SOCKS5 server: {}", err);
         1
     })?;
