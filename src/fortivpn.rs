@@ -5,8 +5,8 @@ use std::{
 
 use log::{debug, warn};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
 };
 use tokio_native_tls::native_tls;
 
@@ -33,7 +33,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     };
     let socket = match listener.accept().await {
         Ok((socket, addr)) => {
-            debug!("New connection on token port from {}", addr);
+            debug!("New connection on SAML redirect port from {}", addr);
             socket
         }
         Err(err) => {
@@ -41,25 +41,21 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
             return Err("Failed to accept incoming connection".into());
         }
     };
-    let (reader, writer) = socket.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
-    let mut line = String::new();
-    let mut token_id = None;
-    while reader.read_line(&mut line).await? > 0 {
-        if line == "\r\n" {
-            break;
-        }
-        if token_id.is_none() && line.starts_with("GET /?id=") {
-            if let Some(start_index) = line.find("=") {
-                let line = &line[start_index + 1..];
-                if let Some(end_index) = line.find(" ") {
-                    token_id = Some((&line[..end_index]).to_string());
-                }
+    let mut socket = BufferedTlsStream::new(socket);
+    let headers = read_http_headers(&mut socket).await?;
+    let token_id = headers
+        .lines()
+        .next()
+        .map(|line| {
+            if !line.starts_with("GET /?id=") {
+                return None;
             }
-        }
-        line.clear();
-    }
+            let start_index = line.find("=")?;
+            let line = &line[start_index + 1..];
+            let end_index = line.find(" ")?;
+            Some((&line[..end_index]).to_string())
+        })
+        .flatten();
 
     let token_id = if let Some(token_id) = token_id {
         token_id
@@ -67,63 +63,214 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         return Err("No token found in request".into());
     };
 
-    debug!("Successfully received token");
-
     // Get real token based on token ID.
-    let socket = TcpStream::connect(&config.destination_addr).await?;
-    let connector = native_tls::TlsConnector::builder().build()?;
-    let connector = tokio_native_tls::TlsConnector::from(connector);
-    let domain = if let Some(separator) = config.destination_hostport.find(":") {
-        &config.destination_hostport[..separator]
-    } else {
-        &config.destination_hostport
-    };
-    let mut socket = connector.connect(domain, socket).await?;
-    debug!("Connected to cookie retrieval host");
-    socket
-        .write_all(
-            build_http_request(
-                format!("GET /remote/saml/auth_id?id={}", token_id).as_str(),
-                domain,
+    let cookie = {
+        let socket = TcpStream::connect(&config.destination_addr).await?;
+        let connector = native_tls::TlsConnector::builder().build()?;
+        let connector = tokio_native_tls::TlsConnector::from(connector);
+        let domain = if let Some(separator) = config.destination_hostport.find(":") {
+            &config.destination_hostport[..separator]
+        } else {
+            &config.destination_hostport
+        };
+        let socket = connector.connect(domain, socket).await?;
+        let mut socket = BufferedTlsStream::new(socket);
+        debug!("Connected to cookie retrieval host");
+        socket
+            .write_all(
+                build_http_request(
+                    format!("GET /remote/saml/auth_id?id={}", token_id).as_str(),
+                    domain,
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .await?;
-    let mut reader = BufReader::new(socket);
-    let mut cookie = None;
-    debug!("Reading cookie response");
-    while reader.read_line(&mut line).await? > 0 {
-        if line == "\r\n" {
-            break;
-        }
-        if cookie.is_none() && line.starts_with("Set-Cookie: SVPNCOOKIE=") {
-            if let Some(start_index) = line.find("=") {
-                let line = &line[start_index + 1..];
-                if let Some(end_index) = line.find("; ") {
-                    cookie = Some((&line[..end_index]).to_string());
+            .await?;
+        let mut cookie = None;
+        debug!("Reading cookie response");
+        let headers = read_http_headers(&mut socket).await?;
+        for line in headers.lines() {
+            if cookie.is_none() && line.starts_with("Set-Cookie: SVPNCOOKIE=") {
+                if let Some(start_index) = line.find("=") {
+                    let line = &line[start_index + 1..];
+                    if let Some(end_index) = line.find("; ") {
+                        cookie = Some((&line[..end_index]).to_string());
+                    }
                 }
             }
         }
-        line.clear();
-    }
-
-    let cookie = if let Some(cookie) = cookie {
-        cookie
-    } else {
-        return Err("Response has no cookie".into());
+        if let Some(cookie) = cookie {
+            cookie
+        } else {
+            return Err("Response has no cookie".into());
+        }
     };
+
     debug!("Successfully obtained cookie");
 
     let response = include_bytes!("static/token.html");
-    write_http_response(&mut writer, response).await?;
+    write_http_response(&mut socket, response).await?;
 
     Ok(cookie)
 }
 
-async fn write_http_response(
-    writer: &mut BufWriter<OwnedWriteHalf>,
+struct Buffer<const S: usize> {
+    data: [u8; S],
+    read_start: usize,
+    write_start: usize,
+    move_threshold: usize,
+}
+
+impl<const S: usize> Buffer<S> {
+    fn new() -> Buffer<S> {
+        Buffer {
+            data: [0u8; S],
+            read_start: 0,
+            write_start: 0,
+            move_threshold: 3 * S / 4,
+        }
+    }
+
+    fn read(&mut self, dest: &mut [u8]) -> usize {
+        let source_range = if self.read_start + dest.len() > self.write_start {
+            self.read_start..self.write_start
+        } else {
+            self.read_start..(self.read_start + dest.len()).min(self.data.len())
+        };
+        dest[..source_range.len()].copy_from_slice(&self.data[source_range.clone()]);
+        self.read_start = source_range.end;
+        if self.read_start > self.move_threshold {
+            // This is not the best ring buffer implementation, hope this trick avoids copying too much data.
+            // Only do a memmove if a smaller portion of data needs to be relocated.
+            // This means that the buffer's capacity needs to be larger than usual.
+            self.data.copy_within(self.read_start..self.write_start, 0);
+            self.write_start -= self.read_start;
+            self.read_start = 0;
+        }
+
+        source_range.len()
+    }
+
+    fn peek(&self) -> &[u8] {
+        &self.data[self.read_start..self.write_start]
+    }
+
+    fn write_slice(&mut self) -> &mut [u8] {
+        &mut self.data[self.write_start..]
+    }
+
+    fn advance_write(&mut self, bytes: usize) {
+        self.write_start += bytes
+    }
+}
+
+struct BufferedTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream: S,
+    buffer: Buffer<4096>,
+}
+
+impl<S> BufferedTlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(stream: S) -> BufferedTlsStream<S> {
+        BufferedTlsStream {
+            stream,
+            buffer: Buffer::new(),
+        }
+    }
+
+    async fn read_peek(&mut self) -> Result<&[u8], FortiError> {
+        let write_slice = self.buffer.write_slice();
+        if !write_slice.is_empty() {
+            let bytes_read = self.stream.read(write_slice).await?;
+            self.buffer.advance_write(bytes_read);
+        }
+        Ok(self.buffer.peek())
+    }
+
+    async fn read(&mut self, dest: &mut [u8]) -> Result<usize, FortiError> {
+        if self.buffer.peek().is_empty() {
+            let write_slice = self.buffer.write_slice();
+            if !write_slice.is_empty() {
+                let bytes_read = self.stream.read(write_slice).await?;
+                self.buffer.advance_write(bytes_read);
+            }
+        }
+        Ok(self.buffer.read(dest))
+    }
+
+    async fn write_all(&mut self, data: &[u8]) -> Result<(), FortiError> {
+        Ok(self.stream.write_all(data).await?)
+    }
+
+    async fn flush(&mut self) -> Result<(), FortiError> {
+        Ok(self.stream.flush().await?)
+    }
+}
+
+struct FortiVPNTunnel {}
+
+async fn read_http_headers<S>(socket: &mut BufferedTlsStream<S>) -> Result<String, FortiError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut result = vec![];
+    loop {
+        let headers = socket.read_peek().await?;
+        let result_len = result.len();
+        let found = if let Some(header_end) = find_header_end(result.as_slice(), headers) {
+            result.resize(result.len() + header_end, 0u8);
+            true
+        } else {
+            result.resize(result.len() + headers.len(), 0u8);
+            false
+        };
+        socket.read(&mut result[result_len..]).await?;
+        if found {
+            break;
+        }
+    }
+    Ok(String::from_utf8(result).map_err(|err| {
+        warn!("Failed to decode headers as UTF-8: {}", err);
+        "Failed to decode headers as UTF-8"
+    })?)
+}
+
+fn find_header_end(previous_chunk: &[u8], data: &[u8]) -> Option<usize> {
+    const HEADER_END_MARKER: &[u8] = "\r\n\r\n".as_bytes();
+    // First character doesn't count, only extras are relevant.
+    for i in 0..data.len() {
+        if i < 3 {
+            let mut merged_chunk = [0u8; 4];
+            let previous_bytes = 3 - i;
+            if previous_chunk.len() < previous_bytes {
+                continue;
+            }
+            merged_chunk[..previous_bytes]
+                .copy_from_slice(&previous_chunk[previous_chunk.len() - previous_bytes..]);
+            merged_chunk[previous_bytes..].copy_from_slice(&data[..=i]);
+            if &merged_chunk == HEADER_END_MARKER {
+                return Some(i + 1);
+            }
+        } else {
+            if &data[i - 3..=i] == HEADER_END_MARKER {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
+async fn write_http_response<S>(
+    writer: &mut BufferedTlsStream<S>,
     data: &[u8],
-) -> Result<(), FortiError> {
+) -> Result<(), FortiError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     writer
         .write_all(
             format!(
