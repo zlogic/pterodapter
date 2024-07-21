@@ -15,6 +15,7 @@ use crate::fortivpn::FortiVPNTunnel;
 const MAX_MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const DEVICE_BUFFERS_COUNT: usize = 16;
+const IDLE_POLL_DELAY: Duration = Duration::from_secs(1);
 
 pub struct Network<'a> {
     device: VpnDevice<'a>,
@@ -71,18 +72,17 @@ impl Network<'_> {
             self.copy_all_data();
             match self.iface.poll_delay(timestamp, &self.sockets) {
                 Some(poll_delay) => {
-                    let timeout_at = start_time + Duration::from_micros(poll_delay.total_micros());
-                    self.process_commands(Some(timeout_at)).await;
-                }
-                None => {
                     let empty_connections =
                         self.sockets.iter().count() == 0 && self.bridges.is_empty();
-                    let timeout_at = if empty_connections {
-                        Some(start_time + Duration::from_secs(1))
+                    let poll_delay = if empty_connections {
+                        IDLE_POLL_DELAY
                     } else {
-                        None
+                        Duration::from_micros(poll_delay.total_micros())
                     };
-                    self.process_commands(timeout_at).await;
+                    self.process_commands(Some(start_time + poll_delay)).await;
+                }
+                None => {
+                    self.process_commands(None).await;
                 }
             }
         }
