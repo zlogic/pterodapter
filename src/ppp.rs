@@ -24,7 +24,7 @@ impl Packet<'_> {
 
     pub fn to_lcp(&self) -> Result<LcpPacket, FormatError> {
         if self.protocol == Protocol::LCP {
-            LcpPacket::from_bytes(&self.data[2..])
+            LcpPacket::from_bytes(&self.data)
         } else {
             Err("Protocol type is not LCP".into())
         }
@@ -32,7 +32,7 @@ impl Packet<'_> {
 
     pub fn to_ipcp(&self) -> Result<IpcpPacket, FormatError> {
         if self.protocol == Protocol::IPV4CP {
-            IpcpPacket::from_bytes(&self.data[2..])
+            IpcpPacket::from_bytes(&self.data)
         } else {
             Err("Protocol type is not IPCP".into())
         }

@@ -7,16 +7,17 @@ use std::{
 
 use log::{debug, warn};
 use rand::Rng;
-use smoltcp::{iface, phy, socket, wire};
+use smoltcp::{iface, phy, socket, storage, wire};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::fortivpn::FortiVPNTunnel;
 
 const MAX_MTU_SIZE: usize = 1500;
-const SOCKET_BUFFER_SIZE: usize = 4096;
+const SOCKET_BUFFER_SIZE: usize = 65536;
+const DEVICE_BUFFERS_COUNT: usize = 16;
 
 pub struct Network<'a> {
-    device: VpnDevice,
+    device: VpnDevice<'a>,
     iface: iface::Interface,
     sockets: iface::SocketSet<'a>,
     bridges: HashMap<iface::SocketHandle, SocketTunnel>,
@@ -61,22 +62,27 @@ impl Network<'_> {
 
     pub async fn run(&mut self) -> Result<(), NetworkError> {
         loop {
-            let timestamp = smoltcp::time::Instant::now();
-            self.copy_all_data();
-            self.iface
-                .poll(timestamp, &mut self.device, &mut self.sockets);
             self.device.send_data().await?;
             self.device.receive_data().await?;
+            let timestamp = smoltcp::time::Instant::now();
+            let start_time = tokio::time::Instant::now();
+            self.iface
+                .poll(timestamp, &mut self.device, &mut self.sockets);
+            self.copy_all_data();
             match self.iface.poll_delay(timestamp, &self.sockets) {
                 Some(poll_delay) => {
-                    let timeout_at = tokio::time::Instant::now()
-                        + Duration::from_micros(poll_delay.total_micros());
-                    self.process_commands(timeout_at.into()).await;
+                    let timeout_at = start_time + Duration::from_micros(poll_delay.total_micros());
+                    self.process_commands(Some(timeout_at)).await;
                 }
                 None => {
-                    // TODO: refactor this to send all events through queue.
-                    let timeout_at = tokio::time::Instant::now() + Duration::from_millis(100);
-                    self.process_commands(timeout_at.into()).await;
+                    let empty_connections =
+                        self.sockets.iter().count() == 0 && self.bridges.is_empty();
+                    let timeout_at = if empty_connections {
+                        Some(start_time + Duration::from_secs(1))
+                    } else {
+                        None
+                    };
+                    self.process_commands(timeout_at).await;
                 }
             }
         }
@@ -98,6 +104,7 @@ impl Network<'_> {
                             (bytes, Ok::<(), NetworkError>(()))
                         } else {
                             // Zero bytes means the stream is closed.
+                            // TODO: add a custom handler for this error.
                             (0, Err("Proxy reader is closed".into()))
                         }
                     }
@@ -146,6 +153,21 @@ impl Network<'_> {
             self.sockets.remove(*handle);
             false
         });
+        let closed_sockets = self
+            .sockets
+            .iter()
+            .filter_map(|(handle, _)| {
+                let socket = self.sockets.get::<tcp::Socket>(handle);
+                if !self.bridges.contains_key(&handle) && socket.state() == tcp::State::Closed {
+                    Some(handle)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        closed_sockets.into_iter().for_each(|handle| {
+            self.sockets.remove(handle);
+        });
 
         for (handle, response) in self.opening_connections.iter_mut() {
             let socket = self.sockets.get::<tcp::Socket>(*handle);
@@ -178,7 +200,7 @@ impl Network<'_> {
             } else {
                 continue;
             };
-            if let Err(_err) = response.send(result) {
+            if let Err(_) = response.send(result) {
                 debug!("Proxy listener not listening for response");
             }
         }
@@ -194,6 +216,14 @@ impl Network<'_> {
         use socket::tcp;
         match command {
             Command::Connect(addr, response) => {
+                // smoltcp crashes if interface has no IPv6 address.
+                if addr.is_ipv6() {
+                    if let Err(_) = response.send(Err("IPv6 connections are not supported".into()))
+                    {
+                        debug!("Proxy listener not listening for response");
+                    }
+                    return;
+                }
                 let rx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
                 let tx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
@@ -203,7 +233,9 @@ impl Network<'_> {
                 if let Err(err) =
                     socket.connect(self.iface.context(), (remote_addr, addr.port()), local_port)
                 {
-                    let _ = response.send(Err(err.into()));
+                    if let Err(_) = response.send(Err(err.into())) {
+                        debug!("Proxy listener not listening for response");
+                    }
                     return;
                 }
 
@@ -220,12 +252,13 @@ impl Network<'_> {
 
     async fn process_commands(&mut self, timeout_at: Option<tokio::time::Instant>) {
         let command = if let Some(timeout_at) = timeout_at {
-            match tokio::time::timeout_at(timeout_at, self.cmd_receiver.recv()).await {
-                Ok(command) => command,
-                Err(_) => return,
-            }
+            tokio::time::timeout_at(timeout_at, self.cmd_receiver.recv())
         } else {
-            self.cmd_receiver.recv().await
+            tokio::time::timeout(Duration::from_millis(0), self.cmd_receiver.recv())
+        };
+        let command = match command.await {
+            Ok(command) => command,
+            Err(_) => return,
         };
 
         if let Some(command) = command {
@@ -256,54 +289,79 @@ pub enum Command {
     ),
 }
 
-struct VpnDevice {
+struct VpnDevice<'a> {
     vpn: FortiVPNTunnel,
-    read_packet: [u8; MAX_MTU_SIZE],
-    write_packet: [u8; MAX_MTU_SIZE],
-    read_packet_size: usize,
-    write_packet_size: usize,
+    read_buffers: storage::RingBuffer<'a, Vec<u8>>,
+    write_buffers: storage::RingBuffer<'a, Vec<u8>>,
 }
 
-impl VpnDevice {
-    fn new(vpn: FortiVPNTunnel) -> VpnDevice {
+impl<'a> VpnDevice<'_> {
+    fn new(vpn: FortiVPNTunnel) -> VpnDevice<'a> {
         VpnDevice {
             vpn,
-            read_packet: [0u8; MAX_MTU_SIZE],
-            write_packet: [0u8; MAX_MTU_SIZE],
-            read_packet_size: 0,
-            write_packet_size: 0,
+            read_buffers: storage::RingBuffer::new(vec![
+                Vec::with_capacity(MAX_MTU_SIZE);
+                DEVICE_BUFFERS_COUNT
+            ]),
+            write_buffers: storage::RingBuffer::new(vec![
+                Vec::with_capacity(MAX_MTU_SIZE);
+                DEVICE_BUFFERS_COUNT
+            ]),
         }
     }
 }
 
-impl VpnDevice {
+impl VpnDevice<'_> {
     async fn receive_data(&mut self) -> Result<(), NetworkError> {
-        if self.read_packet_size > 0 {
-            // Data is not consumed yet.
-            return Ok(());
+        while !self.read_buffers.is_full() {
+            let bytes_available = self
+                .vpn
+                .try_next_ip_packet(Some(Duration::from_millis(0)))
+                .await?;
+            if bytes_available == 0 {
+                break;
+            }
+            let dest = if let Ok(dest) = self.read_buffers.enqueue_one() {
+                dest
+            } else {
+                println!("Read buffers are full");
+                // Read buffers are full.
+                return Ok(());
+            };
+            dest.resize(bytes_available, 0);
+            let length = self
+                .vpn
+                .try_read_packet(dest, Some(Duration::from_millis(0)))
+                .await?;
+            dest.truncate(length);
+            if length == 0 {
+                break;
+            }
         }
-        self.read_packet_size = self
-            .vpn
-            .try_read_packet(&mut self.read_packet, None)
-            .await?;
         Ok(())
     }
 
     async fn send_data(&mut self) -> Result<(), NetworkError> {
-        if self.write_packet_size == 0 {
-            // No data to send.
-            return Ok(());
+        while !self.write_buffers.is_empty() {
+            let src = if let Ok(src) = self.write_buffers.dequeue_one() {
+                src
+            } else {
+                // No write buffers are available.
+                return Ok(());
+            };
+
+            if src.is_empty() {
+                continue;
+            }
+            self.vpn.send_packet(src).await?;
+            println!("wrote {} bytes", src.len());
+            src.clear();
         }
-
-        let buf = &self.write_packet[..self.write_packet_size];
-        self.write_packet_size = 0;
-
-        self.vpn.send_packet(buf).await?;
         Ok(())
     }
 }
 
-impl phy::Device for VpnDevice {
+impl phy::Device for VpnDevice<'_> {
     type RxToken<'a> = RxToken<'a>
     where
          Self: 'a;
@@ -316,34 +374,41 @@ impl phy::Device for VpnDevice {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.read_packet_size == 0 || self.write_packet_size != 0 {
+        if self.read_buffers.is_empty() || self.write_buffers.is_full() {
             return None;
         }
-        let read_packet = &mut self.read_packet[..self.read_packet_size];
-        self.read_packet_size = 0;
-        Some((
-            RxToken { read_packet },
-            TxToken {
-                write_packet: &mut self.write_packet,
-                write_packet_size: &mut self.write_packet_size,
-            },
-        ))
+        let src = if let Ok(src) = self.read_buffers.dequeue_one() {
+            src
+        } else {
+            println!("Failed to rx, read");
+            // No read buffers are available.
+            return None;
+        };
+        let dest = if let Ok(dest) = self.write_buffers.enqueue_one() {
+            dest
+        } else {
+            println!("Failed to tx, read");
+            // Write buffers are full.
+            return None;
+        };
+        Some((RxToken { src }, TxToken { dest }))
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        if self.write_packet_size != 0 {
+        let dest = if let Ok(dest) = self.write_buffers.enqueue_one() {
+            dest
+        } else {
+            println!("Failed to rx, write");
+            // Write buffers are full.
             return None;
-        }
-        Some(TxToken {
-            write_packet: &mut self.write_packet,
-            write_packet_size: &mut self.write_packet_size,
-        })
+        };
+        Some(TxToken { dest })
     }
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut caps = phy::DeviceCapabilities::default();
         caps.max_transmission_unit = self.vpn.mtu();
-        //caps.max_burst_size = Some(16);
+        caps.max_burst_size = Some(DEVICE_BUFFERS_COUNT);
         caps.medium = phy::Medium::Ip;
         caps.checksum.ipv4 = phy::Checksum::Both;
         caps.checksum.tcp = phy::Checksum::Both;
@@ -355,7 +420,7 @@ impl phy::Device for VpnDevice {
 }
 
 struct RxToken<'a> {
-    read_packet: &'a mut [u8],
+    src: &'a mut Vec<u8>,
 }
 
 impl<'a> phy::RxToken for RxToken<'a> {
@@ -363,15 +428,12 @@ impl<'a> phy::RxToken for RxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let result = f(&mut self.read_packet);
-        println!("Received packet {:?}", self.read_packet);
-        result
+        f(&mut self.src)
     }
 }
 
 struct TxToken<'a> {
-    write_packet: &'a mut [u8],
-    write_packet_size: &'a mut usize,
+    dest: &'a mut Vec<u8>,
 }
 
 impl<'a> phy::TxToken for TxToken<'a> {
@@ -379,9 +441,8 @@ impl<'a> phy::TxToken for TxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // f will copy data into a provided buffer (avoid allocations).
-        *self.write_packet_size = len;
-        f(&mut self.write_packet[..len])
+        self.dest.resize(len, 0);
+        f(self.dest)
     }
 }
 
