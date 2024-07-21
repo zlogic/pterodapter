@@ -22,7 +22,7 @@ pub struct Config {
 
 // TODO: allow this to be configured.
 // PPP_MTU specifies is the MTU excluding IP, TCP, TLS, FortiVPN and PPP encapsulation headers.
-const PPP_MTU: u16 = 1400; //1500 - 20 - 20 - 5 - 6 - 4;
+const PPP_MTU: u16 = 1500 - 20 - 20 - 5 - 6 - 4;
 
 // TODO: check how FortiVPN chooses the listen port - is it fixed or sent as a parameter?
 const REDIRECT_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8020);
@@ -99,7 +99,6 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         let mut cookie = None;
         debug!("Reading cookie response");
         let headers = read_http_headers(&mut socket).await?;
-        println!("Cookie headers are {}", headers);
         for line in headers.lines() {
             if cookie.is_none() && line.starts_with("Set-Cookie: SVPNCOOKIE=") {
                 if let Some(start_index) = line.find(":") {
@@ -168,7 +167,7 @@ impl FortiVPNTunnel {
         let connector = tokio_native_tls::TlsConnector::from(connector);
         let socket = connector.connect(domain, socket).await?;
         let socket = BufferedTlsStream::new(socket);
-        debug!("Connected to VPN host host");
+        debug!("Connected to VPN host");
 
         Ok(socket)
     }
@@ -212,9 +211,7 @@ impl FortiVPNTunnel {
     ) -> Result<(), FortiError> {
         let req = build_http_request("GET /remote/sslvpn-tunnel", domain, Some(cookie), 0);
         socket.write_all(req.as_bytes()).await?;
-        socket.flush().await?;
-
-        Ok(())
+        Ok(socket.flush().await?)
     }
 
     async fn start_ppp(socket: &mut FortiTlsStream) -> Result<u32, FortiError> {
@@ -231,37 +228,25 @@ impl FortiVPNTunnel {
         let length =
             ppp::encode_lcp_config(&mut req, ppp::LcpCode::CONFIGURE_REQUEST, identifier, &opts)
                 .map_err(|err| {
-                    debug!("Failed to encode Configure-Request: {}", err);
-                    "Failed to encode Configure-Request"
+                    debug!("Failed to encode LCP Configure-Request: {}", err);
+                    "Failed to encode LCP Configure-Request"
                 })?;
-        {
-            let mut pack = [0u8; 200];
-            pack[..2].copy_from_slice(&ppp::Protocol::LCP.value().to_be_bytes());
-            pack[2..length + 2].copy_from_slice(&req[..length]);
-
-            println!(
-                "Encoded packet: {:?}",
-                ppp::Packet::from_bytes(&pack[..length + 2])
-            );
-        }
         FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
 
         let mut local_acked = false;
         let mut remote_acked = false;
         while !(local_acked && remote_acked) {
             let length = FortiVPNTunnel::read_ppp_packet(socket, &mut resp, true).await?;
-            let response = &resp[..length];
-            println!("Read packet: {:?}", response);
             let response = ppp::Packet::from_bytes(&resp[..length]).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
-            println!("Decoded packet: {}", response);
+            debug!("Received LCP packet: {:?}", response);
             let lcp_packet = match response.to_lcp() {
                 Ok(lcp) => lcp,
                 Err(err) => {
                     debug!(
-                        "Received unexpected PPP packet during handshake: {} (error {})",
+                        "Received unexpected PPP packet during LCP handshake: {} (error {})",
                         response, err
                     );
                     continue;
@@ -275,28 +260,28 @@ impl FortiVPNTunnel {
                     let options_match = match received_opts {
                         Ok(received_opts) => &opts == received_opts.as_slice(),
                         Err(err) => {
-                            debug!("Failed to decode Ack options: {}", err);
-                            return Err("Failed to decode Ack options".into());
+                            debug!("Failed to decode LCP Ack options: {}", err);
+                            return Err("Failed to decode LCP Ack options".into());
                         }
                     };
                     if !options_match {
-                        return Err("Configure Ack has unexpected options".into());
+                        return Err("Configure Ack has unexpected LCP options".into());
                     }
                     local_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_REQUEST => {
-                    let received_opts = lcp_packet
+                    lcp_packet
                         .iter_options()
                         .map(|opt| {
                             let opt = match opt {
                                 Ok(opt) => opt,
                                 Err(err) => {
                                     debug!(
-                                        "Remote side sent invalid configuration option: {}",
+                                        "Remote side sent invalid LCP configuration option: {}",
                                         err
                                     );
                                     return Err(
-                                        "Remote side sent invalid configuration option".into()
+                                        "Remote side sent invalid LCP configuration option".into(),
                                     );
                                 }
                             };
@@ -309,49 +294,39 @@ impl FortiVPNTunnel {
                                         Err("Remote side sent unacceptable MTU".into())
                                     }
                                 }
-                                ppp::LcpOptionData::MagicNumber(magic) => Ok(opt),
+                                ppp::LcpOptionData::MagicNumber(_) => Ok(opt),
                                 _ => {
                                     debug!(
-                                        "Remote side sent unsupported configuration option: {}",
+                                        "Remote side sent unsupported LCP configuration option: {}",
                                         opt
                                     );
-                                    Err("Remote side sent unsupported configuration option".into())
+                                    Err("Remote side sent unsupported LCP configuration option"
+                                        .into())
                                 }
                             }
                         })
-                        .collect::<Result<Vec<_>, FortiError>>();
-                    match received_opts {
-                        Ok(opts) => {
-                            let length = ppp::encode_lcp_data(
-                                &mut req,
-                                ppp::LcpCode::CONFIGURE_ACK,
-                                lcp_packet.identifier(),
-                                lcp_packet.read_options(),
-                            )
-                            .map_err(|err| {
-                                debug!("Failed to encode Configure-Ack: {}", err);
-                                "Failed to encode Configure-Ack"
-                            })?;
-                            FortiVPNTunnel::send_ppp_packet(
-                                socket,
-                                ppp::Protocol::LCP,
-                                &req[..length],
-                            )
-                            .await?;
-                            remote_acked = true;
-                        }
-                        Err(err) => {
-                            return Err(err);
-                        }
-                    }
+                        .collect::<Result<Vec<_>, FortiError>>()?;
+                    let length = ppp::encode_lcp_data(
+                        &mut req,
+                        ppp::LcpCode::CONFIGURE_ACK,
+                        lcp_packet.identifier(),
+                        lcp_packet.read_options(),
+                    )
+                    .map_err(|err| {
+                        debug!("Failed to encode LCP Configure-Ack: {}", err);
+                        "Failed to encode LCP Configure-Ack"
+                    })?;
+                    FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length])
+                        .await?;
+                    remote_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_NAK => {
-                    debug!("Remote side Nak'd configuration: {}", response);
-                    return Err("Remote side Nak'd configuration".into());
+                    debug!("Remote side Nak'd LCP configuration: {}", response);
+                    return Err("Remote side Nak'd LCP configuration".into());
                 }
                 ppp::LcpCode::CONFIGURE_REJECT => {
-                    debug!("Remote side rejected configuration: {}", response);
-                    return Err("Remote side rejected configuration".into());
+                    debug!("Remote side rejected LCP configuration: {}", response);
+                    return Err("Remote side rejected LCP configuration".into());
                 }
                 _ => {
                     debug!("Received unexpected PPP packet: {}", response);
@@ -366,34 +341,20 @@ impl FortiVPNTunnel {
     async fn start_ipcp(socket: &mut FortiTlsStream, addr: IpAddr) -> Result<(), FortiError> {
         // Open IPCP link; 20 bytes should fit any IPCP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
-        let mut req = [0u8; 100];
+        let mut req = [0u8; 20];
         let mut resp = [0u8; 200];
         let mut identifier = 1;
         let addr = match addr {
             IpAddr::V4(addr) => addr,
             _ => return Ok(()),
         };
-        let opts = [
-            ppp::IpcpOptionData::IpAddress(addr),
-            //ppp::IpcpOptionData::PrimaryDns(Ipv4Addr::UNSPECIFIED),
-            //ppp::IpcpOptionData::SecondaryDns(Ipv4Addr::UNSPECIFIED),
-        ];
+        let opts = [ppp::IpcpOptionData::IpAddress(addr)];
         let length =
             ppp::encode_ipcp_config(&mut req, ppp::LcpCode::CONFIGURE_REQUEST, identifier, &opts)
                 .map_err(|err| {
-                debug!("Failed to encode Configure-Request: {}", err);
-                "Failed to encode Configure-Request"
+                debug!("Failed to encode IPCP Configure-Request: {}", err);
+                "Failed to encode IPCP Configure-Request"
             })?;
-        {
-            let mut pack = [0u8; 200];
-            pack[..2].copy_from_slice(&ppp::Protocol::IPV4CP.value().to_be_bytes());
-            pack[2..length + 2].copy_from_slice(&req[..length]);
-
-            println!(
-                "Encoded packet: {:?}",
-                ppp::Packet::from_bytes(&pack[..length + 2])
-            );
-        }
         let mut opts = [0u8; 100];
         let mut opts_len = length - 4;
         opts[..opts_len].copy_from_slice(&req[4..length]);
@@ -403,13 +364,11 @@ impl FortiVPNTunnel {
         let mut remote_acked = false;
         while !(local_acked && remote_acked) {
             let length = FortiVPNTunnel::read_ppp_packet(socket, &mut resp, true).await?;
-            let response = &resp[..length];
-            println!("Read packet: {:?}", response);
             let response = ppp::Packet::from_bytes(&resp[..length]).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
-            println!("Decoded packet: {}", response);
+            debug!("Received IPCP packet: {:?}", response);
             let ipcp_packet = match response.to_ipcp() {
                 Ok(lcp) => lcp,
                 Err(err) => {
@@ -423,127 +382,61 @@ impl FortiVPNTunnel {
             match ipcp_packet.code() {
                 ppp::LcpCode::CONFIGURE_ACK => {
                     if ipcp_packet.read_options() != &opts[..opts_len] {
-                        return Err("Configure Ack has unexpected options".into());
+                        return Err("Configure Ack has unexpected IPCP options".into());
                     }
                     local_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_REQUEST => {
-                    let received_opts = ipcp_packet
+                    ipcp_packet
                         .iter_options()
                         .map(|opt| {
                             let opt = match opt {
                                 Ok(opt) => opt,
                                 Err(err) => {
                                     debug!(
-                                        "Remote side sent invalid configuration option: {}",
+                                        "Remote side sent invalid IPCP configuration option: {}",
                                         err
                                     );
                                     return Err(
-                                        "Remote side sent invalid configuration option".into()
+                                        "Remote side sent invalid IPCP configuration option".into(),
                                     );
                                 }
                             };
                             match opt {
-                                ppp::IpcpOptionData::IpAddress(ip) => Ok(opt),
-                                ppp::IpcpOptionData::PrimaryDns(ip) => Ok(opt),
-                                ppp::IpcpOptionData::SecondaryDns(ip) => Ok(opt),
+                                ppp::IpcpOptionData::IpAddress(_) => Ok(opt),
+                                ppp::IpcpOptionData::PrimaryDns(_) => Ok(opt),
+                                ppp::IpcpOptionData::SecondaryDns(_) => Ok(opt),
                                 _ => {
                                     debug!(
-                                        "Remote side sent unsupported configuration option: {}",
+                                        "Remote side sent unsupported IPCP configuration option: {}",
                                         opt
                                     );
-                                    Err("Remote side sent unsupported configuration option".into())
+                                    Err("Remote side sent unsupported IPCP configuration option".into())
                                 }
                             }
                         })
-                        .collect::<Result<Vec<_>, FortiError>>();
-                    match received_opts {
-                        Ok(_) => {
-                            let length = ppp::encode_lcp_data(
-                                &mut req,
-                                ppp::LcpCode::CONFIGURE_ACK,
-                                ipcp_packet.identifier(),
-                                ipcp_packet.read_options(),
-                            )
-                            .map_err(|err| {
-                                debug!("Failed to encode Configure-Ack: {}", err);
-                                "Failed to encode Configure-Ack"
-                            })?;
-                            FortiVPNTunnel::send_ppp_packet(
-                                socket,
-                                ppp::Protocol::IPV4CP,
-                                &req[..length],
-                            )
-                            .await?;
-                            remote_acked = true;
-                        }
-                        Err(err) => {
-                            return Err(err);
-                        }
-                    }
+                        .collect::<Result<Vec<_>, FortiError>>()?;
+                    let length = ppp::encode_lcp_data(
+                        &mut req,
+                        ppp::LcpCode::CONFIGURE_ACK,
+                        ipcp_packet.identifier(),
+                        ipcp_packet.read_options(),
+                    )
+                    .map_err(|err| {
+                        debug!("Failed to encode IPCP Configure-Ack: {}", err);
+                        "Failed to encode IPCP Configure-Ack"
+                    })?;
+                    FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length])
+                        .await?;
+                    remote_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_NAK => {
-                    debug!("Remote side Nak'd configuration: {}", response);
-                    let received_opts = ipcp_packet
-                        .iter_options()
-                        .map(|opt| {
-                            let opt = match opt {
-                                Ok(opt) => opt,
-                                Err(err) => {
-                                    debug!(
-                                        "Remote side sent invalid configuration option: {}",
-                                        err
-                                    );
-                                    return Err(
-                                        "Remote side sent invalid configuration option".into()
-                                    );
-                                }
-                            };
-                            match opt {
-                                ppp::IpcpOptionData::IpAddress(ip) => Ok(opt),
-                                ppp::IpcpOptionData::PrimaryDns(ip) => Ok(opt),
-                                ppp::IpcpOptionData::SecondaryDns(ip) => Ok(opt),
-                                _ => {
-                                    debug!(
-                                        "Remote side sent unsupported configuration option: {}",
-                                        opt
-                                    );
-                                    Err("Remote side sent unsupported configuration option".into())
-                                }
-                            }
-                        })
-                        .collect::<Result<Vec<_>, FortiError>>();
-                    match received_opts {
-                        Ok(_) => {
-                            opts_len = ipcp_packet.read_options().len();
-                            opts[..opts_len].copy_from_slice(ipcp_packet.read_options());
-                            identifier += 1;
-
-                            let length = ppp::encode_lcp_data(
-                                &mut req,
-                                ppp::LcpCode::CONFIGURE_REQUEST,
-                                identifier,
-                                &opts[..opts_len],
-                            )
-                            .map_err(|err| {
-                                debug!("Failed to encode Configure-Request: {}", err);
-                                "Failed to encode Configure-Request"
-                            })?;
-                            FortiVPNTunnel::send_ppp_packet(
-                                socket,
-                                ppp::Protocol::IPV4CP,
-                                &req[..length],
-                            )
-                            .await?;
-                        }
-                        Err(err) => {
-                            return Err(err);
-                        }
-                    }
+                    debug!("Remote side Nak'd IPCP configuration: {}", response);
+                    return Err("Remote side Nak'd IPCP configuration".into());
                 }
                 ppp::LcpCode::CONFIGURE_REJECT => {
-                    debug!("Remote side rejected configuration: {}", response);
-                    return Err("Remote side rejected configuration".into());
+                    debug!("Remote side rejected IPCP configuration: {}", response);
+                    return Err("Remote side rejected IPCP configuration".into());
                 }
                 _ => {
                     debug!("Received unexpected PPP packet: {}", response);
@@ -560,9 +453,6 @@ impl FortiVPNTunnel {
         protocol: ppp::Protocol,
         ppp_data: &[u8],
     ) -> Result<(), FortiError> {
-        let mut buf = String::new();
-        ppp::fmt_slice_hex(ppp_data, &mut buf);
-        println!("About to send packet {:?}, {}", buf, protocol.value());
         // FortiVPN encapsulation.
         let mut packet_header = [0u8; 8];
         let ppp_packet_length = ppp_data.len() + 2;
