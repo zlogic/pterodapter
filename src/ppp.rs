@@ -644,7 +644,7 @@ pub fn encode_ipcp_config(
     Ok(length)
 }
 
-pub fn fmt_slice_hex(data: &[u8], f: &mut dyn std::fmt::Write) -> std::fmt::Result {
+fn fmt_slice_hex(data: &[u8], f: &mut dyn std::fmt::Write) -> std::fmt::Result {
     for (i, b) in data.iter().enumerate() {
         write!(f, "{:02x}", b)?;
         if i + 1 < data.len() {
