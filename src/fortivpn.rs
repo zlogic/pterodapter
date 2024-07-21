@@ -6,17 +6,23 @@ use std::{
 };
 
 use log::{debug, warn};
+use rand::Rng;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_native_tls::native_tls;
 
 use crate::http::{
     build_http_request, read_content, read_http_headers, write_http_response, BufferedTlsStream,
 };
+use crate::ppp;
 
 pub struct Config {
     pub destination_addr: SocketAddr,
     pub destination_hostport: String,
 }
+
+// TODO: allow this to be configured.
+// PPP_MTU specifies is the MTU excluding IP, TCP, TLS, FortiVPN and PPP encapsulation headers.
+const PPP_MTU: u16 = 1400; //1500 - 20 - 20 - 5 - 6 - 4;
 
 // TODO: check how FortiVPN chooses the listen port - is it fixed or sent as a parameter?
 const REDIRECT_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8020);
@@ -122,8 +128,9 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
 pub struct FortiVPNTunnel {
     socket: FortiTlsStream,
     addr: IpAddr,
-    first_packet: bool,
-    tunnel_failed: bool,
+    mtu: usize,
+    ppp_magic: u32,
+    ppp_identifier: u8,
 }
 
 impl FortiVPNTunnel {
@@ -136,16 +143,23 @@ impl FortiVPNTunnel {
         let mut socket = FortiVPNTunnel::connect(&config.destination_hostport, domain).await?;
         let addr = FortiVPNTunnel::request_vpn_allocation(domain, &mut socket, &cookie).await?;
         FortiVPNTunnel::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
+        let ppp_magic = FortiVPNTunnel::start_ppp(&mut socket).await?;
+        FortiVPNTunnel::start_ipcp(&mut socket, addr).await?;
         Ok(FortiVPNTunnel {
             socket,
             addr,
-            first_packet: true,
-            tunnel_failed: true,
+            mtu: PPP_MTU as usize,
+            ppp_magic,
+            ppp_identifier: 2,
         })
     }
 
     pub fn ip_addr(&self) -> IpAddr {
         self.addr
+    }
+
+    pub fn mtu(&self) -> usize {
+        self.mtu as usize
     }
 
     async fn connect(hostport: &str, domain: &str) -> Result<FortiTlsStream, FortiError> {
@@ -197,72 +211,415 @@ impl FortiVPNTunnel {
         cookie: &str,
     ) -> Result<(), FortiError> {
         let req = build_http_request("GET /remote/sslvpn-tunnel", domain, Some(cookie), 0);
-        println!("Starting VPN is {}?", req);
         socket.write_all(req.as_bytes()).await?;
         socket.flush().await?;
 
         Ok(())
     }
 
-    pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
-        println!("About to send packet {:?}", data);
-        // PPP packets are surprisingly basic.
-        let mut packet_header = [0u8; 6];
-        packet_header[..2].copy_from_slice(&(6 + data.len() as u16).to_be_bytes());
-        packet_header[2..4].copy_from_slice(&[0x50, 0x50]);
-        packet_header[4..].copy_from_slice(&(data.len() as u16).to_be_bytes());
+    async fn start_ppp(socket: &mut FortiTlsStream) -> Result<u32, FortiError> {
+        // Open PPP link; 200 bytes should fit any PPP packet.
+        // This is an oversimplified implementation of the RFC 1661 state machine.
+        let mut req = [0u8; 20];
+        let mut resp = [0u8; 200];
+        let identifier = 1;
+        let magic = rand::thread_rng().gen::<u32>();
+        let opts = [
+            ppp::LcpOptionData::MaximumReceiveUnit(PPP_MTU),
+            ppp::LcpOptionData::MagicNumber(magic),
+        ];
+        let length =
+            ppp::encode_lcp_config(&mut req, ppp::LcpCode::CONFIGURE_REQUEST, identifier, &opts)
+                .map_err(|err| {
+                    debug!("Failed to encode Configure-Request: {}", err);
+                    "Failed to encode Configure-Request"
+                })?;
+        {
+            let mut pack = [0u8; 200];
+            pack[..2].copy_from_slice(&ppp::Protocol::LCP.value().to_be_bytes());
+            pack[2..length + 2].copy_from_slice(&req[..length]);
 
-        // TODO: replace with a version that needs less allocations
-        /*
-        let packet_data = Vec::from(data);
-        let data = match hdlc::encode(&packet_data, hdlc::SpecialChars::default()) {
-            Ok(encoded) => encoded,
-            Err(err) => {
-                debug!("Failed to encode HDLC packet: {}", err);
-                return Err("Failed to encode HDLC packet".into());
+            println!(
+                "Encoded packet: {:?}",
+                ppp::Packet::from_bytes(&pack[..length + 2])
+            );
+        }
+        FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
+
+        let mut local_acked = false;
+        let mut remote_acked = false;
+        while !(local_acked && remote_acked) {
+            let length = FortiVPNTunnel::read_ppp_packet(socket, &mut resp, true).await?;
+            let response = &resp[..length];
+            println!("Read packet: {:?}", response);
+            let response = ppp::Packet::from_bytes(&resp[..length]).map_err(|err| {
+                debug!("Failed to decode PPP packet: {}", err);
+                "Failed to decode PPP packet"
+            })?;
+            println!("Decoded packet: {}", response);
+            let lcp_packet = match response.to_lcp() {
+                Ok(lcp) => lcp,
+                Err(err) => {
+                    debug!(
+                        "Received unexpected PPP packet during handshake: {} (error {})",
+                        response, err
+                    );
+                    continue;
+                }
+            };
+            match lcp_packet.code() {
+                ppp::LcpCode::CONFIGURE_ACK => {
+                    let received_opts = lcp_packet
+                        .iter_options()
+                        .collect::<Result<Vec<_>, ppp::FormatError>>();
+                    let options_match = match received_opts {
+                        Ok(received_opts) => &opts == received_opts.as_slice(),
+                        Err(err) => {
+                            debug!("Failed to decode Ack options: {}", err);
+                            return Err("Failed to decode Ack options".into());
+                        }
+                    };
+                    if !options_match {
+                        return Err("Configure Ack has unexpected options".into());
+                    }
+                    local_acked = true;
+                }
+                ppp::LcpCode::CONFIGURE_REQUEST => {
+                    let received_opts = lcp_packet
+                        .iter_options()
+                        .map(|opt| {
+                            let opt = match opt {
+                                Ok(opt) => opt,
+                                Err(err) => {
+                                    debug!(
+                                        "Remote side sent invalid configuration option: {}",
+                                        err
+                                    );
+                                    return Err(
+                                        "Remote side sent invalid configuration option".into()
+                                    );
+                                }
+                            };
+                            match opt {
+                                ppp::LcpOptionData::MaximumReceiveUnit(mtu) => {
+                                    if mtu <= PPP_MTU {
+                                        Ok(opt)
+                                    } else {
+                                        debug!("Remote side sent unacceptable MTU: {}", mtu);
+                                        Err("Remote side sent unacceptable MTU".into())
+                                    }
+                                }
+                                ppp::LcpOptionData::MagicNumber(magic) => Ok(opt),
+                                _ => {
+                                    debug!(
+                                        "Remote side sent unsupported configuration option: {}",
+                                        opt
+                                    );
+                                    Err("Remote side sent unsupported configuration option".into())
+                                }
+                            }
+                        })
+                        .collect::<Result<Vec<_>, FortiError>>();
+                    match received_opts {
+                        Ok(opts) => {
+                            let length = ppp::encode_lcp_data(
+                                &mut req,
+                                ppp::LcpCode::CONFIGURE_ACK,
+                                lcp_packet.identifier(),
+                                lcp_packet.read_options(),
+                            )
+                            .map_err(|err| {
+                                debug!("Failed to encode Configure-Ack: {}", err);
+                                "Failed to encode Configure-Ack"
+                            })?;
+                            FortiVPNTunnel::send_ppp_packet(
+                                socket,
+                                ppp::Protocol::LCP,
+                                &req[..length],
+                            )
+                            .await?;
+                            remote_acked = true;
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                ppp::LcpCode::CONFIGURE_NAK => {
+                    debug!("Remote side Nak'd configuration: {}", response);
+                    return Err("Remote side Nak'd configuration".into());
+                }
+                ppp::LcpCode::CONFIGURE_REJECT => {
+                    debug!("Remote side rejected configuration: {}", response);
+                    return Err("Remote side rejected configuration".into());
+                }
+                _ => {
+                    debug!("Received unexpected PPP packet: {}", response);
+                    return Err("Unexpected PPP packet received".into());
+                }
             }
-        };
-        */
+        }
 
-        self.socket.write_all(&packet_header).await?;
-        Ok(self.socket.write_all(&data).await?)
+        Ok(magic)
     }
 
-    pub async fn read_packet(&mut self, dest: &mut [u8]) -> Result<usize, FortiError> {
-        let socket = &mut self.socket;
+    async fn start_ipcp(socket: &mut FortiTlsStream, addr: IpAddr) -> Result<(), FortiError> {
+        // Open IPCP link; 20 bytes should fit any IPCP packet.
+        // This is an oversimplified implementation of the RFC 1661 state machine.
+        let mut req = [0u8; 100];
+        let mut resp = [0u8; 200];
+        let mut identifier = 1;
+        let addr = match addr {
+            IpAddr::V4(addr) => addr,
+            _ => return Ok(()),
+        };
+        let opts = [
+            ppp::IpcpOptionData::IpAddress(addr),
+            //ppp::IpcpOptionData::PrimaryDns(Ipv4Addr::UNSPECIFIED),
+            //ppp::IpcpOptionData::SecondaryDns(Ipv4Addr::UNSPECIFIED),
+        ];
+        let length =
+            ppp::encode_ipcp_config(&mut req, ppp::LcpCode::CONFIGURE_REQUEST, identifier, &opts)
+                .map_err(|err| {
+                debug!("Failed to encode Configure-Request: {}", err);
+                "Failed to encode Configure-Request"
+            })?;
+        {
+            let mut pack = [0u8; 200];
+            pack[..2].copy_from_slice(&ppp::Protocol::IPV4CP.value().to_be_bytes());
+            pack[2..length + 2].copy_from_slice(&req[..length]);
+
+            println!(
+                "Encoded packet: {:?}",
+                ppp::Packet::from_bytes(&pack[..length + 2])
+            );
+        }
+        let mut opts = [0u8; 100];
+        let mut opts_len = length - 4;
+        opts[..opts_len].copy_from_slice(&req[4..length]);
+        FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
+
+        let mut local_acked = false;
+        let mut remote_acked = false;
+        while !(local_acked && remote_acked) {
+            let length = FortiVPNTunnel::read_ppp_packet(socket, &mut resp, true).await?;
+            let response = &resp[..length];
+            println!("Read packet: {:?}", response);
+            let response = ppp::Packet::from_bytes(&resp[..length]).map_err(|err| {
+                debug!("Failed to decode PPP packet: {}", err);
+                "Failed to decode PPP packet"
+            })?;
+            println!("Decoded packet: {}", response);
+            let ipcp_packet = match response.to_ipcp() {
+                Ok(lcp) => lcp,
+                Err(err) => {
+                    debug!(
+                        "Received unexpected PPP packet during handshake: {} (error {})",
+                        response, err
+                    );
+                    continue;
+                }
+            };
+            match ipcp_packet.code() {
+                ppp::LcpCode::CONFIGURE_ACK => {
+                    if ipcp_packet.read_options() != &opts[..opts_len] {
+                        return Err("Configure Ack has unexpected options".into());
+                    }
+                    local_acked = true;
+                }
+                ppp::LcpCode::CONFIGURE_REQUEST => {
+                    let received_opts = ipcp_packet
+                        .iter_options()
+                        .map(|opt| {
+                            let opt = match opt {
+                                Ok(opt) => opt,
+                                Err(err) => {
+                                    debug!(
+                                        "Remote side sent invalid configuration option: {}",
+                                        err
+                                    );
+                                    return Err(
+                                        "Remote side sent invalid configuration option".into()
+                                    );
+                                }
+                            };
+                            match opt {
+                                ppp::IpcpOptionData::IpAddress(ip) => Ok(opt),
+                                ppp::IpcpOptionData::PrimaryDns(ip) => Ok(opt),
+                                ppp::IpcpOptionData::SecondaryDns(ip) => Ok(opt),
+                                _ => {
+                                    debug!(
+                                        "Remote side sent unsupported configuration option: {}",
+                                        opt
+                                    );
+                                    Err("Remote side sent unsupported configuration option".into())
+                                }
+                            }
+                        })
+                        .collect::<Result<Vec<_>, FortiError>>();
+                    match received_opts {
+                        Ok(_) => {
+                            let length = ppp::encode_lcp_data(
+                                &mut req,
+                                ppp::LcpCode::CONFIGURE_ACK,
+                                ipcp_packet.identifier(),
+                                ipcp_packet.read_options(),
+                            )
+                            .map_err(|err| {
+                                debug!("Failed to encode Configure-Ack: {}", err);
+                                "Failed to encode Configure-Ack"
+                            })?;
+                            FortiVPNTunnel::send_ppp_packet(
+                                socket,
+                                ppp::Protocol::IPV4CP,
+                                &req[..length],
+                            )
+                            .await?;
+                            remote_acked = true;
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                ppp::LcpCode::CONFIGURE_NAK => {
+                    debug!("Remote side Nak'd configuration: {}", response);
+                    let received_opts = ipcp_packet
+                        .iter_options()
+                        .map(|opt| {
+                            let opt = match opt {
+                                Ok(opt) => opt,
+                                Err(err) => {
+                                    debug!(
+                                        "Remote side sent invalid configuration option: {}",
+                                        err
+                                    );
+                                    return Err(
+                                        "Remote side sent invalid configuration option".into()
+                                    );
+                                }
+                            };
+                            match opt {
+                                ppp::IpcpOptionData::IpAddress(ip) => Ok(opt),
+                                ppp::IpcpOptionData::PrimaryDns(ip) => Ok(opt),
+                                ppp::IpcpOptionData::SecondaryDns(ip) => Ok(opt),
+                                _ => {
+                                    debug!(
+                                        "Remote side sent unsupported configuration option: {}",
+                                        opt
+                                    );
+                                    Err("Remote side sent unsupported configuration option".into())
+                                }
+                            }
+                        })
+                        .collect::<Result<Vec<_>, FortiError>>();
+                    match received_opts {
+                        Ok(_) => {
+                            opts_len = ipcp_packet.read_options().len();
+                            opts[..opts_len].copy_from_slice(ipcp_packet.read_options());
+                            identifier += 1;
+
+                            let length = ppp::encode_lcp_data(
+                                &mut req,
+                                ppp::LcpCode::CONFIGURE_REQUEST,
+                                identifier,
+                                &opts[..opts_len],
+                            )
+                            .map_err(|err| {
+                                debug!("Failed to encode Configure-Request: {}", err);
+                                "Failed to encode Configure-Request"
+                            })?;
+                            FortiVPNTunnel::send_ppp_packet(
+                                socket,
+                                ppp::Protocol::IPV4CP,
+                                &req[..length],
+                            )
+                            .await?;
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                ppp::LcpCode::CONFIGURE_REJECT => {
+                    debug!("Remote side rejected configuration: {}", response);
+                    return Err("Remote side rejected configuration".into());
+                }
+                _ => {
+                    debug!("Received unexpected PPP packet: {}", response);
+                    return Err("Unexpected PPP packet received".into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_ppp_packet(
+        socket: &mut FortiTlsStream,
+        protocol: ppp::Protocol,
+        ppp_data: &[u8],
+    ) -> Result<(), FortiError> {
+        let mut buf = String::new();
+        ppp::fmt_slice_hex(ppp_data, &mut buf);
+        println!("About to send packet {:?}, {}", buf, protocol.value());
+        // FortiVPN encapsulation.
+        let mut packet_header = [0u8; 8];
+        let ppp_packet_length = ppp_data.len() + 2;
+        packet_header[..2].copy_from_slice(&(6 + ppp_packet_length as u16).to_be_bytes());
+        packet_header[2..4].copy_from_slice(&[0x50, 0x50]);
+        packet_header[4..6].copy_from_slice(&(ppp_packet_length as u16).to_be_bytes());
+        // PPP encapsulation.
+        packet_header[6..].copy_from_slice(&protocol.value().to_be_bytes());
+
+        socket.write_all(&packet_header).await?;
+        socket.write_all(&ppp_data).await?;
+        Ok(socket.flush().await?)
+    }
+
+    async fn read_ppp_packet(
+        socket: &mut FortiTlsStream,
+        dest: &mut [u8],
+        first_packet: bool,
+    ) -> Result<usize, FortiError> {
         let mut packet_header = [0u8; 6];
         println!("Reading packet");
         // If no data is available, this will return immediately.
         match tokio::time::timeout(Duration::from_millis(100), async {
             loop {
-                //println!("stupid loop");
-                if let Ok(header) = socket.read_peek(6).await {
-                    if header.len() >= 6 {
-                        println!("Have header {} bytes", header.len());
-                        return;
-                    } else {
-                        println!("Have {} bytes", header.len());
+                match socket.read_peek(packet_header.len()).await {
+                    Ok(header) => {
+                        if header.len() >= packet_header.len() {
+                            println!("Have header {} bytes", header.len());
+                            return;
+                        } else {
+                            println!("Have {} bytes", header.len());
+                        }
                     }
-                } else {
-                    return;
-                };
+                    Err(err) => {
+                        println!("Failed to read header {}", err);
+                        return;
+                    }
+                }
             }
         })
         .await
         {
             Ok(_) => {}
-            Err(_) => return Ok(0),
+            Err(_) => {
+                println!("Read timed out");
+                return Ok(0);
+            }
         }
-        println!("Packet not ready");
+        println!("Packet ready");
 
-        socket.read(&mut packet_header).await?;
-        if self.first_packet {
-            self.first_packet = false;
-            if let Err(err) = FortiVPNTunnel::validate_link(socket, &packet_header).await {
-                self.tunnel_failed = true;
+        if first_packet {
+            if let Err(err) = FortiVPNTunnel::validate_link(socket, &packet_header[..6]).await {
                 return Err(err);
             }
         }
+
+        socket.read(&mut packet_header).await?;
         let mut ppp_size = [0u8; 2];
         ppp_size.copy_from_slice(&packet_header[..2]);
         let ppp_size = u16::from_be_bytes(ppp_size);
@@ -298,6 +655,51 @@ impl FortiVPNTunnel {
             received_data += socket.read(&mut dest[received_data..]).await?;
         }
         Ok(data_size)
+    }
+
+    pub async fn send_echo(&mut self) -> Result<(), FortiError> {
+        let mut req = [0u8; 8];
+        let data = self.ppp_magic.to_be_bytes();
+        let length = ppp::encode_lcp_data(
+            &mut req,
+            ppp::LcpCode::ECHO_REQUEST,
+            self.ppp_identifier,
+            &data,
+        )
+        .map_err(|err| {
+            debug!("Failed to encode Echo-Request: {}", err);
+            "Failed to encode Echo-Request"
+        })?;
+        self.ppp_identifier += 1;
+        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await
+    }
+
+    pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
+        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
+    }
+
+    pub async fn read_packet(&mut self, dest: &mut [u8]) -> Result<usize, FortiError> {
+        // TODO: handle async PPP packets.
+        let length = FortiVPNTunnel::read_ppp_packet(&mut self.socket, dest, false).await?;
+        if length == 0 {
+            return Ok(0);
+        }
+        let packet = match ppp::Packet::from_bytes(&dest[..length]) {
+            Ok(packet) => packet,
+            Err(err) => {
+                debug!("Failed to decode PPP packet: {}", err);
+                return Err("Failed to decode PPP packet".into());
+            }
+        };
+        println!("Packet= {}", packet);
+
+        if packet.read_protocol() == ppp::Protocol::IPV4 {
+            // TODO: improve this
+            dest.copy_within(2..length, 0);
+            Ok(length - 2)
+        } else {
+            Ok(0)
+        }
     }
 
     async fn validate_link(

@@ -13,6 +13,7 @@ mod fortivpn;
 mod http;
 mod logger;
 mod network;
+mod ppp;
 mod socks;
 
 enum Action {
@@ -167,7 +168,7 @@ fn serve(config: Config) -> Result<(), i32> {
             1
         })?;
 
-    let forti_client = rt
+    let mut forti_client = rt
         .block_on(fortivpn::FortiVPNTunnel::new(
             &config.fortivpn,
             sslvpn_cookie,
@@ -176,6 +177,11 @@ fn serve(config: Config) -> Result<(), i32> {
             eprintln!("Failed to connect to VPN service: {}", err);
             1
         })?;
+    // TODO: run this in a timer loop.
+    rt.block_on(forti_client.send_echo()).map_err(|err| {
+        eprintln!("Failed to send echo to VPN service: {}", err);
+        1
+    })?;
     let mut client = network::Network::new(forti_client).map_err(|err| {
         eprintln!("Failed to start virtual network interface: {}", err);
         1

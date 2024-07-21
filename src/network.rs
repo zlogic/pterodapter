@@ -6,19 +6,17 @@ use std::{
 };
 
 use log::{debug, warn};
+use rand::Rng;
 use smoltcp::{iface, phy, socket, wire};
-use tokio::{
-    runtime,
-    sync::{mpsc, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::fortivpn::FortiVPNTunnel;
 
-const MTU_SIZE: usize = 1500;
+const MAX_MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 4096;
 
 pub struct Network<'a> {
-    device: PPPDevice,
+    device: VpnDevice,
     iface: iface::Interface,
     sockets: iface::SocketSet<'a>,
     bridges: HashMap<iface::SocketHandle, SocketTunnel>,
@@ -31,9 +29,9 @@ pub struct Network<'a> {
 impl Network<'_> {
     pub fn new<'a>(vpn: FortiVPNTunnel) -> Result<Network<'a>, NetworkError> {
         // TODO: how to choose the CIDR?
-        let ip_cidr = wire::IpCidr::new(vpn.ip_addr().into(), 24);
+        let ip_cidr = wire::IpCidr::new(vpn.ip_addr().into(), 8);
 
-        let mut device = PPPDevice::new(vpn);
+        let mut device = VpnDevice::new(vpn);
         let mut config = iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
         let mut iface = iface::Interface::new(config, &mut device, smoltcp::time::Instant::now());
@@ -67,8 +65,8 @@ impl Network<'_> {
             self.copy_all_data();
             self.iface
                 .poll(timestamp, &mut self.device, &mut self.sockets);
-            self.device.receive_data().await?;
             self.device.send_data().await?;
+            self.device.receive_data().await?;
             match self.iface.poll_delay(timestamp, &self.sockets) {
                 Some(poll_delay) => {
                     let timeout_at = tokio::time::Instant::now()
@@ -76,7 +74,9 @@ impl Network<'_> {
                     self.process_commands(timeout_at.into()).await;
                 }
                 None => {
-                    self.process_commands(None).await;
+                    // TODO: refactor this to send all events through queue.
+                    let timeout_at = tokio::time::Instant::now() + Duration::from_millis(100);
+                    self.process_commands(timeout_at.into()).await;
                 }
             }
         }
@@ -173,8 +173,8 @@ impl Network<'_> {
                 let rx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
                 let tx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-                // TODO: choose a random port between 49152 and 65535.
-                let local_port = 8080;
+                // TODO: check for collisions.
+                let local_port = rand::thread_rng().gen_range(49152..=65535);
                 let remote_addr = wire::IpAddress::from(addr.ip());
                 if let Err(err) =
                     socket.connect(self.iface.context(), (remote_addr, addr.port()), local_port)
@@ -232,27 +232,27 @@ pub enum Command {
     ),
 }
 
-struct PPPDevice {
+struct VpnDevice {
     vpn: FortiVPNTunnel,
-    read_packet: [u8; MTU_SIZE],
-    write_packet: [u8; MTU_SIZE],
+    read_packet: [u8; MAX_MTU_SIZE],
+    write_packet: [u8; MAX_MTU_SIZE],
     read_packet_size: usize,
     write_packet_size: usize,
 }
 
-impl PPPDevice {
-    fn new(vpn: FortiVPNTunnel) -> PPPDevice {
-        PPPDevice {
+impl VpnDevice {
+    fn new(vpn: FortiVPNTunnel) -> VpnDevice {
+        VpnDevice {
             vpn,
-            read_packet: [0u8; MTU_SIZE],
-            write_packet: [0u8; MTU_SIZE],
+            read_packet: [0u8; MAX_MTU_SIZE],
+            write_packet: [0u8; MAX_MTU_SIZE],
             read_packet_size: 0,
             write_packet_size: 0,
         }
     }
 }
 
-impl PPPDevice {
+impl VpnDevice {
     async fn receive_data(&mut self) -> Result<(), NetworkError> {
         if self.read_packet_size > 0 {
             // Data is not consumed yet.
@@ -276,12 +276,12 @@ impl PPPDevice {
     }
 }
 
-impl phy::Device for PPPDevice {
-    type RxToken<'a> = PPPDeviceRxToken<'a>
+impl phy::Device for VpnDevice {
+    type RxToken<'a> = RxToken<'a>
     where
          Self: 'a;
 
-    type TxToken<'a> = PPPDeviceTxToken<'a>
+    type TxToken<'a> = TxToken<'a>
     where
         Self: 'a;
 
@@ -292,11 +292,11 @@ impl phy::Device for PPPDevice {
         if self.read_packet_size == 0 || self.write_packet_size != 0 {
             return None;
         }
+        let read_packet = &mut self.read_packet[..self.read_packet_size];
+        self.read_packet_size = 0;
         Some((
-            PPPDeviceRxToken {
-                read_packet: &mut self.read_packet[..self.read_packet_size],
-            },
-            PPPDeviceTxToken {
+            RxToken { read_packet },
+            TxToken {
                 write_packet: &mut self.write_packet,
                 write_packet_size: &mut self.write_packet_size,
             },
@@ -307,7 +307,7 @@ impl phy::Device for PPPDevice {
         if self.write_packet_size != 0 {
             return None;
         }
-        Some(PPPDeviceTxToken {
+        Some(TxToken {
             write_packet: &mut self.write_packet,
             write_packet_size: &mut self.write_packet_size,
         })
@@ -315,18 +315,23 @@ impl phy::Device for PPPDevice {
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut caps = phy::DeviceCapabilities::default();
-        caps.max_transmission_unit = MTU_SIZE;
-        caps.max_burst_size = Some(1);
+        caps.max_transmission_unit = self.vpn.mtu();
+        //caps.max_burst_size = Some(16);
         caps.medium = phy::Medium::Ip;
+        caps.checksum.ipv4 = phy::Checksum::Both;
+        caps.checksum.tcp = phy::Checksum::Both;
+        caps.checksum.udp = phy::Checksum::Both;
+        caps.checksum.icmpv4 = phy::Checksum::Both;
+        caps.checksum.icmpv6 = phy::Checksum::Both;
         caps
     }
 }
 
-struct PPPDeviceRxToken<'a> {
+struct RxToken<'a> {
     read_packet: &'a mut [u8],
 }
 
-impl<'a> phy::RxToken for PPPDeviceRxToken<'a> {
+impl<'a> phy::RxToken for RxToken<'a> {
     fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -337,12 +342,12 @@ impl<'a> phy::RxToken for PPPDeviceRxToken<'a> {
     }
 }
 
-struct PPPDeviceTxToken<'a> {
+struct TxToken<'a> {
     write_packet: &'a mut [u8],
     write_packet_size: &'a mut usize,
 }
 
-impl<'a> phy::TxToken for PPPDeviceTxToken<'a> {
+impl<'a> phy::TxToken for TxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,

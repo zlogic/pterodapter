@@ -11,7 +11,7 @@ rust-version = "1.77"
 log = { version = "0.4", default-features = false }
 tokio = { version = "1.38", default-features = false, features = ["rt", "io-util", "signal", "net", "time", "sync"] }
 tokio-native-tls = { version = "0.3", default-features = false }
-smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+smoltcp = { version = "0.11", default-features = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 [profile.release]
