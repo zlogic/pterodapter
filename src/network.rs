@@ -83,26 +83,37 @@ impl Network<'_> {
     }
 
     fn copy_all_data(&mut self) {
-        // This is not fancy or super efficient, but with a single-user (a few connections) should work OK.
+        // This is not fancy, but with a single-user (a few connections) should work OK.
+        // smoltcp's poll works exactly the same way and seems to show reasonable performance.
         // The alternative is using poll/waking and additional buffers (or perhaps a list of futures), which
         // doesn't work well with smoltcp - as smoltcp keeps ownership of most of its data, and any writes
         // need to be guarded.
         use socket::tcp;
-        for (handle, tunnel) in self.bridges.iter() {
+        self.bridges.iter().for_each(|(handle, tunnel)| {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
             if socket.can_send() {
                 let result = socket.send(|dest| match tunnel.reader.try_read(dest) {
-                    Ok(bytes) => (bytes, Ok(())),
+                    Ok(bytes) => {
+                        if bytes > 0 && dest.len() > 0 {
+                            (bytes, Ok::<(), NetworkError>(()))
+                        } else {
+                            // Zero bytes means the stream is closed.
+                            (0, Err("Proxy reader is closed".into()))
+                        }
+                    }
                     Err(err) => match err.kind() {
                         io::ErrorKind::WouldBlock => (0, Ok(())),
-                        _ => (0, Err(err)),
+                        _ => (0, Err(err.into())),
                     },
                 });
                 if let Ok(result) = result {
                     if let Err(err) = result {
                         warn!("Failed to read data from SOCKS socket: {}", err);
+                        socket.close();
+                        return;
                     }
                 } else if let Err(err) = result {
+                    // Not critical if socket is still opening.
                     warn!("Failed to send data to virtual socket: {}", err);
                 }
             }
@@ -118,12 +129,23 @@ impl Network<'_> {
                 if let Ok(result) = result {
                     if let Err(err) = result {
                         warn!("Failed to write data to SOCKS socket: {}", err);
+                        socket.close();
+                        return;
                     }
                 } else if let Err(err) = result {
                     warn!("Failed to read data from virtual socket: {}", err);
                 }
             }
-        }
+        });
+
+        self.bridges.retain(|handle, _| {
+            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+            if socket.is_open() {
+                return true;
+            }
+            self.sockets.remove(*handle);
+            false
+        });
 
         for (handle, response) in self.opening_connections.iter_mut() {
             let socket = self.sockets.get::<tcp::Socket>(*handle);
@@ -156,7 +178,9 @@ impl Network<'_> {
             } else {
                 continue;
             };
-            let _ = response.send(result);
+            if let Err(_err) = response.send(result) {
+                debug!("Proxy listener not listening for response");
+            }
         }
         self.opening_connections
             .retain(|_, response| response.is_some());
@@ -258,7 +282,10 @@ impl VpnDevice {
             // Data is not consumed yet.
             return Ok(());
         }
-        self.read_packet_size = self.vpn.read_packet(&mut self.read_packet).await?;
+        self.read_packet_size = self
+            .vpn
+            .try_read_packet(&mut self.read_packet, None)
+            .await?;
         Ok(())
     }
 

@@ -128,6 +128,7 @@ pub struct FortiVPNTunnel {
     socket: FortiTlsStream,
     addr: IpAddr,
     mtu: usize,
+    ppp_state: PPPState,
     ppp_magic: u32,
     ppp_identifier: u8,
 }
@@ -142,12 +143,15 @@ impl FortiVPNTunnel {
         let mut socket = FortiVPNTunnel::connect(&config.destination_hostport, domain).await?;
         let addr = FortiVPNTunnel::request_vpn_allocation(domain, &mut socket, &cookie).await?;
         FortiVPNTunnel::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
-        let ppp_magic = FortiVPNTunnel::start_ppp(&mut socket).await?;
-        FortiVPNTunnel::start_ipcp(&mut socket, addr).await?;
+
+        let mut ppp_state = PPPState::new();
+        let ppp_magic = FortiVPNTunnel::start_ppp(&mut socket, &mut ppp_state).await?;
+        FortiVPNTunnel::start_ipcp(&mut socket, &mut ppp_state, addr).await?;
         Ok(FortiVPNTunnel {
             socket,
             addr,
             mtu: PPP_MTU as usize,
+            ppp_state,
             ppp_magic,
             ppp_identifier: 2,
         })
@@ -214,7 +218,10 @@ impl FortiVPNTunnel {
         Ok(socket.flush().await?)
     }
 
-    async fn start_ppp(socket: &mut FortiTlsStream) -> Result<u32, FortiError> {
+    async fn start_ppp(
+        socket: &mut FortiTlsStream,
+        ppp_state: &mut PPPState,
+    ) -> Result<u32, FortiError> {
         // Open PPP link; 200 bytes should fit any PPP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
         let mut req = [0u8; 20];
@@ -236,8 +243,17 @@ impl FortiVPNTunnel {
         let mut local_acked = false;
         let mut remote_acked = false;
         while !(local_acked && remote_acked) {
-            let length = FortiVPNTunnel::read_ppp_packet(socket, &mut resp, true).await?;
-            let response = ppp::Packet::from_bytes(&resp[..length]).map_err(|err| {
+            ppp_state.read_header(socket).await.map_err(|err| {
+                debug!("Failed to read PPP header: {}", err);
+                "Failed to read PPP header"
+            })?;
+            let protocol = if let Some(protocol) = ppp_state.read_protocol() {
+                protocol
+            } else {
+                return Err("Unable to read PPP protocol".into());
+            };
+            let length = FortiVPNTunnel::read_ppp_packet(socket, ppp_state, &mut resp).await?;
+            let response = ppp::Packet::from_bytes(protocol, &resp[..length]).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
@@ -338,12 +354,16 @@ impl FortiVPNTunnel {
         Ok(magic)
     }
 
-    async fn start_ipcp(socket: &mut FortiTlsStream, addr: IpAddr) -> Result<(), FortiError> {
+    async fn start_ipcp(
+        socket: &mut FortiTlsStream,
+        ppp_state: &mut PPPState,
+        addr: IpAddr,
+    ) -> Result<(), FortiError> {
         // Open IPCP link; 20 bytes should fit any IPCP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
         let mut req = [0u8; 20];
         let mut resp = [0u8; 200];
-        let mut identifier = 1;
+        let identifier = 1;
         let addr = match addr {
             IpAddr::V4(addr) => addr,
             _ => return Ok(()),
@@ -356,15 +376,24 @@ impl FortiVPNTunnel {
                 "Failed to encode IPCP Configure-Request"
             })?;
         let mut opts = [0u8; 100];
-        let mut opts_len = length - 4;
+        let opts_len = length - 4;
         opts[..opts_len].copy_from_slice(&req[4..length]);
         FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
 
         let mut local_acked = false;
         let mut remote_acked = false;
         while !(local_acked && remote_acked) {
-            let length = FortiVPNTunnel::read_ppp_packet(socket, &mut resp, true).await?;
-            let response = ppp::Packet::from_bytes(&resp[..length]).map_err(|err| {
+            ppp_state.read_header(socket).await.map_err(|err| {
+                debug!("Failed to read PPP header: {}", err);
+                "Failed to read PPP header"
+            })?;
+            let protocol = if let Some(protocol) = ppp_state.read_protocol() {
+                protocol
+            } else {
+                return Err("Unable to read PPP protocol".into());
+            };
+            let length = FortiVPNTunnel::read_ppp_packet(socket, ppp_state, &mut resp).await?;
+            let response = ppp::Packet::from_bytes(protocol, &resp[..length]).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
@@ -469,82 +498,31 @@ impl FortiVPNTunnel {
 
     async fn read_ppp_packet(
         socket: &mut FortiTlsStream,
+        state: &mut PPPState,
         dest: &mut [u8],
-        first_packet: bool,
     ) -> Result<usize, FortiError> {
-        let mut packet_header = [0u8; 6];
-        println!("Reading packet");
-        // If no data is available, this will return immediately.
-        match tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                match socket.read_peek(packet_header.len()).await {
-                    Ok(header) => {
-                        if header.len() >= packet_header.len() {
-                            println!("Have header {} bytes", header.len());
-                            return;
-                        } else {
-                            println!("Have {} bytes", header.len());
-                        }
-                    }
-                    Err(err) => {
-                        println!("Failed to read header {}", err);
-                        return;
-                    }
-                }
-            }
-        })
-        .await
-        {
-            Ok(_) => {}
-            Err(_) => {
-                println!("Read timed out");
-                return Ok(0);
-            }
-        }
-        println!("Packet ready");
-
-        if first_packet {
-            if let Err(err) = FortiVPNTunnel::validate_link(socket, &packet_header[..6]).await {
-                return Err(err);
-            }
-        }
-
-        socket.read(&mut packet_header).await?;
-        let mut ppp_size = [0u8; 2];
-        ppp_size.copy_from_slice(&packet_header[..2]);
-        let ppp_size = u16::from_be_bytes(ppp_size);
-        let mut data_size = [0u8; 2];
-        data_size.copy_from_slice(&packet_header[4..6]);
-        let data_size = u16::from_be_bytes(data_size);
-        let magic = &packet_header[2..4];
-        if ppp_size != data_size + 6 {
-            debug!(
-                "Conflicting packet size data: PPP packet size is {}, data size is {}",
-                ppp_size, data_size
-            );
-            return Err("Header has conflicting length data".into());
-        }
-        if magic != &[0x50, 0x50] {
-            debug!(
-                "Found {:x}{:x} instead of magic",
-                packet_header[2], packet_header[3]
-            );
-            return Err("Magic not found".into());
-        }
-        let data_size = data_size as usize;
-        if data_size > dest.len() {
+        state.read_header(socket).await.map_err(|err| {
+            debug!("Failed to read PPP header: {}", err);
+            "Failed to read PPP header"
+        })?;
+        if state.remaining_bytes() > dest.len() {
             debug!(
                 "Destination buffer ({} bytes) is smaller than the traferred packet ({} bytes)",
                 dest.len(),
-                data_size
+                state.remaining_bytes()
             );
             return Err("Destination buffer not large enough to fit all data".into());
         }
-        let mut received_data = 0usize;
-        while received_data < data_size {
-            received_data += socket.read(&mut dest[received_data..]).await?;
+        // TODO: check if perhaps sending partial data is acceptable?
+        let mut received_data = 0;
+        while state.remaining_bytes() > 0 {
+            let bytes_transferred = socket
+                .read(&mut dest[received_data..received_data + state.remaining_bytes()])
+                .await?;
+            state.consume_bytes(bytes_transferred)?;
+            received_data += bytes_transferred;
         }
-        Ok(data_size)
+        Ok(received_data)
     }
 
     pub async fn send_echo(&mut self) -> Result<(), FortiError> {
@@ -568,36 +546,170 @@ impl FortiVPNTunnel {
         FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
     }
 
-    pub async fn read_packet(&mut self, dest: &mut [u8]) -> Result<usize, FortiError> {
-        // TODO: handle async PPP packets.
-        let length = FortiVPNTunnel::read_ppp_packet(&mut self.socket, dest, false).await?;
-        if length == 0 {
-            return Ok(0);
+    pub async fn try_read_packet(
+        &mut self,
+        dest: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<usize, FortiError> {
+        // Peek header if not yet available - to get the protocol.
+        if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, self.ppp_state.read_header(&mut self.socket)).await
+            {
+                Ok(res) => res,
+                Err(_) => return Ok(0),
+            }
+        } else {
+            self.ppp_state.read_header(&mut self.socket).await
         }
-        let packet = match ppp::Packet::from_bytes(&dest[..length]) {
-            Ok(packet) => packet,
-            Err(err) => {
-                debug!("Failed to decode PPP packet: {}", err);
-                return Err("Failed to decode PPP packet".into());
+        .map_err(|err| {
+            debug!("Failed to read PPP header: {}", err);
+            "Failed to read PPP header"
+        })?;
+        let protocol = match self.ppp_state.read_protocol() {
+            Some(protocol) => protocol,
+            None => {
+                return Err("Unknown PPP protocol, possibly a framing error".into());
             }
         };
-        println!("Packet= {}", packet);
+        let length =
+            FortiVPNTunnel::read_ppp_packet(&mut self.socket, &mut self.ppp_state, dest).await?;
+        match protocol {
+            ppp::Protocol::LCP => {
+                // TODO: handle echo requests/responsed here.
+                let packet = match ppp::Packet::from_bytes(protocol, &dest[..length]) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        debug!("Failed to decode PPP packet: {}", err);
+                        return Err("Failed to decode PPP packet".into());
+                    }
+                };
+                println!("Packet= {}", packet);
+                Ok(0)
+            }
+            ppp::Protocol::IPV4 | ppp::Protocol::IPV6 => Ok(length),
+            _ => {
+                println!("Received unexpected PPP packet {}, ignoring", protocol);
+                Ok(0)
+            }
+        }
+    }
+}
 
-        if packet.read_protocol() == ppp::Protocol::IPV4 {
-            // TODO: improve this
-            dest.copy_within(2..length, 0);
-            Ok(length - 2)
-        } else {
-            Ok(0)
+struct PPPState {
+    ppp_header: [u8; 8],
+    ppp_header_length: usize,
+    bytes_remaining: usize,
+    first_packet: bool,
+}
+
+impl PPPState {
+    fn new() -> PPPState {
+        PPPState {
+            ppp_header: [0u8; 8],
+            ppp_header_length: 0,
+            bytes_remaining: 0,
+            first_packet: true,
         }
     }
 
-    async fn validate_link(
-        socket: &mut FortiTlsStream,
-        packet_header: &[u8],
-    ) -> Result<(), FortiError> {
+    async fn read_header(&mut self, socket: &mut FortiTlsStream) -> Result<(), FortiError> {
+        println!("Reading packet");
+        if self.bytes_remaining > 0 {
+            return Ok(());
+        }
+        // If no data is available, this will return immediately.
+        //match tokio::time::timeout(Duration::from_millis(100), async {
+        while self.ppp_header_length < self.ppp_header.len() {
+            match socket
+                .read(&mut self.ppp_header[self.ppp_header_length..])
+                .await
+            {
+                Ok(bytes_read) => {
+                    self.ppp_header_length += bytes_read;
+                    if self.ppp_header_length >= self.ppp_header.len() {
+                        println!("Have header {} bytes", self.ppp_header_length);
+                        break;
+                    } else {
+                        println!("Have {} bytes", self.ppp_header_length);
+                    }
+                }
+                Err(err) => {
+                    debug!("Failed to read PPP header {}", err);
+                    return Err("Failed to read PPP header".into());
+                }
+            }
+        }
+        /*
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => {
+                    println!("Read timed out");
+                    return Ok(0);
+                }
+            }
+        */
+        println!("Packet ready");
+        if let Err(err) = self.validate_link(socket).await {
+            return Err(err);
+        }
+
+        let mut ppp_size = [0u8; 2];
+        ppp_size.copy_from_slice(&self.ppp_header[..2]);
+        let ppp_size = u16::from_be_bytes(ppp_size);
+        let mut data_size = [0u8; 2];
+        data_size.copy_from_slice(&self.ppp_header[4..6]);
+        let data_size = u16::from_be_bytes(data_size);
+        let magic = &self.ppp_header[2..4];
+        if ppp_size != data_size + 6 {
+            debug!(
+                "Conflicting packet size data: PPP packet size is {}, data size is {}",
+                ppp_size, data_size
+            );
+            return Err("Header has conflicting length data".into());
+        }
+        if magic != &[0x50, 0x50] {
+            debug!(
+                "Found {:x}{:x} instead of magic",
+                self.ppp_header[2], self.ppp_header[3]
+            );
+            return Err("Magic not found".into());
+        }
+        self.bytes_remaining = data_size as usize - 2;
+        Ok(())
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        self.bytes_remaining
+    }
+
+    fn consume_bytes(&mut self, count: usize) -> Result<(), FortiError> {
+        if self.bytes_remaining < count {
+            Err("Consumed more bytes than were available".into())
+        } else {
+            self.bytes_remaining -= count;
+            if self.bytes_remaining == 0 {
+                self.ppp_header_length = 0;
+            }
+            Ok(())
+        }
+    }
+
+    fn read_protocol(&self) -> Option<ppp::Protocol> {
+        if self.ppp_header_length == 8 {
+            Some(ppp::Protocol::from_be_slice(&self.ppp_header[6..]))
+        } else {
+            None
+        }
+    }
+
+    async fn validate_link(&mut self, socket: &mut FortiTlsStream) -> Result<(), FortiError> {
         const FALL_BACK_TO_HTTP: &[u8] = "HTTP/1".as_bytes();
-        if packet_header == FALL_BACK_TO_HTTP {
+        if !self.first_packet {
+            return Ok(());
+        }
+        self.first_packet = false;
+        if &self.ppp_header[..FALL_BACK_TO_HTTP.len()] == FALL_BACK_TO_HTTP {
             // FortiVPN will return an HTTP response if something goes wrong on setup.
             let headers = read_http_headers(socket).await?;
             debug!("Tunnel not active, error response: {}", headers);
