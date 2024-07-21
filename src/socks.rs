@@ -130,7 +130,7 @@ impl SocksConnection {
         reader: &mut tcp::OwnedReadHalf,
         writer: &mut tcp::OwnedWriteHalf,
     ) -> Result<smoltcp::iface::SocketHandle, SocksError> {
-        println!("Prepating to read request");
+        println!("Preparing to read request");
         let version = reader.read_u8().await?;
         println!("Read to read request");
         if version != SOCKS5_VERSION {
@@ -180,15 +180,30 @@ impl SocksConnection {
         }
         let addr = match addr {
             Some(DestinationAddress::IpAddr(ip)) => ip,
-            _ => {
-                // DNS lookups are not yet supported.
+            Some(DestinationAddress::Domain(domain)) => {
+                // IPv6 connections are not yet supported.
+                let ip = tokio::net::lookup_host(format!("{}:{}", domain, port))
+                    .await?
+                    .filter(|addr| addr.is_ipv4())
+                    .next();
+                if let Some(ip) = ip {
+                    ip.ip()
+                } else {
+                    SocksConnection::write_error_response(
+                        writer,
+                        CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
+                    )
+                    .await?;
+                    return Err("Failed to lookup host".into());
+                }
+            }
+            None => {
                 SocksConnection::write_error_response(
                     writer,
                     CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
                 )
                 .await?;
-                debug!("Address type {} is not supported", addr_type);
-                return Err("Address type is not supported".into());
+                return Err("Address type unknown".into());
             }
         };
 
@@ -316,11 +331,8 @@ impl CommandResponse {
     const TTL_EXPIRED: CommandResponse = CommandResponse(0x06);
     const COMMAND_NOT_SUPPORTED: CommandResponse = CommandResponse(0x07);
     const ADDRESS_TYPE_NOT_SUPPORTED: CommandResponse = CommandResponse(0x08);
-
-    fn from_u8(method: u8) -> SocksCommand {
-        SocksCommand(method)
-    }
 }
+
 impl fmt::Display for CommandResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -355,7 +367,7 @@ impl fmt::Display for DestinationAddress {
 struct SocksAddressType(u8);
 impl SocksAddressType {
     const IPV4: SocksAddressType = SocksAddressType(0x01);
-    const DOMAINNAME: SocksAddressType = SocksAddressType(0x02);
+    const DOMAINNAME: SocksAddressType = SocksAddressType(0x03);
     const IPV6: SocksAddressType = SocksAddressType(0x04);
 
     fn from_u8(method: u8) -> SocksAddressType {

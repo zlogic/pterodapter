@@ -125,7 +125,7 @@ where
             format!(
                 "HTTP/1.1 200 OK\r\n\
             Content-Type: text/html\r\n\
-            Cache-Control: no-store\r\n
+            Cache-Control: no-store\r\n\
             Content-Length: {}\r\n\
             \r\n",
                 data.len()
@@ -219,7 +219,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     stream: S,
-    buffer: Buffer<4096>,
+    buffer: Buffer<16000>,
 }
 
 impl<S> BufferedTlsStream<S>

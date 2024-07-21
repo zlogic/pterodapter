@@ -546,6 +546,30 @@ impl FortiVPNTunnel {
         FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
     }
 
+    pub async fn try_next_ip_packet(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<usize, FortiError> {
+        // Peek header if not yet available - to get the protocol.
+        if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, self.ppp_state.read_header(&mut self.socket)).await
+            {
+                Ok(res) => res,
+                Err(_) => return Ok(0),
+            }
+        } else {
+            self.ppp_state.read_header(&mut self.socket).await
+        }
+        .map_err(|err| {
+            debug!("Failed to read PPP header: {}", err);
+            "Failed to read PPP header"
+        })?;
+        match self.ppp_state.read_protocol() {
+            Some(ppp::Protocol::IPV4) => Ok(self.ppp_state.remaining_bytes()),
+            _ => Ok(0),
+        }
+    }
+
     pub async fn try_read_packet(
         &mut self,
         dest: &mut [u8],
@@ -613,12 +637,10 @@ impl PPPState {
     }
 
     async fn read_header(&mut self, socket: &mut FortiTlsStream) -> Result<(), FortiError> {
-        println!("Reading packet");
         if self.bytes_remaining > 0 {
             return Ok(());
         }
         // If no data is available, this will return immediately.
-        //match tokio::time::timeout(Duration::from_millis(100), async {
         while self.ppp_header_length < self.ppp_header.len() {
             match socket
                 .read(&mut self.ppp_header[self.ppp_header_length..])
@@ -639,16 +661,6 @@ impl PPPState {
                 }
             }
         }
-        /*
-            .await
-            {
-                Ok(_) => {}
-                Err(_) => {
-                    println!("Read timed out");
-                    return Ok(0);
-                }
-            }
-        */
         println!("Packet ready");
         if let Err(err) = self.validate_link(socket).await {
             return Err(err);
