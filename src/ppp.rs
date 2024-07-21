@@ -7,34 +7,23 @@ use log::debug;
  */
 
 pub struct Packet<'a> {
+    protocol: Protocol,
     data: &'a [u8],
 }
 
 impl Packet<'_> {
-    pub fn from_bytes(b: &[u8]) -> Result<Packet, FormatError> {
-        if b.len() < 2 {
-            debug!("Not enough data in PPP packet");
-            Err("Not enough data in PPP packet".into())
-        } else {
-            let packet = Packet { data: b };
-            packet.validate()?;
-            Ok(packet)
-        }
+    pub fn from_bytes(protocol: Protocol, data: &[u8]) -> Result<Packet, FormatError> {
+        let packet = Packet { protocol, data };
+        packet.validate()?;
+        Ok(packet)
     }
 
     pub fn validate(&self) -> Result<(), FormatError> {
-        self.read_protocol().validate()
-    }
-
-    pub fn read_protocol(&self) -> Protocol {
-        let mut result = [0u8; 2];
-        result.copy_from_slice(&self.data[..2]);
-        Protocol::from_u16(u16::from_be_bytes(result))
+        self.protocol.validate()
     }
 
     pub fn to_lcp(&self) -> Result<LcpPacket, FormatError> {
-        let protocol = self.read_protocol();
-        if protocol == Protocol::LCP {
+        if self.protocol == Protocol::LCP {
             LcpPacket::from_bytes(&self.data[2..])
         } else {
             Err("Protocol type is not LCP".into())
@@ -42,8 +31,7 @@ impl Packet<'_> {
     }
 
     pub fn to_ipcp(&self) -> Result<IpcpPacket, FormatError> {
-        let protocol = self.read_protocol();
-        if protocol == Protocol::IPV4CP {
+        if self.protocol == Protocol::IPV4CP {
             IpcpPacket::from_bytes(&self.data[2..])
         } else {
             Err("Protocol type is not IPCP".into())
@@ -59,6 +47,12 @@ impl Protocol {
     pub const IPV6: Protocol = Protocol(0x0057);
     pub const LCP: Protocol = Protocol(0xc021);
     pub const IPV4CP: Protocol = Protocol(0x8021);
+
+    pub fn from_be_slice(slice: &[u8]) -> Protocol {
+        let mut result = [0u8; 2];
+        result.copy_from_slice(&slice);
+        Protocol::from_u16(u16::from_be_bytes(result))
+    }
 
     fn from_u16(value: u16) -> Protocol {
         Protocol(value)
@@ -656,7 +650,7 @@ fn fmt_slice_hex(data: &[u8], f: &mut dyn std::fmt::Write) -> std::fmt::Result {
 
 impl fmt::Display for Packet<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Protocol: {}", self.read_protocol())?;
+        write!(f, "Protocol: {}", self.protocol)?;
         if let Ok(lcp) = self.to_lcp() {
             write!(f, ", LCP code: {} id: {}", lcp.code(), lcp.identifier())?;
             for opt in lcp.iter_options() {
