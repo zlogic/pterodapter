@@ -125,6 +125,7 @@ where
             format!(
                 "HTTP/1.1 200 OK\r\n\
             Content-Type: text/html\r\n\
+            Cache-Control: no-store\r\n
             Content-Length: {}\r\n\
             \r\n",
                 data.len()
