@@ -7,12 +7,13 @@ use std::{
 
 use log::{debug, warn};
 use rand::Rng;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    net::{TcpListener, TcpStream},
+};
 use tokio_native_tls::native_tls;
 
-use crate::http::{
-    build_http_request, read_content, read_http_headers, write_http_response, BufferedTlsStream,
-};
+use crate::http;
 use crate::ppp;
 
 pub struct Config {
@@ -50,8 +51,8 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
             return Err("Failed to accept incoming connection".into());
         }
     };
-    let mut socket = BufferedTlsStream::new(socket);
-    let headers = read_http_headers(&mut socket).await?;
+    let mut socket = BufStream::new(socket);
+    let headers = http::read_headers(&mut socket).await?;
     let token_id = headers
         .lines()
         .next()
@@ -83,11 +84,11 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
             &config.destination_hostport
         };
         let socket = connector.connect(domain, socket).await?;
-        let mut socket = BufferedTlsStream::new(socket);
+        let mut socket = BufStream::new(socket);
         debug!("Connected to cookie retrieval host");
         socket
             .write_all(
-                build_http_request(
+                http::build_request(
                     format!("GET /remote/saml/auth_id?id={}", token_id).as_str(),
                     domain,
                     None,
@@ -96,9 +97,10 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
                 .as_bytes(),
             )
             .await?;
+        socket.flush().await?;
         let mut cookie = None;
         debug!("Reading cookie response");
-        let headers = read_http_headers(&mut socket).await?;
+        let headers = http::read_headers(&mut socket).await?;
         for line in headers.lines() {
             if cookie.is_none() && line.starts_with("Set-Cookie: SVPNCOOKIE=") {
                 if let Some(start_index) = line.find(":") {
@@ -119,13 +121,13 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     debug!("Successfully obtained cookie");
 
     let response = include_bytes!("static/token.html");
-    write_http_response(&mut socket, response).await?;
+    http::write_response(&mut socket, response).await?;
 
     Ok(cookie)
 }
 
 pub struct FortiVPNTunnel {
-    socket: FortiTlsStream,
+    socket: BufTlsStream,
     addr: IpAddr,
     mtu: usize,
     ppp_state: PPPState,
@@ -165,12 +167,12 @@ impl FortiVPNTunnel {
         self.mtu as usize
     }
 
-    async fn connect(hostport: &str, domain: &str) -> Result<FortiTlsStream, FortiError> {
+    async fn connect(hostport: &str, domain: &str) -> Result<BufTlsStream, FortiError> {
         let socket = TcpStream::connect(hostport).await?;
         let connector = native_tls::TlsConnector::builder().build()?;
         let connector = tokio_native_tls::TlsConnector::from(connector);
         let socket = connector.connect(domain, socket).await?;
-        let socket = BufferedTlsStream::new(socket);
+        let socket = BufStream::new(socket);
         debug!("Connected to VPN host");
 
         Ok(socket)
@@ -178,15 +180,15 @@ impl FortiVPNTunnel {
 
     async fn request_vpn_allocation(
         domain: &str,
-        socket: &mut FortiTlsStream,
+        socket: &mut BufTlsStream,
         cookie: &str,
     ) -> Result<IpAddr, FortiError> {
-        let req = build_http_request("GET /remote/fortisslvpn_xml", domain, Some(cookie), 0);
+        let req = http::build_request("GET /remote/fortisslvpn_xml", domain, Some(cookie), 0);
         socket.write_all(req.as_bytes()).await?;
         socket.flush().await?;
 
-        let headers = read_http_headers(socket).await?;
-        let content = read_content(socket, headers.as_str()).await?;
+        let headers = http::read_headers(socket).await?;
+        let content = http::read_content(socket, headers.as_str()).await?;
 
         const IPV4_ADDRESS_PREFIX: &str = "<assigned-addr ipv4='";
         let ipv4_addr_start = if let Some(start) = content.find(IPV4_ADDRESS_PREFIX) {
@@ -210,16 +212,16 @@ impl FortiVPNTunnel {
 
     async fn start_vpn_tunnel(
         domain: &str,
-        socket: &mut FortiTlsStream,
+        socket: &mut BufTlsStream,
         cookie: &str,
     ) -> Result<(), FortiError> {
-        let req = build_http_request("GET /remote/sslvpn-tunnel", domain, Some(cookie), 0);
+        let req = http::build_request("GET /remote/sslvpn-tunnel", domain, Some(cookie), 0);
         socket.write_all(req.as_bytes()).await?;
         Ok(socket.flush().await?)
     }
 
     async fn start_ppp(
-        socket: &mut FortiTlsStream,
+        socket: &mut BufTlsStream,
         ppp_state: &mut PPPState,
     ) -> Result<u32, FortiError> {
         // Open PPP link; 200 bytes should fit any PPP packet.
@@ -355,7 +357,7 @@ impl FortiVPNTunnel {
     }
 
     async fn start_ipcp(
-        socket: &mut FortiTlsStream,
+        socket: &mut BufTlsStream,
         ppp_state: &mut PPPState,
         addr: IpAddr,
     ) -> Result<(), FortiError> {
@@ -478,7 +480,7 @@ impl FortiVPNTunnel {
     }
 
     async fn send_ppp_packet(
-        socket: &mut FortiTlsStream,
+        socket: &mut BufTlsStream,
         protocol: ppp::Protocol,
         ppp_data: &[u8],
     ) -> Result<(), FortiError> {
@@ -497,7 +499,7 @@ impl FortiVPNTunnel {
     }
 
     async fn read_ppp_packet(
-        socket: &mut FortiTlsStream,
+        socket: &mut BufTlsStream,
         state: &mut PPPState,
         dest: &mut [u8],
     ) -> Result<usize, FortiError> {
@@ -636,7 +638,7 @@ impl PPPState {
         }
     }
 
-    async fn read_header(&mut self, socket: &mut FortiTlsStream) -> Result<(), FortiError> {
+    async fn read_header(&mut self, socket: &mut BufTlsStream) -> Result<(), FortiError> {
         if self.bytes_remaining > 0 {
             return Ok(());
         }
@@ -715,7 +717,7 @@ impl PPPState {
         }
     }
 
-    async fn validate_link(&mut self, socket: &mut FortiTlsStream) -> Result<(), FortiError> {
+    async fn validate_link(&mut self, socket: &mut BufTlsStream) -> Result<(), FortiError> {
         const FALL_BACK_TO_HTTP: &[u8] = "HTTP/1".as_bytes();
         if !self.first_packet {
             return Ok(());
@@ -723,9 +725,9 @@ impl PPPState {
         self.first_packet = false;
         if &self.ppp_header[..FALL_BACK_TO_HTTP.len()] == FALL_BACK_TO_HTTP {
             // FortiVPN will return an HTTP response if something goes wrong on setup.
-            let headers = read_http_headers(socket).await?;
+            let headers = http::read_headers(socket).await?;
             debug!("Tunnel not active, error response: {}", headers);
-            let content = read_content(socket, headers.as_str()).await?;
+            let content = http::read_content(socket, headers.as_str()).await?;
             debug!("Error contents: {}", content);
             Err("Tunnel refused to establish link".into())
         } else {
@@ -734,7 +736,7 @@ impl PPPState {
     }
 }
 
-type FortiTlsStream = BufferedTlsStream<tokio_native_tls::TlsStream<TcpStream>>;
+type BufTlsStream = BufStream<tokio_native_tls::TlsStream<TcpStream>>;
 
 #[derive(Debug)]
 pub enum FortiError {
