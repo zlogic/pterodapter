@@ -14,7 +14,7 @@ use crate::fortivpn::FortiVPNTunnel;
 
 const MAX_MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 65536;
-const DEVICE_BUFFERS_COUNT: usize = 16;
+const DEVICE_BUFFERS_COUNT: usize = 32;
 const IDLE_POLL_DELAY: Duration = Duration::from_secs(1);
 
 pub struct Network<'a> {

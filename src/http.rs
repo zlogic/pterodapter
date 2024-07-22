@@ -1,59 +1,45 @@
 use std::{error, fmt, io};
 
 use log::warn;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+};
 use tokio_native_tls::native_tls;
 
-const HEADER_END_MARKER: &[u8] = "\r\n\r\n".as_bytes();
-const CHUNKS_END_MARKER: &[u8] = "\r\n0\r\n\r\n".as_bytes();
+const HEADER_END_MARKER: &str = "\r\n\r\n";
+const CHUNKS_END_MARKER: &str = "\r\n0\r\n\r\n";
 
-pub async fn read_http_headers<S>(socket: &mut BufferedTlsStream<S>) -> Result<String, HttpError>
+pub async fn read_headers<S>(socket: &mut S) -> Result<String, HttpError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    // TODO: use trait aliases once they become available.
+    S: AsyncRead + AsyncBufRead + AsyncWrite + Unpin,
 {
-    read_http_chunk(socket, HEADER_END_MARKER).await
+    read_until(socket, HEADER_END_MARKER).await
 }
 
-async fn read_http_chunk<S>(
-    socket: &mut BufferedTlsStream<S>,
-    separator: &[u8],
-) -> Result<String, HttpError>
+async fn read_until<S>(socket: &mut S, end_of_message: &str) -> Result<String, HttpError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncBufRead + AsyncWrite + Unpin,
 {
-    let mut result = vec![];
-    loop {
-        let chunk = socket.read_peek(result.len() + 1).await?;
-        let result_len = result.len();
-        let found = if let Some(header_end) = find_chunk_end(separator, result.as_slice(), chunk) {
-            result.resize(result.len() + header_end, 0u8);
-            true
-        } else {
-            result.resize(result.len() + chunk.len(), 0u8);
-            false
-        };
-        socket.read(&mut result[result_len..]).await?;
-        if found {
+    let mut result = String::new();
+    while !result.ends_with(end_of_message) {
+        // TODO: detect chunk start/end and discard; count number of bytes read.
+        if socket.read_line(&mut result).await? == 0 {
+            // EOF reached.
             break;
         }
     }
-    Ok(String::from_utf8(result).map_err(|err| {
-        warn!("Failed to decode chunk as UTF-8: {}", err);
-        "Failed to decode chunk as UTF-8"
-    })?)
+    Ok(result)
 }
 
-pub async fn read_content<S>(
-    socket: &mut BufferedTlsStream<S>,
-    headers: &str,
-) -> Result<String, HttpError>
+pub async fn read_content<S>(socket: &mut S, headers: &str) -> Result<String, HttpError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncBufRead + AsyncWrite + Unpin,
 {
     if headers.find("Transfer-Encoding: chunked").is_some() {
         // This is super janky, but should work if chunks are small enough.
         // openfortivpn works the same way.
-        return read_http_chunk(socket, CHUNKS_END_MARKER).await;
+        return read_until(socket, CHUNKS_END_MARKER).await;
     }
     let content_length = match read_content_length(headers) {
         Some(content_length) => content_length,
@@ -62,39 +48,12 @@ where
         }
     };
     let mut buf = vec![0; content_length];
-    let mut received_data = 0;
-    while received_data < buf.len() {
-        received_data += socket.read(&mut buf[received_data..]).await?;
-    }
+    socket.read_exact(&mut buf).await?;
 
     Ok(String::from_utf8(buf).map_err(|err| {
         warn!("Failed to decode headers as UTF-8: {}", err);
         "Failed to decode headers as UTF-8"
     })?)
-}
-
-fn find_chunk_end(separator: &[u8], current_data: &[u8], new_data: &[u8]) -> Option<usize> {
-    // First character doesn't count, only extras are relevant.
-    let mut merged_chunk = vec![0; separator.len()];
-    for i in 0..new_data.len() {
-        if i < separator.len() - 1 {
-            let previous_bytes = separator.len() - 1 - i;
-            if current_data.len() < previous_bytes {
-                continue;
-            }
-            merged_chunk[..previous_bytes]
-                .copy_from_slice(&current_data[current_data.len() - previous_bytes..]);
-            merged_chunk[previous_bytes..].copy_from_slice(&new_data[..=i]);
-            if &merged_chunk == separator {
-                return Some(i + 1);
-            }
-        } else {
-            if &new_data[i + 1 - separator.len()..=i] == separator {
-                return Some(i + 1);
-            }
-        }
-    }
-    None
 }
 
 pub fn read_content_length(headers: &str) -> Option<usize> {
@@ -113,10 +72,7 @@ pub fn read_content_length(headers: &str) -> Option<usize> {
     None
 }
 
-pub async fn write_http_response<S>(
-    writer: &mut BufferedTlsStream<S>,
-    data: &[u8],
-) -> Result<(), HttpError>
+pub async fn write_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -138,7 +94,7 @@ where
     Ok(())
 }
 
-pub fn build_http_request(
+pub fn build_request(
     verb: &str,
     host: &str,
     cookie: Option<&str>,
@@ -162,105 +118,6 @@ pub fn build_http_request(
             {}{}\r\n",
         verb, host, cookie, content_length
     )
-}
-
-struct Buffer<const S: usize> {
-    data: [u8; S],
-    read_start: usize,
-    write_start: usize,
-    move_threshold: usize,
-}
-
-impl<const S: usize> Buffer<S> {
-    fn new() -> Buffer<S> {
-        Buffer {
-            data: [0u8; S],
-            read_start: 0,
-            write_start: 0,
-            move_threshold: 3 * S / 4,
-        }
-    }
-
-    fn read(&mut self, dest: &mut [u8]) -> usize {
-        let source_range = if self.read_start + dest.len() > self.write_start {
-            self.read_start..self.write_start
-        } else {
-            self.read_start..(self.read_start + dest.len()).min(self.data.len())
-        };
-        dest[..source_range.len()].copy_from_slice(&self.data[source_range.clone()]);
-        self.read_start = source_range.end;
-        if self.read_start > self.move_threshold {
-            // This is not the best circular buffer implementation, hope this trick avoids copying too much data.
-            // Only do a memmove if a smaller portion of data needs to be relocated.
-            // This means that the buffer's capacity needs to be larger than usual.
-            self.data.copy_within(self.read_start..self.write_start, 0);
-            self.write_start -= self.read_start;
-            self.read_start = 0;
-        }
-
-        source_range.len()
-    }
-
-    fn peek(&self) -> &[u8] {
-        &self.data[self.read_start..self.write_start]
-    }
-
-    fn write_slice(&mut self) -> &mut [u8] {
-        &mut self.data[self.write_start..]
-    }
-
-    fn advance_write(&mut self, bytes: usize) {
-        self.write_start += bytes
-    }
-}
-
-pub struct BufferedTlsStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    stream: S,
-    buffer: Buffer<16000>,
-}
-
-impl<S> BufferedTlsStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    pub fn new(stream: S) -> BufferedTlsStream<S> {
-        BufferedTlsStream {
-            stream,
-            buffer: Buffer::new(),
-        }
-    }
-
-    pub async fn read_peek(&mut self, need_bytes: usize) -> Result<&[u8], HttpError> {
-        let need_more_data = self.buffer.peek().len() < need_bytes;
-        let write_slice = self.buffer.write_slice();
-        if need_more_data && !write_slice.is_empty() {
-            let bytes_read = self.stream.read(write_slice).await?;
-            self.buffer.advance_write(bytes_read);
-        }
-        Ok(self.buffer.peek())
-    }
-
-    pub async fn read(&mut self, dest: &mut [u8]) -> Result<usize, HttpError> {
-        if self.buffer.peek().is_empty() {
-            let write_slice = self.buffer.write_slice();
-            if !write_slice.is_empty() {
-                let bytes_read = self.stream.read(write_slice).await?;
-                self.buffer.advance_write(bytes_read);
-            }
-        }
-        Ok(self.buffer.read(dest))
-    }
-
-    pub async fn write_all(&mut self, data: &[u8]) -> Result<(), HttpError> {
-        Ok(self.stream.write_all(data).await?)
-    }
-
-    pub async fn flush(&mut self) -> Result<(), HttpError> {
-        Ok(self.stream.flush().await?)
-    }
 }
 
 #[derive(Debug)]
