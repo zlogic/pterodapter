@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use log::info;
+use log::{debug, info};
 use tokio::signal;
 
 mod fortivpn;
@@ -188,9 +188,13 @@ fn serve(config: Config) -> Result<(), i32> {
         1
     })?;
 
-    let client_handle = rt.spawn(async move {
-        if let Err(err) = client.run().await {
-            eprintln!("Network failed to run: {}", err);
+    let command_bridge = client.create_command_sender();
+    let cancel_handle = rt.spawn(async move {
+        if let Err(err) = signal::ctrl_c().await {
+            eprintln!("Failed to wait for CTRL+C signal: {}", err);
+        }
+        if let Err(err) = command_bridge.send(network::Command::Shutdown).await {
+            eprintln!("Failed to send shutdown command: {}", err);
         }
     });
     let server_handle = rt.spawn(async move {
@@ -198,14 +202,17 @@ fn serve(config: Config) -> Result<(), i32> {
             eprintln!("Server failed to run: {}", err);
         }
     });
-
-    rt.block_on(async {
-        if let Err(err) = signal::ctrl_c().await {
-            eprintln!("Failed to wait for CTRL+C signal: {}", err);
+    rt.block_on(async move {
+        if let Err(err) = client.run().await {
+            eprintln!("Network failed to run: {}", err);
+        }
+        if let Err(err) = client.terminate().await {
+            debug!("Failed to terminate client: {}", err);
         }
     });
+
     server_handle.abort();
-    client_handle.abort();
+    cancel_handle.abort();
     rt.shutdown_timeout(Duration::from_secs(60));
 
     info!("Stopped server");
