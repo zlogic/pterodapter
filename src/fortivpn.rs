@@ -2,14 +2,14 @@ use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
-    time::Duration,
 };
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use rand::Rng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpListener, TcpStream},
+    time::{Duration, Instant},
 };
 use tokio_native_tls::native_tls;
 
@@ -76,7 +76,9 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     // Get real token based on token ID.
     let cookie = {
         let socket = TcpStream::connect(&config.destination_addr).await?;
-        let connector = native_tls::TlsConnector::builder().build()?;
+        let connector = native_tls::TlsConnector::builder()
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()?;
         let connector = tokio_native_tls::TlsConnector::from(connector);
         let domain = if let Some(separator) = config.destination_hostport.find(":") {
             &config.destination_hostport[..separator]
@@ -133,6 +135,7 @@ pub struct FortiVPNTunnel {
     ppp_state: PPPState,
     ppp_magic: u32,
     ppp_identifier: u8,
+    last_echo_reply: Instant,
 }
 
 impl FortiVPNTunnel {
@@ -156,6 +159,7 @@ impl FortiVPNTunnel {
             ppp_state,
             ppp_magic,
             ppp_identifier: 2,
+            last_echo_reply: Instant::now(),
         })
     }
 
@@ -515,7 +519,6 @@ impl FortiVPNTunnel {
             );
             return Err("Destination buffer not large enough to fit all data".into());
         }
-        // TODO: check if perhaps sending partial data is acceptable?
         let mut received_data = 0;
         while state.remaining_bytes() > 0 {
             let bytes_transferred = socket
@@ -527,21 +530,24 @@ impl FortiVPNTunnel {
         Ok(received_data)
     }
 
-    pub async fn send_echo(&mut self) -> Result<(), FortiError> {
+    async fn send_echo(&mut self, code: ppp::LcpCode, identifier: u8) -> Result<(), FortiError> {
         let mut req = [0u8; 8];
         let data = self.ppp_magic.to_be_bytes();
-        let length = ppp::encode_lcp_data(
-            &mut req,
-            ppp::LcpCode::ECHO_REQUEST,
-            self.ppp_identifier,
-            &data,
-        )
-        .map_err(|err| {
-            debug!("Failed to encode Echo-Request: {}", err);
-            "Failed to encode Echo-Request"
+        let length = ppp::encode_lcp_data(&mut req, code, identifier, &data).map_err(|err| {
+            debug!("Failed to encode {}: {}", code, err);
+            "Failed to encode Echo message"
         })?;
         self.ppp_identifier += 1;
         FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await
+    }
+
+    pub async fn send_echo_request(&mut self) -> Result<(), FortiError> {
+        self.send_echo(ppp::LcpCode::ECHO_REQUEST, self.ppp_identifier)
+            .await
+    }
+
+    pub fn last_echo_reply(&self) -> Instant {
+        self.last_echo_reply
     }
 
     pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
@@ -588,7 +594,7 @@ impl FortiVPNTunnel {
             self.ppp_state.read_header(&mut self.socket).await
         }
         .map_err(|err| {
-            debug!("Failed to read PPP header: {}", err);
+            info!("Failed to read PPP header: {}", err);
             "Failed to read PPP header"
         })?;
         let protocol = match self.ppp_state.read_protocol() {
@@ -605,19 +611,96 @@ impl FortiVPNTunnel {
                 let packet = match ppp::Packet::from_bytes(protocol, &dest[..length]) {
                     Ok(packet) => packet,
                     Err(err) => {
-                        debug!("Failed to decode PPP packet: {}", err);
+                        info!("Failed to decode PPP packet: {}", err);
                         return Err("Failed to decode PPP packet".into());
                     }
                 };
-                println!("Packet= {}", packet);
-                Ok(0)
+                let packet = packet
+                    .to_lcp()
+                    .map_err(|_| "Failed to convert packet to LCP")?;
+                match packet.code() {
+                    ppp::LcpCode::ECHO_REPLY => {
+                        self.last_echo_reply = Instant::now();
+                        Ok(0)
+                    }
+                    ppp::LcpCode::ECHO_REQUEST => {
+                        self.send_echo(ppp::LcpCode::ECHO_REPLY, packet.identifier())
+                            .await
+                            .map_err(|err| {
+                                debug!("Failed to reply to echo {}", err);
+                                err
+                            })?;
+                        Ok(0)
+                    }
+                    _ => {
+                        info!("Received unexpected LCP packet {}, ignoring", packet.code());
+                        Ok(0)
+                    }
+                }
             }
             ppp::Protocol::IPV4 | ppp::Protocol::IPV6 => Ok(length),
             _ => {
-                println!("Received unexpected PPP packet {}, ignoring", protocol);
+                info!("Received unexpected PPP packet {}, ignoring", protocol);
                 Ok(0)
             }
         }
+    }
+
+    pub async fn terminate(&mut self) -> Result<(), FortiError> {
+        // Open PPP link; 200 bytes should fit any PPP packet.
+        let mut req = [0u8; 4];
+        let mut resp = [0u8; 200];
+        let length = ppp::encode_lcp_data(
+            &mut req,
+            ppp::LcpCode::TERMINATE_REQUEST,
+            self.ppp_identifier,
+            &[],
+        )
+        .map_err(|err| {
+            debug!("Failed to encode Terminate-Request: {}", err);
+            "Failed to encode Terminate-Request message"
+        })?;
+        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length])
+            .await?;
+
+        loop {
+            self.ppp_state
+                .read_header(&mut self.socket)
+                .await
+                .map_err(|err| {
+                    debug!("Failed to read PPP header: {}", err);
+                    "Failed to read PPP header"
+                })?;
+            let protocol = if let Some(protocol) = self.ppp_state.read_protocol() {
+                protocol
+            } else {
+                return Err("Unable to read PPP protocol".into());
+            };
+            let length =
+                FortiVPNTunnel::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut resp)
+                    .await?;
+            let response = ppp::Packet::from_bytes(protocol, &resp[..length]).map_err(|err| {
+                debug!("Failed to decode PPP packet: {}", err);
+                "Failed to decode PPP packet"
+            })?;
+            let lcp_packet = match response.to_lcp() {
+                Ok(lcp) => lcp,
+                Err(err) => {
+                    debug!(
+                        "Received unexpected PPP packet during termination: {} (error {})",
+                        response, err
+                    );
+                    continue;
+                }
+            };
+            debug!("Received LCP packet: {:?}", response);
+            if lcp_packet.code() == ppp::LcpCode::TERMINATE_ACK {
+                break;
+            }
+        }
+
+        self.socket.shutdown().await?;
+        Ok(())
     }
 }
 
@@ -651,10 +734,8 @@ impl PPPState {
                 Ok(bytes_read) => {
                     self.ppp_header_length += bytes_read;
                     if self.ppp_header_length >= self.ppp_header.len() {
-                        println!("Have header {} bytes", self.ppp_header_length);
                         break;
                     } else {
-                        println!("Have {} bytes", self.ppp_header_length);
                     }
                 }
                 Err(err) => {
@@ -663,7 +744,6 @@ impl PPPState {
                 }
             }
         }
-        println!("Packet ready");
         if let Err(err) = self.validate_link(socket).await {
             return Err(err);
         }

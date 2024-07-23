@@ -2,13 +2,15 @@ use std::{
     collections::HashMap,
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
 };
 
 use log::{debug, warn};
 use rand::Rng;
 use smoltcp::{iface, phy, socket, storage, wire};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Duration,
+};
 
 use crate::fortivpn::FortiVPNTunnel;
 
@@ -16,6 +18,8 @@ const MAX_MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const DEVICE_BUFFERS_COUNT: usize = 32;
 const IDLE_POLL_DELAY: Duration = Duration::from_secs(1);
+const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
+const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Network<'a> {
     device: VpnDevice<'a>,
@@ -24,6 +28,7 @@ pub struct Network<'a> {
     bridges: HashMap<iface::SocketHandle, SocketTunnel>,
     opening_connections:
         HashMap<iface::SocketHandle, Option<oneshot::Sender<SocketConnectionResult>>>,
+    canceled: bool,
     cmd_sender: mpsc::Sender<Command>,
     cmd_receiver: mpsc::Receiver<Command>,
 }
@@ -56,15 +61,17 @@ impl Network<'_> {
             sockets,
             bridges: HashMap::new(),
             opening_connections: HashMap::new(),
+            canceled: false,
             cmd_sender,
             cmd_receiver,
         })
     }
 
     pub async fn run(&mut self) -> Result<(), NetworkError> {
-        loop {
+        while !self.canceled {
             self.device.send_data().await?;
             self.device.receive_data().await?;
+            self.device.process_keepalive().await?;
             let timestamp = smoltcp::time::Instant::now();
             let start_time = tokio::time::Instant::now();
             self.iface
@@ -86,6 +93,7 @@ impl Network<'_> {
                 }
             }
         }
+        Ok(())
     }
 
     fn copy_all_data(&mut self) {
@@ -247,6 +255,10 @@ impl Network<'_> {
                 let socket_tunnel = SocketTunnel { reader, writer };
                 self.bridges.insert(socket_handle, socket_tunnel);
             }
+            Command::Shutdown => {
+                debug!("Shutdown command received");
+                self.canceled = true;
+            }
         }
     }
 
@@ -265,6 +277,10 @@ impl Network<'_> {
             self.process_command(command);
             return;
         }
+    }
+
+    pub async fn terminate(&mut self) -> Result<(), NetworkError> {
+        Ok(self.device.vpn.terminate().await?)
     }
 }
 
@@ -287,10 +303,12 @@ pub enum Command {
         tokio::net::tcp::OwnedReadHalf,
         tokio::net::tcp::OwnedWriteHalf,
     ),
+    Shutdown,
 }
 
 struct VpnDevice<'a> {
     vpn: FortiVPNTunnel,
+    last_echo_sent: tokio::time::Instant,
     read_buffers: storage::RingBuffer<'a, Vec<u8>>,
     write_buffers: storage::RingBuffer<'a, Vec<u8>>,
 }
@@ -299,6 +317,7 @@ impl<'a> VpnDevice<'_> {
     fn new(vpn: FortiVPNTunnel) -> VpnDevice<'a> {
         VpnDevice {
             vpn,
+            last_echo_sent: tokio::time::Instant::now(),
             read_buffers: storage::RingBuffer::new(vec![
                 Vec::with_capacity(MAX_MTU_SIZE);
                 DEVICE_BUFFERS_COUNT
@@ -358,6 +377,19 @@ impl VpnDevice<'_> {
             src.clear();
         }
         Ok(())
+    }
+
+    async fn process_keepalive(&mut self) -> Result<(), NetworkError> {
+        let current_time = tokio::time::Instant::now();
+        if self.last_echo_sent + ECHO_SEND_INTERVAL < current_time {
+            self.vpn.send_echo_request().await?;
+            self.last_echo_sent = tokio::time::Instant::now();
+        }
+        if self.vpn.last_echo_reply() + ECHO_TIMEOUT < current_time {
+            Err("No echo replies received".into())
+        } else {
+            Ok(())
+        }
     }
 }
 
