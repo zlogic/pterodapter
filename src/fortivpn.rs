@@ -672,9 +672,9 @@ impl FortiVPNTunnel {
     }
 
     pub async fn terminate(&mut self) -> Result<(), FortiError> {
-        // Open PPP link; 200 bytes should fit any PPP packet.
         let mut req = [0u8; 4];
-        let mut resp = [0u8; 200];
+        // Ensure that any stray IP packets are accepted.
+        let mut resp = [0u8; PPP_MTU as usize + 8];
         let length = ppp::encode_lcp_data(
             &mut req,
             ppp::LcpCode::TERMINATE_REQUEST,
