@@ -537,13 +537,14 @@ impl FortiVPNTunnel {
             debug!("Failed to encode {}: {}", code, err);
             "Failed to encode Echo message"
         })?;
-        self.ppp_identifier += 1;
         FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await
     }
 
     pub async fn send_echo_request(&mut self) -> Result<(), FortiError> {
         self.send_echo(ppp::LcpCode::ECHO_REQUEST, self.ppp_identifier)
-            .await
+            .await?;
+        self.ppp_identifier += 1;
+        Ok(())
     }
 
     pub fn last_echo_reply(&self) -> Instant {
@@ -552,6 +553,54 @@ impl FortiVPNTunnel {
 
     pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
         FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
+    }
+
+    async fn process_control_packet(&mut self) -> Result<(), FortiError> {
+        let protocol = match self.ppp_state.read_protocol() {
+            Some(ppp::Protocol::IPV4) => return Ok(()),
+            Some(protocol) => protocol,
+            None => return Ok(()),
+        };
+        // 200 bytes should fit any PPP packet.
+        let mut dest = [0u8; 200];
+        let length =
+            FortiVPNTunnel::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut dest)
+                .await?;
+
+        match protocol {
+            ppp::Protocol::LCP => {
+                let packet = match ppp::Packet::from_bytes(protocol, &dest[..length]) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        info!("Failed to decode PPP packet: {}", err);
+                        return Err("Failed to decode PPP packet".into());
+                    }
+                };
+                let packet = packet
+                    .to_lcp()
+                    .map_err(|_| "Failed to convert packet to LCP")?;
+                match packet.code() {
+                    ppp::LcpCode::ECHO_REPLY => {
+                        self.last_echo_reply = Instant::now();
+                    }
+                    ppp::LcpCode::ECHO_REQUEST => {
+                        self.send_echo(ppp::LcpCode::ECHO_REPLY, packet.identifier())
+                            .await
+                            .map_err(|err| {
+                                debug!("Failed to reply to echo {}", err);
+                                err
+                            })?;
+                    }
+                    _ => {
+                        info!("Received unexpected LCP packet {}, ignoring", packet.code());
+                    }
+                }
+            }
+            _ => {
+                info!("Received unexpected PPP packet {}, ignoring", protocol);
+            }
+        }
+        Ok(())
     }
 
     pub async fn try_next_ip_packet(
@@ -574,6 +623,10 @@ impl FortiVPNTunnel {
         })?;
         match self.ppp_state.read_protocol() {
             Some(ppp::Protocol::IPV4) => Ok(self.ppp_state.remaining_bytes()),
+            Some(ppp::Protocol::LCP) => {
+                self.process_control_packet().await?;
+                Ok(0)
+            }
             _ => Ok(0),
         }
     }
@@ -607,36 +660,8 @@ impl FortiVPNTunnel {
             FortiVPNTunnel::read_ppp_packet(&mut self.socket, &mut self.ppp_state, dest).await?;
         match protocol {
             ppp::Protocol::LCP => {
-                // TODO: handle echo requests/responsed here.
-                let packet = match ppp::Packet::from_bytes(protocol, &dest[..length]) {
-                    Ok(packet) => packet,
-                    Err(err) => {
-                        info!("Failed to decode PPP packet: {}", err);
-                        return Err("Failed to decode PPP packet".into());
-                    }
-                };
-                let packet = packet
-                    .to_lcp()
-                    .map_err(|_| "Failed to convert packet to LCP")?;
-                match packet.code() {
-                    ppp::LcpCode::ECHO_REPLY => {
-                        self.last_echo_reply = Instant::now();
-                        Ok(0)
-                    }
-                    ppp::LcpCode::ECHO_REQUEST => {
-                        self.send_echo(ppp::LcpCode::ECHO_REPLY, packet.identifier())
-                            .await
-                            .map_err(|err| {
-                                debug!("Failed to reply to echo {}", err);
-                                err
-                            })?;
-                        Ok(0)
-                    }
-                    _ => {
-                        info!("Received unexpected LCP packet {}, ignoring", packet.code());
-                        Ok(0)
-                    }
-                }
+                self.process_control_packet().await?;
+                Ok(0)
             }
             ppp::Protocol::IPV4 | ppp::Protocol::IPV6 => Ok(length),
             _ => {
