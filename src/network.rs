@@ -17,6 +17,7 @@ use crate::fortivpn::FortiVPNTunnel;
 const MAX_MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const DEVICE_BUFFERS_COUNT: usize = 32;
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
 const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -68,22 +69,23 @@ impl Network<'_> {
 
     pub async fn run(&mut self) -> Result<(), NetworkError> {
         while !self.canceled {
-            self.device.process_keepalive().await?;
-            self.device.send_data().await?;
-            self.device.receive_data().await?;
             let timestamp = smoltcp::time::Instant::now();
-            let start_time = tokio::time::Instant::now();
             self.iface
                 .poll(timestamp, &mut self.device, &mut self.sockets);
             self.copy_all_data();
-            match self.iface.poll_delay(timestamp, &self.sockets) {
-                Some(poll_delay) => {
-                    let timeout_at = start_time + Duration::from_micros(poll_delay.total_micros());
-                    self.process_commands(Some(timeout_at)).await;
-                }
-                None => {
-                    self.process_commands(None).await;
-                }
+            let timeout = match self.iface.poll_delay(timestamp, &self.sockets) {
+                Some(poll_delay) => Duration::from_micros(poll_delay.total_micros()),
+                None => MAX_POLL_INTERVAL,
+            };
+            self.device.process_keepalive().await?;
+            let timeout = if self.device.send_data().await? > 0 {
+                Duration::from_millis(0)
+            } else {
+                timeout
+            };
+            self.device.receive_data(timeout).await?;
+            if let Ok(command) = self.cmd_receiver.try_recv() {
+                self.process_command(command);
             }
         }
         Ok(())
@@ -254,23 +256,6 @@ impl Network<'_> {
         }
     }
 
-    async fn process_commands(&mut self, timeout_at: Option<tokio::time::Instant>) {
-        let command = if let Some(timeout_at) = timeout_at {
-            tokio::time::timeout_at(timeout_at, self.cmd_receiver.recv())
-        } else {
-            tokio::time::timeout(Duration::from_millis(0), self.cmd_receiver.recv())
-        };
-        let command = match command.await {
-            Ok(command) => command,
-            Err(_) => return,
-        };
-
-        if let Some(command) = command {
-            self.process_command(command);
-            return;
-        }
-    }
-
     pub async fn terminate(&mut self) -> Result<(), NetworkError> {
         Ok(self.device.vpn.terminate().await?)
     }
@@ -325,50 +310,47 @@ impl<'a> VpnDevice<'_> {
 }
 
 impl VpnDevice<'_> {
-    async fn receive_data(&mut self) -> Result<(), NetworkError> {
-        while !self.read_buffers.is_full() {
-            let bytes_available = self
-                .vpn
-                .try_next_ip_packet(Some(Duration::from_millis(0)))
-                .await?;
-            if bytes_available == 0 {
-                break;
-            }
-            let dest = if let Ok(dest) = self.read_buffers.enqueue_one() {
-                dest
-            } else {
-                // Read buffers are full.
-                return Ok(());
-            };
-            dest.resize(bytes_available, 0);
-            let length = self
-                .vpn
-                .try_read_packet(dest, Some(Duration::from_millis(0)))
-                .await?;
-            dest.truncate(length);
-            if length == 0 {
-                break;
-            }
+    async fn receive_data(
+        &mut self,
+        timeout: tokio::time::Duration,
+    ) -> Result<usize, NetworkError> {
+        if self.read_buffers.is_full() {
+            return Ok(0);
         }
-        Ok(())
+        let bytes_available = self.vpn.try_next_ip_packet(Some(timeout)).await?;
+        if bytes_available == 0 {
+            return Ok(0);
+        }
+        let dest = if let Ok(dest) = self.read_buffers.enqueue_one() {
+            dest
+        } else {
+            // Read buffers are full.
+            return Ok(0);
+        };
+        dest.resize(bytes_available, 0);
+        let length = self.vpn.try_read_packet(dest, Some(timeout)).await?;
+        dest.truncate(length);
+        Ok(length)
     }
 
-    async fn send_data(&mut self) -> Result<(), NetworkError> {
+    async fn send_data(&mut self) -> Result<usize, NetworkError> {
         while !self.write_buffers.is_empty() {
             let src = if let Ok(src) = self.write_buffers.dequeue_one() {
                 src
             } else {
                 // No write buffers are available.
-                return Ok(());
+                return Ok(0);
             };
 
             if src.is_empty() {
                 continue;
             }
             self.vpn.send_packet(src).await?;
+            let bytes_sent = src.len();
             src.clear();
+            return Ok(bytes_sent);
         }
-        Ok(())
+        Ok(0)
     }
 
     async fn process_keepalive(&mut self) -> Result<(), NetworkError> {
