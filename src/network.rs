@@ -17,7 +17,6 @@ use crate::fortivpn::FortiVPNTunnel;
 const MAX_MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const DEVICE_BUFFERS_COUNT: usize = 32;
-const IDLE_POLL_DELAY: Duration = Duration::from_secs(1);
 const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
 const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -79,14 +78,8 @@ impl Network<'_> {
             self.copy_all_data();
             match self.iface.poll_delay(timestamp, &self.sockets) {
                 Some(poll_delay) => {
-                    let empty_connections =
-                        self.sockets.iter().count() == 0 && self.bridges.is_empty();
-                    let poll_delay = if empty_connections {
-                        IDLE_POLL_DELAY
-                    } else {
-                        Duration::from_micros(poll_delay.total_micros())
-                    };
-                    self.process_commands(Some(start_time + poll_delay)).await;
+                    let timeout_at = start_time + Duration::from_micros(poll_delay.total_micros());
+                    self.process_commands(Some(timeout_at)).await;
                 }
                 None => {
                     self.process_commands(None).await;
@@ -123,7 +116,7 @@ impl Network<'_> {
                 });
                 if let Ok(result) = result {
                     if let Err(err) = result {
-                        warn!("Failed to read data from SOCKS socket: {}", err);
+                        debug!("Failed to read data from SOCKS socket: {}", err);
                         socket.close();
                         return;
                     }
@@ -143,7 +136,7 @@ impl Network<'_> {
                 });
                 if let Ok(result) = result {
                     if let Err(err) = result {
-                        warn!("Failed to write data to SOCKS socket: {}", err);
+                        debug!("Failed to write data to SOCKS socket: {}", err);
                         socket.close();
                         return;
                     }
@@ -308,6 +301,7 @@ pub enum Command {
 struct VpnDevice<'a> {
     vpn: FortiVPNTunnel,
     last_echo_sent: tokio::time::Instant,
+    next_echo_receive_check: tokio::time::Instant,
     read_buffers: storage::RingBuffer<'a, Vec<u8>>,
     write_buffers: storage::RingBuffer<'a, Vec<u8>>,
 }
@@ -317,6 +311,7 @@ impl<'a> VpnDevice<'_> {
         VpnDevice {
             vpn,
             last_echo_sent: tokio::time::Instant::now(),
+            next_echo_receive_check: tokio::time::Instant::now() + ECHO_TIMEOUT,
             read_buffers: storage::RingBuffer::new(vec![
                 Vec::with_capacity(MAX_MTU_SIZE);
                 DEVICE_BUFFERS_COUNT
@@ -378,13 +373,22 @@ impl VpnDevice<'_> {
 
     async fn process_keepalive(&mut self) -> Result<(), NetworkError> {
         let current_time = tokio::time::Instant::now();
+        if self.last_echo_sent + ECHO_TIMEOUT < current_time {
+            // Reset timeout if no echos were sent for too long (e.g. because of sleep).
+            self.next_echo_receive_check = current_time + ECHO_TIMEOUT;
+        }
         if self.last_echo_sent + ECHO_SEND_INTERVAL < current_time {
+            // No echo sent recently, should test if connection is still alive.
             self.vpn.send_echo_request().await?;
             self.last_echo_sent = current_time;
         }
-        if self.vpn.last_echo_reply() + ECHO_TIMEOUT < current_time {
+        if current_time < self.next_echo_receive_check {
+            // Haven't reached the next timeout check yet.
+            Ok(())
+        } else if self.vpn.last_echo_reply() + ECHO_TIMEOUT < current_time {
             Err("No echo replies received".into())
         } else {
+            self.next_echo_receive_check = current_time + ECHO_TIMEOUT;
             Ok(())
         }
     }

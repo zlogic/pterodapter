@@ -130,9 +130,7 @@ impl SocksConnection {
         reader: &mut tcp::OwnedReadHalf,
         writer: &mut tcp::OwnedWriteHalf,
     ) -> Result<smoltcp::iface::SocketHandle, SocksError> {
-        println!("Preparing to read request");
         let version = reader.read_u8().await?;
-        println!("Read to read request");
         if version != SOCKS5_VERSION {
             return Err("Unsupported SOCKS version".into());
         }
