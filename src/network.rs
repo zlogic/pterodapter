@@ -200,7 +200,6 @@ impl Network<'_> {
             let result = if let Some(result) = result {
                 result
             } else {
-                println!("Socket state is {}", socket.state());
                 continue;
             };
             let response = if let Some(response) = response.take() {
@@ -343,7 +342,6 @@ impl VpnDevice<'_> {
             let dest = if let Ok(dest) = self.read_buffers.enqueue_one() {
                 dest
             } else {
-                println!("Read buffers are full");
                 // Read buffers are full.
                 return Ok(());
             };
@@ -373,7 +371,6 @@ impl VpnDevice<'_> {
                 continue;
             }
             self.vpn.send_packet(src).await?;
-            println!("wrote {} bytes", src.len());
             src.clear();
         }
         Ok(())
@@ -412,14 +409,12 @@ impl phy::Device for VpnDevice<'_> {
         let src = if let Ok(src) = self.read_buffers.dequeue_one() {
             src
         } else {
-            println!("Failed to rx, read");
             // No read buffers are available.
             return None;
         };
         let dest = if let Ok(dest) = self.write_buffers.enqueue_one() {
             dest
         } else {
-            println!("Failed to tx, read");
             // Write buffers are full.
             return None;
         };
@@ -430,7 +425,6 @@ impl phy::Device for VpnDevice<'_> {
         let dest = if let Ok(dest) = self.write_buffers.enqueue_one() {
             dest
         } else {
-            println!("Failed to rx, write");
             // Write buffers are full.
             return None;
         };
