@@ -69,9 +69,9 @@ impl Network<'_> {
 
     pub async fn run(&mut self) -> Result<(), NetworkError> {
         while !self.canceled {
+            self.device.process_keepalive().await?;
             self.device.send_data().await?;
             self.device.receive_data().await?;
-            self.device.process_keepalive().await?;
             let timestamp = smoltcp::time::Instant::now();
             let start_time = tokio::time::Instant::now();
             self.iface
@@ -380,7 +380,7 @@ impl VpnDevice<'_> {
         let current_time = tokio::time::Instant::now();
         if self.last_echo_sent + ECHO_SEND_INTERVAL < current_time {
             self.vpn.send_echo_request().await?;
-            self.last_echo_sent = tokio::time::Instant::now();
+            self.last_echo_sent = current_time;
         }
         if self.vpn.last_echo_reply() + ECHO_TIMEOUT < current_time {
             Err("No echo replies received".into())
