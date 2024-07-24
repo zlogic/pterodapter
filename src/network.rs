@@ -6,7 +6,7 @@ use std::{
 
 use log::{debug, warn};
 use rand::Rng;
-use smoltcp::{iface, phy, socket, storage, wire};
+use smoltcp::{iface, phy, socket, wire};
 use tokio::{
     sync::{mpsc, oneshot},
     time::Duration,
@@ -16,13 +16,12 @@ use crate::fortivpn::FortiVPNTunnel;
 
 const MAX_MTU_SIZE: usize = 1500;
 const SOCKET_BUFFER_SIZE: usize = 65536;
-const DEVICE_BUFFERS_COUNT: usize = 32;
-const MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
 const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Network<'a> {
-    device: VpnDevice<'a>,
+    device: VpnDevice,
     iface: iface::Interface,
     sockets: iface::SocketSet<'a>,
     bridges: HashMap<iface::SocketHandle, SocketTunnel>,
@@ -69,10 +68,10 @@ impl Network<'_> {
 
     pub async fn run(&mut self) -> Result<(), NetworkError> {
         while !self.canceled {
+            self.copy_all_data();
             let timestamp = smoltcp::time::Instant::now();
             self.iface
                 .poll(timestamp, &mut self.device, &mut self.sockets);
-            self.copy_all_data();
             let timeout = match self.iface.poll_delay(timestamp, &self.sockets) {
                 Some(poll_delay) => Duration::from_micros(poll_delay.total_micros()),
                 None => MAX_POLL_INTERVAL,
@@ -283,74 +282,56 @@ pub enum Command {
     Shutdown,
 }
 
-struct VpnDevice<'a> {
+struct VpnDevice {
     vpn: FortiVPNTunnel,
     last_echo_sent: tokio::time::Instant,
     next_echo_receive_check: tokio::time::Instant,
-    read_buffers: storage::RingBuffer<'a, Vec<u8>>,
-    write_buffers: storage::RingBuffer<'a, Vec<u8>>,
+    read_buffer: Vec<u8>,
+    write_buffer: Vec<u8>,
 }
 
-impl<'a> VpnDevice<'_> {
-    fn new(vpn: FortiVPNTunnel) -> VpnDevice<'a> {
+impl VpnDevice {
+    fn new(vpn: FortiVPNTunnel) -> VpnDevice {
         VpnDevice {
             vpn,
             last_echo_sent: tokio::time::Instant::now(),
             next_echo_receive_check: tokio::time::Instant::now() + ECHO_TIMEOUT,
-            read_buffers: storage::RingBuffer::new(vec![
-                Vec::with_capacity(MAX_MTU_SIZE);
-                DEVICE_BUFFERS_COUNT
-            ]),
-            write_buffers: storage::RingBuffer::new(vec![
-                Vec::with_capacity(MAX_MTU_SIZE);
-                DEVICE_BUFFERS_COUNT
-            ]),
+            read_buffer: Vec::with_capacity(MAX_MTU_SIZE),
+            write_buffer: Vec::with_capacity(MAX_MTU_SIZE),
         }
     }
 }
 
-impl VpnDevice<'_> {
+impl VpnDevice {
     async fn receive_data(
         &mut self,
         timeout: tokio::time::Duration,
     ) -> Result<usize, NetworkError> {
-        if self.read_buffers.is_full() {
+        if !self.read_buffer.is_empty() {
             return Ok(0);
         }
         let bytes_available = self.vpn.try_next_ip_packet(Some(timeout)).await?;
         if bytes_available == 0 {
             return Ok(0);
         }
-        let dest = if let Ok(dest) = self.read_buffers.enqueue_one() {
-            dest
-        } else {
-            // Read buffers are full.
-            return Ok(0);
-        };
-        dest.resize(bytes_available, 0);
-        let length = self.vpn.try_read_packet(dest, Some(timeout)).await?;
-        dest.truncate(length);
+        self.read_buffer.resize(bytes_available, 0);
+        let length = self
+            .vpn
+            .try_read_packet(&mut self.read_buffer, Some(timeout))
+            .await?;
+        self.read_buffer.truncate(length);
         Ok(length)
     }
 
     async fn send_data(&mut self) -> Result<usize, NetworkError> {
-        while !self.write_buffers.is_empty() {
-            let src = if let Ok(src) = self.write_buffers.dequeue_one() {
-                src
-            } else {
-                // No write buffers are available.
-                return Ok(0);
-            };
-
-            if src.is_empty() {
-                continue;
-            }
-            self.vpn.send_packet(src).await?;
-            let bytes_sent = src.len();
-            src.clear();
-            return Ok(bytes_sent);
+        if self.write_buffer.is_empty() {
+            return Ok(0);
         }
-        Ok(0)
+
+        self.vpn.send_packet(&self.write_buffer).await?;
+        let bytes_sent = self.write_buffer.len();
+        self.write_buffer.clear();
+        return Ok(bytes_sent);
     }
 
     async fn process_keepalive(&mut self) -> Result<(), NetworkError> {
@@ -376,7 +357,7 @@ impl VpnDevice<'_> {
     }
 }
 
-impl phy::Device for VpnDevice<'_> {
+impl phy::Device for VpnDevice {
     type RxToken<'a> = RxToken<'a>
     where
          Self: 'a;
@@ -389,38 +370,32 @@ impl phy::Device for VpnDevice<'_> {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.read_buffers.is_empty() || self.write_buffers.is_full() {
+        if self.read_buffer.is_empty() || !self.write_buffer.is_empty() {
             return None;
         }
-        let src = if let Ok(src) = self.read_buffers.dequeue_one() {
-            src
-        } else {
-            // No read buffers are available.
-            return None;
-        };
-        let dest = if let Ok(dest) = self.write_buffers.enqueue_one() {
-            dest
-        } else {
-            // Write buffers are full.
-            return None;
-        };
-        Some((RxToken { src }, TxToken { dest }))
+        Some((
+            RxToken {
+                src: &mut self.read_buffer,
+            },
+            TxToken {
+                dest: &mut self.write_buffer,
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        let dest = if let Ok(dest) = self.write_buffers.enqueue_one() {
-            dest
-        } else {
-            // Write buffers are full.
+        if !self.write_buffer.is_empty() {
             return None;
-        };
-        Some(TxToken { dest })
+        }
+        Some(TxToken {
+            dest: &mut self.write_buffer,
+        })
     }
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut caps = phy::DeviceCapabilities::default();
         caps.max_transmission_unit = self.vpn.mtu();
-        caps.max_burst_size = Some(DEVICE_BUFFERS_COUNT);
+        caps.max_burst_size = Some(SOCKET_BUFFER_SIZE / MAX_MTU_SIZE);
         caps.medium = phy::Medium::Ip;
         caps.checksum.ipv4 = phy::Checksum::Both;
         caps.checksum.tcp = phy::Checksum::Both;
@@ -440,7 +415,9 @@ impl<'a> phy::RxToken for RxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        f(&mut self.src)
+        let result = f(&mut self.src);
+        self.src.clear();
+        result
     }
 }
 
