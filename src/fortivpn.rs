@@ -769,14 +769,14 @@ impl PPPState {
                 .await
             {
                 Ok(bytes_read) => {
-                    self.ppp_header_length += bytes_read;
-                    if self.ppp_header_length >= self.ppp_header.len() {
-                        break;
+                    if bytes_read > 0 {
+                        self.ppp_header_length += bytes_read;
                     } else {
+                        return Err("TLS reader is closed".into());
                     }
                 }
                 Err(err) => {
-                    debug!("Failed to read PPP header {}", err);
+                    debug!("Failed to read PPP header: {}", err);
                     return Err("Failed to read PPP header".into());
                 }
             }
