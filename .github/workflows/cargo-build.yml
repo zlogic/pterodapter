@@ -33,13 +33,6 @@ jobs:
     - name: Validate Rust code with clippy
       run: cargo clippy
 
-    - name: Install cargo-edit
-      if: ${{ steps.cache-rust.outputs.cache-hit != 'true' }}
-      run: cargo install cargo-edit
-
-    - name: Check for new dependency versions
-      run: cargo upgrade --dry-run
-
   build-linux:
     runs-on: ubuntu-latest
     needs: validate
