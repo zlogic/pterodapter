@@ -110,7 +110,15 @@ impl Network<'_> {
                 let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
                 if socket.can_send() {
                     let result = socket.send(|dest| match tunnel.try_read(dest) {
-                        Ok(bytes) => (bytes, Ok::<(), NetworkError>(())),
+                        Ok(bytes) => {
+                            if bytes > 0 && dest.len() > 0 {
+                                (bytes, Ok::<(), NetworkError>(()))
+                            } else {
+                                // Zero bytes means the stream is closed.
+                                // TODO: add a custom handler for this error.
+                                (0, Err("Proxy reader is closed".into()))
+                            }
+                        }
                         Err(err) => match err.kind() {
                             io::ErrorKind::WouldBlock => (0, Ok(())),
                             _ => (0, Err(err.into())),
