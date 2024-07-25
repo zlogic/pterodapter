@@ -2,6 +2,8 @@
 
 ![Build status](https://github.com/zlogic/pterodapter/actions/workflows/cargo-build.yml/badge.svg)
 
+<img src="logo.png" alt="Logo" style="width:32px;height:32px;">
+
 Pterodapter is a userspace SOCKS5-to-FortiVPN adapter that acts as an open standard SOCKS5 proxy server, and forwards traffic to a FortiVPN network.
 
 No drivers to install or root access to create tun/utun devices.
