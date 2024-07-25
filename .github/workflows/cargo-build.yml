@@ -106,3 +106,55 @@ jobs:
         name: pterodapter-${{ matrix.os }}-${{ matrix.arch }}
         path: pterodapter-*.tar.bz2
 
+
+  build-macos:
+    runs-on: macos-latest
+    needs: validate
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [aarch64, x86_64]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Get current Rust version
+      id: get-rust-version
+      run: echo VERSION=$(rustc --version | sed s/\ /_/g) >> "$GITHUB_OUTPUT"
+
+    - name: Cache Rust dependencies and artifacts
+      id: cache-rust
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ${{ github.workspace }}/target
+        key: rust-${{ runner.os }}-${{ matrix.arch }}-${{ steps.get-rust-version.outputs.VERSION }}-${{ hashFiles('Cargo.*') }}
+
+    - name: Install compiler and prepare for cross-compilation
+      if: matrix.arch == 'x86_64'
+      run: rustup target add ${{ matrix.arch }}-apple-darwin
+
+    - name: Build
+      run: cargo build --target=${{ matrix.arch }}-apple-darwin --release
+
+    - name: Package application
+      run: tar -cvjf pterodapter-${{ runner.os }}-${{ matrix.arch }}.tar.bz2 -C target/${{ matrix.arch }}-apple-darwin/release pterodapter
+
+    - name: Upload application
+      uses: actions/upload-artifact@v4
+      with:
+        name: pterodapter-${{ runner.os }}-${{ matrix.arch }}
+        path: pterodapter-*.tar.bz2
+
+  package:
+    runs-on: ubuntu-latest
+    needs: [ "build-linux", "build-macos" ]
+    steps:
+      - name: Merge all applications
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: pterodapter-all
+          pattern: pterodapter-*
