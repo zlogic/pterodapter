@@ -173,7 +173,9 @@ impl FortiVPNTunnel {
 
     async fn connect(hostport: &str, domain: &str) -> Result<BufTlsStream, FortiError> {
         let socket = TcpStream::connect(hostport).await?;
-        let connector = native_tls::TlsConnector::builder().build()?;
+        let connector = native_tls::TlsConnector::builder()
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()?;
         let connector = tokio_native_tls::TlsConnector::from(connector);
         let socket = connector.connect(domain, socket).await?;
         let socket = BufStream::new(socket);
@@ -245,6 +247,7 @@ impl FortiVPNTunnel {
                     "Failed to encode LCP Configure-Request"
                 })?;
         FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
+        socket.flush().await?;
 
         let mut local_acked = false;
         let mut remote_acked = false;
@@ -340,6 +343,7 @@ impl FortiVPNTunnel {
                     })?;
                     FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length])
                         .await?;
+                    socket.flush().await?;
                     remote_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_NAK => {
@@ -385,6 +389,7 @@ impl FortiVPNTunnel {
         let opts_len = length - 4;
         opts[..opts_len].copy_from_slice(&req[4..length]);
         FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
+        socket.flush().await?;
 
         let mut local_acked = false;
         let mut remote_acked = false;
@@ -463,6 +468,7 @@ impl FortiVPNTunnel {
                     })?;
                     FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length])
                         .await?;
+                    socket.flush().await?;
                     remote_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_NAK => {
@@ -498,8 +504,7 @@ impl FortiVPNTunnel {
         packet_header[6..].copy_from_slice(&protocol.value().to_be_bytes());
 
         socket.write_all(&packet_header).await?;
-        socket.write_all(&ppp_data).await?;
-        Ok(socket.flush().await?)
+        Ok(socket.write_all(&ppp_data).await?)
     }
 
     async fn read_ppp_packet(
@@ -537,7 +542,9 @@ impl FortiVPNTunnel {
             debug!("Failed to encode {}: {}", code, err);
             "Failed to encode Echo message"
         })?;
-        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await
+        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length])
+            .await?;
+        Ok(self.socket.flush().await?)
     }
 
     pub async fn send_echo_request(&mut self) -> Result<(), FortiError> {
@@ -553,6 +560,10 @@ impl FortiVPNTunnel {
 
     pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
         FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
+    }
+
+    pub async fn flush(&mut self) -> Result<(), FortiError> {
+        Ok(self.socket.flush().await?)
     }
 
     async fn process_control_packet(&mut self) -> Result<(), FortiError> {
@@ -687,6 +698,7 @@ impl FortiVPNTunnel {
         })?;
         FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length])
             .await?;
+        self.socket.flush().await?;
 
         loop {
             self.ppp_state
