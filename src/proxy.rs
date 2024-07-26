@@ -93,7 +93,11 @@ impl ProxyConnection {
                 self.socks_handshake(&mut socket).await?;
                 self.socks_read_request(&mut socket).await?
             }
+            0x16 => {
+                return Err("Received incoming TLS connection".into());
+            }
             _ => {
+                warn!("Received unexpected first byte {:2x}", first_byte);
                 return Err("Unsupported protocol".into());
             }
         };
@@ -114,7 +118,7 @@ impl ProxyConnection {
                 rt.spawn(async move {
                     if let Err(err) = tokio::io::copy_bidirectional(&mut socket, &mut stream).await
                     {
-                        warn!("Direct connection tunnel failed: {}", err);
+                        debug!("Direct connection tunnel failed: {}", err);
                     }
                 });
                 Ok(())
@@ -150,6 +154,7 @@ impl ProxyConnection {
         } else {
             // Assume it's an HTTP Proxy protocol.
             // TODO: remove host from HTTP request path.
+            // TODO: remove the Proxy-Connection header?
             let host = if let Some(host) = http::read_host(&request) {
                 host
             } else {
@@ -311,7 +316,10 @@ impl ProxyConnection {
             Some(DestinationAddress::IpAddr(ip)) => {
                 self.connect_to_addr((ip, port).into(), false, None).await
             }
-            Some(DestinationAddress::Domain(domain)) => self.connect_to_domain(&domain, None).await,
+            Some(DestinationAddress::Domain(ref domain)) => {
+                self.connect_to_domain(format!("{}:{}", domain, port).as_str(), None)
+                    .await
+            }
             None => {
                 ProxyConnection::socks_write_error_response(
                     socket,

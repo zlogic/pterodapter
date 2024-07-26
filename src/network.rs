@@ -26,8 +26,13 @@ pub struct Network<'a> {
     iface: iface::Interface,
     sockets: iface::SocketSet<'a>,
     bridges: HashMap<iface::SocketHandle, tokio::net::TcpStream>,
-    opening_connections:
-        HashMap<iface::SocketHandle, Option<oneshot::Sender<SocketConnectionResult>>>,
+    opening_connections: HashMap<
+        iface::SocketHandle,
+        (
+            Option<Vec<u8>>,
+            Option<oneshot::Sender<SocketConnectionResult>>,
+        ),
+    >,
     canceled: bool,
     command_receiver: mpsc::Receiver<Command>,
 }
@@ -186,11 +191,13 @@ impl Network<'_> {
             })
             .collect::<HashSet<_>>();
         closed_sockets.into_iter().for_each(|handle| {
+            self.bridges.remove(&handle);
+            self.opening_connections.remove(&handle);
             self.sockets.remove(handle);
         });
 
         for (handle, response) in self.opening_connections.iter_mut() {
-            let socket = self.sockets.get::<tcp::Socket>(*handle);
+            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
             let result = match socket.state() {
                 tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing => {
                     Some(Err("Socket is closed".into()))
@@ -199,14 +206,33 @@ impl Network<'_> {
                     // Not ready.
                     None
                 }
-                _ => {
-                    let response = match socket.local_endpoint() {
+                tcp::State::Established | tcp::State::CloseWait => {
+                    let send_response = match socket.local_endpoint() {
                         Some(endpoint) => {
                             (*handle, SocketAddr::from((endpoint.addr, endpoint.port)))
                         }
                         None => (*handle, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
                     };
-                    Some(Ok(response))
+                    if let Some(initial_data) = response.0.take() {
+                        match socket.send_slice(&initial_data) {
+                            Ok(length) => {
+                                if length != initial_data.len() {
+                                    warn!("Failed to send all initial data to socket");
+                                };
+                            }
+                            Err(err) => {
+                                warn!("Failed to send initial data to socket: {}", err);
+                            }
+                        };
+                    }
+                    Some(Ok(send_response))
+                }
+                tcp::State::Listen
+                | tcp::State::FinWait1
+                | tcp::State::FinWait2
+                | tcp::State::LastAck => {
+                    // About to close.
+                    Some(Err("Socket is closing".into()))
                 }
             };
             let result = if let Some(result) = result {
@@ -214,7 +240,7 @@ impl Network<'_> {
             } else {
                 continue;
             };
-            let response = if let Some(response) = response.take() {
+            let response = if let Some(response) = response.1.take() {
                 response
             } else {
                 continue;
@@ -224,7 +250,7 @@ impl Network<'_> {
             }
         }
         self.opening_connections
-            .retain(|_, response| response.is_some());
+            .retain(|_, response| response.1.is_some());
     }
 
     fn process_command(&mut self, command: Command) {
@@ -240,12 +266,7 @@ impl Network<'_> {
                     return;
                 }
                 let rx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
-                let mut tx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
-                if let Some(data) = initial_data {
-                    if tx_buffer.enqueue_slice(&data) != data.len() {
-                        warn!("Failed to enqueue initial buffer data");
-                    }
-                }
+                let tx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
                 let mut local_port = rand::thread_rng().gen_range(49152..=65535);
@@ -266,7 +287,7 @@ impl Network<'_> {
 
                 let socket_handle = self.sockets.add(socket);
                 self.opening_connections
-                    .insert(socket_handle, Some(response));
+                    .insert(socket_handle, (initial_data, Some(response)));
             }
             Command::Bridge(socket_handle, socket) => {
                 self.bridges.insert(socket_handle, socket);
