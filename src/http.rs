@@ -1,8 +1,9 @@
 use std::{error, fmt, io};
 
 use log::warn;
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
 };
 use tokio_native_tls::native_tls;
 
@@ -72,6 +73,46 @@ pub fn read_content_length(headers: &str) -> Option<usize> {
     None
 }
 
+pub fn read_host(headers: &str) -> Option<&str> {
+    const HOST_HEADER: &str = "Host: ";
+    for line in headers.lines() {
+        if line.starts_with(HOST_HEADER) {
+            return Some(&line[HOST_HEADER.len()..]);
+        }
+    }
+    None
+}
+
+pub async fn read_unbuffered_chunk(
+    socket: &mut TcpStream,
+    dest: &mut Vec<u8>,
+) -> Result<(), HttpError> {
+    const BUFFER_SIZE: usize = 3;
+    let mut current_length = dest.len();
+    loop {
+        dest.resize(current_length + BUFFER_SIZE, 0);
+        let bytes_read = socket.peek(&mut dest[current_length..]).await?;
+        dest.truncate(current_length + bytes_read);
+        let mut found_index = None;
+        for i in current_length.saturating_sub(HEADER_END_MARKER.len())
+            ..=dest.len().saturating_sub(HEADER_END_MARKER.len())
+        {
+            if &dest[i..i + HEADER_END_MARKER.len()] == HEADER_END_MARKER.as_bytes() {
+                found_index = Some(i);
+                break;
+            }
+        }
+        if let Some(found_index) = found_index {
+            dest.truncate(found_index + HEADER_END_MARKER.len());
+            socket.read_exact(&mut dest[current_length..]).await?;
+            return Ok(());
+        } else {
+            socket.read_exact(&mut dest[current_length..]).await?;
+            current_length = dest.len();
+        }
+    }
+}
+
 pub async fn write_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -94,6 +135,26 @@ where
     Ok(())
 }
 
+pub async fn write_pac_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    writer
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+            Content-Type: application/x-ns-proxy-autoconfig\r\n\
+            Content-Length: {}\r\n\
+            \r\n",
+                data.len()
+            )
+            .as_bytes(),
+        )
+        .await?;
+    writer.write_all(data).await?;
+    writer.flush().await?;
+    Ok(())
+}
 pub fn build_request(
     verb: &str,
     host: &str,
