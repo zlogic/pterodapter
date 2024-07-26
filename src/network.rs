@@ -25,7 +25,7 @@ pub struct Network<'a> {
     device: VpnDevice<'a>,
     iface: iface::Interface,
     sockets: iface::SocketSet<'a>,
-    bridges: HashMap<iface::SocketHandle, tokio::net::TcpStream>,
+    bridges: HashMap<iface::SocketHandle, (tokio::net::TcpStream, tokio::io::Ready)>,
     opening_connections: HashMap<
         iface::SocketHandle,
         (
@@ -108,12 +108,39 @@ impl Network<'_> {
         // need to be guarded.
         use socket::tcp;
         use tokio::io::AsyncWriteExt;
+        use tokio::io::Interest;
+        for (_, (tunnel, ready)) in self.bridges.iter_mut() {
+            let socket_state = tokio::time::timeout(
+                tokio::time::Duration::from_millis(0),
+                tunnel.ready(Interest::READABLE | Interest::WRITABLE | Interest::ERROR),
+            )
+            .await;
+            match socket_state {
+                Ok(Ok(state)) => *ready = state,
+                Ok(Err(err)) => {
+                    debug!("Failed to check proxy client socket state: {}", err);
+                    *ready = tokio::io::Ready::ERROR;
+                }
+                Err(_) => {
+                    // Timed out - socket is not ready, don't process it.
+                    *ready = tokio::io::Ready::EMPTY;
+                }
+            };
+        }
         let closed_bridges = self
             .bridges
             .iter()
-            .filter_map(|(handle, tunnel)| {
+            .filter_map(|(handle, (tunnel, ready))| {
+                if ready.is_empty() {
+                    // Socket is not ready, don't process it.
+                    return None;
+                }
                 let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
-                if socket.can_send() {
+                if ready.is_error() {
+                    socket.close();
+                    return Some(handle.to_owned());
+                }
+                if ready.is_readable() && socket.can_send() {
                     let result = socket.send(|dest| match tunnel.try_read(dest) {
                         Ok(bytes) => {
                             if bytes > 0 && dest.len() > 0 {
@@ -129,19 +156,21 @@ impl Network<'_> {
                             _ => (0, Err(err.into())),
                         },
                     });
-                    if let Ok(result) = result {
-                        if let Err(err) = result {
+                    match result {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
                             debug!("Failed to read data from proxy client socket: {}", err);
                             socket.close();
                             return Some(handle.to_owned());
                         }
-                    } else if let Err(err) = result {
-                        // Not critical if socket is still opening.
-                        warn!("Failed to send data to virtual socket: {}", err);
+                        Err(err) => {
+                            // Not critical if socket is still opening.
+                            warn!("Failed to send data to virtual socket: {}", err);
+                        }
                     }
                 }
 
-                if socket.can_recv() {
+                if ready.is_writable() && socket.can_recv() {
                     let result = socket.recv(|src| match tunnel.try_write(src) {
                         Ok(bytes) => (bytes, Ok(())),
                         Err(err) => match err.kind() {
@@ -149,14 +178,16 @@ impl Network<'_> {
                             _ => (0, Err(err)),
                         },
                     });
-                    if let Ok(result) = result {
-                        if let Err(err) = result {
+                    match result {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
                             debug!("Failed to write data to proxy client socket: {}", err);
                             socket.close();
                             return Some(handle.to_owned());
                         }
-                    } else if let Err(err) = result {
-                        warn!("Failed to read data from virtual socket: {}", err);
+                        Err(err) => {
+                            warn!("Failed to read data from virtual socket: {}", err);
+                        }
                     }
                 }
 
@@ -168,7 +199,7 @@ impl Network<'_> {
             .collect::<HashSet<_>>();
 
         for handle in closed_bridges.iter() {
-            if let Some(tunnel) = self.bridges.get_mut(handle) {
+            if let Some((tunnel, _)) = self.bridges.get_mut(handle) {
                 if let Err(err) = tunnel.shutdown().await {
                     debug!("Failed to shut down proxy client socket: {}", err);
                 }
@@ -290,7 +321,8 @@ impl Network<'_> {
                     .insert(socket_handle, (initial_data, Some(response)));
             }
             Command::Bridge(socket_handle, socket) => {
-                self.bridges.insert(socket_handle, socket);
+                self.bridges
+                    .insert(socket_handle, (socket, tokio::io::Ready::EMPTY));
             }
             Command::Shutdown => {
                 debug!("Shutdown command received");
