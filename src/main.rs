@@ -7,14 +7,14 @@ use std::{
 };
 
 use log::{debug, info};
-use tokio::signal;
+use tokio::{signal, sync::mpsc};
 
 mod fortivpn;
 mod http;
 mod logger;
 mod network;
 mod ppp;
-mod socks;
+mod proxy;
 
 enum Action {
     Proxy(Config),
@@ -33,7 +33,7 @@ Options:\
 \n      --help                    Print help";
 
 struct Config {
-    socks: socks::Config,
+    proxy: proxy::Config,
     fortivpn: fortivpn::Config,
 }
 
@@ -130,14 +130,14 @@ impl Args {
                         }
                     };
 
-                let socks_config = socks::Config { listen_addr };
+                let proxy_config = proxy::Config { listen_addr };
                 let fortivpn_config = fortivpn::Config {
                     destination_addr,
                     destination_hostport,
                 };
 
                 let action = Action::Proxy(Config {
-                    socks: socks_config,
+                    proxy: proxy_config,
                     fortivpn: fortivpn_config,
                 });
                 Args { log_level, action }
@@ -161,6 +161,17 @@ fn serve(config: Config) -> Result<(), i32> {
             1
         })?;
 
+    let (command_sender, command_receiver) = mpsc::channel(64);
+    let server = proxy::Server::new(config.proxy, command_sender.clone()).map_err(|err| {
+        eprintln!("Failed to start proxy server: {}", err);
+        1
+    })?;
+    let server_handle = rt.spawn(async move {
+        if let Err(err) = server.run().await {
+            eprintln!("Server failed to run: {}", err);
+        }
+    });
+
     let sslvpn_cookie = rt
         .block_on(fortivpn::get_oauth_cookie(&config.fortivpn))
         .map_err(|err| {
@@ -177,29 +188,17 @@ fn serve(config: Config) -> Result<(), i32> {
             eprintln!("Failed to connect to VPN service: {}", err);
             1
         })?;
-    let mut client = network::Network::new(forti_client).map_err(|err| {
+    let mut client = network::Network::new(forti_client, command_receiver).map_err(|err| {
         eprintln!("Failed to start virtual network interface: {}", err);
         1
     })?;
-    let command_bridge = client.create_command_sender();
 
-    let server = socks::Server::new(config.socks, command_bridge).map_err(|err| {
-        eprintln!("Failed to start SOCKS5 server: {}", err);
-        1
-    })?;
-
-    let command_bridge = client.create_command_sender();
     let cancel_handle = rt.spawn(async move {
         if let Err(err) = signal::ctrl_c().await {
             eprintln!("Failed to wait for CTRL+C signal: {}", err);
         }
-        if let Err(err) = command_bridge.send(network::Command::Shutdown).await {
+        if let Err(err) = command_sender.send(network::Command::Shutdown).await {
             eprintln!("Failed to send shutdown command: {}", err);
-        }
-    });
-    let server_handle = rt.spawn(async move {
-        if let Err(err) = server.run().await {
-            eprintln!("Server failed to run: {}", err);
         }
     });
     rt.block_on(async move {

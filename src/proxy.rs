@@ -5,13 +5,14 @@ use std::{
 
 use log::{debug, info, warn};
 use tokio::{
+    fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     runtime,
     sync::{mpsc, oneshot},
 };
 
-use crate::network;
+use crate::{http, network};
 
 pub struct Config {
     pub listen_addr: SocketAddr,
@@ -26,14 +27,14 @@ impl Server {
     pub fn new(
         config: Config,
         command_bridge: mpsc::Sender<network::Command>,
-    ) -> Result<Server, SocksError> {
+    ) -> Result<Server, ProxyError> {
         Ok(Server {
             listen_addr: config.listen_addr,
             command_bridge,
         })
     }
 
-    pub async fn run(&self) -> Result<(), SocksError> {
+    pub async fn run(&self) -> Result<(), ProxyError> {
         let listener = match TcpListener::bind(&self.listen_addr).await {
             Ok(listener) => listener,
             Err(err) => {
@@ -46,11 +47,11 @@ impl Server {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     debug!("Received connection from {}", addr);
-                    let mut handler = SocksConnection::new(socket, self.command_bridge.clone());
+                    let handler = ProxyConnection::new(socket, self.command_bridge.clone());
                     let rt = runtime::Handle::current();
                     rt.spawn(async move {
                         if let Err(err) = handler.handle_connection().await {
-                            warn!("SOCKS connection failed: {}", err);
+                            warn!("Proxy connection failed: {}", err);
                         }
                     });
                 }
@@ -60,46 +61,176 @@ impl Server {
     }
 }
 
-struct SocksConnection {
+struct ProxyConnection {
     socket: Option<TcpStream>,
     command_bridge: mpsc::Sender<network::Command>,
 }
 
-impl SocksConnection {
+impl ProxyConnection {
     fn new<'a>(
         socket: TcpStream,
         command_bridge: mpsc::Sender<network::Command>,
-    ) -> SocksConnection {
-        SocksConnection {
+    ) -> ProxyConnection {
+        ProxyConnection {
             socket: Some(socket),
             command_bridge,
         }
     }
 
-    async fn handle_connection(&mut self) -> Result<(), SocksError> {
+    async fn handle_connection(mut self) -> Result<(), ProxyError> {
         let mut socket = match self.socket.take() {
             Some(reader) => reader,
             None => return Err("Socket already consumed".into()),
         };
-        self.perform_handshake(&mut socket).await?;
-        let handle = self.read_request(&mut socket).await?;
+        // Detect protocol type.
+        let first_byte = socket.read_u8().await?;
+        let destination_connection = match first_byte {
+            b'a'..=b'z' | b'A'..=b'Z' => {
+                self.handle_http_request(&mut socket, vec![first_byte])
+                    .await?
+            }
+            SOCKS5_VERSION => {
+                self.socks_handshake(&mut socket).await?;
+                self.socks_read_request(&mut socket).await?
+            }
+            _ => {
+                return Err("Unsupported protocol".into());
+            }
+        };
 
-        // TODO: don't forget to close socket!
-        match self
-            .command_bridge
-            .send(network::Command::Bridge(handle, socket))
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(_) => Err("Command channel closed".into()),
+        match destination_connection {
+            DestinationConnection::TunnelHandle(handle, _) => {
+                match self
+                    .command_bridge
+                    .send(network::Command::Bridge(handle, socket))
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err("Command channel closed".into()),
+                }
+            }
+            DestinationConnection::DirectConnection(mut stream) => {
+                let rt = runtime::Handle::current();
+                rt.spawn(async move {
+                    if let Err(err) = tokio::io::copy_bidirectional(&mut socket, &mut stream).await
+                    {
+                        warn!("Direct connection tunnel failed: {}", err);
+                    }
+                });
+                Ok(())
+            }
+            DestinationConnection::None => Ok(()),
         }
     }
 
-    async fn perform_handshake(&mut self, socket: &mut TcpStream) -> Result<(), SocksError> {
-        let version = socket.read_u8().await?;
-        if version != SOCKS5_VERSION {
-            return Err("Unsupported SOCKS version".into());
+    async fn handle_http_request(
+        &mut self,
+        socket: &mut TcpStream,
+        mut request: Vec<u8>,
+    ) -> Result<DestinationConnection, ProxyError> {
+        http::read_unbuffered_chunk(socket, &mut request).await?;
+        let request =
+            String::from_utf8(request).map_err(|_| "First handshake byte is not utf-8")?;
+        if request.starts_with("GET /proxy.pac HTTP/1.1\r\n") {
+            Self::send_pac_file(socket).await?;
+            Ok(DestinationConnection::None)
+        } else if request.starts_with("CONNECT ") {
+            let host = if let Some(host) = http::read_host(&request) {
+                host
+            } else {
+                return Err("CONNECT request has no Host header".into());
+            };
+            let destination_connection = self.connect_to_domain(host, None).await?;
+            // TODO: write an error if connection fails.
+            socket
+                .write_all("HTTP/1.1 200 Connection Established\r\n\r\n".as_bytes())
+                .await?;
+            socket.flush().await?;
+            Ok(destination_connection)
+        } else {
+            // Assume it's an HTTP Proxy protocol.
+            // TODO: remove host from HTTP request path.
+            let host = if let Some(host) = http::read_host(&request) {
+                host
+            } else {
+                return Err("HTTP proxy request has no Host header".into());
+            };
+            self.connect_to_domain(host, Some(request.as_bytes().into()))
+                .await
         }
+    }
+
+    async fn send_pac_file(socket: &mut TcpStream) -> Result<(), ProxyError> {
+        // TODO: allow configuring this
+        let mut file = File::open("proxy.pac").await?;
+        let mut contents = vec![];
+        file.read_to_end(&mut contents).await?;
+        http::write_pac_response(socket, &contents).await?;
+        socket.shutdown().await?;
+        Ok(())
+    }
+
+    async fn connect_to_domain(
+        &mut self,
+        host: &str,
+        initial_data: Option<Vec<u8>>,
+    ) -> Result<DestinationConnection, ProxyError> {
+        let (host, domain) = if let Some((domain, _)) = host.split_once(":") {
+            (host.to_owned(), domain)
+        } else {
+            // Fallback to port 80 (the default).
+            (host.to_owned() + ":80", host)
+        };
+        // TODO: allow configuring this
+        let direct_connection = domain.ends_with(".home");
+        let ip = tokio::net::lookup_host(host).await?.next();
+        match ip {
+            Some(addr) => {
+                self.connect_to_addr(addr, direct_connection, initial_data)
+                    .await
+            }
+            None => Err("Failed to lookup host".into()),
+        }
+    }
+
+    async fn connect_to_addr(
+        &mut self,
+        addr: SocketAddr,
+        direct_connection: bool,
+        initial_data: Option<Vec<u8>>,
+    ) -> Result<DestinationConnection, ProxyError> {
+        if !direct_connection && addr.is_ipv4() {
+            let (sender, receiver) = oneshot::channel();
+            let connect_command = network::Command::Connect(addr, initial_data, sender);
+            if self.command_bridge.send(connect_command).await.is_err() {
+                return Err("Command channel closed".into());
+            }
+            match receiver.await {
+                Ok(Ok(socket)) => Ok(DestinationConnection::TunnelHandle(socket.0, socket.1)),
+                Ok(Err(err)) => {
+                    debug!("Failed to connect to host: {}", err);
+                    Err("Failed to connect to host".into())
+                }
+                Err(_) => Err("Channel closed".into()),
+            }
+        } else {
+            match TcpStream::connect(addr).await {
+                Ok(mut socket) => {
+                    if let Some(data) = initial_data {
+                        socket.write_all(&data).await?;
+                        socket.flush().await?;
+                    }
+                    Ok(DestinationConnection::DirectConnection(socket))
+                }
+                Err(err) => {
+                    debug!("Failed to open direct connection: {}", err);
+                    Err("Failed to open direct connection".into())
+                }
+            }
+        }
+    }
+
+    async fn socks_handshake(&mut self, socket: &mut TcpStream) -> Result<(), ProxyError> {
         let nmethods = socket.read_u8().await?;
         let mut selected_method = AuthenticationMethod::NO_ACCEPTABLE_METHODS;
         for _ in 0..nmethods {
@@ -114,10 +245,10 @@ impl SocksConnection {
         Ok(())
     }
 
-    async fn read_request(
+    async fn socks_read_request(
         &mut self,
         socket: &mut TcpStream,
-    ) -> Result<smoltcp::iface::SocketHandle, SocksError> {
+    ) -> Result<DestinationConnection, ProxyError> {
         let version = socket.read_u8().await?;
         if version != SOCKS5_VERSION {
             return Err("Unsupported SOCKS version".into());
@@ -159,32 +290,30 @@ impl SocksConnection {
 
         socket.write_u8(SOCKS5_VERSION).await?;
         if cmd != SocksCommand::CONNECT {
-            SocksConnection::write_error_response(socket, CommandResponse::COMMAND_NOT_SUPPORTED)
-                .await?;
+            ProxyConnection::socks_write_error_response(
+                socket,
+                CommandResponse::COMMAND_NOT_SUPPORTED,
+            )
+            .await?;
             debug!("Command {} is not supported", cmd);
             return Err("Command is not supported".into());
         }
-        let addr = match addr {
-            Some(DestinationAddress::IpAddr(ip)) => ip,
-            Some(DestinationAddress::Domain(domain)) => {
-                // IPv6 connections are not yet supported.
-                let ip = tokio::net::lookup_host(format!("{}:{}", domain, port))
-                    .await?
-                    .filter(|addr| addr.is_ipv4())
-                    .next();
-                if let Some(ip) = ip {
-                    ip.ip()
-                } else {
-                    SocksConnection::write_error_response(
-                        socket,
-                        CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
-                    )
-                    .await?;
-                    return Err("Failed to lookup host".into());
-                }
+        Ok(self.socks_connect_to_host(socket, addr, port).await?)
+    }
+
+    async fn socks_connect_to_host(
+        &mut self,
+        socket: &mut TcpStream,
+        addr: Option<DestinationAddress>,
+        port: u16,
+    ) -> Result<DestinationConnection, ProxyError> {
+        let destination_connection = match addr {
+            Some(DestinationAddress::IpAddr(ip)) => {
+                self.connect_to_addr((ip, port).into(), false, None).await
             }
+            Some(DestinationAddress::Domain(domain)) => self.connect_to_domain(&domain, None).await,
             None => {
-                SocksConnection::write_error_response(
+                ProxyConnection::socks_write_error_response(
                     socket,
                     CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
                 )
@@ -192,37 +321,39 @@ impl SocksConnection {
                 return Err("Address type unknown".into());
             }
         };
-
-        Ok(self.connect_to_host(socket, addr, port).await?)
-    }
-
-    async fn connect_to_host(
-        &mut self,
-        socket: &mut TcpStream,
-        addr: IpAddr,
-        port: u16,
-    ) -> Result<smoltcp::iface::SocketHandle, SocksError> {
-        let (sender, receiver) = oneshot::channel();
-        let connect_command = network::Command::Connect((addr, port).into(), sender);
-        if self.command_bridge.send(connect_command).await.is_err() {
-            SocksConnection::write_error_response(socket, CommandResponse::GENERAL_FAILURE).await?;
-            return Err("Command channel closed".into());
-        }
-        let (socket_handle, local_addr) = match receiver.await {
-            Ok(Ok(socket)) => socket,
-            Ok(Err(err)) => {
-                debug!("Failed to connect to host: {}", err);
-                SocksConnection::write_error_response(socket, CommandResponse::NETWORK_UNREACHABLE)
-                    .await?;
-                return Err("Failed to connect to host".into());
-            }
-            Err(_) => {
-                SocksConnection::write_error_response(socket, CommandResponse::GENERAL_FAILURE)
-                    .await?;
-                return Err("Channel closed".into());
+        let destination_connection = match destination_connection {
+            Ok(connection) => connection,
+            Err(err) => {
+                debug!("Failed to connect to destination: {}", err);
+                ProxyConnection::socks_write_error_response(
+                    socket,
+                    CommandResponse::NETWORK_UNREACHABLE,
+                )
+                .await?;
+                return Err("Failed to connect to destination".into());
             }
         };
-
+        let local_addr = match destination_connection {
+            DestinationConnection::None => Err("Destination connection has no address"),
+            DestinationConnection::TunnelHandle(_, local_addr) => Ok(local_addr),
+            DestinationConnection::DirectConnection(ref stream) => {
+                stream.local_addr().map_err(|err| {
+                    debug!("Failed to get local address for connection: {}", err);
+                    "Failed to get local address for connection"
+                })
+            }
+        };
+        let local_addr = match local_addr {
+            Ok(addr) => addr,
+            Err(err) => {
+                ProxyConnection::socks_write_error_response(
+                    socket,
+                    CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
+                )
+                .await?;
+                return Err(err.into());
+            }
+        };
         let bnd_addr = local_addr.ip();
         let bnd_port = local_addr.port();
 
@@ -240,13 +371,13 @@ impl SocksConnection {
         }
         socket.write_u16(bnd_port).await?;
         socket.flush().await?;
-        Ok(socket_handle)
+        Ok(destination_connection)
     }
 
-    async fn write_error_response(
+    async fn socks_write_error_response(
         socket: &mut TcpStream,
         response: CommandResponse,
-    ) -> Result<(), SocksError> {
+    ) -> Result<(), ProxyError> {
         socket.write_u8(response.0).await?;
         socket.write_u8(0).await?; // Reserved byte.
         socket.write_u8(SocksAddressType::DOMAINNAME.0).await?;
@@ -255,6 +386,12 @@ impl SocksConnection {
         socket.flush().await?;
         Ok(())
     }
+}
+
+enum DestinationConnection {
+    None,
+    TunnelHandle(smoltcp::iface::SocketHandle, SocketAddr),
+    DirectConnection(TcpStream),
 }
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -372,13 +509,14 @@ impl fmt::Display for SocksAddressType {
 }
 
 #[derive(Debug)]
-pub enum SocksError {
+pub enum ProxyError {
     Internal(&'static str),
     Join(tokio::task::JoinError),
     Io(io::Error),
+    Http(crate::http::HttpError),
 }
 
-impl fmt::Display for SocksError {
+impl fmt::Display for ProxyError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
@@ -386,34 +524,44 @@ impl fmt::Display for SocksError {
             Self::Io(ref e) => {
                 write!(f, "IO error: {}", e)
             }
+            Self::Http(ref e) => {
+                write!(f, "HTTP error: {}", e)
+            }
         }
     }
 }
 
-impl error::Error for SocksError {
+impl error::Error for ProxyError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             Self::Internal(_msg) => None,
             Self::Join(ref err) => Some(err),
             Self::Io(ref err) => Some(err),
+            Self::Http(ref err) => Some(err),
         }
     }
 }
 
-impl From<&'static str> for SocksError {
-    fn from(msg: &'static str) -> SocksError {
+impl From<&'static str> for ProxyError {
+    fn from(msg: &'static str) -> ProxyError {
         Self::Internal(msg)
     }
 }
 
-impl From<tokio::task::JoinError> for SocksError {
-    fn from(err: tokio::task::JoinError) -> SocksError {
+impl From<tokio::task::JoinError> for ProxyError {
+    fn from(err: tokio::task::JoinError) -> ProxyError {
         Self::Join(err)
     }
 }
 
-impl From<io::Error> for SocksError {
-    fn from(err: io::Error) -> SocksError {
+impl From<io::Error> for ProxyError {
+    fn from(err: io::Error) -> ProxyError {
         Self::Io(err)
+    }
+}
+
+impl From<crate::http::HttpError> for ProxyError {
+    fn from(err: crate::http::HttpError) -> ProxyError {
+        Self::Http(err)
     }
 }

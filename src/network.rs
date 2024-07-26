@@ -29,12 +29,14 @@ pub struct Network<'a> {
     opening_connections:
         HashMap<iface::SocketHandle, Option<oneshot::Sender<SocketConnectionResult>>>,
     canceled: bool,
-    cmd_sender: mpsc::Sender<Command>,
-    cmd_receiver: mpsc::Receiver<Command>,
+    command_receiver: mpsc::Receiver<Command>,
 }
 
 impl Network<'_> {
-    pub fn new<'a>(vpn: FortiVPNTunnel) -> Result<Network<'a>, NetworkError> {
+    pub fn new<'a>(
+        vpn: FortiVPNTunnel,
+        command_receiver: mpsc::Receiver<Command>,
+    ) -> Result<Network<'a>, NetworkError> {
         // TODO: how to choose the CIDR?
         let ip_cidr = wire::IpCidr::new(vpn.ip_addr().into(), 8);
 
@@ -53,7 +55,6 @@ impl Network<'_> {
         }
 
         let sockets = iface::SocketSet::new(vec![]);
-        let (cmd_sender, cmd_receiver) = mpsc::channel(64);
 
         Ok(Network {
             device,
@@ -62,8 +63,7 @@ impl Network<'_> {
             bridges: HashMap::new(),
             opening_connections: HashMap::new(),
             canceled: false,
-            cmd_sender,
-            cmd_receiver,
+            command_receiver,
         })
     }
 
@@ -71,7 +71,7 @@ impl Network<'_> {
         while !self.canceled {
             self.device.process_keepalive().await?;
             loop {
-                if let Ok(command) = self.cmd_receiver.try_recv() {
+                if let Ok(command) = self.command_receiver.try_recv() {
                     self.process_command(command);
                 } else {
                     break;
@@ -126,7 +126,7 @@ impl Network<'_> {
                     });
                     if let Ok(result) = result {
                         if let Err(err) = result {
-                            debug!("Failed to read data from SOCKS socket: {}", err);
+                            debug!("Failed to read data from proxy client socket: {}", err);
                             socket.close();
                             return Some(handle.to_owned());
                         }
@@ -146,7 +146,7 @@ impl Network<'_> {
                     });
                     if let Ok(result) = result {
                         if let Err(err) = result {
-                            debug!("Failed to write data to SOCKS socket: {}", err);
+                            debug!("Failed to write data to proxy client socket: {}", err);
                             socket.close();
                             return Some(handle.to_owned());
                         }
@@ -165,7 +165,7 @@ impl Network<'_> {
         for handle in closed_bridges.iter() {
             if let Some(tunnel) = self.bridges.get_mut(handle) {
                 if let Err(err) = tunnel.shutdown().await {
-                    debug!("Failed to shut down SOCKS socket: {}", err);
+                    debug!("Failed to shut down proxy client socket: {}", err);
                 }
             }
         }
@@ -227,14 +227,10 @@ impl Network<'_> {
             .retain(|_, response| response.is_some());
     }
 
-    pub fn create_command_sender(&self) -> mpsc::Sender<Command> {
-        self.cmd_sender.clone()
-    }
-
     fn process_command(&mut self, command: Command) {
         use socket::tcp;
         match command {
-            Command::Connect(addr, response) => {
+            Command::Connect(addr, initial_data, response) => {
                 // smoltcp crashes if interface has no IPv6 address.
                 if addr.is_ipv6() {
                     if let Err(_) = response.send(Err("IPv6 connections are not supported".into()))
@@ -244,7 +240,12 @@ impl Network<'_> {
                     return;
                 }
                 let rx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
-                let tx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                let mut tx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                if let Some(data) = initial_data {
+                    if tx_buffer.enqueue_slice(&data) != data.len() {
+                        warn!("Failed to enqueue initial buffer data");
+                    }
+                }
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
                 let mut local_port = rand::thread_rng().gen_range(49152..=65535);
@@ -313,6 +314,7 @@ type SocketConnectionResult = Result<(iface::SocketHandle, SocketAddr), NetworkE
 pub enum Command {
     Connect(
         std::net::SocketAddr,
+        Option<Vec<u8>>,
         oneshot::Sender<SocketConnectionResult>,
     ),
     Bridge(iface::SocketHandle, tokio::net::TcpStream),
