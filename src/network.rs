@@ -398,7 +398,7 @@ impl ProxyClientConnection {
     async fn close(&mut self, socket: &mut smoltcp::socket::tcp::Socket<'_>) {
         use tokio::io::AsyncWriteExt;
         socket.close();
-        if let Some(tunnel) = self.tunnel.as_mut() {
+        if let Some(mut tunnel) = self.tunnel.take() {
             if let Err(err) = tunnel.shutdown().await {
                 debug!("Failed to shut down proxy client socket: {}", err);
             }
