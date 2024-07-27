@@ -24,7 +24,7 @@ impl Packet<'_> {
 
     pub fn to_lcp(&self) -> Result<LcpPacket, FormatError> {
         if self.protocol == Protocol::LCP {
-            LcpPacket::from_bytes(&self.data)
+            LcpPacket::from_bytes(self.data)
         } else {
             Err("Protocol type is not LCP".into())
         }
@@ -32,7 +32,7 @@ impl Packet<'_> {
 
     pub fn to_ipcp(&self) -> Result<IpcpPacket, FormatError> {
         if self.protocol == Protocol::IPV4CP {
-            IpcpPacket::from_bytes(&self.data)
+            IpcpPacket::from_bytes(self.data)
         } else {
             Err("Protocol type is not IPCP".into())
         }
@@ -50,7 +50,7 @@ impl Protocol {
 
     pub fn from_be_slice(slice: &[u8]) -> Protocol {
         let mut result = [0u8; 2];
-        result.copy_from_slice(&slice);
+        result.copy_from_slice(slice);
         Protocol::from_u16(u16::from_be_bytes(result))
     }
 
@@ -282,13 +282,13 @@ impl LcpOptionData<'_> {
                 LcpOptionData::MagicNumber(u32::from_be_bytes(magic))
             }
             7 => {
-                if data.len() != 0 {
+                if !data.is_empty() {
                     return Err("Unexpected Protocol Field Compression length".into());
                 }
                 LcpOptionData::ProtocolFieldCompression()
             }
             8 => {
-                if data.len() != 0 {
+                if !data.is_empty() {
                     return Err("Unexpected Address and Protocol Field Compression length".into());
                 }
                 LcpOptionData::AddressControlFieldCompression()
@@ -549,7 +549,7 @@ impl IpcpOptionData<'_> {
         dest[1] = self.length() as u8;
         let dest = &mut dest[2..];
         match *self {
-            Self::IpCompressionProtocol(data) => dest.copy_from_slice(&data),
+            Self::IpCompressionProtocol(data) => dest.copy_from_slice(data),
             Self::IpAddress(ip) => dest.copy_from_slice(&ip.octets()),
             Self::PrimaryDns(ip) => dest.copy_from_slice(&ip.octets()),
             Self::PrimaryNbns(ip) => dest.copy_from_slice(&ip.octets()),

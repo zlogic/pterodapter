@@ -53,19 +53,15 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     };
     let mut socket = BufStream::new(socket);
     let headers = http::read_headers(&mut socket).await?;
-    let token_id = headers
-        .lines()
-        .next()
-        .map(|line| {
-            if !line.starts_with("GET /?id=") {
-                return None;
-            }
-            let start_index = line.find("=")?;
-            let line = &line[start_index + 1..];
-            let end_index = line.find(" ")?;
-            Some((&line[..end_index]).to_string())
-        })
-        .flatten();
+    let token_id = headers.lines().next().and_then(|line| {
+        if !line.starts_with("GET /?id=") {
+            return None;
+        }
+        let start_index = line.find("=")?;
+        let line = &line[start_index + 1..];
+        let end_index = line.find(" ")?;
+        Some(line[..end_index].to_string())
+    });
 
     let token_id = if let Some(token_id) = token_id {
         token_id
@@ -108,7 +104,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
                 if let Some(start_index) = line.find(":") {
                     let line = &line[start_index + 2..];
                     if let Some(end_index) = line.find("; ") {
-                        cookie = Some((&line[..end_index]).to_string());
+                        cookie = Some(line[..end_index].to_string());
                     }
                 }
             }
@@ -168,7 +164,7 @@ impl FortiVPNTunnel {
     }
 
     pub fn mtu(&self) -> usize {
-        self.mtu as usize
+        self.mtu
     }
 
     async fn connect(hostport: &str, domain: &str) -> Result<BufTlsStream, FortiError> {
@@ -283,7 +279,7 @@ impl FortiVPNTunnel {
                         .iter_options()
                         .collect::<Result<Vec<_>, ppp::FormatError>>();
                     let options_match = match received_opts {
-                        Ok(received_opts) => &opts == received_opts.as_slice(),
+                        Ok(received_opts) => opts == received_opts.as_slice(),
                         Err(err) => {
                             debug!("Failed to decode LCP Ack options: {}", err);
                             return Err("Failed to decode LCP Ack options".into());
@@ -504,7 +500,7 @@ impl FortiVPNTunnel {
         packet_header[6..].copy_from_slice(&protocol.value().to_be_bytes());
 
         socket.write_all(&packet_header).await?;
-        Ok(socket.write_all(&ppp_data).await?)
+        Ok(socket.write_all(ppp_data).await?)
     }
 
     async fn read_ppp_packet(
@@ -781,9 +777,7 @@ impl PPPState {
                 }
             }
         }
-        if let Err(err) = self.validate_link(socket).await {
-            return Err(err);
-        }
+        self.validate_link(socket).await?;
 
         let mut ppp_size = [0u8; 2];
         ppp_size.copy_from_slice(&self.ppp_header[..2]);
@@ -799,7 +793,7 @@ impl PPPState {
             );
             return Err("Header has conflicting length data".into());
         }
-        if magic != &[0x50, 0x50] {
+        if magic != [0x50, 0x50] {
             debug!(
                 "Found {:x}{:x} instead of magic",
                 self.ppp_header[2], self.ppp_header[3]

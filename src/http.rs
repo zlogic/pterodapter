@@ -37,7 +37,7 @@ pub async fn read_content<S>(socket: &mut S, headers: &str) -> Result<String, Ht
 where
     S: AsyncRead + AsyncBufRead + AsyncWrite + Unpin,
 {
-    if headers.find("Transfer-Encoding: chunked").is_some() {
+    if headers.contains("Transfer-Encoding: chunked") {
         // This is super janky, but should work if chunks are small enough.
         // openfortivpn works the same way.
         return read_until(socket, CHUNKS_END_MARKER).await;
@@ -60,9 +60,9 @@ where
 pub fn read_content_length(headers: &str) -> Option<usize> {
     const CONTENT_LENGTH_HEADER: &str = "Content-Length: ";
     for line in headers.lines() {
-        if line.starts_with(CONTENT_LENGTH_HEADER) {
-            match &line[CONTENT_LENGTH_HEADER.len()..].parse::<usize>() {
-                Ok(content_length) => return Some(*content_length),
+        if let Some(content_length) = line.strip_prefix(CONTENT_LENGTH_HEADER) {
+            match content_length.parse::<usize>() {
+                Ok(content_length) => return Some(content_length),
                 Err(err) => {
                     warn!("Failed to parse content-length: {}", err);
                     continue;
@@ -76,8 +76,8 @@ pub fn read_content_length(headers: &str) -> Option<usize> {
 pub fn read_host(headers: &str) -> Option<&str> {
     const HOST_HEADER: &str = "Host: ";
     for line in headers.lines() {
-        if line.starts_with(HOST_HEADER) {
-            return Some(&line[HOST_HEADER.len()..]);
+        if let Some(host) = line.strip_prefix(HOST_HEADER) {
+            return Some(host);
         }
     }
     None

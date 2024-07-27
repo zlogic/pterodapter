@@ -67,10 +67,7 @@ struct ProxyConnection {
 }
 
 impl ProxyConnection {
-    fn new<'a>(
-        socket: TcpStream,
-        command_bridge: mpsc::Sender<network::Command>,
-    ) -> ProxyConnection {
+    fn new(socket: TcpStream, command_bridge: mpsc::Sender<network::Command>) -> ProxyConnection {
         ProxyConnection {
             socket: Some(socket),
             command_bridge,
@@ -206,7 +203,8 @@ impl ProxyConnection {
     ) -> Result<DestinationConnection, ProxyError> {
         if !direct_connection && addr.is_ipv4() {
             let (sender, receiver) = oneshot::channel();
-            let connect_command = network::Command::Connect(addr, initial_data, sender);
+            let connection_request = network::SocketConnectionRequest::new(sender, initial_data);
+            let connect_command = network::Command::Connect(addr, connection_request);
             if self.command_bridge.send(connect_command).await.is_err() {
                 return Err("Command channel closed".into());
             }
@@ -303,7 +301,7 @@ impl ProxyConnection {
             debug!("Command {} is not supported", cmd);
             return Err("Command is not supported".into());
         }
-        Ok(self.socks_connect_to_host(socket, addr, port).await?)
+        self.socks_connect_to_host(socket, addr, port).await
     }
 
     async fn socks_connect_to_host(
@@ -418,11 +416,11 @@ impl AuthenticationMethod {
 }
 impl fmt::Display for AuthenticationMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            &Self::NO_AUTHENTICATION_REQUIRED => write!(f, "NO AUTHENTICATION REQUIRED"),
-            &Self::GSSAPI => write!(f, "GSSAPI"),
-            &Self::USERNAME_PASSWORD => write!(f, "USERNAME/PASSWORD"),
-            &Self::NO_ACCEPTABLE_METHODS => write!(f, "NO ACCEPTABLE METHODS"),
+        match *self {
+            Self::NO_AUTHENTICATION_REQUIRED => write!(f, "NO AUTHENTICATION REQUIRED"),
+            Self::GSSAPI => write!(f, "GSSAPI"),
+            Self::USERNAME_PASSWORD => write!(f, "USERNAME/PASSWORD"),
+            Self::NO_ACCEPTABLE_METHODS => write!(f, "NO ACCEPTABLE METHODS"),
             _ => write!(f, "Unknown authentication method {}", self.0),
         }
     }
@@ -441,10 +439,10 @@ impl SocksCommand {
 }
 impl fmt::Display for SocksCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            &Self::CONNECT => write!(f, "CONNECT"),
-            &Self::BIND => write!(f, "BIND"),
-            &Self::UDP_ASSOCIATE => write!(f, "UDP ASSOCIATE"),
+        match *self {
+            Self::CONNECT => write!(f, "CONNECT"),
+            Self::BIND => write!(f, "BIND"),
+            Self::UDP_ASSOCIATE => write!(f, "UDP ASSOCIATE"),
             _ => write!(f, "Unknown command {}", self.0),
         }
     }
@@ -466,16 +464,16 @@ impl CommandResponse {
 
 impl fmt::Display for CommandResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            &Self::SUCCEDED => write!(f, "succeeded"),
-            &Self::GENERAL_FAILURE => write!(f, "general SOCKS server failure"),
-            &Self::CONNECTION_NOT_ALLOWED => write!(f, "connection not allowed by ruleset"),
-            &Self::NETWORK_UNREACHABLE => write!(f, "Network unreachable"),
-            &Self::HOST_UNREACHABLE => write!(f, "Host unreachable"),
-            &Self::CONNECTION_REFUSED => write!(f, "Connection refused"),
-            &Self::TTL_EXPIRED => write!(f, "TTL expired"),
-            &Self::COMMAND_NOT_SUPPORTED => write!(f, "Command not supported"),
-            &Self::ADDRESS_TYPE_NOT_SUPPORTED => write!(f, "Address type not supported"),
+        match *self {
+            Self::SUCCEDED => write!(f, "succeeded"),
+            Self::GENERAL_FAILURE => write!(f, "general SOCKS server failure"),
+            Self::CONNECTION_NOT_ALLOWED => write!(f, "connection not allowed by ruleset"),
+            Self::NETWORK_UNREACHABLE => write!(f, "Network unreachable"),
+            Self::HOST_UNREACHABLE => write!(f, "Host unreachable"),
+            Self::CONNECTION_REFUSED => write!(f, "Connection refused"),
+            Self::TTL_EXPIRED => write!(f, "TTL expired"),
+            Self::COMMAND_NOT_SUPPORTED => write!(f, "Command not supported"),
+            Self::ADDRESS_TYPE_NOT_SUPPORTED => write!(f, "Address type not supported"),
             _ => write!(f, "Unknown command response {}", self.0),
         }
     }
@@ -507,10 +505,10 @@ impl SocksAddressType {
 }
 impl fmt::Display for SocksAddressType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            &Self::IPV4 => write!(f, "IP V4 address"),
-            &Self::DOMAINNAME => write!(f, "DOMAINNAME"),
-            &Self::IPV6 => write!(f, "IP V6 address"),
+        match *self {
+            Self::IPV4 => write!(f, "IP V4 address"),
+            Self::DOMAINNAME => write!(f, "DOMAINNAME"),
+            Self::IPV6 => write!(f, "IP V6 address"),
             _ => write!(f, "Unknown address type {}", self.0),
         }
     }
