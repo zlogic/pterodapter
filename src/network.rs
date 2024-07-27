@@ -15,8 +15,9 @@ use tokio::{
 use crate::fortivpn::FortiVPNTunnel;
 
 const MAX_MTU_SIZE: usize = 1500;
-const SOCKET_BUFFER_SIZE: usize = 65536;
-const DEVICE_BUFFERS_COUNT: usize = 32;
+const READ_BUFFER_SIZE: usize = 65536 * 2 * 2;
+const WRITE_BUFFER_SIZE: usize = 65536 * 2;
+const DEVICE_BUFFERS_COUNT: usize = 8 * 2;
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
 const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
@@ -186,8 +187,8 @@ impl Network<'_> {
                     }
                     return;
                 }
-                let rx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
-                let tx_buffer = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                let rx_buffer = tcp::SocketBuffer::new(vec![0; READ_BUFFER_SIZE]);
+                let tx_buffer = tcp::SocketBuffer::new(vec![0; WRITE_BUFFER_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
                 let mut local_port = rand::thread_rng().gen_range(49152..=65535);
@@ -424,11 +425,9 @@ impl VpnDevice<'_> {
     fn new<'a>(vpn: FortiVPNTunnel) -> VpnDevice<'a> {
         let read_buffers = (0..DEVICE_BUFFERS_COUNT)
             .map(|_| Vec::with_capacity(MAX_MTU_SIZE))
-            .take(DEVICE_BUFFERS_COUNT)
             .collect::<Vec<_>>();
         let write_buffers = (0..DEVICE_BUFFERS_COUNT)
             .map(|_| Vec::with_capacity(MAX_MTU_SIZE))
-            .take(DEVICE_BUFFERS_COUNT)
             .collect::<Vec<_>>();
         VpnDevice {
             vpn,
@@ -561,7 +560,7 @@ impl phy::Device for VpnDevice<'_> {
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut caps = phy::DeviceCapabilities::default();
         caps.max_transmission_unit = self.vpn.mtu();
-        caps.max_burst_size = Some(DEVICE_BUFFERS_COUNT);
+        caps.max_burst_size = Some(DEVICE_BUFFERS_COUNT / 2);
         caps.medium = phy::Medium::Ip;
         caps.checksum.ipv4 = phy::Checksum::Both;
         caps.checksum.tcp = phy::Checksum::Both;
