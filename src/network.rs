@@ -25,14 +25,8 @@ pub struct Network<'a> {
     device: VpnDevice<'a>,
     iface: iface::Interface,
     sockets: iface::SocketSet<'a>,
-    bridges: HashMap<iface::SocketHandle, (tokio::net::TcpStream, tokio::io::Ready)>,
-    opening_connections: HashMap<
-        iface::SocketHandle,
-        (
-            Option<Vec<u8>>,
-            Option<oneshot::Sender<SocketConnectionResult>>,
-        ),
-    >,
+    bridges: HashMap<iface::SocketHandle, ProxyClientConnection>,
+    opening_connections: HashMap<iface::SocketHandle, SocketConnectionRequest>,
     canceled: bool,
     command_receiver: mpsc::Receiver<Command>,
 }
@@ -75,12 +69,8 @@ impl Network<'_> {
     pub async fn run(&mut self) -> Result<(), NetworkError> {
         while !self.canceled {
             self.device.process_keepalive().await?;
-            loop {
-                if let Ok(command) = self.command_receiver.try_recv() {
-                    self.process_command(command);
-                } else {
-                    break;
-                }
+            while let Ok(command) = self.command_receiver.try_recv() {
+                self.process_command(command);
             }
             self.copy_all_data().await;
             let timestamp = smoltcp::time::Instant::now();
@@ -107,113 +97,17 @@ impl Network<'_> {
         // doesn't work well with smoltcp - as smoltcp keeps ownership of most of its data, and any writes
         // need to be guarded.
         use socket::tcp;
-        use tokio::io::AsyncWriteExt;
-        use tokio::io::Interest;
-        for (_, (tunnel, ready)) in self.bridges.iter_mut() {
-            let socket_state = tokio::time::timeout(
-                tokio::time::Duration::from_millis(0),
-                tunnel.ready(Interest::READABLE | Interest::WRITABLE | Interest::ERROR),
-            )
-            .await;
-            match socket_state {
-                Ok(Ok(state)) => *ready = state,
-                Ok(Err(err)) => {
-                    debug!("Failed to check proxy client socket state: {}", err);
-                    *ready = tokio::io::Ready::ERROR;
-                }
-                Err(_) => {
-                    // Timed out - socket is not ready, don't process it.
-                    *ready = tokio::io::Ready::EMPTY;
-                }
-            };
+        for (handle, proxy_client) in self.bridges.iter_mut() {
+            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+            let _ = proxy_client.transfer_data(socket).await;
         }
-        let closed_bridges = self
-            .bridges
-            .iter()
-            .filter_map(|(handle, (tunnel, ready))| {
-                if ready.is_empty() {
-                    // Socket is not ready, don't process it.
-                    return None;
-                }
-                let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
-                if ready.is_error() {
-                    socket.close();
-                    return Some(handle.to_owned());
-                }
-                if ready.is_readable() && socket.can_send() {
-                    let result = socket.send(|dest| match tunnel.try_read(dest) {
-                        Ok(bytes) => {
-                            if bytes > 0 && dest.len() > 0 {
-                                (bytes, Ok::<(), NetworkError>(()))
-                            } else {
-                                // Zero bytes means the stream is closed.
-                                // TODO: add a custom handler for this error.
-                                (0, Err("Proxy reader is closed".into()))
-                            }
-                        }
-                        Err(err) => match err.kind() {
-                            io::ErrorKind::WouldBlock => (0, Ok(())),
-                            _ => (0, Err(err.into())),
-                        },
-                    });
-                    match result {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => {
-                            debug!("Failed to read data from proxy client socket: {}", err);
-                            socket.close();
-                            return Some(handle.to_owned());
-                        }
-                        Err(err) => {
-                            // Not critical if socket is still opening.
-                            warn!("Failed to send data to virtual socket: {}", err);
-                        }
-                    }
-                }
 
-                if ready.is_writable() && socket.can_recv() {
-                    let result = socket.recv(|src| match tunnel.try_write(src) {
-                        Ok(bytes) => (bytes, Ok(())),
-                        Err(err) => match err.kind() {
-                            io::ErrorKind::WouldBlock => (0, Ok(())),
-                            _ => (0, Err(err)),
-                        },
-                    });
-                    match result {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => {
-                            debug!("Failed to write data to proxy client socket: {}", err);
-                            socket.close();
-                            return Some(handle.to_owned());
-                        }
-                        Err(err) => {
-                            warn!("Failed to read data from virtual socket: {}", err);
-                        }
-                    }
-                }
-
-                if !socket.is_open() {
-                    return Some(handle.to_owned());
-                }
-                None
-            })
-            .collect::<HashSet<_>>();
-
-        for handle in closed_bridges.iter() {
-            if let Some((tunnel, _)) = self.bridges.get_mut(handle) {
-                if let Err(err) = tunnel.shutdown().await {
-                    debug!("Failed to shut down proxy client socket: {}", err);
-                }
-            }
-        }
-        self.bridges
-            .retain(|handle, _| !closed_bridges.contains(handle));
+        self.bridges.retain(|_, tunnel| tunnel.is_open());
         let closed_sockets = self
             .sockets
             .iter()
             .filter_map(|(handle, socket)| {
-                let socket = match socket {
-                    socket::Socket::Tcp(socket) => socket,
-                };
+                let socket::Socket::Tcp(socket) = socket;
                 if !self.bridges.contains_key(&handle) && socket.state() == tcp::State::Closed {
                     Some(handle)
                 } else {
@@ -244,7 +138,7 @@ impl Network<'_> {
                         }
                         None => (*handle, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
                     };
-                    if let Some(initial_data) = response.0.take() {
+                    if let Some(initial_data) = response.initial_data.take() {
                         match socket.send_slice(&initial_data) {
                             Ok(length) => {
                                 if length != initial_data.len() {
@@ -271,28 +165,24 @@ impl Network<'_> {
             } else {
                 continue;
             };
-            let response = if let Some(response) = response.1.take() {
-                response
-            } else {
-                continue;
-            };
-            if let Err(_) = response.send(result) {
+            if response.send(result).is_err() {
                 debug!("Proxy listener not listening for response");
             }
         }
         self.opening_connections
-            .retain(|_, response| response.1.is_some());
+            .retain(|_, response| !response.is_processed());
     }
 
     fn process_command(&mut self, command: Command) {
         use socket::tcp;
         match command {
-            Command::Connect(addr, initial_data, response) => {
+            Command::Connect(addr, mut connect_request) => {
                 // smoltcp crashes if interface has no IPv6 address.
                 if addr.is_ipv6() {
-                    if let Err(_) = response.send(Err("IPv6 connections are not supported".into()))
+                    if let Err(err) =
+                        connect_request.send(Err("IPv6 connections are not supported".into()))
                     {
-                        debug!("Proxy listener not listening for response");
+                        debug!("Failed to send response to proxy client: {}", err);
                     }
                     return;
                 }
@@ -310,19 +200,19 @@ impl Network<'_> {
                     (remote_addr, addr.port()),
                     (self.device.vpn.ip_addr(), local_port),
                 ) {
-                    if let Err(_) = response.send(Err(err.into())) {
-                        debug!("Proxy listener not listening for response");
+                    if let Err(err) = connect_request.send(Err(err.into())) {
+                        debug!("Failed to send response to proxy client: {}", err);
                     }
                     return;
                 }
 
                 let socket_handle = self.sockets.add(socket);
                 self.opening_connections
-                    .insert(socket_handle, (initial_data, Some(response)));
+                    .insert(socket_handle, connect_request);
             }
             Command::Bridge(socket_handle, socket) => {
                 self.bridges
-                    .insert(socket_handle, (socket, tokio::io::Ready::EMPTY));
+                    .insert(socket_handle, ProxyClientConnection::new(socket));
             }
             Command::Shutdown => {
                 debug!("Shutdown command received");
@@ -337,9 +227,7 @@ impl Network<'_> {
         check_local_port: u16,
     ) -> bool {
         self.sockets.iter().all(|(_, socket)| {
-            let socket = match socket {
-                socket::Socket::Tcp(socket) => socket,
-            };
+            let socket::Socket::Tcp(socket) = socket;
             if let Some(remote_endpoint) = socket.remote_endpoint() {
                 if remote_endpoint.addr != check_remote_endpoint.ip().into()
                     || remote_endpoint.port != check_remote_endpoint.port()
@@ -364,12 +252,162 @@ impl Network<'_> {
 
 type SocketConnectionResult = Result<(iface::SocketHandle, SocketAddr), NetworkError>;
 
+pub struct SocketConnectionRequest {
+    response: Option<oneshot::Sender<SocketConnectionResult>>,
+    initial_data: Option<Vec<u8>>,
+}
+
+impl SocketConnectionRequest {
+    pub fn new(
+        response: oneshot::Sender<SocketConnectionResult>,
+        initial_data: Option<Vec<u8>>,
+    ) -> SocketConnectionRequest {
+        SocketConnectionRequest {
+            response: Some(response),
+            initial_data,
+        }
+    }
+
+    fn send(&mut self, result: SocketConnectionResult) -> Result<(), NetworkError> {
+        if let Some(response) = self.response.take() {
+            response
+                .send(result)
+                .map_err(|_| "Proxy listener not listening for response")?;
+            Ok(())
+        } else {
+            Err("Connection result already sent".into())
+        }
+    }
+
+    fn is_processed(&self) -> bool {
+        self.response.is_none()
+    }
+}
+
+struct ProxyClientConnection {
+    tunnel: Option<tokio::net::TcpStream>,
+}
+
+impl ProxyClientConnection {
+    fn new(tunnel: tokio::net::TcpStream) -> ProxyClientConnection {
+        ProxyClientConnection {
+            tunnel: Some(tunnel),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.tunnel.is_some()
+    }
+
+    async fn poll_ready(&self) -> tokio::io::Ready {
+        use tokio::io::Interest;
+        let tunnel = if let Some(tunnel) = &self.tunnel {
+            tunnel
+        } else {
+            return tokio::io::Ready::ERROR;
+        };
+        let socket_state = tokio::time::timeout(
+            tokio::time::Duration::from_millis(0),
+            tunnel.ready(Interest::READABLE | Interest::WRITABLE | Interest::ERROR),
+        )
+        .await;
+        match socket_state {
+            Ok(Ok(state)) => state,
+            Ok(Err(err)) => {
+                debug!("Failed to check proxy client socket state: {}", err);
+                tokio::io::Ready::ERROR
+            }
+            Err(_) => {
+                // Timed out - socket is not ready, don't process it.
+                tokio::io::Ready::EMPTY
+            }
+        }
+    }
+
+    async fn transfer_data(
+        &mut self,
+        socket: &mut smoltcp::socket::tcp::Socket<'_>,
+    ) -> Result<(), NetworkError> {
+        let ready = self.poll_ready().await;
+        if ready.is_error() {
+            self.close(socket).await;
+            return Err("Proxy client is in error state".into());
+        }
+        let tunnel = if let Some(tunnel) = self.tunnel.as_mut() {
+            tunnel
+        } else {
+            return Err("Proxy client connection is closed".into());
+        };
+        if ready.is_readable() && socket.can_send() {
+            let result = socket.send(|dest| match tunnel.try_read(dest) {
+                Ok(bytes) => {
+                    if bytes > 0 && !dest.is_empty() {
+                        (bytes, Ok::<(), NetworkError>(()))
+                    } else {
+                        // Zero bytes means the stream is closed.
+                        // TODO: add a custom handler for this error.
+                        (0, Err("Proxy reader is closed".into()))
+                    }
+                }
+                Err(err) => match err.kind() {
+                    io::ErrorKind::WouldBlock => (0, Ok(())),
+                    _ => (0, Err(err.into())),
+                },
+            });
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    debug!("Failed to read data from proxy client socket: {}", err);
+                    self.close(socket).await;
+                    return Err("Failed to read data from proxy client socket".into());
+                }
+                Err(err) => {
+                    // Not critical if socket is still opening.
+                    warn!("Failed to send data to virtual socket: {}", err);
+                }
+            }
+        }
+
+        if ready.is_writable() && socket.can_recv() {
+            let result = socket.recv(|src| match tunnel.try_write(src) {
+                Ok(bytes) => (bytes, Ok(())),
+                Err(err) => match err.kind() {
+                    io::ErrorKind::WouldBlock => (0, Ok(())),
+                    _ => (0, Err(err)),
+                },
+            });
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    debug!("Failed to write data to proxy client socket: {}", err);
+                    self.close(socket).await;
+                    return Err("Failed to write data to proxy client socket".into());
+                }
+                Err(err) => {
+                    warn!("Failed to read data from virtual socket: {}", err);
+                }
+            }
+        }
+
+        if !socket.is_open() {
+            self.close(socket).await;
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self, socket: &mut smoltcp::socket::tcp::Socket<'_>) {
+        use tokio::io::AsyncWriteExt;
+        socket.close();
+        if let Some(tunnel) = self.tunnel.as_mut() {
+            if let Err(err) = tunnel.shutdown().await {
+                debug!("Failed to shut down proxy client socket: {}", err);
+            }
+        }
+    }
+}
+
 pub enum Command {
-    Connect(
-        std::net::SocketAddr,
-        Option<Vec<u8>>,
-        oneshot::Sender<SocketConnectionResult>,
-    ),
+    Connect(std::net::SocketAddr, SocketConnectionRequest),
     Bridge(iface::SocketHandle, tokio::net::TcpStream),
     Shutdown,
 }
@@ -384,18 +422,20 @@ struct VpnDevice<'a> {
 
 impl VpnDevice<'_> {
     fn new<'a>(vpn: FortiVPNTunnel) -> VpnDevice<'a> {
+        let read_buffers = (0..DEVICE_BUFFERS_COUNT)
+            .map(|_| Vec::with_capacity(MAX_MTU_SIZE))
+            .take(DEVICE_BUFFERS_COUNT)
+            .collect::<Vec<_>>();
+        let write_buffers = (0..DEVICE_BUFFERS_COUNT)
+            .map(|_| Vec::with_capacity(MAX_MTU_SIZE))
+            .take(DEVICE_BUFFERS_COUNT)
+            .collect::<Vec<_>>();
         VpnDevice {
             vpn,
             last_echo_sent: tokio::time::Instant::now(),
             next_echo_receive_check: tokio::time::Instant::now() + ECHO_TIMEOUT,
-            read_buffers: storage::RingBuffer::new(vec![
-                Vec::with_capacity(MAX_MTU_SIZE);
-                DEVICE_BUFFERS_COUNT
-            ]),
-            write_buffers: storage::RingBuffer::new(vec![
-                Vec::with_capacity(MAX_MTU_SIZE);
-                DEVICE_BUFFERS_COUNT
-            ]),
+            read_buffers: storage::RingBuffer::new(read_buffers),
+            write_buffers: storage::RingBuffer::new(write_buffers),
         }
     }
 }
@@ -537,11 +577,11 @@ struct RxToken<'a> {
 }
 
 impl<'a> phy::RxToken for RxToken<'a> {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        f(&mut self.src)
+        f(self.src)
     }
 }
 
