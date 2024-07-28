@@ -346,7 +346,6 @@ impl ProxyClientConnection {
                         (bytes, Ok::<(), NetworkError>(()))
                     } else {
                         // Zero bytes means the stream is closed.
-                        // TODO: add a custom handler for this error.
                         (0, Err("Proxy reader is closed".into()))
                     }
                 }

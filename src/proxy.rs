@@ -129,14 +129,14 @@ impl ProxyConnection {
         socket: &mut TcpStream,
         mut request: Vec<u8>,
     ) -> Result<DestinationConnection, ProxyError> {
-        http::read_unbuffered_chunk(socket, &mut request).await?;
+        http::read_headers_unbuffered(socket, &mut request).await?;
         let request =
             String::from_utf8(request).map_err(|_| "First handshake byte is not utf-8")?;
         if request.starts_with("GET /proxy.pac HTTP/1.1\r\n") {
             Self::send_pac_file(socket).await?;
             Ok(DestinationConnection::None)
         } else if request.starts_with("CONNECT ") {
-            let host = if let Some(host) = http::read_host(&request) {
+            let host = if let Some(host) = http::extract_host(&request) {
                 host
             } else {
                 return Err("CONNECT request has no Host header".into());
@@ -152,7 +152,7 @@ impl ProxyConnection {
             // Assume it's an HTTP Proxy protocol.
             // TODO: remove host from HTTP request path.
             // TODO: remove the Proxy-Connection header?
-            let host = if let Some(host) = http::read_host(&request) {
+            let host = if let Some(host) = http::extract_host(&request) {
                 host
             } else {
                 return Err("HTTP proxy request has no Host header".into());

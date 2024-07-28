@@ -1,6 +1,6 @@
 use std::{error, fmt, io};
 
-use log::warn;
+use log::{debug, warn};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -8,7 +8,7 @@ use tokio::{
 use tokio_native_tls::native_tls;
 
 const HEADER_END_MARKER: &str = "\r\n\r\n";
-const CHUNKS_END_MARKER: &str = "\r\n0\r\n\r\n";
+const BUFFER_SIZE: usize = 256;
 
 pub async fn read_headers<S>(socket: &mut S) -> Result<String, HttpError>
 where
@@ -18,13 +18,19 @@ where
     read_until(socket, HEADER_END_MARKER).await
 }
 
+pub async fn read_headers_unbuffered(
+    socket: &mut TcpStream,
+    dest: &mut Vec<u8>,
+) -> Result<(), HttpError> {
+    read_until_unbuffered(socket, HEADER_END_MARKER, dest).await
+}
+
 async fn read_until<S>(socket: &mut S, end_of_message: &str) -> Result<String, HttpError>
 where
     S: AsyncBufRead + AsyncWrite + Unpin,
 {
     let mut result = String::new();
     while !result.ends_with(end_of_message) {
-        // TODO: detect chunk start/end and discard; count number of bytes read.
         if socket.read_line(&mut result).await? == 0 {
             // EOF reached.
             break;
@@ -33,16 +39,81 @@ where
     Ok(result)
 }
 
+async fn read_until_unbuffered(
+    socket: &mut TcpStream,
+    end_of_message: &str,
+    dest: &mut Vec<u8>,
+) -> Result<(), HttpError> {
+    let mut current_length = dest.len();
+    loop {
+        dest.resize(current_length + BUFFER_SIZE, 0);
+        let bytes_read = socket.peek(&mut dest[current_length..]).await?;
+        dest.truncate(current_length + bytes_read);
+        let mut found_index = None;
+        for i in current_length.saturating_sub(end_of_message.len())
+            ..=dest.len().saturating_sub(end_of_message.len())
+        {
+            if &dest[i..i + end_of_message.len()] == end_of_message.as_bytes() {
+                found_index = Some(i);
+                break;
+            }
+        }
+        if let Some(found_index) = found_index {
+            dest.truncate(found_index + end_of_message.len());
+            socket.read_exact(&mut dest[current_length..]).await?;
+            return Ok(());
+        } else {
+            socket.read_exact(&mut dest[current_length..]).await?;
+            current_length = dest.len();
+        }
+    }
+}
+
+async fn read_chunked_content<S>(socket: &mut S) -> Result<String, HttpError>
+where
+    S: AsyncRead + AsyncBufRead + AsyncWrite + Unpin,
+{
+    let mut result = vec![];
+    loop {
+        let mut chunk_length = String::new();
+        socket.read_line(&mut chunk_length).await?;
+        let chunk_length = match <usize>::from_str_radix(&chunk_length, 16) {
+            Ok(chunk_length) => chunk_length,
+            Err(err) => {
+                debug!("Failed to parse chunk length: {}", err);
+                return Err("Failed to parse chunk length".into());
+            }
+        };
+        if chunk_length > 0 {
+            let dest = result.len()..result.len() + chunk_length;
+            result.resize(dest.end, 0);
+            socket.read_exact(&mut result[dest]).await?;
+        }
+        // Consume and verify CRLF.
+        let mut crlf = [0u8; 2];
+        socket.read_exact(&mut crlf).await?;
+        if &crlf != b"\r\n" {
+            return Err("Missing CRLF chunk trailer".into());
+        }
+        if chunk_length == 0 {
+            break;
+        }
+    }
+
+    Ok(String::from_utf8(result).map_err(|err| {
+        debug!("Failed to decode content as UTF-8: {}", err);
+        "Failed to decode content as UTF-8"
+    })?)
+}
+
 pub async fn read_content<S>(socket: &mut S, headers: &str) -> Result<String, HttpError>
 where
     S: AsyncRead + AsyncBufRead + AsyncWrite + Unpin,
 {
     if headers.contains("Transfer-Encoding: chunked") {
-        // This is super janky, but should work if chunks are small enough.
-        // openfortivpn works the same way.
-        return read_until(socket, CHUNKS_END_MARKER).await;
+        return read_chunked_content(socket).await;
     }
-    let content_length = match read_content_length(headers) {
+    let content_length = match find_content_length(headers) {
         Some(content_length) => content_length,
         None => {
             return Err("Failed to extract content length".into());
@@ -57,7 +128,7 @@ where
     })?)
 }
 
-pub fn read_content_length(headers: &str) -> Option<usize> {
+pub fn find_content_length(headers: &str) -> Option<usize> {
     const CONTENT_LENGTH_HEADER: &str = "Content-Length: ";
     for line in headers.lines() {
         if let Some(content_length) = line.strip_prefix(CONTENT_LENGTH_HEADER) {
@@ -73,7 +144,7 @@ pub fn read_content_length(headers: &str) -> Option<usize> {
     None
 }
 
-pub fn read_host(headers: &str) -> Option<&str> {
+pub fn extract_host(headers: &str) -> Option<&str> {
     const HOST_HEADER: &str = "Host: ";
     for line in headers.lines() {
         if let Some(host) = line.strip_prefix(HOST_HEADER) {
@@ -81,36 +152,6 @@ pub fn read_host(headers: &str) -> Option<&str> {
         }
     }
     None
-}
-
-pub async fn read_unbuffered_chunk(
-    socket: &mut TcpStream,
-    dest: &mut Vec<u8>,
-) -> Result<(), HttpError> {
-    const BUFFER_SIZE: usize = 3;
-    let mut current_length = dest.len();
-    loop {
-        dest.resize(current_length + BUFFER_SIZE, 0);
-        let bytes_read = socket.peek(&mut dest[current_length..]).await?;
-        dest.truncate(current_length + bytes_read);
-        let mut found_index = None;
-        for i in current_length.saturating_sub(HEADER_END_MARKER.len())
-            ..=dest.len().saturating_sub(HEADER_END_MARKER.len())
-        {
-            if &dest[i..i + HEADER_END_MARKER.len()] == HEADER_END_MARKER.as_bytes() {
-                found_index = Some(i);
-                break;
-            }
-        }
-        if let Some(found_index) = found_index {
-            dest.truncate(found_index + HEADER_END_MARKER.len());
-            socket.read_exact(&mut dest[current_length..]).await?;
-            return Ok(());
-        } else {
-            socket.read_exact(&mut dest[current_length..]).await?;
-            current_length = dest.len();
-        }
-    }
 }
 
 pub async fn write_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
@@ -155,6 +196,7 @@ where
     writer.flush().await?;
     Ok(())
 }
+
 pub fn build_request(
     verb: &str,
     host: &str,
