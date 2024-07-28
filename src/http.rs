@@ -145,16 +145,6 @@ pub fn find_content_length(headers: &str) -> Option<usize> {
     None
 }
 
-pub fn extract_host(headers: &str) -> Option<&str> {
-    const HOST_HEADER: &str = "Host: ";
-    for line in headers.lines() {
-        if let Some(host) = line.strip_prefix(HOST_HEADER) {
-            return Some(host);
-        }
-    }
-    None
-}
-
 pub fn extract_response_code(headers: &str) -> Option<u16> {
     // Normalize reponse to remove HTTP-Version if present.
     let code_start = if let Some(headers) = headers.strip_prefix("HTTP/1.1 ") {
@@ -247,6 +237,66 @@ pub fn build_request(
             {}{}\r\n",
         verb, host, cookie, content_length
     )
+}
+
+pub fn extract_connect_host(headers: &str) -> Option<&str> {
+    const HOST_HEADER: &str = "Host: ";
+    let mut lines = headers.lines();
+    if let Some(request_line) = lines.next() {
+        if let Some(remain) = request_line.strip_prefix("CONNECT ") {
+            if let Some((request_host, _)) = remain.split_once(' ') {
+                return Some(request_host);
+            }
+        }
+    }
+    for line in lines {
+        if let Some(request_host) = line.strip_prefix(HOST_HEADER) {
+            return Some(request_host);
+        }
+    }
+    None
+}
+
+pub fn extract_proxy_host(headers: &str) -> (String, Option<&str>) {
+    const HOST_HEADER: &str = "Host: ";
+    let mut result = String::new();
+    let mut lines = headers.lines();
+    let mut host = None;
+    if let Some(request_line) = lines.next() {
+        if let Some((verb, remain)) = request_line.split_once(' ') {
+            result.push_str(verb);
+            result.push_str(" ");
+            let remain = if let Some(schema_pos) = remain.find("://") {
+                &remain[schema_pos + 3..]
+            } else {
+                remain
+            };
+            if let Some((request_host, path)) = remain.split_once('/') {
+                host = Some(request_host);
+                // Keep the path only.
+                result.push_str("/");
+                result.push_str(path);
+            } else {
+                // Pass remainder as-is.
+                result.push_str(remain);
+            }
+        } else {
+            // Pass request line as-is.
+            result.push_str(request_line);
+        }
+        result.push_str("\n");
+    }
+    for line in lines {
+        if line.starts_with("Proxy-Authorization: ") || line.starts_with("Proxy-Connection: ") {
+            continue;
+        }
+        result.push_str(line);
+        result.push_str("\n");
+        if let Some(request_host) = line.strip_prefix(HOST_HEADER) {
+            host = Some(request_host);
+        }
+    }
+    (result, host)
 }
 
 #[derive(Debug)]

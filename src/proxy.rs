@@ -136,23 +136,31 @@ impl ProxyConnection {
             Self::send_pac_file(socket).await?;
             Ok(DestinationConnection::None)
         } else if request.starts_with("CONNECT ") {
-            let host = if let Some(host) = http::extract_host(&request) {
+            let host = if let Some(host) = http::extract_connect_host(&request) {
                 host
             } else {
-                return Err("CONNECT request has no Host header".into());
+                return Err("CONNECT request has no Host details".into());
             };
-            let destination_connection = self.connect_to_domain(host, None).await?;
-            // TODO: write an error if connection fails.
-            socket
-                .write_all("HTTP/1.1 200 Connection Established\r\n\r\n".as_bytes())
-                .await?;
-            socket.flush().await?;
-            Ok(destination_connection)
+            match self.connect_to_domain(host, None).await {
+                Ok(destination_connection) => {
+                    socket
+                        .write_all("HTTP/1.1 200 Connection Established\r\n\r\n".as_bytes())
+                        .await?;
+                    socket.flush().await?;
+                    Ok(destination_connection)
+                }
+                Err(err) => {
+                    socket
+                        .write_all("HTTP/1.1 502 Bad Gateway\r\n\r\n".as_bytes())
+                        .await?;
+                    socket.flush().await?;
+                    Err(err)
+                }
+            }
         } else {
             // Assume it's an HTTP Proxy protocol.
-            // TODO: remove host from HTTP request path.
-            // TODO: remove the Proxy-Connection header?
-            let host = if let Some(host) = http::extract_host(&request) {
+            let (request, host) = http::extract_proxy_host(&request);
+            let host = if let Some(host) = host {
                 host
             } else {
                 return Err("HTTP proxy request has no Host header".into());
