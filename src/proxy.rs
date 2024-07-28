@@ -1,6 +1,7 @@
 use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
 };
 
 use log::{debug, info, warn};
@@ -16,10 +17,14 @@ use crate::{http, network};
 
 pub struct Config {
     pub listen_addr: SocketAddr,
+    pub pac_path: Option<String>,
+    pub tunnel_domains: Vec<String>,
 }
 
 pub struct Server {
     listen_addr: SocketAddr,
+    pac_path: Option<String>,
+    tunnel_domains: Vec<String>,
     command_bridge: mpsc::Sender<network::Command>,
 }
 
@@ -30,6 +35,8 @@ impl Server {
     ) -> Result<Server, ProxyError> {
         Ok(Server {
             listen_addr: config.listen_addr,
+            pac_path: config.pac_path,
+            tunnel_domains: config.tunnel_domains,
             command_bridge,
         })
     }
@@ -43,11 +50,16 @@ impl Server {
             }
         };
         info!("Started server on {}", self.listen_addr);
+        let options = Arc::new(ProxyOptions {
+            pac_path: self.pac_path.clone(),
+            tunnel_domains: self.tunnel_domains.clone(),
+        });
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     debug!("Received connection from {}", addr);
-                    let handler = ProxyConnection::new(socket, self.command_bridge.clone());
+                    let handler =
+                        ProxyConnection::new(socket, options.clone(), self.command_bridge.clone());
                     let rt = runtime::Handle::current();
                     rt.spawn(async move {
                         if let Err(err) = handler.handle_connection().await {
@@ -61,15 +73,26 @@ impl Server {
     }
 }
 
+struct ProxyOptions {
+    pac_path: Option<String>,
+    tunnel_domains: Vec<String>,
+}
+
 struct ProxyConnection {
     socket: Option<TcpStream>,
+    options: Arc<ProxyOptions>,
     command_bridge: mpsc::Sender<network::Command>,
 }
 
 impl ProxyConnection {
-    fn new(socket: TcpStream, command_bridge: mpsc::Sender<network::Command>) -> ProxyConnection {
+    fn new(
+        socket: TcpStream,
+        options: Arc<ProxyOptions>,
+        command_bridge: mpsc::Sender<network::Command>,
+    ) -> ProxyConnection {
         ProxyConnection {
             socket: Some(socket),
+            options,
             command_bridge,
         }
     }
@@ -133,7 +156,7 @@ impl ProxyConnection {
         let request =
             String::from_utf8(request).map_err(|_| "First handshake byte is not utf-8")?;
         if request.starts_with("GET /proxy.pac HTTP/1.1\r\n") {
-            Self::send_pac_file(socket).await?;
+            self.send_pac_file(socket).await?;
             Ok(DestinationConnection::None)
         } else if request.starts_with("CONNECT ") {
             let host = if let Some(host) = http::extract_connect_host(&request) {
@@ -170,9 +193,13 @@ impl ProxyConnection {
         }
     }
 
-    async fn send_pac_file(socket: &mut TcpStream) -> Result<(), ProxyError> {
-        // TODO: allow configuring this
-        let mut file = File::open("proxy.pac").await?;
+    async fn send_pac_file(&self, socket: &mut TcpStream) -> Result<(), ProxyError> {
+        let pac_path = if let Some(pac_path) = self.options.pac_path.as_ref() {
+            pac_path
+        } else {
+            return Err("Path to pac file is not defined".into());
+        };
+        let mut file = File::open(pac_path).await?;
         let mut contents = vec![];
         file.read_to_end(&mut contents).await?;
         http::write_pac_response(socket, &contents).await?;
@@ -191,8 +218,12 @@ impl ProxyConnection {
             // Fallback to port 80 (the default).
             (host.to_owned() + ":80", host)
         };
-        // TODO: allow configuring this
-        let direct_connection = domain.ends_with(".home");
+        let direct_connection = !(self.options.tunnel_domains.is_empty()
+            || self
+                .options
+                .tunnel_domains
+                .iter()
+                .any(|tunnel_domain| domain.ends_with(tunnel_domain)));
         let ip = tokio::net::lookup_host(host).await?.next();
         match ip {
             Some(addr) => {

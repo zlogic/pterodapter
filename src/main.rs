@@ -31,6 +31,8 @@ Options:\
 \n      --log-level=<LOG_LEVEL>   Log level [default: info]\
 \n      --listen-address=<IP>     Listen IP address [default: :::5328]\
 \n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --pac-file=<PATH>         (Optional) Path to pac file (available at /proxy.pac)\
+\n      --tunnel-domain=<PREFIX>  (Optional) Forward only subdomains to VPN, other domains will use direct connection; can be specified multiple times\
 \n      --help                    Print help";
 
 struct Config {
@@ -53,6 +55,8 @@ impl Args {
         let mut listen_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5328);
         let mut destination_addr = None;
         let mut destination_hostport = None;
+        let mut pac_path = None;
+        let mut tunnel_domains = vec![];
 
         for arg in env::args()
             .take(env::args().len().saturating_sub(1))
@@ -104,6 +108,10 @@ impl Args {
                         format_args!("Failed to parse destination address: {}", err),
                     ),
                 };
+            } else if name == "--pac-file" {
+                pac_path = Some(value.into());
+            } else if name == "--tunnel-domain" {
+                tunnel_domains.push(value.into());
             } else {
                 eprintln!("Unsupported argument {}", arg);
             }
@@ -131,7 +139,11 @@ impl Args {
                         }
                     };
 
-                let proxy_config = proxy::Config { listen_addr };
+                let proxy_config = proxy::Config {
+                    listen_addr,
+                    pac_path,
+                    tunnel_domains,
+                };
                 let fortivpn_config = fortivpn::Config {
                     destination_addr,
                     destination_hostport,
