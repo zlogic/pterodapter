@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{atomic, Arc},
 };
 
 use log::{debug, warn};
@@ -28,7 +29,7 @@ pub struct Network<'a> {
     sockets: iface::SocketSet<'a>,
     bridges: HashMap<iface::SocketHandle, ProxyClientConnection>,
     opening_connections: HashMap<iface::SocketHandle, SocketConnectionRequest>,
-    canceled: bool,
+    cancel_flag: Arc<atomic::AtomicBool>,
     command_receiver: mpsc::Receiver<Command>,
 }
 
@@ -36,6 +37,7 @@ impl Network<'_> {
     pub fn new<'a>(
         vpn: FortiVPNTunnel,
         command_receiver: mpsc::Receiver<Command>,
+        cancel_flag: Arc<atomic::AtomicBool>,
     ) -> Result<Network<'a>, NetworkError> {
         // TODO: how to choose the CIDR?
         let ip_cidr = wire::IpCidr::new(vpn.ip_addr().into(), 8);
@@ -62,13 +64,13 @@ impl Network<'_> {
             sockets,
             bridges: HashMap::new(),
             opening_connections: HashMap::new(),
-            canceled: false,
+            cancel_flag,
             command_receiver,
         })
     }
 
     pub async fn run(&mut self) -> Result<(), NetworkError> {
-        while !self.canceled {
+        while !self.cancel_flag.load(atomic::Ordering::Relaxed) {
             self.device.process_keepalive().await?;
             while let Ok(command) = self.command_receiver.try_recv() {
                 self.process_command(command);
@@ -214,10 +216,6 @@ impl Network<'_> {
             Command::Bridge(socket_handle, socket) => {
                 self.bridges
                     .insert(socket_handle, ProxyClientConnection::new(socket));
-            }
-            Command::Shutdown => {
-                debug!("Shutdown command received");
-                self.canceled = true;
             }
         }
     }
@@ -409,7 +407,6 @@ impl ProxyClientConnection {
 pub enum Command {
     Connect(std::net::SocketAddr, SocketConnectionRequest),
     Bridge(iface::SocketHandle, tokio::net::TcpStream),
-    Shutdown,
 }
 
 struct VpnDevice<'a> {

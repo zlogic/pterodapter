@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     process,
     str::FromStr,
+    sync::{atomic, Arc},
     time::Duration,
 };
 
@@ -188,18 +189,18 @@ fn serve(config: Config) -> Result<(), i32> {
             eprintln!("Failed to connect to VPN service: {}", err);
             1
         })?;
-    let mut client = network::Network::new(forti_client, command_receiver).map_err(|err| {
-        eprintln!("Failed to start virtual network interface: {}", err);
-        1
-    })?;
+    let cancel_flag = Arc::new(atomic::AtomicBool::new(false));
+    let mut client = network::Network::new(forti_client, command_receiver, cancel_flag.clone())
+        .map_err(|err| {
+            eprintln!("Failed to start virtual network interface: {}", err);
+            1
+        })?;
 
     let cancel_handle = rt.spawn(async move {
         if let Err(err) = signal::ctrl_c().await {
             eprintln!("Failed to wait for CTRL+C signal: {}", err);
         }
-        if let Err(err) = command_sender.send(network::Command::Shutdown).await {
-            eprintln!("Failed to send shutdown command: {}", err);
-        }
+        cancel_flag.store(true, atomic::Ordering::Relaxed);
     });
     rt.block_on(async move {
         if let Err(err) = client.run().await {
