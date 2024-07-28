@@ -77,10 +77,11 @@ where
     loop {
         let mut chunk_length = String::new();
         socket.read_line(&mut chunk_length).await?;
+        let chunk_length = chunk_length.trim_ascii();
         let chunk_length = match <usize>::from_str_radix(&chunk_length, 16) {
             Ok(chunk_length) => chunk_length,
             Err(err) => {
-                debug!("Failed to parse chunk length: {}", err);
+                debug!("Failed to parse chunk length {}: {}", chunk_length, err);
                 return Err("Failed to parse chunk length".into());
             }
         };
