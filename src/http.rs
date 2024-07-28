@@ -154,7 +154,32 @@ pub fn extract_host(headers: &str) -> Option<&str> {
     None
 }
 
-pub async fn write_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
+pub fn extract_response_code(headers: &str) -> Option<u16> {
+    // Normalize reponse to remove HTTP-Version if present.
+    let code_start = if let Some(headers) = headers.strip_prefix("HTTP/1.1 ") {
+        headers
+    } else {
+        headers
+    };
+    if let Some((code, _)) = code_start.split_once(" ") {
+        code.parse::<u16>().ok()
+    } else {
+        None
+    }
+}
+
+pub fn validate_response_code(headers: &str) -> Result<(), HttpError> {
+    match extract_response_code(headers) {
+        Some(200) => Ok(()),
+        Some(code) => {
+            debug!("Received unexpected HTTP response code: {}", code);
+            Err("Received unexpected HTTP response code".into())
+        }
+        None => Err("Unable to read HTTP response code".into()),
+    }
+}
+
+pub async fn write_sso_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

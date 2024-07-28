@@ -99,6 +99,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         let mut cookie = None;
         debug!("Reading cookie response");
         let headers = http::read_headers(&mut socket).await?;
+        http::validate_response_code(&headers)?;
         for line in headers.lines() {
             if cookie.is_none() && line.starts_with("Set-Cookie: SVPNCOOKIE=") {
                 if let Some(start_index) = line.find(":") {
@@ -119,7 +120,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     debug!("Successfully obtained cookie");
 
     let response = include_bytes!("static/token.html");
-    http::write_response(&mut socket, response).await?;
+    http::write_sso_response(&mut socket, response).await?;
 
     Ok(cookie)
 }
@@ -190,6 +191,7 @@ impl FortiVPNTunnel {
         socket.flush().await?;
 
         let headers = http::read_headers(socket).await?;
+        http::validate_response_code(&headers)?;
         let content = http::read_content(socket, headers.as_str()).await?;
 
         const IPV4_ADDRESS_PREFIX: &str = "<assigned-addr ipv4='";
