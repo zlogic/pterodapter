@@ -77,8 +77,8 @@ where
     loop {
         let mut chunk_length = String::new();
         socket.read_line(&mut chunk_length).await?;
-        let chunk_length = chunk_length.trim_ascii();
-        let chunk_length = match <usize>::from_str_radix(&chunk_length, 16) {
+        let chunk_length = chunk_length.trim();
+        let chunk_length = match <usize>::from_str_radix(chunk_length, 16) {
             Ok(chunk_length) => chunk_length,
             Err(err) => {
                 debug!("Failed to parse chunk length {}: {}", chunk_length, err);
@@ -265,7 +265,7 @@ pub fn extract_proxy_host(headers: &str) -> (String, Option<&str>) {
     if let Some(request_line) = lines.next() {
         if let Some((verb, remain)) = request_line.split_once(' ') {
             result.push_str(verb);
-            result.push_str(" ");
+            result.push(' ');
             let remain = if let Some(schema_pos) = remain.find("://") {
                 &remain[schema_pos + 3..]
             } else {
@@ -274,7 +274,7 @@ pub fn extract_proxy_host(headers: &str) -> (String, Option<&str>) {
             if let Some((request_host, path)) = remain.split_once('/') {
                 host = Some(request_host);
                 // Keep the path only.
-                result.push_str("/");
+                result.push('/');
                 result.push_str(path);
             } else {
                 // Pass remainder as-is.
@@ -284,14 +284,14 @@ pub fn extract_proxy_host(headers: &str) -> (String, Option<&str>) {
             // Pass request line as-is.
             result.push_str(request_line);
         }
-        result.push_str("\n");
+        result.push('\n');
     }
     for line in lines {
         if line.starts_with("Proxy-Authorization: ") || line.starts_with("Proxy-Connection: ") {
             continue;
         }
         result.push_str(line);
-        result.push_str("\n");
+        result.push('\n');
         if let Some(request_host) = line.strip_prefix(HOST_HEADER) {
             host = Some(request_host);
         }
