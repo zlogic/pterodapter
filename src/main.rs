@@ -32,7 +32,7 @@ Options:\
 \n      --listen-address=<IP>     Listen IP address [default: :::5328]\
 \n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --pac-file=<PATH>         (Optional) Path to pac file (available at /proxy.pac)\
-\n      --tunnel-domain=<PREFIX>  (Optional) Forward only subdomains to VPN, other domains will use direct connection; can be specified multiple times\
+\n      --tunnel-domain=<SUFFIX>  (Optional) Forward only subdomains to VPN, other domains will use direct connection; can be specified multiple times\
 \n      --help                    Print help";
 
 struct Config {
