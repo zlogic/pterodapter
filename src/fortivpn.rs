@@ -2,6 +2,7 @@ use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
+    sync::Arc,
 };
 
 use log::{debug, info, warn};
@@ -11,12 +12,13 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time::{Duration, Instant},
 };
-use tokio_native_tls::native_tls;
+use tokio_rustls::rustls;
 
 use crate::http;
 use crate::ppp;
 
 pub struct Config {
+    pub tls_config: Arc<rustls::client::ClientConfig>,
     pub destination_addr: SocketAddr,
     pub destination_hostport: String,
 }
@@ -71,18 +73,14 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
 
     // Get real token based on token ID.
     let cookie = {
-        let socket = TcpStream::connect(&config.destination_addr).await?;
-        let connector = native_tls::TlsConnector::builder()
-            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-            .build()?;
-        let connector = tokio_native_tls::TlsConnector::from(connector);
         let domain = if let Some(separator) = config.destination_hostport.find(":") {
             &config.destination_hostport[..separator]
         } else {
             &config.destination_hostport
         };
-        let socket = connector.connect(domain, socket).await?;
-        let mut socket = BufStream::new(socket);
+        let mut socket =
+            FortiVPNTunnel::connect(&config.destination_addr, domain, config.tls_config.clone())
+                .await?;
         debug!("Connected to cookie retrieval host");
         socket
             .write_all(
@@ -142,7 +140,10 @@ impl FortiVPNTunnel {
         } else {
             &config.destination_hostport
         };
-        let mut socket = FortiVPNTunnel::connect(&config.destination_hostport, domain).await?;
+        let mut socket =
+            FortiVPNTunnel::connect(&config.destination_addr, domain, config.tls_config.clone())
+                .await?;
+        debug!("Connected to VPN host");
         let addr = FortiVPNTunnel::request_vpn_allocation(domain, &mut socket, &cookie).await?;
         FortiVPNTunnel::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
 
@@ -168,17 +169,17 @@ impl FortiVPNTunnel {
         self.mtu
     }
 
-    async fn connect(hostport: &str, domain: &str) -> Result<BufTlsStream, FortiError> {
-        let socket = TcpStream::connect(hostport).await?;
-        let connector = native_tls::TlsConnector::builder()
-            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-            .build()?;
-        let connector = tokio_native_tls::TlsConnector::from(connector);
-        let socket = connector.connect(domain, socket).await?;
-        let socket = BufStream::new(socket);
-        debug!("Connected to VPN host");
+    async fn connect(
+        hostport: &SocketAddr,
+        domain: &str,
+        tls_config: Arc<rustls::client::ClientConfig>,
+    ) -> Result<BufTlsStream, FortiError> {
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
+        let dnsname = rustls::pki_types::ServerName::try_from(domain.to_owned())?;
 
-        Ok(socket)
+        let socket = TcpStream::connect(&hostport).await?;
+        let socket = connector.connect(dnsname, socket).await?;
+        Ok(BufStream::new(socket))
     }
 
     async fn request_vpn_allocation(
@@ -849,13 +850,14 @@ impl PPPState {
     }
 }
 
-type BufTlsStream = BufStream<tokio_native_tls::TlsStream<TcpStream>>;
+type BufTlsStream = BufStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 #[derive(Debug)]
 pub enum FortiError {
     Internal(&'static str),
     Io(io::Error),
-    Tls(native_tls::Error),
+    Tls(rustls::Error),
+    Dns(rustls::pki_types::InvalidDnsNameError),
     Http(crate::http::HttpError),
 }
 
@@ -868,6 +870,9 @@ impl fmt::Display for FortiError {
             }
             Self::Tls(ref e) => {
                 write!(f, "TLS error: {}", e)
+            }
+            Self::Dns(ref e) => {
+                write!(f, "DNS error: {}", e)
             }
             Self::Http(ref e) => {
                 write!(f, "HTTP error: {}", e)
@@ -882,6 +887,7 @@ impl error::Error for FortiError {
             Self::Internal(_msg) => None,
             Self::Io(ref err) => Some(err),
             Self::Tls(ref err) => Some(err),
+            Self::Dns(ref err) => Some(err),
             Self::Http(ref err) => Some(err),
         }
     }
@@ -899,9 +905,15 @@ impl From<io::Error> for FortiError {
     }
 }
 
-impl From<native_tls::Error> for FortiError {
-    fn from(err: native_tls::Error) -> FortiError {
+impl From<rustls::Error> for FortiError {
+    fn from(err: rustls::Error) -> FortiError {
         Self::Tls(err)
+    }
+}
+
+impl From<rustls::pki_types::InvalidDnsNameError> for FortiError {
+    fn from(err: rustls::pki_types::InvalidDnsNameError) -> FortiError {
+        Self::Dns(err)
     }
 }
 

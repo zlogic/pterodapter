@@ -5,7 +5,7 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
-use tokio_native_tls::native_tls;
+use tokio_rustls::rustls;
 
 const HEADER_END_MARKER: &str = "\r\n\r\n";
 const BUFFER_SIZE: usize = 256;
@@ -303,7 +303,7 @@ pub fn extract_proxy_host(headers: &str) -> (String, Option<&str>) {
 pub enum HttpError {
     Internal(&'static str),
     Io(io::Error),
-    Tls(native_tls::Error),
+    Tls(rustls::Error),
 }
 
 impl fmt::Display for HttpError {
@@ -342,8 +342,8 @@ impl From<io::Error> for HttpError {
     }
 }
 
-impl From<native_tls::Error> for HttpError {
-    fn from(err: native_tls::Error) -> HttpError {
+impl From<rustls::Error> for HttpError {
+    fn from(err: rustls::Error) -> HttpError {
         Self::Tls(err)
     }
 }

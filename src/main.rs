@@ -9,6 +9,7 @@ use std::{
 
 use log::{debug, info};
 use tokio::{signal, sync::mpsc};
+use tokio_rustls::rustls;
 
 mod fortivpn;
 mod http;
@@ -57,6 +58,14 @@ impl Args {
         let mut destination_hostport = None;
         let mut pac_path = None;
         let mut tunnel_domains = vec![];
+        let tls_config =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .dangerous() // rustls_platform_verifier is claims this is not dangerous
+                .with_custom_certificate_verifier(Arc::new(
+                    rustls_platform_verifier::Verifier::new(),
+                ))
+                .with_no_client_auth();
+        let tls_config = Arc::new(tls_config);
 
         for arg in env::args()
             .take(env::args().len().saturating_sub(1))
@@ -147,6 +156,7 @@ impl Args {
                 let fortivpn_config = fortivpn::Config {
                     destination_addr,
                     destination_hostport,
+                    tls_config,
                 };
 
                 let action = Action::Proxy(Config {
@@ -236,6 +246,13 @@ fn main() {
         "Pterodapter version {}",
         option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
     );
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("Crypto provider is aleady set, this should never happen");
+        process::exit(1);
+    }
     let args = Args::parse();
 
     if let Err(err) = logger::setup_logger(args.log_level) {
