@@ -179,7 +179,7 @@ impl LcpCode {
     }
 
     fn has_configure_options(&self) -> bool {
-        (Self::CONFIGURE_REQUEST.0..=LcpCode::CONFIGURE_REJECT.0).contains(&self.0)
+        (Self::CONFIGURE_REQUEST.0..=Self::CONFIGURE_REJECT.0).contains(&self.0)
     }
 }
 
@@ -249,23 +249,23 @@ pub enum LcpOptionData<'a> {
     Unknown(u8, &'a [u8]),
 }
 
-impl LcpOptionData<'_> {
-    fn from_data(option_type: u8, data: &[u8]) -> Result<LcpOptionData, FormatError> {
+impl<'a> LcpOptionData<'a> {
+    fn from_data(option_type: u8, data: &'a [u8]) -> Result<LcpOptionData, FormatError> {
         let data = match option_type {
-            0 => LcpOptionData::Reserved(),
+            0 => Self::Reserved(),
             1 => {
                 if data.len() != 2 {
                     return Err("Unexpected Maximum Receive Unit length".into());
                 }
                 let mut mru = [0u8; 2];
                 mru.copy_from_slice(data);
-                LcpOptionData::MaximumReceiveUnit(u16::from_be_bytes(mru))
+                Self::MaximumReceiveUnit(u16::from_be_bytes(mru))
             }
             3 => {
                 if data.len() < 2 {
                     return Err("Unexpected Authentication Protocol length".into());
                 }
-                LcpOptionData::AuthenticationProtocol(data)
+                Self::AuthenticationProtocol(data)
             }
             4 => {
                 if data.len() < 2 {
@@ -279,21 +279,21 @@ impl LcpOptionData<'_> {
                 }
                 let mut magic = [0u8; 4];
                 magic.copy_from_slice(data);
-                LcpOptionData::MagicNumber(u32::from_be_bytes(magic))
+                Self::MagicNumber(u32::from_be_bytes(magic))
             }
             7 => {
                 if !data.is_empty() {
                     return Err("Unexpected Protocol Field Compression length".into());
                 }
-                LcpOptionData::ProtocolFieldCompression()
+                Self::ProtocolFieldCompression()
             }
             8 => {
                 if !data.is_empty() {
                     return Err("Unexpected Address and Protocol Field Compression length".into());
                 }
-                LcpOptionData::AddressControlFieldCompression()
+                Self::AddressControlFieldCompression()
             }
-            _ => LcpOptionData::Unknown(option_type, data),
+            _ => Self::Unknown(option_type, data),
         };
         Ok(data)
     }
@@ -460,15 +460,15 @@ pub enum IpcpOptionData<'a> {
     SecondaryNbns(Ipv4Addr),
 }
 
-impl IpcpOptionData<'_> {
-    fn from_data(option_type: u8, data: &[u8]) -> Result<IpcpOptionData, FormatError> {
+impl<'a> IpcpOptionData<'a> {
+    fn from_data(option_type: u8, data: &'a [u8]) -> Result<IpcpOptionData, FormatError> {
         let data = match option_type {
-            1 => IpcpOptionData::IpAddresses(),
+            1 => Self::IpAddresses(),
             2 => {
                 if data.len() < 2 {
                     return Err("Unexpected IP Compression Protocol length".into());
                 }
-                IpcpOptionData::IpCompressionProtocol(data)
+                Self::IpCompressionProtocol(data)
             }
             3 => {
                 if data.len() != 4 {
@@ -477,7 +477,7 @@ impl IpcpOptionData<'_> {
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(data);
                 let ip = Ipv4Addr::from(ip);
-                IpcpOptionData::IpAddress(ip)
+                Self::IpAddress(ip)
             }
             129 => {
                 if data.len() != 4 {
@@ -486,7 +486,7 @@ impl IpcpOptionData<'_> {
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(data);
                 let ip = Ipv4Addr::from(ip);
-                IpcpOptionData::PrimaryDns(ip)
+                Self::PrimaryDns(ip)
             }
             130 => {
                 if data.len() != 4 {
@@ -495,7 +495,7 @@ impl IpcpOptionData<'_> {
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(data);
                 let ip = Ipv4Addr::from(ip);
-                IpcpOptionData::PrimaryNbns(ip)
+                Self::PrimaryNbns(ip)
             }
             131 => {
                 if data.len() != 4 {
@@ -504,7 +504,7 @@ impl IpcpOptionData<'_> {
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(data);
                 let ip = Ipv4Addr::from(ip);
-                IpcpOptionData::SecondaryDns(ip)
+                Self::SecondaryDns(ip)
             }
             132 => {
                 if data.len() != 4 {
@@ -513,7 +513,7 @@ impl IpcpOptionData<'_> {
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(data);
                 let ip = Ipv4Addr::from(ip);
-                IpcpOptionData::SecondaryNbns(ip)
+                Self::SecondaryNbns(ip)
             }
             _ => return Err("Unexpected IPCP option type".into()),
         };

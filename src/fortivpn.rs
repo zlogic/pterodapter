@@ -141,15 +141,14 @@ impl FortiVPNTunnel {
             &config.destination_hostport
         };
         let mut socket =
-            FortiVPNTunnel::connect(&config.destination_addr, domain, config.tls_config.clone())
-                .await?;
+            Self::connect(&config.destination_addr, domain, config.tls_config.clone()).await?;
         debug!("Connected to VPN host");
-        let addr = FortiVPNTunnel::request_vpn_allocation(domain, &mut socket, &cookie).await?;
-        FortiVPNTunnel::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
+        let addr = Self::request_vpn_allocation(domain, &mut socket, &cookie).await?;
+        Self::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
 
         let mut ppp_state = PPPState::new();
-        let ppp_magic = FortiVPNTunnel::start_ppp(&mut socket, &mut ppp_state).await?;
-        FortiVPNTunnel::start_ipcp(&mut socket, &mut ppp_state, addr).await?;
+        let ppp_magic = Self::start_ppp(&mut socket, &mut ppp_state).await?;
+        Self::start_ipcp(&mut socket, &mut ppp_state, addr).await?;
         Ok(FortiVPNTunnel {
             socket,
             addr,
@@ -245,7 +244,7 @@ impl FortiVPNTunnel {
                     debug!("Failed to encode LCP Configure-Request: {}", err);
                     "Failed to encode LCP Configure-Request"
                 })?;
-        FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
+        Self::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
         socket.flush().await?;
 
         let mut local_acked = false;
@@ -260,7 +259,7 @@ impl FortiVPNTunnel {
             } else {
                 return Err("Unable to read PPP protocol".into());
             };
-            let length = FortiVPNTunnel::read_ppp_packet(socket, ppp_state, &mut resp).await?;
+            let length = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
             let response = ppp::Packet::from_bytes(protocol, &resp[..length]).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
@@ -340,8 +339,7 @@ impl FortiVPNTunnel {
                         debug!("Failed to encode LCP Configure-Ack: {}", err);
                         "Failed to encode LCP Configure-Ack"
                     })?;
-                    FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length])
-                        .await?;
+                    Self::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
                     socket.flush().await?;
                     remote_acked = true;
                 }
@@ -387,7 +385,7 @@ impl FortiVPNTunnel {
         let mut opts = [0u8; 100];
         let opts_len = length - 4;
         opts[..opts_len].copy_from_slice(&req[4..length]);
-        FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
+        Self::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
         socket.flush().await?;
 
         let mut local_acked = false;
@@ -402,7 +400,7 @@ impl FortiVPNTunnel {
             } else {
                 return Err("Unable to read PPP protocol".into());
             };
-            let length = FortiVPNTunnel::read_ppp_packet(socket, ppp_state, &mut resp).await?;
+            let length = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
             let response = ppp::Packet::from_bytes(protocol, &resp[..length]).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
@@ -465,8 +463,7 @@ impl FortiVPNTunnel {
                         debug!("Failed to encode IPCP Configure-Ack: {}", err);
                         "Failed to encode IPCP Configure-Ack"
                     })?;
-                    FortiVPNTunnel::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length])
-                        .await?;
+                    Self::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
                     socket.flush().await?;
                     remote_acked = true;
                 }
@@ -541,8 +538,7 @@ impl FortiVPNTunnel {
             debug!("Failed to encode {}: {}", code, err);
             "Failed to encode Echo message"
         })?;
-        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length])
-            .await?;
+        Self::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await?;
         Ok(self.socket.flush().await?)
     }
 
@@ -558,7 +554,7 @@ impl FortiVPNTunnel {
     }
 
     pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
-        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
+        Self::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
     }
 
     pub async fn flush(&mut self) -> Result<(), FortiError> {
@@ -574,8 +570,7 @@ impl FortiVPNTunnel {
         // 200 bytes should fit any PPP packet.
         let mut dest = [0u8; 200];
         let length =
-            FortiVPNTunnel::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut dest)
-                .await?;
+            Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut dest).await?;
 
         match protocol {
             ppp::Protocol::LCP => {
@@ -666,8 +661,7 @@ impl FortiVPNTunnel {
                 return Err("Unknown PPP protocol, possibly a framing error".into());
             }
         };
-        let length =
-            FortiVPNTunnel::read_ppp_packet(&mut self.socket, &mut self.ppp_state, dest).await?;
+        let length = Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, dest).await?;
         match protocol {
             ppp::Protocol::LCP => {
                 self.process_control_packet().await?;
@@ -695,8 +689,7 @@ impl FortiVPNTunnel {
             debug!("Failed to encode Terminate-Request: {}", err);
             "Failed to encode Terminate-Request message"
         })?;
-        FortiVPNTunnel::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length])
-            .await?;
+        Self::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await?;
         self.socket.flush().await?;
 
         loop {
@@ -713,8 +706,7 @@ impl FortiVPNTunnel {
                 return Err("Unable to read PPP protocol".into());
             };
             let length =
-                FortiVPNTunnel::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut resp)
-                    .await?;
+                Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut resp).await?;
             let response = ppp::Packet::from_bytes(protocol, &resp[..length]).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
@@ -858,7 +850,7 @@ pub enum FortiError {
     Io(io::Error),
     Tls(rustls::Error),
     Dns(rustls::pki_types::InvalidDnsNameError),
-    Http(crate::http::HttpError),
+    Http(http::HttpError),
 }
 
 impl fmt::Display for FortiError {

@@ -332,11 +332,8 @@ impl ProxyConnection {
 
         socket.write_u8(SOCKS5_VERSION).await?;
         if cmd != SocksCommand::CONNECT {
-            ProxyConnection::socks_write_error_response(
-                socket,
-                CommandResponse::COMMAND_NOT_SUPPORTED,
-            )
-            .await?;
+            Self::socks_write_error_response(socket, CommandResponse::COMMAND_NOT_SUPPORTED)
+                .await?;
             debug!("Command {} is not supported", cmd);
             return Err("Command is not supported".into());
         }
@@ -358,7 +355,7 @@ impl ProxyConnection {
                     .await
             }
             None => {
-                ProxyConnection::socks_write_error_response(
+                Self::socks_write_error_response(
                     socket,
                     CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
                 )
@@ -370,11 +367,8 @@ impl ProxyConnection {
             Ok(connection) => connection,
             Err(err) => {
                 debug!("Failed to connect to destination: {}", err);
-                ProxyConnection::socks_write_error_response(
-                    socket,
-                    CommandResponse::NETWORK_UNREACHABLE,
-                )
-                .await?;
+                Self::socks_write_error_response(socket, CommandResponse::NETWORK_UNREACHABLE)
+                    .await?;
                 return Err("Failed to connect to destination".into());
             }
         };
@@ -391,7 +385,7 @@ impl ProxyConnection {
         let local_addr = match local_addr {
             Ok(addr) => addr,
             Err(err) => {
-                ProxyConnection::socks_write_error_response(
+                Self::socks_write_error_response(
                     socket,
                     CommandResponse::ADDRESS_TYPE_NOT_SUPPORTED,
                 )
@@ -558,7 +552,7 @@ pub enum ProxyError {
     Internal(&'static str),
     Join(tokio::task::JoinError),
     Io(io::Error),
-    Http(crate::http::HttpError),
+    Http(http::HttpError),
 }
 
 impl fmt::Display for ProxyError {

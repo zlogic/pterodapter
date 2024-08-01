@@ -13,7 +13,7 @@ use tokio::{
     time::Duration,
 };
 
-use crate::fortivpn::FortiVPNTunnel;
+use crate::fortivpn;
 
 const MAX_MTU_SIZE: usize = 1500;
 const READ_BUFFER_SIZE: usize = 65536 * 2 * 2;
@@ -35,7 +35,7 @@ pub struct Network<'a> {
 
 impl Network<'_> {
     pub fn new<'a>(
-        vpn: FortiVPNTunnel,
+        vpn: fortivpn::FortiVPNTunnel,
         command_receiver: mpsc::Receiver<Command>,
         cancel_flag: Arc<atomic::AtomicBool>,
     ) -> Result<Network<'a>, NetworkError> {
@@ -410,7 +410,7 @@ pub enum Command {
 }
 
 struct VpnDevice<'a> {
-    vpn: FortiVPNTunnel,
+    vpn: fortivpn::FortiVPNTunnel,
     last_echo_sent: tokio::time::Instant,
     next_echo_receive_check: tokio::time::Instant,
     read_buffers: storage::RingBuffer<'a, Vec<u8>>,
@@ -418,7 +418,7 @@ struct VpnDevice<'a> {
 }
 
 impl VpnDevice<'_> {
-    fn new<'a>(vpn: FortiVPNTunnel) -> VpnDevice<'a> {
+    fn new<'a>(vpn: fortivpn::FortiVPNTunnel) -> VpnDevice<'a> {
         let read_buffers = (0..DEVICE_BUFFERS_COUNT)
             .map(|_| Vec::with_capacity(MAX_MTU_SIZE))
             .collect::<Vec<_>>();
@@ -599,7 +599,7 @@ pub enum NetworkError {
     Internal(&'static str),
     Connect(socket::tcp::ConnectError),
     Io(io::Error),
-    Forti(crate::fortivpn::FortiError),
+    Forti(fortivpn::FortiError),
 }
 
 impl fmt::Display for NetworkError {
