@@ -53,6 +53,7 @@ impl Server {
         let options = Arc::new(ProxyOptions {
             pac_path: self.pac_path.clone(),
             tunnel_domains: self.tunnel_domains.clone(),
+            listen_addr: self.listen_addr,
         });
         loop {
             match listener.accept().await {
@@ -76,6 +77,7 @@ impl Server {
 struct ProxyOptions {
     pac_path: Option<String>,
     tunnel_domains: Vec<String>,
+    listen_addr: SocketAddr,
 }
 
 struct ProxyConnection {
@@ -240,6 +242,12 @@ impl ProxyConnection {
         direct_connection: bool,
         initial_data: Option<Vec<u8>>,
     ) -> Result<DestinationConnection, ProxyError> {
+        if addr.port() == self.options.listen_addr.port()
+            && ((self.options.listen_addr.ip().is_loopback() && addr.ip().is_loopback())
+                || addr.ip() == self.options.listen_addr.ip())
+        {
+            return Err("Loop detected".into());
+        }
         if !direct_connection && addr.is_ipv4() {
             let (sender, receiver) = oneshot::channel();
             let connection_request = network::SocketConnectionRequest::new(sender, initial_data);
