@@ -12,8 +12,15 @@ log = { version = "0.4", default-features = false }
 tokio = { version = "1.39", default-features = false, features = ["rt", "io-util", "signal", "net", "fs", "time", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-platform-verifier = { version = "0.3", default-features = false }
-smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+smoltcp = { version = "0.11", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
+openssl = { version = "0.10", optional = true, default-features = false }
+
+[features]
+default = ["proxy"]
+proxy = ["dep:smoltcp"]
+ikev2 = ["dep:openssl"]
 
 [profile.release]
 strip = true
