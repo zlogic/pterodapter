@@ -35,7 +35,8 @@ pub struct TransformParameters {
     dh: Option<Transform>,
     esn: Option<Transform>,
     protocol_id: message::IPSecProtocolID,
-    spi: message::Spi,
+    local_spi: message::Spi,
+    remote_spi: message::Spi,
 }
 
 impl TransformParameters {
@@ -57,8 +58,16 @@ impl TransformParameters {
         self.protocol_id
     }
 
-    pub fn spi(&self) -> message::Spi {
-        self.spi
+    pub fn local_spi(&self) -> message::Spi {
+        self.local_spi
+    }
+
+    pub fn set_local_spi(&mut self, local_spi: message::Spi) {
+        self.local_spi = local_spi
+    }
+
+    pub fn remote_spi(&self) -> message::Spi {
+        self.remote_spi
     }
 
     fn enc_key_length(&self) -> usize {
@@ -155,7 +164,8 @@ pub fn choose_sa_parameters(
                 dh: None,
                 esn: None,
                 protocol_id: prop.protocol_id(),
-                spi: prop.spi(),
+                local_spi: message::Spi::None,
+                remote_spi: prop.spi(),
             };
 
             let valid = prop.iter_transforms().all(|tt| {
@@ -977,7 +987,7 @@ impl Encryption for EncryptionAesCbc256 {
          */
         let data_range = &mut data[iv_size..encrypted_payload_length + aes_cbc_cipher.block_size()];
         let _ = ctx
-            .cipher_update_inplace(data_range, msg_len)
+            .cipher_update_inplace(data_range, padded_msg_len)
             .map_err(|err| {
                 debug!("Failed to encode AES CBC 256 message: {}", err);
                 "Failed to encode AES CBC 256 message"

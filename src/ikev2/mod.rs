@@ -5,7 +5,7 @@ use std::{
     error, fmt,
     hash::{Hash, Hasher},
     io,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -303,9 +303,11 @@ impl Sessions {
             remote_spi,
             local_spi: existing_half_session.0,
         };
-        self.sessions
-            .entry(session_id)
-            .or_insert_with(|| IKEv2Session::new(remote_addr, self.pki_processing.clone()));
+        // TODO: get address from FortiVPN, or through a custom config variable.
+        let internal_addr = IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10));
+        self.sessions.entry(session_id).or_insert_with(|| {
+            IKEv2Session::new(remote_addr, internal_addr, self.pki_processing.clone())
+        });
         session_id
     }
 
@@ -446,6 +448,7 @@ enum SessionState {
 struct IKEv2Session {
     remote_addr: SocketAddr,
     state: SessionState,
+    internal_addr: IpAddr,
     pki_processing: Arc<pki::PkiProcessing>,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
@@ -456,10 +459,15 @@ struct IKEv2Session {
 }
 
 impl IKEv2Session {
-    fn new(remote_addr: SocketAddr, pki_processing: Arc<pki::PkiProcessing>) -> IKEv2Session {
+    fn new(
+        remote_addr: SocketAddr,
+        internal_addr: IpAddr,
+        pki_processing: Arc<pki::PkiProcessing>,
+    ) -> IKEv2Session {
         IKEv2Session {
             remote_addr,
             state: SessionState::Empty,
+            internal_addr,
             pki_processing,
             params: None,
             crypto_stack: None,
@@ -902,6 +910,9 @@ impl IKEv2Session {
         let mut server_cert = self.pki_processing.default_server_cert();
         let mut id_initiator = None;
         let mut transform_params = None;
+        let mut ts_remote = vec![];
+        let mut ts_local = vec![];
+        let mut ipv4_address_requested = false;
 
         for payload in decrypted_iter {
             let payload = match payload {
@@ -981,6 +992,46 @@ impl IKEv2Session {
                         continue;
                     };
                 }
+                message::PayloadType::TRAFFIC_SELECTOR_INITIATOR => {
+                    let ts = payload
+                        .to_traffic_selector()?
+                        .iter_traffic_selectors()
+                        .collect::<Result<Vec<_>, message::FormatError>>()
+                        .map_err(|err| {
+                            debug!("Failed to decode initiator traffic selectors: {}", err);
+                            err
+                        });
+                    if let Ok(ts) = ts {
+                        ts_remote = ts
+                    }
+                }
+                message::PayloadType::TRAFFIC_SELECTOR_RESPONDER => {
+                    let ts = payload
+                        .to_traffic_selector()?
+                        .iter_traffic_selectors()
+                        .collect::<Result<Vec<_>, message::FormatError>>()
+                        .map_err(|err| {
+                            debug!("Failed to decode responder traffic selectors: {}", err);
+                            err
+                        });
+                    if let Ok(ts) = ts {
+                        ts_local = ts
+                    }
+                }
+                message::PayloadType::CONFIGURATION => {
+                    ipv4_address_requested =
+                        payload.to_configuration()?.iter_attributes().any(|attr| {
+                            let attr = match attr {
+                                Ok(attr) => attr,
+                                Err(err) => {
+                                    debug!("Failed to decode configuration attribute: {}", err);
+                                    return false;
+                                }
+                            };
+                            attr.attribute_type()
+                                == message::ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
+                        })
+                }
                 _ => {}
             }
         }
@@ -1000,12 +1051,16 @@ impl IKEv2Session {
         } else {
             return self.process_auth_failed_response(response, "Client provided no ID".into());
         };
-        let (transform_params, proposal_num) = if let Some(params) = transform_params {
+        let (mut transform_params, proposal_num) = if let Some(params) = transform_params {
             params
         } else {
             // TODO: return NO_PROPOSAL_CHOSEN notification.
-            return Err("Unacceptable Security Associattion proposals".into());
+            return Err("Unacceptable Security Association proposals".into());
         };
+        if ts_local.is_empty() || ts_remote.is_empty() {
+            // TODO: return TS_UNACCEPTABLE notification.
+            return Err("No traffic selectors offered by client".into());
+        }
 
         let initiator_signed_len =
             ctx.message_initiator.len() + ctx.nonce_responder.len() + prf_key_len;
@@ -1038,18 +1093,15 @@ impl IKEv2Session {
         response.start_encrypted_payload()?;
 
         if let Some(id_responder) = self.pki_processing.server_id() {
-            {
-                let write_slice = response
-                    .next_payload_slice(message::PayloadType::ID_RESPONDER, id_responder.len())?;
-                write_slice.copy_from_slice(id_responder);
-            }
+            let write_slice = response
+                .next_payload_slice(message::PayloadType::ID_RESPONDER, id_responder.len())?;
+            write_slice.copy_from_slice(id_responder);
         }
 
         if let Some(cert) = server_cert {
             response
                 .write_certificate_payload(message::CertificateEncoding::X509_SIGNATURE, cert)?;
         }
-        response.write_accept_proposal(proposal_num, &transform_params)?;
 
         if let Some(id_responder) = self.pki_processing.server_id() {
             let responder_signed_len =
@@ -1078,6 +1130,19 @@ impl IKEv2Session {
             self.pki_processing
                 .sign_auth(&responder_signed[..responder_signed_len], write_slice)?;
         };
+
+        if ipv4_address_requested {
+            response.write_configuration_payload(self.internal_addr)?;
+        }
+
+        let local_spi = message::Spi::U32(rand::thread_rng().gen::<u32>());
+        transform_params.set_local_spi(local_spi);
+        response.write_accept_proposal(proposal_num, &transform_params)?;
+
+        // TODO: narrow down Traffic Selectors.
+        // TODO: will macOS or Windows accept more traffic selectors?
+        response.write_traffic_selector_payload(true, &ts_remote)?;
+        response.write_traffic_selector_payload(false, &ts_local)?;
 
         self.complete_encrypted_payload(response)
     }
@@ -1166,6 +1231,21 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     let src_data = &src_data[..16 + addr_len + 2];
 
     crypto::hash_sha1(src_data).unwrap_or([0u8; 20])
+}
+
+struct SecurityAssociation {
+    ts_local: message::TrafficSelector,
+    ts_remote: message::TrafficSelector,
+    // TODO: store encryption parameters
+}
+
+impl SecurityAssociation {
+    fn contains(&self, remote_addr: &SocketAddr, local_addr: &SocketAddr) -> bool {
+        self.ts_remote.addr_range().contains(&remote_addr.ip())
+            && self.ts_remote.port_range().contains(&remote_addr.port())
+            && self.ts_local.addr_range().contains(&local_addr.ip())
+            && self.ts_local.port_range().contains(&local_addr.port())
+    }
 }
 
 #[derive(Debug)]

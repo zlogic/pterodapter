@@ -174,7 +174,7 @@ impl Args {
                 pac_path = Some(value.into());
             } else if action_type == ActionType::Proxy && name == "--tunnel-domain" {
                 tunnel_domains.push(value.into());
-            } else if action_type == ActionType::Proxy && name == "--listen-ip" {
+            } else if action_type == ActionType::IkeV2 && name == "--listen-ip" {
                 match IpAddr::from_str(value) {
                     Ok(ip) => {
                         listen_ips.push(ip);

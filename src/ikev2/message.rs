@@ -1,6 +1,7 @@
 use std::{
     error, fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ops::RangeInclusive,
 };
 
 use log::debug;
@@ -350,12 +351,11 @@ impl MessageWriter<'_> {
                 }
             })
             .fold((0, 0), |acc, e| (acc.0 + e.0, acc.1 + e.1));
-        let spi = proposal.spi();
+        let spi = proposal.local_spi();
         let proposal_len = 8 + spi.length() + data_len;
         let next_payload_slice =
             self.next_payload_slice(PayloadType::SECURITY_ASSOCIATION, proposal_len)?;
         next_payload_slice[0] = 0;
-        next_payload_slice[1] = 0;
         next_payload_slice[2..4].copy_from_slice(&(proposal_len as u16).to_be_bytes());
         next_payload_slice[4] = proposal_num;
         next_payload_slice[5] = proposal.protocol_id().0;
@@ -457,6 +457,104 @@ impl MessageWriter<'_> {
         next_payload_slice[2..4].copy_from_slice(&notify_message_type.0.to_be_bytes());
         next_payload_slice[4..4 + spi.len()].copy_from_slice(spi);
         next_payload_slice[4 + spi.len()..].copy_from_slice(data);
+        Ok(())
+    }
+
+    pub fn write_traffic_selector_payload(
+        &mut self,
+        is_initiator: bool,
+        selectors: &[TrafficSelector],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let payload_type = if is_initiator {
+            PayloadType::TRAFFIC_SELECTOR_INITIATOR
+        } else {
+            PayloadType::TRAFFIC_SELECTOR_RESPONDER
+        };
+        let payload_length = selectors
+            .iter()
+            .map(|selector| selector.ts_type().length())
+            .sum::<usize>();
+        let next_payload_slice = self.next_payload_slice(payload_type, 4 + payload_length)?;
+        next_payload_slice[0] = selectors.len() as u8;
+
+        let mut next_selector_offset = 4;
+        selectors.iter().for_each(|ts| {
+            let ts_length = ts.ts_type.length();
+            let dest =
+                &mut next_payload_slice[next_selector_offset..next_selector_offset + ts_length];
+            dest[0] = ts.ts_type.0;
+            dest[1] = ts.ip_protocol.0;
+            dest[2..4].copy_from_slice(&(ts_length as u16).to_be_bytes());
+            let dest = &mut dest[4..];
+
+            dest[0..2].copy_from_slice(&ts.port.start().to_be_bytes());
+            dest[2..4].copy_from_slice(&ts.port.end().to_be_bytes());
+            // Addresses are supposed to be pre-validated, but just in case specify an all-exclusive range.
+            match ts.ts_type {
+                TrafficSelectorType::TS_IPV4_ADDR_RANGE => {
+                    if let IpAddr::V4(start_addr) = ts.addr.start() {
+                        dest[4..8].copy_from_slice(&start_addr.octets());
+                    } else {
+                        dest[4..8].fill(255);
+                    }
+                    if let IpAddr::V4(end_addr) = ts.addr.end() {
+                        dest[8..12].copy_from_slice(&end_addr.octets());
+                    } else {
+                        dest[8..12].fill(0);
+                    }
+                }
+                TrafficSelectorType::TS_IPV6_ADDR_RANGE => {
+                    if let IpAddr::V6(start_addr) = ts.addr.start() {
+                        dest[4..20].copy_from_slice(&start_addr.octets());
+                    } else {
+                        dest[4..20].fill(255);
+                    }
+                    if let IpAddr::V6(end_addr) = ts.addr.end() {
+                        dest[20..36].copy_from_slice(&end_addr.octets());
+                    } else {
+                        dest[20..36].fill(0);
+                    }
+                }
+                _ => {}
+            }
+            next_selector_offset += ts_length;
+        });
+
+        Ok(())
+    }
+
+    pub fn write_configuration_payload(&mut self, addr: IpAddr) -> Result<(), NotEnoughSpaceError> {
+        let addr_length = match addr {
+            IpAddr::V4(_) => 4 + 4,
+            IpAddr::V6(_) => 4 + 17,
+        };
+        let config_length = if addr.is_ipv4() {
+            addr_length
+        } else {
+            addr_length
+        };
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::CONFIGURATION, 4 + config_length)?;
+        next_payload_slice[0] = ConfigurationType::CFG_REPLY.0;
+
+        // Write IP address.
+        let data = &mut next_payload_slice[4..4 + addr_length];
+        let attribute_type = match addr {
+            IpAddr::V4(addr) => {
+                data[2..4].copy_from_slice(&4u16.to_be_bytes());
+                data[4..8].copy_from_slice(&addr.octets());
+                ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
+            }
+            IpAddr::V6(addr) => {
+                data[2..4].copy_from_slice(&17u16.to_be_bytes());
+                data[4..20].copy_from_slice(&addr.octets());
+                // Assume that only one IP address can be used.
+                data[20] = 128;
+                ConfigurationAttributeType::INTERNAL_IP6_ADDRESS
+            }
+        };
+        data[0..2].copy_from_slice(&attribute_type.0.to_be_bytes());
+
         Ok(())
     }
 
@@ -600,7 +698,7 @@ impl Payload<'_> {
         }
     }
 
-    fn to_traffic_selector(&self) -> Result<PayloadTrafficSelector, FormatError> {
+    pub fn to_traffic_selector(&self) -> Result<PayloadTrafficSelector, FormatError> {
         if self.payload_type == PayloadType::TRAFFIC_SELECTOR_INITIATOR
             || self.payload_type == PayloadType::TRAFFIC_SELECTOR_RESPONDER
         {
@@ -610,7 +708,7 @@ impl Payload<'_> {
         }
     }
 
-    fn to_configuration(&self) -> Result<PayloadConfiguration, FormatError> {
+    pub fn to_configuration(&self) -> Result<PayloadConfiguration, FormatError> {
         if self.payload_type == PayloadType::CONFIGURATION {
             PayloadConfiguration::from_payload(self.data)
         } else {
@@ -1626,6 +1724,14 @@ impl TrafficSelectorType {
             Err("Unsupported IKEv2 Traffic Selector type".into())
         }
     }
+
+    fn length(&self) -> usize {
+        match *self {
+            Self::TS_IPV4_ADDR_RANGE => 4 + 4 + 4 + 4,
+            Self::TS_IPV6_ADDR_RANGE => 4 + 4 + 16 + 16,
+            _ => 0,
+        }
+    }
 }
 
 impl fmt::Display for TrafficSelectorType {
@@ -1666,67 +1772,28 @@ impl fmt::Display for IPProtocolType {
     }
 }
 
-pub struct TrafficSelector<'a> {
+pub struct TrafficSelector {
     ts_type: TrafficSelectorType,
     ip_protocol: IPProtocolType,
-    data: &'a [u8],
+    addr: RangeInclusive<IpAddr>,
+    port: RangeInclusive<u16>,
 }
 
-impl<'a> TrafficSelector<'a> {
-    pub fn read_start_port(&self) -> u16 {
-        let mut port = [0u8; 2];
-        port.copy_from_slice(&self.data[0..2]);
-        u16::from_be_bytes(port)
+impl TrafficSelector {
+    pub fn ts_type(&self) -> TrafficSelectorType {
+        self.ts_type
     }
 
-    pub fn read_end_port(&self) -> u16 {
-        let mut port = [0u8; 2];
-        port.copy_from_slice(&self.data[2..4]);
-        u16::from_be_bytes(port)
+    pub fn ip_protocol(&self) -> IPProtocolType {
+        self.ip_protocol
     }
 
-    pub fn read_start_address(&self) -> Result<IpAddr, FormatError> {
-        match self.ts_type {
-            TrafficSelectorType::TS_IPV4_ADDR_RANGE => {
-                if self.data.len() != 4 + 4 + 4 {
-                    return Err("Invalid IPv4 address data".into());
-                }
-                let mut addr = [0u8; 4];
-                addr.copy_from_slice(&self.data[4..8]);
-                Ok(IpAddr::V4(Ipv4Addr::from(addr)))
-            }
-            TrafficSelectorType::TS_IPV6_ADDR_RANGE => {
-                if self.data.len() != 4 + 16 + 16 {
-                    return Err("Invalid IPv6 address data".into());
-                }
-                let mut addr = [0u8; 16];
-                addr.copy_from_slice(&self.data[4..20]);
-                Ok(IpAddr::V6(Ipv6Addr::from(addr)))
-            }
-            _ => Err("Unsupported traffic selector type".into()),
-        }
+    pub fn addr_range(&self) -> &RangeInclusive<IpAddr> {
+        &self.addr
     }
 
-    pub fn read_end_address(&self) -> Result<IpAddr, FormatError> {
-        match self.ts_type {
-            TrafficSelectorType::TS_IPV4_ADDR_RANGE => {
-                if self.data.len() != 4 + 4 + 4 {
-                    return Err("Invalid IPv4 address data".into());
-                }
-                let mut addr = [0u8; 4];
-                addr.copy_from_slice(&self.data[8..12]);
-                Ok(IpAddr::V4(Ipv4Addr::from(addr)))
-            }
-            TrafficSelectorType::TS_IPV6_ADDR_RANGE => {
-                if self.data.len() != 4 + 16 + 16 {
-                    return Err("Invalid IPv6 address data".into());
-                }
-                let mut addr = [0u8; 16];
-                addr.copy_from_slice(&self.data[20..36]);
-                Ok(IpAddr::V6(Ipv6Addr::from(addr)))
-            }
-            _ => Err("Unsupported traffic selector type".into()),
-        }
+    pub fn port_range(&self) -> &RangeInclusive<u16> {
+        &self.port
     }
 }
 
@@ -1736,7 +1803,7 @@ pub struct TrafficSelectorIter<'a> {
 }
 
 impl<'a> Iterator for TrafficSelectorIter<'a> {
-    type Item = Result<TrafficSelector<'a>, FormatError>;
+    type Item = Result<TrafficSelector, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.data.is_empty() {
@@ -1757,7 +1824,7 @@ impl<'a> Iterator for TrafficSelectorIter<'a> {
             return None;
         }
 
-        let data = self.data;
+        let data = &self.data[..selector_length];
         self.data = &self.data[selector_length..];
         self.num_selectors = self.num_selectors.saturating_sub(1);
         let ts_type = match TrafficSelectorType::from_u8(data[0]) {
@@ -1765,11 +1832,45 @@ impl<'a> Iterator for TrafficSelectorIter<'a> {
             Err(err) => return Some(Err(err)),
         };
         let ip_protocol = IPProtocolType::from_u8(data[1]);
+        let data = &data[4..];
+
+        let mut start_port = [0u8; 2];
+        start_port.copy_from_slice(&data[0..2]);
+        let start_port = u16::from_be_bytes(start_port);
+        let mut end_port = [0u8; 2];
+        end_port.copy_from_slice(&data[2..4]);
+        let end_port = u16::from_be_bytes(end_port);
+        let port_range = start_port..=end_port;
+
+        let addr_range = match ts_type {
+            TrafficSelectorType::TS_IPV4_ADDR_RANGE => {
+                if data.len() != 4 + 4 + 4 {
+                    return Some(Err("Invalid IPv4 address data".into()));
+                }
+                let mut start_addr = [0u8; 4];
+                let mut end_addr = [0u8; 4];
+                start_addr.copy_from_slice(&data[4..8]);
+                end_addr.copy_from_slice(&data[8..12]);
+                IpAddr::V4(Ipv4Addr::from(start_addr))..=IpAddr::V4(Ipv4Addr::from(end_addr))
+            }
+            TrafficSelectorType::TS_IPV6_ADDR_RANGE => {
+                if data.len() != 4 + 16 + 16 {
+                    return Some(Err("Invalid IPv6 address data".into()));
+                }
+                let mut start_addr = [0u8; 16];
+                let mut end_addr = [0u8; 16];
+                start_addr.copy_from_slice(&data[4..20]);
+                end_addr.copy_from_slice(&data[20..36]);
+                IpAddr::V6(Ipv6Addr::from(start_addr))..=IpAddr::V6(Ipv6Addr::from(end_addr))
+            }
+            _ => return Some(Err("Unsupported traffic selector type".into())),
+        };
 
         let selector = TrafficSelector {
             ts_type,
             ip_protocol,
-            data: &data[4..selector_length],
+            port: port_range,
+            addr: addr_range,
         };
 
         Some(Ok(selector))
@@ -2080,10 +2181,10 @@ impl fmt::Debug for Payload<'_> {
                     "    TS Type {} IP protocol {} ports {}-{} addresses {:?}-{:?}",
                     ts.ts_type,
                     ts.ip_protocol,
-                    ts.read_start_port(),
-                    ts.read_end_port(),
-                    ts.read_start_address(),
-                    ts.read_end_address(),
+                    ts.port.start(),
+                    ts.port.end(),
+                    ts.addr.start(),
+                    ts.addr.end(),
                 )?;
             }
         } else if let Ok(pl_ca) = self.to_configuration() {
