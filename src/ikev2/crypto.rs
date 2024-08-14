@@ -544,7 +544,7 @@ impl PseudorandomTransform {
                     }
                     // Following T-chunks.
                     next_data[0..hash.len()].copy_from_slice(&hash);
-                    next_data[hash.len()..hash.len() + data.len()].copy_from_slice(&data);
+                    next_data[hash.len()..hash.len() + data.len()].copy_from_slice(data);
                     next_data[hash.len() + data.len()] = t + 1;
                     hmac.update(&next_data);
                 }
@@ -952,7 +952,7 @@ pub struct EncryptionAesCbc256 {
 }
 
 impl Encryption for EncryptionAesCbc256 {
-    fn encrypt<'a>(&self, data: &'a mut [u8], msg_len: usize, _: &[u8]) -> Result<(), CryptoError> {
+    fn encrypt(&self, data: &mut [u8], msg_len: usize, _: &[u8]) -> Result<(), CryptoError> {
         let iv_size = AesCbc256Encryptor::iv_size();
         let encrypted_payload_length = self.encrypted_payload_length(msg_len);
         if data.len() < encrypted_payload_length {
@@ -1004,7 +1004,7 @@ impl Encryption for EncryptionAesCbc256 {
             Ok(data) => Ok(data),
             Err(err) => {
                 debug!("Failed to decode AES CBC 256 message: {}", err);
-                return Err("Failed to decode AES CBC 256 message".into());
+                Err("Failed to decode AES CBC 256 message".into())
             }
         }
     }
@@ -1023,9 +1023,9 @@ pub struct EncryptionAesGcm256 {
 }
 
 impl Encryption for EncryptionAesGcm256 {
-    fn encrypt<'a>(
+    fn encrypt(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<(), CryptoError> {
@@ -1089,7 +1089,7 @@ impl Encryption for EncryptionAesGcm256 {
             Ok(()) => Ok(&buffer.slice[..buffer.len]),
             Err(err) => {
                 debug!("Failed to decode AES GCM 16 256 message: {}", err);
-                return Err("Failed to decode AES GCM 16 256 message".into());
+                Err("Failed to decode AES GCM 16 256 message".into())
             }
         }
     }

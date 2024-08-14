@@ -1100,7 +1100,7 @@ impl IKEv2Session {
                 ..ctx.message_responder.len() + ctx.nonce_initiator.len()]
                 .copy_from_slice(&ctx.nonce_initiator);
             crypto_stack.authenticate_id_responder(
-                &id_responder,
+                id_responder,
                 &mut responder_signed
                     [ctx.message_responder.len() + ctx.nonce_initiator.len()..responder_signed_len],
             );

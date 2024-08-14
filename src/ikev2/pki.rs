@@ -103,12 +103,11 @@ impl PkiProcessing {
         if !certificate_date_valid(&client_cert.tbs_certificate) {
             return Err("Client certificate has invalid date".into());
         }
-        if !(client_cert
+        if client_cert
             .tbs_certificate
             .subject_public_key_info
             .algorithm
-            .oid
-            == OID_RSA_ENCRYPTION)
+            .oid != OID_RSA_ENCRYPTION
         {
             debug!(
                 "Certificate public key algorithm {} is not supported",
@@ -186,7 +185,7 @@ struct ClientValidation {
 
 impl ClientValidation {
     pub fn new(root_ca_pem: &str) -> Result<ClientValidation, CertError> {
-        let root_ca = Certificate::from_pem(&root_ca_pem)?;
+        let root_ca = Certificate::from_pem(root_ca_pem)?;
 
         let root_ca_bytes = if let Some(root_ca_bytes) = root_ca
             .tbs_certificate
@@ -233,7 +232,7 @@ impl ClientValidation {
             Some(signature) => signature,
             None => return Err("Client cert has no valid signature".into()),
         };
-        if !(client_cert.signature_algorithm.oid == OID_ECDSA_WITH_SHA_256) {
+        if client_cert.signature_algorithm.oid != OID_ECDSA_WITH_SHA_256 {
             debug!(
                 "Certificate signature algorithm {} is not supported",
                 client_cert.signature_algorithm.oid
@@ -263,10 +262,10 @@ struct ServerIdentity {
 impl ServerIdentity {
     fn new(public_cert_pem: &str, private_key_pem: &str) -> Result<ServerIdentity, CertError> {
         // TODO: if client requests cert, check if public key is signed by CA from client's CERTREQUEST.
-        let public_cert_der = Certificate::from_pem(&public_cert_pem)?;
+        let public_cert_der = Certificate::from_pem(public_cert_pem)?;
         let public_cert_der = public_cert_der.to_der()?;
 
-        let private_key = RsaPrivateKey::from_pkcs8_pem(&private_key_pem)?;
+        let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)?;
         let signature_length = private_key.size();
         let signing_key = pkcs1v15::SigningKey::<Sha1>::new(private_key);
         Ok(ServerIdentity {

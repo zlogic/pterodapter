@@ -528,13 +528,8 @@ impl MessageWriter<'_> {
             IpAddr::V4(_) => 4 + 4,
             IpAddr::V6(_) => 4 + 17,
         };
-        let config_length = if addr.is_ipv4() {
-            addr_length
-        } else {
-            addr_length
-        };
         let next_payload_slice =
-            self.next_payload_slice(PayloadType::CONFIGURATION, 4 + config_length)?;
+            self.next_payload_slice(PayloadType::CONFIGURATION, 4 + addr_length)?;
         next_payload_slice[0] = ConfigurationType::CFG_REPLY.0;
 
         // Write IP address.
