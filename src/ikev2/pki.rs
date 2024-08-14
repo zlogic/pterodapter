@@ -1,9 +1,25 @@
 use std::{error, fmt};
 
+use der::{oid, Decode, DecodePem, Encode};
 use log::debug;
-use openssl::{asn1, hash, nid, pkey, sign, x509};
+use p256::ecdsa::{self, DerSignature};
+use rsa::{
+    pkcs1v15,
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
+    signature::{SignatureEncoding, Signer, Verifier},
+    traits::PublicKeyParts,
+    RsaPrivateKey, RsaPublicKey,
+};
+use sha1::{Digest, Sha1};
+use x509_cert::{certificate, Certificate};
 
 use super::message;
+
+// Simpler than importing the const-oid crate.
+const OID_ECDSA_WITH_SHA_256: oid::ObjectIdentifier =
+    oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+const OID_RSA_ENCRYPTION: oid::ObjectIdentifier =
+    oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 
 #[derive(Clone)]
 pub struct PkiProcessing {
@@ -83,52 +99,46 @@ impl PkiProcessing {
         &self,
         client_cert_der: &[u8],
     ) -> Result<ClientCertificate, CertError> {
-        let client_cert = x509::X509::from_der(client_cert_der)?;
-        if !certificate_date_valid(&client_cert) {
+        let client_cert = Certificate::from_der(client_cert_der)?;
+        if !certificate_date_valid(&client_cert.tbs_certificate) {
             return Err("Client certificate has invalid date".into());
+        }
+        if !(client_cert
+            .tbs_certificate
+            .subject_public_key_info
+            .algorithm
+            .oid
+            == OID_RSA_ENCRYPTION)
+        {
+            debug!(
+                "Certificate public key algorithm {} is not supported",
+                client_cert
+                    .tbs_certificate
+                    .subject_public_key_info
+                    .algorithm
+                    .oid
+            );
+            return Err("Certificate public key algorithm is not supported".into());
         }
 
         if let Some(client_validation) = &self.client_validation {
             client_validation.verify_cert(&client_cert)?;
         }
-        let public_key = client_cert.public_key()?;
 
-        if !(public_key.id() == pkey::Id::RSA) {
-            debug!(
-                "Certificate public key algorithm {} is not supported",
-                public_key.id().as_raw()
-            );
-            return Err("Certificate public key algorithm is not supported".into());
-        }
+        let subject = client_cert.tbs_certificate.subject.to_string();
+        let public_key_bytes = if let Ok(public_key_bytes) =
+            client_cert.tbs_certificate.subject_public_key_info.to_der()
+        {
+            public_key_bytes
+        } else {
+            return Err("Certificate has no valid public key".into());
+        };
 
-        let subject_email = if let Some(sans) = client_cert.subject_alt_names() {
-            sans.iter()
-                .filter_map(|san| Some(san.email()?.to_string()))
-                .next()
-        } else {
-            None
-        };
-        let subject_cn = client_cert
-            .subject_name()
-            .entries()
-            .filter_map(|entry| {
-                if entry.object().nid() == nid::Nid::COMMONNAME {
-                    Some(entry.data().as_utf8().ok()?.to_string())
-                } else {
-                    None
-                }
-            })
-            .next();
-        let subject = if subject_email.is_some() {
-            subject_email
-        } else if subject_cn.is_some() {
-            subject_cn
-        } else {
-            None
-        };
+        let public_key = RsaPublicKey::from_public_key_der(&public_key_bytes)?;
+        let verifying_key = pkcs1v15::VerifyingKey::new(public_key);
 
         Ok(ClientCertificate {
-            public_key,
+            verifying_key,
             subject,
         })
     }
@@ -151,44 +161,48 @@ impl PkiProcessing {
 }
 
 pub struct ClientCertificate {
-    public_key: pkey::PKey<pkey::Public>,
-    subject: Option<String>,
+    verifying_key: pkcs1v15::VerifyingKey<Sha1>,
+    subject: String,
 }
 
 impl ClientCertificate {
-    pub fn subject(&self) -> Option<&str> {
-        self.subject.as_deref()
+    pub fn subject(&self) -> &str {
+        self.subject.as_str()
     }
 
     pub fn verify_signature(&self, msg: &[u8], signature: &[u8]) -> Result<(), CertError> {
-        let mut verifier = sign::Verifier::new(hash::MessageDigest::sha1(), &self.public_key)?;
-        if !verifier.verify_oneshot(signature, msg)? {
-            Err("Signature verification failed".into())
-        } else {
-            Ok(())
-        }
+        let signature = pkcs1v15::Signature::try_from(signature)?;
+        self.verifying_key.verify(msg, &signature)?;
+        Ok(())
     }
 }
 
 #[derive(Clone)]
 struct ClientValidation {
-    root_ca: x509::X509,
+    root_ca: Certificate,
     root_ca_request: [u8; 20],
-    public_key: pkey::PKey<pkey::Public>,
+    public_key: ecdsa::VerifyingKey,
 }
 
 impl ClientValidation {
     pub fn new(root_ca_pem: &str) -> Result<ClientValidation, CertError> {
-        let root_ca = x509::X509::from_pem(root_ca_pem.as_bytes())?;
+        let root_ca = Certificate::from_pem(&root_ca_pem)?;
 
-        let public_key = root_ca.public_key()?;
+        let root_ca_bytes = if let Some(root_ca_bytes) = root_ca
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .as_bytes()
+        {
+            root_ca_bytes
+        } else {
+            return Err("Root ca has invalid public key".into());
+        };
+        let public_key = ecdsa::VerifyingKey::try_from(root_ca_bytes)?;
 
-        let mut root_ca_request = [0u8; 20];
-        hash::hash_xof(
-            hash::MessageDigest::sha1(),
-            public_key.public_key_to_der()?.as_slice(),
-            &mut root_ca_request,
-        )?;
+        let mut hasher = Sha1::new();
+        hasher.update(root_ca.tbs_certificate.subject_public_key_info.to_der()?);
+        let root_ca_request = hasher.finalize().into();
 
         Ok(ClientValidation {
             root_ca,
@@ -201,20 +215,38 @@ impl ClientValidation {
         &self.root_ca_request
     }
 
-    fn verify_cert(&self, client_cert: &x509::X509) -> Result<(), CertError> {
-        if !certificate_date_valid(&self.root_ca) {
+    fn verify_cert(&self, client_cert: &Certificate) -> Result<(), CertError> {
+        if client_cert.tbs_certificate.issuer != self.root_ca.tbs_certificate.subject {
+            // This is probably unnecessary, just a quick check here.
+            debug!(
+                "Certificate is signed by {}, expecting {}",
+                client_cert.tbs_certificate.subject, self.root_ca.tbs_certificate.issuer
+            );
+            return Err("Certificate signed by another issuer".into());
+        };
+        if !certificate_date_valid(&self.root_ca.tbs_certificate) {
             return Err("Root CA certificate has invalid date".into());
         }
 
-        if !client_cert.verify(&self.public_key)? {
-            return Err("Certificate verification failed".into());
-        }
-        if self.root_ca.issued(client_cert) != x509::X509VerifyResult::OK {
-            return Err("Certificate was not issued by the root CA".into());
-        }
+        let signed_data = client_cert.tbs_certificate.to_der()?;
+        let signature = match client_cert.signature.as_bytes() {
+            Some(signature) => signature,
+            None => return Err("Client cert has no valid signature".into()),
+        };
+        if !(client_cert.signature_algorithm.oid == OID_ECDSA_WITH_SHA_256) {
+            debug!(
+                "Certificate signature algorithm {} is not supported",
+                client_cert.signature_algorithm.oid
+            );
+            return Err("Certificate signature algorithm is not supported".into());
+        };
+        let signature = DerSignature::try_from(signature)?;
+        self.public_key.verify(&signed_data, &signature)?;
         /* TODO: check the following extensions:
-        - Subject Alternative Name (OID 2.5.29.17) (matches root CA limitations)
+        - Subject Alternative Name (OID 2.5.29.17)
         - Enhanced Key Usage (OID 2.5.29.37)
+        Each needs a custom DecodeValue trait/implementation for the der crate;
+        most likely with a #[derive(Choice)] annotation.
         */
 
         Ok(())
@@ -225,21 +257,22 @@ impl ClientValidation {
 struct ServerIdentity {
     public_cert_der: Vec<u8>,
     signature_length: usize,
-    private_key: pkey::PKey<pkey::Private>,
+    signing_key: pkcs1v15::SigningKey<Sha1>,
 }
 
 impl ServerIdentity {
     fn new(public_cert_pem: &str, private_key_pem: &str) -> Result<ServerIdentity, CertError> {
         // TODO: if client requests cert, check if public key is signed by CA from client's CERTREQUEST.
-        let public_cert_der = x509::X509::from_pem(public_cert_pem.as_bytes())?;
+        let public_cert_der = Certificate::from_pem(&public_cert_pem)?;
         let public_cert_der = public_cert_der.to_der()?;
 
-        let private_key = pkey::PKey::private_key_from_pem(private_key_pem.as_bytes())?;
+        let private_key = RsaPrivateKey::from_pkcs8_pem(&private_key_pem)?;
         let signature_length = private_key.size();
+        let signing_key = pkcs1v15::SigningKey::<Sha1>::new(private_key);
         Ok(ServerIdentity {
             public_cert_der,
             signature_length,
-            private_key,
+            signing_key,
         })
     }
 
@@ -248,34 +281,37 @@ impl ServerIdentity {
     }
 
     fn sign_message(&self, msg: &[u8], dest: &mut [u8]) -> Result<(), CertError> {
-        let mut signer = sign::Signer::new(hash::MessageDigest::sha1(), &self.private_key)?;
-        signer.sign_oneshot(dest, msg)?;
+        let signature = self.signing_key.try_sign(msg)?;
+        dest.copy_from_slice(&signature.to_bytes());
         Ok(())
     }
 }
 
-fn certificate_date_valid(cert: &x509::X509) -> bool {
-    let time_now = match asn1::Asn1Time::days_from_now(0) {
-        Ok(time) => time,
-        Err(err) => {
-            debug!("Failed to get current time in ASN format: {}", err);
-            return false;
-        }
-    };
-    cert.not_before() < time_now && cert.not_after() > time_now
+fn certificate_date_valid(cert: &certificate::TbsCertificateInner) -> bool {
+    let time_now = std::time::SystemTime::now();
+    cert.validity.not_before.to_system_time() < time_now
+        && cert.validity.not_after.to_system_time() > time_now
 }
 
 #[derive(Debug)]
 pub enum CertError {
     Internal(&'static str),
-    OpenSSL(openssl::error::ErrorStack),
+    Pkcs8(rsa::pkcs8::Error),
+    Rsa(rsa::Error),
+    Der(der::Error),
+    Ecdsa(p256::ecdsa::Error),
+    Spki(x509_cert::spki::Error),
 }
 
 impl fmt::Display for CertError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::OpenSSL(ref e) => write!(f, "OpenSSL error: {}", e),
+            Self::Pkcs8(ref e) => write!(f, "Decode error: {}", e),
+            Self::Rsa(ref e) => write!(f, "Signature verification error: {}", e),
+            Self::Der(ref e) => write!(f, "Decode error: {}", e),
+            Self::Ecdsa(ref e) => write!(f, "Decode error: {}", e),
+            Self::Spki(ref e) => write!(f, "Decode error: {}", e),
         }
     }
 }
@@ -284,7 +320,11 @@ impl error::Error for CertError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             Self::Internal(_msg) => None,
-            Self::OpenSSL(ref err) => Some(err),
+            Self::Pkcs8(ref err) => Some(err),
+            Self::Rsa(ref err) => Some(err),
+            Self::Der(ref err) => Some(err),
+            Self::Ecdsa(ref err) => Some(err),
+            Self::Spki(ref err) => Some(err),
         }
     }
 }
@@ -295,8 +335,32 @@ impl From<&'static str> for CertError {
     }
 }
 
-impl From<openssl::error::ErrorStack> for CertError {
-    fn from(err: openssl::error::ErrorStack) -> CertError {
-        Self::OpenSSL(err)
+impl From<rsa::pkcs8::Error> for CertError {
+    fn from(err: rsa::pkcs8::Error) -> CertError {
+        Self::Pkcs8(err)
+    }
+}
+
+impl From<rsa::Error> for CertError {
+    fn from(err: rsa::Error) -> CertError {
+        Self::Rsa(err)
+    }
+}
+
+impl From<der::Error> for CertError {
+    fn from(err: der::Error) -> CertError {
+        Self::Der(err)
+    }
+}
+
+impl From<p256::ecdsa::Error> for CertError {
+    fn from(err: p256::ecdsa::Error) -> CertError {
+        Self::Ecdsa(err)
+    }
+}
+
+impl From<x509_cert::spki::Error> for CertError {
+    fn from(err: x509_cert::spki::Error) -> CertError {
+        Self::Spki(err)
     }
 }

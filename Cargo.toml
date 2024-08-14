@@ -15,12 +15,24 @@ rustls-platform-verifier = { version = "0.3", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 smoltcp = { version = "0.11", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
-openssl = { version = "0.10", optional = true, default-features = false }
+
+sha1 = { version = "0.10", optional = true, default-features = false, features = ["oid"] }
+p256 = { version = "0.13", optional = true, default-features = false, features = ["arithmetic", "ecdsa"] }
+hmac = { version = "0.12", optional = true, default-features = false, features = ["reset"] }
+sha2 = { version = "0.10", optional = true, default-features = false }
+aes = { version = "0.8", optional = true, default-features = false }
+aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes"] }
+crypto-bigint = { version = "*", optional = true, default-features = false, features = ["rand"] }
+der = { version = "*", optional = true, default-features = false }
+x509-cert = { version = "*", optional = true, default-features = false, features = ["pem", "std"] }
+rsa = { version = "*", optional = true, default-features = false, features = ["pem", "std"] }
+cipher = { version = "*", optional = true, default-features = false, features = ["block-padding"] }
+cbc = { version = "*", optional = true, default-features = false }
 
 [features]
-default = ["proxy"]
-proxy = ["dep:smoltcp"]
-ikev2 = ["dep:openssl"]
+default = ["proxy", "ikev2"]
+proxy = ["smoltcp"]
+ikev2 = ["sha1", "p256", "hmac", "sha2", "aes", "aes-gcm", "crypto-bigint", "der", "x509-cert", "rsa", "cipher", "cbc"]
 
 [profile.release]
 strip = true
