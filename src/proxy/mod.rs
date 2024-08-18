@@ -13,7 +13,9 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use crate::{http, network};
+use crate::http;
+
+pub mod network;
 
 pub struct Config {
     pub listen_addr: SocketAddr,

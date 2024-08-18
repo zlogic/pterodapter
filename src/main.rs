@@ -17,8 +17,6 @@ mod logger;
 mod ppp;
 
 #[cfg(feature = "proxy")]
-mod network;
-#[cfg(feature = "proxy")]
 mod proxy;
 
 #[cfg(feature = "ikev2")]
@@ -332,11 +330,13 @@ fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
             1
         })?;
     let cancel_flag = Arc::new(atomic::AtomicBool::new(false));
-    let mut client = network::Network::new(forti_client, command_receiver, cancel_flag.clone())
-        .map_err(|err| {
-            eprintln!("Failed to start virtual network interface: {}", err);
-            1
-        })?;
+    let mut client =
+        proxy::network::Network::new(forti_client, command_receiver, cancel_flag.clone()).map_err(
+            |err| {
+                eprintln!("Failed to start virtual network interface: {}", err);
+                1
+            },
+        )?;
 
     let cancel_handle = rt.spawn(async move {
         if let Err(err) = signal::ctrl_c().await {
