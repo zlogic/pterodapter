@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, signal, sync::mpsc, task::JoinHandle};
+use tokio::{net::UdpSocket, runtime, sync::mpsc, task::JoinHandle};
 
 mod crypto;
 mod message;
@@ -41,6 +41,7 @@ pub struct Config {
 pub struct Server {
     listen_ips: Vec<IpAddr>,
     pki_processing: Arc<pki::PkiProcessing>,
+    handles: Vec<JoinHandle<Result<(), IKEv2Error>>>,
 }
 
 impl Server {
@@ -56,6 +57,7 @@ impl Server {
         Ok(Server {
             listen_ips: config.listen_ips,
             pki_processing: Arc::new(pki_processing),
+            handles: vec![],
         })
     }
 
@@ -97,21 +99,16 @@ impl Server {
         }
     }
 
-    async fn wait_termination(
-        handles: Vec<JoinHandle<Result<(), IKEv2Error>>>,
-    ) -> Result<(), IKEv2Error> {
-        signal::ctrl_c().await?;
-        handles.iter().for_each(|handle| handle.abort());
+    pub fn terminate(&mut self) -> Result<(), IKEv2Error> {
+        // TODO: send command to Sessions to Delete all IKE sessions.
+        self.handles.iter().for_each(|handle| handle.abort());
         Ok(())
     }
 
-    pub fn run(&self) -> Result<(), IKEv2Error> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()?;
-        let sockets = rt.block_on(Sockets::new(&self.listen_ips))?;
+    pub async fn start(&mut self) -> Result<(), IKEv2Error> {
+        let sockets = Arc::new(Sockets::new(&self.listen_ips).await?);
         let sessions = Sessions::new(self.pki_processing.clone(), sockets.clone());
+        let rt = runtime::Handle::current();
         let mut handles = sockets
             .iter_sockets()
             .map(|(listen_addr, socket)| {
@@ -130,15 +127,10 @@ impl Server {
             let mut sessions = sessions;
             sessions.process_messages().await
         }));
-        rt.block_on(Server::wait_termination(handles))?;
-        rt.shutdown_timeout(Duration::from_secs(60));
-
-        info!("Stopped server");
         Ok(())
     }
 }
 
-#[derive(Clone)]
 struct Sockets {
     sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
 }
@@ -261,7 +253,7 @@ enum SessionMessage {
 
 struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
-    sockets: Sockets,
+    sockets: Arc<Sockets>,
     sessions: HashMap<SessionID, IKEv2Session>,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
     tx: mpsc::Sender<SessionMessage>,
@@ -269,7 +261,7 @@ struct Sessions {
 }
 
 impl Sessions {
-    fn new(pki_processing: Arc<pki::PkiProcessing>, sockets: Sockets) -> Sessions {
+    fn new(pki_processing: Arc<pki::PkiProcessing>, sockets: Arc<Sockets>) -> Sessions {
         let (tx, rx) = mpsc::channel(100);
         Sessions {
             pki_processing,

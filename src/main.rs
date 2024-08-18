@@ -363,18 +363,49 @@ fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
 
 #[cfg(feature = "ikev2")]
 fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
+    use tokio::sync::oneshot;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|err| {
+            eprintln!("Failed to start runtime: {}", err);
+            1
+        })?;
     // TODO: init FortiVPN client connection here.
-    let server = match ikev2::Server::new(config.ikev2) {
+    let mut server = match ikev2::Server::new(config.ikev2) {
         Ok(server) => server,
         Err(err) => {
-            println!("Failed to create server, error is {}", err);
+            eprintln!("Failed to create server: {}", err);
             std::process::exit(1)
         }
     };
-    server.run().map_err(|err| {
+    rt.block_on(server.start()).map_err(|err| {
         eprintln!("Failed to run server: {}", err);
         1
     })?;
+    let cancel_flag = Arc::new(atomic::AtomicBool::new(false));
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let cancel_handle = rt.spawn(async move {
+        if let Err(err) = signal::ctrl_c().await {
+            eprintln!("Failed to wait for CTRL+C signal: {}", err);
+        }
+        cancel_flag.store(true, atomic::Ordering::Relaxed);
+        let _ = shutdown_sender.send(());
+    });
+    rt.block_on(async move {
+        let _ = shutdown_receiver.await;
+    });
+
+    if let Err(err) = server.terminate() {
+        eprintln!("Failed to terminate server: {}", err);
+    };
+
+    cancel_handle.abort();
+    rt.shutdown_timeout(Duration::from_secs(60));
+
+    info!("Stopped server");
     Ok(())
 }
 
