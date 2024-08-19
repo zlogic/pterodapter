@@ -622,11 +622,12 @@ impl IKEv2Session {
             message::ExchangeType::IKE_SA_INIT => {
                 self.process_sa_init_message(session_id, request, response)
             }
-            message::ExchangeType::IKE_AUTH => {
-                self.process_auth_message(session_id, request, response)
-            }
+            message::ExchangeType::IKE_AUTH => self.process_auth_message(request, response),
             message::ExchangeType::INFORMATIONAL => {
-                self.process_informational_message(session_id, request, response)
+                self.process_informational_message(request, response)
+            }
+            message::ExchangeType::CREATE_CHILD_SA => {
+                self.process_create_child_sa_message(request, response)
             }
             _ => {
                 debug!("Unimplemented handler for message {}", exchange_type);
@@ -688,8 +689,8 @@ impl IKEv2Session {
         match crypto_stack.decrypt_data(decrypted_data, encrypted_data_len, associated_data) {
             Ok(decrypted_slice) => Ok(decrypted_slice),
             Err(err) => {
-                debug!("Failed to decrypt data {}", err);
-                Err("Failed to decrypt data {}".into())
+                debug!("Failed to decrypt data: {}", err);
+                Err("Failed to decrypt data".into())
             }
         }
     }
@@ -956,7 +957,6 @@ impl IKEv2Session {
 
     fn process_auth_message(
         &mut self,
-        session_id: SessionID,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
@@ -1300,7 +1300,6 @@ impl IKEv2Session {
 
     fn process_informational_message(
         &mut self,
-        session_id: SessionID,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
@@ -1343,7 +1342,60 @@ impl IKEv2Session {
             }
         }
 
-        Ok(response.complete_message())
+        // For now, no data is processed.
+        response.start_encrypted_payload()?;
+
+        self.complete_encrypted_payload(response)
+    }
+
+    fn process_create_child_sa_message(
+        &mut self,
+        request: &message::InputMessage,
+        response: &mut message::MessageWriter,
+    ) -> Result<usize, IKEv2Error> {
+        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
+        let mut decrypted_iter = None;
+
+        for payload in request.iter_payloads() {
+            let payload = if let Ok(payload) = payload {
+                payload
+            } else {
+                // TODO: return INVALID_SYNTAX notification.
+                continue;
+            };
+            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
+                let encrypted_payload = payload.encrypted_data()?;
+                let decrypted_slice = self.process_encrypted_payload(
+                    request,
+                    &encrypted_payload,
+                    &mut decrypted_data,
+                )?;
+                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
+            }
+        }
+
+        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
+            decrypted_iter
+        } else {
+            // TODO: return INVALID_SYNTAX notification.
+            // INFORMATIONAL payload is supposed to have an encrypted payload.
+            return Ok(response.complete_message());
+        };
+        for pl in decrypted_iter {
+            match pl {
+                Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
+                Err(err) => {
+                    debug!("Failed to read decrypted payload data {}", err);
+                    // TODO: return error notification.
+                    continue;
+                }
+            }
+        }
+
+        // For now, no data is processed.
+        response.start_encrypted_payload()?;
+
+        self.complete_encrypted_payload(response)
     }
 }
 

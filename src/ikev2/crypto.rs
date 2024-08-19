@@ -1048,7 +1048,7 @@ impl PaddingType {
             Self::IKEv2 => data[data.len() - 1] + 1,
             Self::Esp => data[data.len() - 2] + 2,
         } as usize;
-        if data.len() > padding_length {
+        if data.len() >= padding_length {
             Ok(&data[..data.len() - padding_length])
         } else {
             Err("Padding exceeds message size".into())
