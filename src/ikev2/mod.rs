@@ -1462,7 +1462,7 @@ impl SecurityAssociation {
         }
         let mut sequence_id = [0u8; 4];
         sequence_id.copy_from_slice(&data[4..8]);
-        // TODO: validate that sequence ID is not reused (sliding window?)
+        // TODO: validate that sequence ID is not reused, as defined in https://datatracker.ietf.org/doc/html/rfc6479
         let sequence_id = u32::from_be_bytes(sequence_id);
         let signed_data_len = data.len() - self.signature_length;
         let valid_signature = self.crypto_stack.validate_signature(data);
