@@ -186,7 +186,7 @@ impl Args {
             } else if action_type == ActionType::IkeV2 && name == "--id-hostname" {
                 id_hostname = Some(value.into());
             } else if action_type == ActionType::IkeV2 && name == "--cacert" {
-                match fs::read_to_string(value) {
+                match fs::read(value) {
                     Ok(cert) => root_ca = Some(cert),
                     Err(err) => fail_with_error(
                         name,
@@ -195,7 +195,7 @@ impl Args {
                     ),
                 };
             } else if action_type == ActionType::IkeV2 && name == "--cert" {
-                match fs::read_to_string(value) {
+                match fs::read(value) {
                     Ok(cert) => public_cert = Some(cert),
                     Err(err) => fail_with_error(
                         name,
@@ -414,7 +414,7 @@ fn main() {
         "Pterodapter version {}",
         option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
     );
-    if rustls::crypto::ring::default_provider()
+    if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .is_err()
     {

@@ -34,8 +34,8 @@ const IKE_RESPONSE_EXPIRATION: Duration = Duration::from_secs(60);
 pub struct Config {
     pub listen_ips: Vec<IpAddr>,
     pub hostname: Option<String>,
-    pub root_ca: Option<String>,
-    pub server_cert: Option<(String, String)>,
+    pub root_ca: Option<Vec<u8>>,
+    pub server_cert: Option<(Vec<u8>, String)>,
 }
 
 pub struct Server {
@@ -52,7 +52,7 @@ impl Server {
             config
                 .server_cert
                 .as_ref()
-                .map(|(public_cert, private_key)| (public_cert.as_str(), private_key.as_str())),
+                .map(|(public_cert, private_key)| (public_cert.as_ref(), private_key.as_str())),
         )?;
         Ok(Server {
             listen_ips: config.listen_ips,
