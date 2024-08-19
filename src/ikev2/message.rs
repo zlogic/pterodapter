@@ -525,7 +525,7 @@ impl MessageWriter<'_> {
 
     pub fn write_configuration_payload(&mut self, addr: IpAddr) -> Result<(), NotEnoughSpaceError> {
         let addr_length = match addr {
-            IpAddr::V4(_) => 4 + 4,
+            IpAddr::V4(_) => (4 + 4) * 2,
             IpAddr::V6(_) => 4 + 17,
         };
         let next_payload_slice =
@@ -534,21 +534,36 @@ impl MessageWriter<'_> {
 
         // Write IP address.
         let data = &mut next_payload_slice[4..4 + addr_length];
-        let attribute_type = match addr {
+        match addr {
             IpAddr::V4(addr) => {
+                data[0..2].copy_from_slice(
+                    &ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
+                        .0
+                        .to_be_bytes(),
+                );
                 data[2..4].copy_from_slice(&4u16.to_be_bytes());
                 data[4..8].copy_from_slice(&addr.octets());
-                ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
+                // Assume only current address can be reached.
+                data[8..10].copy_from_slice(
+                    &ConfigurationAttributeType::INTERNAL_IP4_NETMASK
+                        .0
+                        .to_be_bytes(),
+                );
+                data[10..12].copy_from_slice(&4u16.to_be_bytes());
+                data[12..16].fill_with(|| 255);
             }
             IpAddr::V6(addr) => {
+                data[0..2].copy_from_slice(
+                    &ConfigurationAttributeType::INTERNAL_IP6_ADDRESS
+                        .0
+                        .to_be_bytes(),
+                );
                 data[2..4].copy_from_slice(&17u16.to_be_bytes());
                 data[4..20].copy_from_slice(&addr.octets());
-                // Assume that only one IP address can be used.
+                // Assume only current address can be reached.
                 data[20] = 128;
-                ConfigurationAttributeType::INTERNAL_IP6_ADDRESS
             }
         };
-        data[0..2].copy_from_slice(&attribute_type.0.to_be_bytes());
 
         Ok(())
     }
@@ -1789,6 +1804,15 @@ impl TrafficSelector {
 
     pub fn port_range(&self) -> &RangeInclusive<u16> {
         &self.port
+    }
+
+    pub fn set_to_address(&mut self, addr: IpAddr) -> Result<(), FormatError> {
+        if self.addr.contains(&addr) {
+            self.addr = addr..=addr;
+            Ok(())
+        } else {
+            Err("Narrowed address doesn't fit range".into())
+        }
     }
 }
 

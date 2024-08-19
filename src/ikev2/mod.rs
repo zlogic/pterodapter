@@ -213,6 +213,47 @@ impl SessionID {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SecurityAssociationID {
+    remote_spi: u32,
+    local_spi: u32,
+    remote_addr: SocketAddr,
+}
+
+impl PartialEq for SecurityAssociationID {
+    fn eq(&self, other: &Self) -> bool {
+        // Ignore remote SPI, as ESP packets only include destination SPI.
+        self.local_spi == other.local_spi && self.remote_addr == other.remote_addr
+    }
+}
+
+impl Eq for SecurityAssociationID {}
+
+impl Hash for SecurityAssociationID {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.local_spi.hash(state);
+        self.remote_addr.hash(state);
+    }
+}
+
+impl SecurityAssociationID {
+    fn from_transform_params(
+        remote_addr: SocketAddr,
+        transform_params: &crypto::TransformParameters,
+    ) -> Result<SecurityAssociationID, IKEv2Error> {
+        match (transform_params.remote_spi(), transform_params.local_spi()) {
+            (message::Spi::U32(remote_spi), message::Spi::U32(local_spi)) => {
+                Ok(SecurityAssociationID {
+                    remote_spi,
+                    local_spi,
+                    remote_addr,
+                })
+            }
+            _ => Err("Security Association has unsupported SPI types".into()),
+        }
+    }
+}
+
 struct UdpDatagram {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
@@ -221,11 +262,7 @@ struct UdpDatagram {
 
 impl UdpDatagram {
     fn is_non_esp(&self) -> bool {
-        self.request.len() >= 4
-            && self.request[0] == 0x00
-            && self.request[1] == 0x00
-            && self.request[2] == 0x00
-            && self.request[3] == 0x00
+        self.request.len() >= 4 && self.request[0..4] == [0x00, 0x00, 0x00, 0x00]
     }
 
     fn is_ikev2(&self) -> bool {
@@ -255,6 +292,7 @@ struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Arc<Sockets>,
     sessions: HashMap<SessionID, IKEv2Session>,
+    security_associations: HashMap<SecurityAssociationID, SecurityAssociation>,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
     tx: mpsc::Sender<SessionMessage>,
     rx: mpsc::Receiver<SessionMessage>,
@@ -267,6 +305,7 @@ impl Sessions {
             pki_processing,
             sockets,
             sessions: HashMap::new(),
+            security_associations: HashMap::new(),
             half_sessions: HashMap::new(),
             tx,
             rx,
@@ -343,7 +382,7 @@ impl Sessions {
         while let Some(message) = self.rx.recv().await {
             match message {
                 SessionMessage::UdpDatagram(mut datagram) => {
-                    if let Err(err) = self.process_message(&mut datagram).await {
+                    if let Err(err) = self.process_datagram(&mut datagram).await {
                         warn!(
                             "Failed to process message from {}: {}",
                             datagram.remote_addr, err
@@ -358,14 +397,18 @@ impl Sessions {
         Ok(())
     }
 
-    async fn process_message(&mut self, datagram: &mut UdpDatagram) -> Result<(), IKEv2Error> {
-        if !datagram.is_ikev2() {
-            debug!(
-                "Received ESP packet from {}\n{:?}",
-                datagram.remote_addr, datagram.request
-            );
-            return Ok(());
+    async fn process_datagram(&mut self, datagram: &mut UdpDatagram) -> Result<(), IKEv2Error> {
+        if datagram.is_ikev2() {
+            self.process_ikev2_message(datagram).await
+        } else {
+            self.process_esp_packet(datagram).await
         }
+    }
+
+    async fn process_ikev2_message(
+        &mut self,
+        datagram: &mut UdpDatagram,
+    ) -> Result<(), IKEv2Error> {
         let request_bytes = datagram.ikev2_data();
         let ikev2_request = message::InputMessage::from_datagram(request_bytes)?;
         if !ikev2_request.is_valid() {
@@ -419,7 +462,72 @@ impl Sessions {
                 .await?;
         }
 
+        self.process_pending_actions(session_id);
+
         Ok(())
+    }
+
+    fn process_pending_actions(&mut self, session_id: SessionID) {
+        let session = if let Some(session_id) = self.sessions.get_mut(&session_id) {
+            session_id
+        } else {
+            debug!(
+                "Failed to find IKEv2 session {:x}-{:x} to process pending actions",
+                session_id.remote_spi, session_id.local_spi
+            );
+            return;
+        };
+
+        session
+            .pending_actions
+            .drain(..)
+            .for_each(|action| match action {
+                IKEv2PendingAction::CreateChildSA(mut session_id, security_association) => {
+                    session_id.remote_addr = session.remote_addr;
+                    self.security_associations
+                        .insert(session_id, security_association);
+                }
+            })
+    }
+
+    async fn process_esp_packet(&mut self, datagram: &mut UdpDatagram) -> Result<(), IKEv2Error> {
+        let packet_bytes = datagram.request.as_mut_slice();
+        if packet_bytes == [0xff] {
+            debug!("Received ESP NAT keepalive from {}", datagram.remote_addr);
+            return self
+                .sockets
+                .send_datagram(&datagram.local_addr, &datagram.remote_addr, &[0xff])
+                .await;
+        }
+        debug!(
+            "Received ESP packet from {}\n{:?}",
+            datagram.remote_addr, packet_bytes,
+        );
+        if packet_bytes.len() < 8 {
+            return Err("Not enough data in ESP packet".into());
+        }
+        let mut local_spi = [0u8; 4];
+        local_spi.copy_from_slice(&packet_bytes[0..4]);
+        let local_spi = u32::from_be_bytes(local_spi);
+        let sa_id = SecurityAssociationID {
+            remote_spi: 0,
+            local_spi,
+            remote_addr: datagram.remote_addr,
+        };
+        if let Some(sa) = self.security_associations.get(&sa_id) {
+            let decrypted_data = sa.handle_esp(packet_bytes)?;
+            debug!(
+                "Decrypted ESP packet from {}\n{:?}",
+                datagram.remote_addr, decrypted_data
+            );
+            Ok(())
+        } else {
+            debug!(
+                "Security Association {:x} from {} not found",
+                local_spi, datagram.remote_addr
+            );
+            Err("Security Association not found".into())
+        }
     }
 }
 
@@ -437,6 +545,10 @@ enum SessionState {
     Established,
 }
 
+enum IKEv2PendingAction {
+    CreateChildSA(SecurityAssociationID, SecurityAssociation),
+}
+
 struct IKEv2Session {
     remote_addr: SocketAddr,
     state: SessionState,
@@ -448,6 +560,7 @@ struct IKEv2Session {
     last_update: Instant,
     last_message_id: u32,
     last_response: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
+    pending_actions: Vec<IKEv2PendingAction>,
 }
 
 impl IKEv2Session {
@@ -467,6 +580,7 @@ impl IKEv2Session {
             last_update: Instant::now(),
             last_message_id: 0,
             last_response: None,
+            pending_actions: vec![],
         }
     }
 
@@ -506,7 +620,7 @@ impl IKEv2Session {
 
         let response_length = match exchange_type {
             message::ExchangeType::IKE_SA_INIT => {
-                self.process_sa_init_message(session_id, remote_addr, request, response)
+                self.process_sa_init_message(session_id, request, response)
             }
             message::ExchangeType::IKE_AUTH => {
                 self.process_auth_message(session_id, request, response)
@@ -531,6 +645,9 @@ impl IKEv2Session {
             self.last_response = Some(last_response);
         };
         self.last_message_id = message_id;
+
+        // Update remote address if client changed IP or switched to another NAT port.
+        self.remote_addr = remote_addr;
 
         Ok(response_length)
     }
@@ -633,7 +750,6 @@ impl IKEv2Session {
     fn process_sa_init_message(
         &mut self,
         session_id: SessionID,
-        remote_addr: SocketAddr,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
@@ -797,8 +913,8 @@ impl IKEv2Session {
         let nat_ip = nat_detection_ip(
             request.read_initiator_spi(),
             request.read_responder_spi(),
-            remote_addr.ip(),
-            remote_addr.port(),
+            self.remote_addr.ip(),
+            self.remote_addr.port(),
         );
         response.write_notify_payload(
             None,
@@ -987,7 +1103,10 @@ impl IKEv2Session {
                             debug!("Failed to decode initiator traffic selectors: {}", err);
                             err
                         });
-                    if let Ok(ts) = ts {
+                    if let Ok(mut ts) = ts {
+                        ts.retain(|ts| {
+                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
+                        });
                         ts_remote = ts
                     }
                 }
@@ -1000,7 +1119,10 @@ impl IKEv2Session {
                             debug!("Failed to decode responder traffic selectors: {}", err);
                             err
                         });
-                    if let Ok(ts) = ts {
+                    if let Ok(mut ts) = ts {
+                        ts.retain(|ts| {
+                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
+                        });
                         ts_local = ts
                     }
                 }
@@ -1047,6 +1169,28 @@ impl IKEv2Session {
             // TODO: return TS_UNACCEPTABLE notification.
             return Err("No traffic selectors offered by client".into());
         }
+        // TODO: use the client's IP address.
+        if let Err(err) = ts_local
+            .iter_mut()
+            .try_for_each(|ts| ts.set_to_address(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))))
+        {
+            // TODO: return TS_UNACCEPTABLE notification.
+            debug!("Failed to narrow traffic selector: {}", err);
+            return Err("Failed to narrow traffic selector".into());
+        }
+
+        let local_spi = message::Spi::U32(rand::thread_rng().gen::<u32>());
+        transform_params.set_local_spi(local_spi);
+        let sa_session_id =
+            match SecurityAssociationID::from_transform_params(self.remote_addr, &transform_params)
+            {
+                Ok(sa_session_id) => sa_session_id,
+                Err(err) => {
+                    // TODO: return NO_PROPOSAL_CHOSEN notification.
+                    debug!("Transform has unsupporeted SPI for child SA: {}", err);
+                    return Err("Transform has unsupporeted SPI for child SA".into());
+                }
+            };
 
         let initiator_signed_len =
             ctx.message_initiator.len() + ctx.nonce_responder.len() + prf_key_len;
@@ -1109,14 +1253,30 @@ impl IKEv2Session {
             response.write_configuration_payload(self.internal_addr)?;
         }
 
-        let local_spi = message::Spi::U32(rand::thread_rng().gen::<u32>());
-        transform_params.set_local_spi(local_spi);
+        let child_crypto_stack = match crypto_stack.create_child_stack(
+            &transform_params,
+            [ctx.nonce_initiator, ctx.nonce_responder]
+                .concat()
+                .as_slice(),
+        ) {
+            Ok(crypto_stack) => crypto_stack,
+            Err(err) => {
+                debug!("Failed to set up child cryptography stack: {}", err);
+                // TODO: return INVALID_SYNTAX notification.
+                return Err("Failed to set up child cryptography stack".into());
+            }
+        };
+
         response.write_accept_proposal(proposal_num, &transform_params)?;
 
-        // TODO: narrow down Traffic Selectors.
         // TODO: will macOS or Windows accept more traffic selectors?
         response.write_traffic_selector_payload(true, &ts_remote)?;
         response.write_traffic_selector_payload(false, &ts_local)?;
+
+        let child_sa =
+            SecurityAssociation::new(ts_local, ts_remote, child_crypto_stack, &transform_params);
+        self.pending_actions
+            .push(IKEv2PendingAction::CreateChildSA(sa_session_id, child_sa));
 
         self.complete_encrypted_payload(response)
     }
@@ -1208,17 +1368,73 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
 }
 
 struct SecurityAssociation {
-    ts_local: message::TrafficSelector,
-    ts_remote: message::TrafficSelector,
-    // TODO: store encryption parameters
+    ts_local: Vec<message::TrafficSelector>,
+    ts_remote: Vec<message::TrafficSelector>,
+    crypto_stack: crypto::CryptoStack,
+    signature_length: usize,
 }
 
 impl SecurityAssociation {
+    fn new(
+        ts_local: Vec<message::TrafficSelector>,
+        ts_remote: Vec<message::TrafficSelector>,
+        crypto_stack: crypto::CryptoStack,
+        params: &crypto::TransformParameters,
+    ) -> SecurityAssociation {
+        let signature_length = if let Some(signature_length) = params.auth_signature_length() {
+            signature_length / 8
+        } else {
+            0
+        };
+        SecurityAssociation {
+            ts_local,
+            ts_remote,
+            crypto_stack,
+            signature_length,
+        }
+    }
+
     fn contains(&self, remote_addr: &SocketAddr, local_addr: &SocketAddr) -> bool {
-        self.ts_remote.addr_range().contains(&remote_addr.ip())
-            && self.ts_remote.port_range().contains(&remote_addr.port())
-            && self.ts_local.addr_range().contains(&local_addr.ip())
-            && self.ts_local.port_range().contains(&local_addr.port())
+        self.ts_local.iter().any(|ts_local| {
+            ts_local.addr_range().contains(&local_addr.ip())
+                && ts_local.port_range().contains(&local_addr.port())
+        }) && self.ts_remote.iter().any(|ts_remote| {
+            ts_remote.addr_range().contains(&remote_addr.ip())
+                && ts_remote.port_range().contains(&remote_addr.port())
+        })
+    }
+
+    fn handle_esp<'a>(&self, data: &'a mut [u8]) -> Result<&'a [u8], IKEv2Error> {
+        if data.len() < 8 + self.signature_length {
+            return Err("Not enough data in ESP packet".into());
+        }
+        let mut sequence_id = [0u8; 4];
+        sequence_id.copy_from_slice(&data[4..8]);
+        // TODO: validate that sequence ID is not reused (sliding window?)
+        let sequence_id = u32::from_be_bytes(sequence_id);
+        let signed_data_len = data.len() - self.signature_length;
+        let valid_signature = self.crypto_stack.validate_signature(data);
+        if !valid_signature {
+            return Err("Packet has invalid signature".into());
+        }
+        let mut associated_data = [0u8; 8];
+        let associated_data = if self.signature_length == 0 {
+            associated_data.copy_from_slice(&data[0..8]);
+            &associated_data[..]
+        } else {
+            &[]
+        };
+        match self.crypto_stack.decrypt_data(
+            &mut data[8..signed_data_len],
+            signed_data_len - 8,
+            associated_data,
+        ) {
+            Ok(data) => Ok(data),
+            Err(err) => {
+                debug!("Failed to decrypt ESP packet: {}", err);
+                Err("Failed to decrypt ESP packet".into())
+            }
+        }
     }
 }
 

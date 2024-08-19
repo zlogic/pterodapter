@@ -485,6 +485,7 @@ type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
 
 pub enum PseudorandomTransform {
+    None,
     HmacSha256(HmacSha256),
 }
 
@@ -507,27 +508,22 @@ impl PseudorandomTransform {
     pub fn prf(&self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
         match self {
             Self::HmacSha256(ref hmac) => {
-                const BLOCK_LENGTH: usize = 256 / 8;
                 let mut hmac = hmac.clone();
                 hmac.update(data);
                 let hash = hmac.finalize().into_bytes();
-                let mut result = Array::new(BLOCK_LENGTH);
+                let mut result = Array::new(self.key_length());
                 result.as_mut_slice().copy_from_slice(&hash);
                 result
             }
+            Self::None => Array::new(0),
         }
     }
 
-    pub fn create_crypto_stack(
-        &self,
-        params: &TransformParameters,
-        data: &[u8],
-    ) -> Result<CryptoStack, InitError> {
-        let mut keys = DerivedKeys::new(params);
+    fn derive_keys(&self, keys: &mut DerivedKeys, data: &[u8]) -> Result<(), InitError> {
         match self {
             Self::HmacSha256(ref hmac) => {
                 let mut hmac = hmac.clone();
-                let mut next_data = vec![0u8; data.len() + params.prf_key_length() / 8 + 1];
+                let mut next_data = vec![0u8; data.len() + self.key_length() + 1];
                 let mut cursor = 0;
                 // First T1 chunk.
                 next_data[0..data.len()].copy_from_slice(data);
@@ -548,8 +544,26 @@ impl PseudorandomTransform {
                     next_data[hash.len() + data.len()] = t + 1;
                     hmac.update(&next_data);
                 }
-                CryptoStack::new(params, &keys)
+                Ok(())
             }
+            Self::None => Err("PRF is none and cannot create new crypto stacks".into()),
+        }
+    }
+
+    pub fn create_crypto_stack(
+        &self,
+        params: &TransformParameters,
+        data: &[u8],
+    ) -> Result<CryptoStack, InitError> {
+        let mut keys = DerivedKeys::new_ikev2(params);
+        self.derive_keys(&mut keys, data)?;
+        CryptoStack::new(params, &keys)
+    }
+
+    fn key_length(&self) -> usize {
+        match self {
+            Self::HmacSha256(_) => 256 / 8,
+            Self::None => 0,
         }
     }
 }
@@ -566,7 +580,7 @@ pub struct DerivedKeys {
 }
 
 impl DerivedKeys {
-    fn new(params: &TransformParameters) -> DerivedKeys {
+    fn new_ikev2(params: &TransformParameters) -> DerivedKeys {
         let derive_key_length = params.prf_key_length() / 8;
         let derive = 0..derive_key_length;
         let auth_key_length = params.auth_key_length() / 8;
@@ -590,8 +604,36 @@ impl DerivedKeys {
         }
     }
 
+    fn new_esp(params: &TransformParameters) -> DerivedKeys {
+        let enc_key_length = (params.enc_key_length() + params.enc_key_salt_length()) / 8;
+        let auth_key_length = params.auth_key_length() / 8;
+        let enc_initiator = 0..enc_key_length;
+        let auth_initiator = enc_initiator.end..enc_initiator.end + auth_key_length;
+        let enc_responder = auth_initiator.end..auth_initiator.end + enc_key_length;
+        let auth_responder = enc_responder.end..enc_responder.end + auth_key_length;
+        let derive = 0..0;
+        let prf_initiator = 0..0;
+        let prf_responder = 0..0;
+        DerivedKeys {
+            keys: [0u8; MAX_KEY_MATERIAL_LENGTH],
+            derive,
+            auth_initiator,
+            auth_responder,
+            enc_initiator,
+            enc_responder,
+            prf_initiator,
+            prf_responder,
+        }
+    }
+
     fn full_length(&self) -> usize {
-        self.prf_responder.end
+        self.derive.len()
+            + self.auth_initiator.len()
+            + self.auth_responder.len()
+            + self.enc_initiator.len()
+            + self.enc_responder.len()
+            + self.prf_initiator.len()
+            + self.prf_responder.len()
     }
 }
 
@@ -729,7 +771,7 @@ impl AuthHmacSha1tr96 {
 }
 
 pub struct CryptoStack {
-    derive_key: Vec<u8>,
+    prf_child_sa: PseudorandomTransform,
     auth_initiator: Auth,
     auth_responder: Auth,
     enc_initiator: EncryptionType,
@@ -740,8 +782,6 @@ pub struct CryptoStack {
 
 impl CryptoStack {
     fn new(params: &TransformParameters, keys: &DerivedKeys) -> Result<CryptoStack, InitError> {
-        let mut derive_key = vec![0u8; keys.derive.len()];
-        derive_key[0..keys.derive.len()].copy_from_slice(&keys.keys[keys.derive.clone()]);
         let enc = params
             .enc
             .as_ref()
@@ -755,12 +795,21 @@ impl CryptoStack {
             .as_ref()
             .ok_or("Undefined pseudorandom transform parameters")?
             .transform_type;
+        let padding = PaddingType::from_transform(params)?;
         Ok(CryptoStack {
-            derive_key,
+            prf_child_sa: PseudorandomTransform::init(prf, &keys.keys[keys.derive.clone()])?,
             auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
             auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
-            enc_initiator: EncryptionType::init(enc, &keys.keys[keys.enc_initiator.clone()])?,
-            enc_responder: EncryptionType::init(enc, &keys.keys[keys.enc_responder.clone()])?,
+            enc_initiator: EncryptionType::init(
+                enc,
+                &keys.keys[keys.enc_initiator.clone()],
+                padding,
+            )?,
+            enc_responder: EncryptionType::init(
+                enc,
+                &keys.keys[keys.enc_responder.clone()],
+                padding,
+            )?,
             prf_initiator: PseudorandomTransform::init(
                 prf,
                 &keys.keys[keys.prf_initiator.clone()],
@@ -769,6 +818,41 @@ impl CryptoStack {
                 prf,
                 &keys.keys[keys.prf_responder.clone()],
             )?,
+        })
+    }
+
+    pub fn create_child_stack(
+        &self,
+        params: &TransformParameters,
+        data: &[u8],
+    ) -> Result<CryptoStack, InitError> {
+        let mut keys = DerivedKeys::new_esp(params);
+        self.prf_child_sa.derive_keys(&mut keys, data)?;
+        let enc = params
+            .enc
+            .as_ref()
+            .ok_or("Undefined encryption parameters")?;
+        let auth = params
+            .auth
+            .as_ref()
+            .map(|transform| transform.transform_type);
+        let padding = PaddingType::from_transform(params)?;
+        Ok(CryptoStack {
+            prf_child_sa: PseudorandomTransform::None,
+            auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
+            auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
+            enc_initiator: EncryptionType::init(
+                enc,
+                &keys.keys[keys.enc_initiator.clone()],
+                padding,
+            )?,
+            enc_responder: EncryptionType::init(
+                enc,
+                &keys.keys[keys.enc_responder.clone()],
+                padding,
+            )?,
+            prf_initiator: PseudorandomTransform::None,
+            prf_responder: PseudorandomTransform::None,
         })
     }
 
@@ -792,18 +876,7 @@ impl CryptoStack {
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
-        let decrypted_slice = self.enc_initiator.decrypt(data, msg_len, associated_data)?;
-        let padding_length = if !decrypted_slice.is_empty() {
-            decrypted_slice[decrypted_slice.len() - 1] as usize + 1
-        } else {
-            0
-        };
-        let decrypted_slice = if decrypted_slice.len() >= padding_length {
-            &decrypted_slice[..decrypted_slice.len() - padding_length]
-        } else {
-            decrypted_slice
-        };
-        Ok(decrypted_slice)
+        self.enc_initiator.decrypt(data, msg_len, associated_data)
     }
 
     pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
@@ -888,7 +961,11 @@ pub enum EncryptionType {
 }
 
 impl EncryptionType {
-    fn init(transform_type: &Transform, key: &[u8]) -> Result<EncryptionType, InitError> {
+    fn init(
+        transform_type: &Transform,
+        key: &[u8],
+        padding: PaddingType,
+    ) -> Result<EncryptionType, InitError> {
         match transform_type.transform_type {
             message::TransformType::ENCR_AES_CBC => {
                 if transform_type.key_length != Some(256) {
@@ -896,7 +973,7 @@ impl EncryptionType {
                 }
                 let cipher = aes::cipher::KeyInit::new_from_slice(key)
                     .map_err(|_| InitError::new("Failed to init AES CBC 256 cipher"))?;
-                Ok(Self::AesCbc256(EncryptionAesCbc256 { cipher }))
+                Ok(Self::AesCbc256(EncryptionAesCbc256 { cipher, padding }))
             }
             message::TransformType::ENCR_AES_GCM_16 => {
                 if transform_type.key_length != Some(256) {
@@ -906,7 +983,11 @@ impl EncryptionType {
                     .map_err(|_| InitError::new("Failed to init AES GCM 256 cipher"))?;
                 let mut salt = [0u8; 4];
                 salt.copy_from_slice(&key[32..]);
-                Ok(Self::AesGcm256(EncryptionAesGcm256 { cipher, salt }))
+                Ok(Self::AesGcm256(EncryptionAesGcm256 {
+                    cipher,
+                    salt,
+                    padding,
+                }))
             }
             _ => Err("ENC not initialized".into()),
         }
@@ -944,11 +1025,70 @@ impl EncryptionType {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PaddingType {
+    IKEv2,
+    Esp,
+}
+
+impl PaddingType {
+    fn from_transform(params: &TransformParameters) -> Result<PaddingType, InitError> {
+        match params.protocol_id() {
+            message::IPSecProtocolID::IKE => Ok(PaddingType::IKEv2),
+            message::IPSecProtocolID::ESP => Ok(PaddingType::Esp),
+            _ => Err("Cannot set up padding for unsupported IPSec protocol".into()),
+        }
+    }
+
+    fn remove_padding<'a>(&self, data: &'a [u8]) -> Result<&'a [u8], CryptoError> {
+        if data.len() < self.length() {
+            return Err("Not enough data to get padding length".into());
+        }
+        let padding_length = match self {
+            Self::IKEv2 => data[data.len() - 1] + 1,
+            Self::Esp => data[data.len() - 2] + 2,
+        } as usize;
+        if data.len() > padding_length {
+            Ok(&data[..data.len() - padding_length])
+        } else {
+            Err("Padding exceeds message size".into())
+        }
+    }
+
+    fn add_padding(&self, data: &mut [u8], msg_len: usize) -> Result<(), CryptoError> {
+        if data.len() < msg_len + self.length() {
+            return Err("Not enough space to add padding".into());
+        }
+        if data.len() > 255 + msg_len + self.length() {
+            return Err("Padding value overflow".into());
+        }
+        let padding_length = (data.len() - msg_len - self.length()) as u8;
+        match self {
+            Self::IKEv2 => {
+                data[data.len() - 1] = padding_length;
+            }
+            Self::Esp => {
+                // TODO: specify protocol type from https://datatracker.ietf.org/doc/html/rfc4303#section-2.6 externally?
+                data[data.len() - 2] = padding_length;
+            }
+        }
+        Ok(())
+    }
+
+    fn length(&self) -> usize {
+        match self {
+            Self::IKEv2 => 1,
+            Self::Esp => 2,
+        }
+    }
+}
+
 type AesCbc256Decryptor = cbc::Decryptor<Aes256>;
 type AesCbc256Encryptor = cbc::Encryptor<Aes256>;
 
 pub struct EncryptionAesCbc256 {
     cipher: Aes256,
+    padding: PaddingType,
 }
 
 impl Encryption for EncryptionAesCbc256 {
@@ -962,7 +1102,8 @@ impl Encryption for EncryptionAesCbc256 {
         // Move message to the right to make space for the IV.
         data.copy_within(..msg_len, iv_size);
         let padded_msg_len = encrypted_payload_length - iv_size;
-        data[encrypted_payload_length - 1] = (padded_msg_len - 1 - msg_len) as u8;
+        self.padding
+            .add_padding(&mut data[iv_size..encrypted_payload_length], msg_len)?;
         rand::thread_rng()
             .try_fill(iv.as_mut_slice())
             .map_err(|err| {
@@ -1000,19 +1141,26 @@ impl Encryption for EncryptionAesCbc256 {
                 }
             };
         let data_range = &mut data[iv_size..msg_len];
-        match block_decryptor.decrypt_padded_mut::<block_padding::NoPadding>(data_range) {
-            Ok(data) => Ok(data),
-            Err(err) => {
+        let decrypted_slice = block_decryptor
+            .decrypt_padded_mut::<block_padding::NoPadding>(data_range)
+            .map_err(|err| {
                 debug!("Failed to decode AES CBC 256 message: {}", err);
-                Err("Failed to decode AES CBC 256 message".into())
-            }
-        }
+                "Failed to decode AES CBC 256 message"
+            })?;
+        self.padding.remove_padding(decrypted_slice)
     }
 
     fn encrypted_payload_length(&self, msg_len: usize) -> usize {
         let iv_size = AesCbc256Encryptor::iv_size();
         let block_size = AesCbc256Encryptor::block_size();
-        let encrypted_size = (1 + msg_len / block_size) * block_size;
+        let msg_len = msg_len + self.padding.length();
+        let encrypted_size = (msg_len / block_size) * block_size;
+        let encrypted_size = if encrypted_size < msg_len {
+            encrypted_size + block_size
+        } else {
+            encrypted_size
+        };
+
         iv_size + encrypted_size
     }
 }
@@ -1020,6 +1168,7 @@ impl Encryption for EncryptionAesCbc256 {
 pub struct EncryptionAesGcm256 {
     cipher: Aes256Gcm,
     salt: [u8; 4],
+    padding: PaddingType,
 }
 
 impl Encryption for EncryptionAesGcm256 {
@@ -1033,7 +1182,8 @@ impl Encryption for EncryptionAesGcm256 {
             return Err("Message length is too short".into());
         }
         // Pad length.
-        data[msg_len] = 0;
+        self.padding
+            .add_padding(&mut data[..msg_len + 1], msg_len)?;
         let msg_len = msg_len + 1;
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.salt);
@@ -1081,24 +1231,24 @@ impl Encryption for EncryptionAesGcm256 {
             len: msg_len - 8,
         };
         let mut cipher = self.cipher.clone();
-        match cipher.decrypt_in_place(
-            Nonce::from_slice(nonce.as_slice()),
-            associated_data,
-            &mut buffer,
-        ) {
-            Ok(()) => Ok(&buffer.slice[..buffer.len]),
-            Err(err) => {
+        cipher
+            .decrypt_in_place(
+                Nonce::from_slice(nonce.as_slice()),
+                associated_data,
+                &mut buffer,
+            )
+            .map_err(|err| {
                 debug!("Failed to decode AES GCM 16 256 message: {}", err);
-                Err("Failed to decode AES GCM 16 256 message".into())
-            }
-        }
+                "Failed to decode AES GCM 16 256 message"
+            })?;
+        self.padding.remove_padding(&buffer.slice[..buffer.len])
     }
 
     fn encrypted_payload_length(&self, msg_len: usize) -> usize {
         const TAG_SIZE: usize = 16;
         // AES GCM is a stream cipher, encrypted payload will contain
-        // IV + message (with padding=1) + tag.
-        8 + msg_len + 1 + TAG_SIZE
+        // IV + message (with padding) + tag.
+        8 + msg_len + self.padding.length() + TAG_SIZE
     }
 }
 
