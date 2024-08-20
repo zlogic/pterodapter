@@ -414,7 +414,7 @@ fn main() {
         "Pterodapter version {}",
         option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
     );
-    if rustls::crypto::aws_lc_rs::default_provider()
+    if rustls::crypto::ring::default_provider()
         .install_default()
         .is_err()
     {

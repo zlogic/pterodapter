@@ -1,7 +1,7 @@
 use std::{error, fmt};
 
-use aws_lc_rs::signature;
 use log::debug;
+use ring::signature;
 use sha1::{Digest, Sha1};
 use x509_parser::{
     certificate,
@@ -278,7 +278,7 @@ impl ServerIdentity {
         let (_, private_key_der) = pem::parse_x509_pem(private_key_pem)?;
         let key_pair = signature::RsaKeyPair::from_pkcs8(&private_key_der.contents)
             .map_err(|_| "Failed to parse RSA private key")?;
-        let signature_length = key_pair.public_modulus_len();
+        let signature_length = key_pair.public().modulus_len();
         Ok(ServerIdentity {
             public_cert_der,
             signature_length,
@@ -291,7 +291,7 @@ impl ServerIdentity {
     }
 
     fn sign_message(&self, msg: &[u8], dest: &mut [u8]) -> Result<(), CertError> {
-        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let rng = ring::rand::SystemRandom::new();
         // TODO: This only works if https://www.rfc-editor.org/rfc/rfc7427.html is implemented correctly.
         // Keep RSA on Windows if 16431 allows to use better ciphers?
         // Windows uses authentication mode 9 in EC mode, macOS uses mode 14
