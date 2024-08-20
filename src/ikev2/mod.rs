@@ -26,6 +26,8 @@ const MAX_DATAGRAM_SIZE: usize = 4096;
 const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;
 // All keys are less than 256 bits, but mathching the client nonce size is a good idea.
 const MAX_NONCE: usize = 384 / 8;
+// ECSDA DER-encoded signatures can vafy in length and reach up to 72 bytes, plus optional algorithm parameters.
+const MAX_SIGNATURE_LENGTH: usize = 1 + 12 + 72;
 
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 const IKE_SESSION_EXPIRATION: Duration = Duration::from_secs(60 * 15);
@@ -592,7 +594,6 @@ impl IKEv2Session {
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
         // TODO: return error if payload type is critical but not recognized
-
         self.last_update = Instant::now();
         let message_id = request.read_message_id();
         if message_id < self.last_message_id {
@@ -937,6 +938,23 @@ impl IKEv2Session {
             return Err("No nonce provided in response".into());
         };
 
+        response.write_notify_payload(
+            None,
+            &[],
+            message::NotifyMessageType::NAT_DETECTION_DESTINATION_IP,
+            &nat_ip,
+        )?;
+
+        // Only one algorithm is supported, otherwise this would need to be an array.
+        let supported_signature_algorithms =
+            message::SignatureHashAlgorithm::SHA2_256.to_be_bytes();
+        response.write_notify_payload(
+            None,
+            &[],
+            message::NotifyMessageType::SIGNATURE_HASH_ALGORITHMS,
+            &supported_signature_algorithms,
+        )?;
+
         let response_length = response.complete_message();
         let response_data = &response.raw_data()[..response_length];
         let mut message_responder = vec![0; response_data.len()];
@@ -1074,17 +1092,25 @@ impl IKEv2Session {
                 }
                 message::PayloadType::AUTHENTICATION => {
                     let auth = payload.to_authentication()?;
-                    if auth.read_method() != message::AuthMethod::RSA_DIGITAL_SIGNATURE {
-                        debug!(
-                            "Authentication method {} is unsupported",
-                            auth.read_method()
-                        );
-                        return self.process_auth_failed_response(
-                            response,
-                            "Authentication method is unsupported".into(),
-                        );
+                    client_auth = match auth.read_method() {
+                        message::AuthMethod::ECDSA_SHA256_P256 => {
+                            Some((auth.read_value().to_vec(), pki::SignatureFormat::Default))
+                        }
+                        message::AuthMethod::DIGITAL_SIGNATURE => Some((
+                            auth.read_value().to_vec(),
+                            pki::SignatureFormat::AdditionalParameters,
+                        )),
+                        _ => {
+                            debug!(
+                                "Authentication method {} is unsupported",
+                                auth.read_method()
+                            );
+                            return self.process_auth_failed_response(
+                                response,
+                                "Authentication method is unsupported".into(),
+                            );
+                        }
                     }
-                    client_auth = Some(auth.read_value().to_vec());
                 }
                 message::PayloadType::SECURITY_ASSOCIATION => {
                     let sa = payload.to_security_association()?;
@@ -1149,7 +1175,7 @@ impl IKEv2Session {
         } else {
             return self.process_auth_failed_response(response, "Client provided no cert".into());
         };
-        let client_auth = if let Some(auth) = client_auth {
+        let (client_auth, signature_format) = if let Some(auth) = client_auth {
             auth
         } else {
             return self.process_auth_failed_response(response, "Client provided no auth".into());
@@ -1204,9 +1230,11 @@ impl IKEv2Session {
             &mut initiator_signed
                 [ctx.message_initiator.len() + ctx.nonce_responder.len()..initiator_signed_len],
         );
-        if let Err(err) =
-            client_cert.verify_signature(&initiator_signed[..initiator_signed_len], &client_auth)
-        {
+        if let Err(err) = client_cert.verify_signature(
+            signature_format,
+            &initiator_signed[..initiator_signed_len],
+            &client_auth,
+        ) {
             debug!("Client authentication failed: {}", err);
             return Err("Client authentication failed".into());
         }
@@ -1241,12 +1269,20 @@ impl IKEv2Session {
                     [ctx.message_responder.len() + ctx.nonce_initiator.len()..responder_signed_len],
             );
 
-            let write_slice = response.write_authentication_payload_slice(
-                message::AuthMethod::RSA_DIGITAL_SIGNATURE,
-                self.pki_processing.signature_length(),
+            let mut signature = [0u8; MAX_SIGNATURE_LENGTH];
+            let signature_length = self.pki_processing.sign_auth(
+                signature_format,
+                &responder_signed[..responder_signed_len],
+                &mut signature,
             )?;
-            self.pki_processing
-                .sign_auth(&responder_signed[..responder_signed_len], write_slice)?;
+            let auth_method = match signature_format {
+                pki::SignatureFormat::Default => message::AuthMethod::ECDSA_SHA256_P256,
+                pki::SignatureFormat::AdditionalParameters => {
+                    message::AuthMethod::DIGITAL_SIGNATURE
+                }
+            };
+            response
+                .write_authentication_payload_slice(auth_method, &signature[..signature_length])?;
         };
 
         if ipv4_address_requested {

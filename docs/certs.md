@@ -26,7 +26,7 @@ Generate server key
 
 ```shell
 SERVER_HOST=pterodapter.home
-openssl req -new -x509 -newkey -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-server.cert.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=${SERVER_HOST}" \
+openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-server.cert.pem -keyout vpn-server.key.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=${SERVER_HOST}" \
   -addext "subjectAltName = DNS:${SERVER_HOST}" -addext "extendedKeyUsage = serverAuth, 1.3.6.1.5.5.8.2.2"
 ```
 
@@ -44,7 +44,7 @@ Generate client key
 ```shell
 SERVER_HOST=pterodapter.home
 USERNAME="user@${SERVER_HOST}"
-openssl req -new -x509 -newkey -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-client.cert.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter Client/CN=${USERNAME}" \
+openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-client.cert.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter Client/CN=${USERNAME}" \
   -addext "subjectAltName = email:${USERNAME}" -addext "extendedKeyUsage = clientAuth" -addext "keyUsage = digitalSignature" -addext "basicConstraints = critical, CA:FALSE"
 ```
 
@@ -63,7 +63,7 @@ For more details on configuring Windows, check the [StrongSwan documentation](ht
 To be able to use ECDSA certs, run the following command (replace `<name>` with the VPN connection name):
 
 ```
-Set-VpnConnectionIPsecConfiguration -ConnectionName <name> -CipherTransformConstants AES256 -EncryptionMethod GCMAES256 -IntegrityCheckMethod SHA256 -DHGroup ECP256 -AuthenticationTransformConstants None -PfsGroup None
+Set-VpnConnectionIPsecConfiguration -ConnectionName <name> -CipherTransformConstants GCMAES256 -EncryptionMethod GCMAES256 -IntegrityCheckMethod SHA256 -DHGroup ECP256 -AuthenticationTransformConstants GCMAES256 -PfsGroup None
 ```
 
 ### macOS

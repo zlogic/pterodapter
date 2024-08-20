@@ -431,12 +431,13 @@ impl MessageWriter<'_> {
     pub fn write_authentication_payload_slice(
         &mut self,
         auth_method: AuthMethod,
-        signature_length: usize,
-    ) -> Result<&mut [u8], NotEnoughSpaceError> {
+        signature_data: &[u8],
+    ) -> Result<(), NotEnoughSpaceError> {
         let next_payload_slice =
-            self.next_payload_slice(PayloadType::AUTHENTICATION, 4 + signature_length)?;
+            self.next_payload_slice(PayloadType::AUTHENTICATION, 4 + signature_data.len())?;
         next_payload_slice[0] = auth_method.0;
-        Ok(&mut next_payload_slice[4..])
+        next_payload_slice[4..].copy_from_slice(signature_data);
+        Ok(())
     }
 
     pub fn write_notify_payload(
@@ -1521,6 +1522,9 @@ impl AuthMethod {
     pub const SHARED_MESSAGE_INTEGRITY_CODE: AuthMethod = AuthMethod(2);
     pub const DSS_DIGITAL_SIGNATURE: AuthMethod = AuthMethod(3);
 
+    pub const ECDSA_SHA256_P256: AuthMethod = AuthMethod(9);
+    pub const DIGITAL_SIGNATURE: AuthMethod = AuthMethod(14);
+
     fn from_u8(value: u8) -> AuthMethod {
         AuthMethod(value)
     }
@@ -1532,6 +1536,8 @@ impl fmt::Display for AuthMethod {
             Self::RSA_DIGITAL_SIGNATURE => write!(f, "RSA Digital Signature")?,
             Self::SHARED_MESSAGE_INTEGRITY_CODE => write!(f, "Shared Key Message Integrity Code")?,
             Self::DSS_DIGITAL_SIGNATURE => write!(f, "DSS Digital Signature")?,
+            Self::ECDSA_SHA256_P256 => write!(f, "ECDSA with SHA-256 on the P-256 curve")?,
+            Self::DIGITAL_SIGNATURE => write!(f, "Digital Signature")?,
             _ => write!(f, "Unknown Authentication Method {}", self.0)?,
         }
         Ok(())
@@ -1544,7 +1550,7 @@ pub struct PayloadAuthentication<'a> {
 
 impl<'a> PayloadAuthentication<'a> {
     fn from_payload(data: &'a [u8]) -> Result<PayloadAuthentication<'a>, FormatError> {
-        if data.is_empty() {
+        if data.len() < 4 {
             debug!("Not enough data in authentication payload");
             return Err("Not enough data in certificate payload".into());
         }
@@ -1606,9 +1612,10 @@ impl NotifyMessageType {
     pub const ESP_TFC_PADDING_NOT_SUPPORTED: NotifyMessageType = NotifyMessageType(16394);
     pub const NON_FIRST_FRAGMENTS_ALSO: NotifyMessageType = NotifyMessageType(16395);
 
+    pub const MOBIKE_SUPPORTED: NotifyMessageType = NotifyMessageType(16396);
     pub const REDIRECT_SUPPORTED: NotifyMessageType = NotifyMessageType(16406);
     pub const IKEV2_FRAGMENTATION_SUPPORTED: NotifyMessageType = NotifyMessageType(16430);
-    pub const MOBIKE_SUPPORTED: NotifyMessageType = NotifyMessageType(16396);
+    pub const SIGNATURE_HASH_ALGORITHMS: NotifyMessageType = NotifyMessageType(16431);
 
     fn from_u16(value: u16) -> NotifyMessageType {
         NotifyMessageType(value)
@@ -1647,9 +1654,10 @@ impl fmt::Display for NotifyMessageType {
             Self::REKEY_SA => write!(f, "REKEY_SA")?,
             Self::ESP_TFC_PADDING_NOT_SUPPORTED => write!(f, "ESP_TFC_PADDING_NOT_SUPPORTED")?,
             Self::NON_FIRST_FRAGMENTS_ALSO => write!(f, "NON_FIRST_FRAGMENTS_ALSO")?,
+            Self::MOBIKE_SUPPORTED => write!(f, "MOBIKE_SUPPORTED")?,
             Self::REDIRECT_SUPPORTED => write!(f, "REDIRECT_SUPPORTED")?,
             Self::IKEV2_FRAGMENTATION_SUPPORTED => write!(f, "IKEV2_FRAGMENTATION_SUPPORTED")?,
-            Self::MOBIKE_SUPPORTED => write!(f, "MOBIKE_SUPPORTED")?,
+            Self::SIGNATURE_HASH_ALGORITHMS => write!(f, "SIGNATURE_HASH_ALGORITHMS")?,
             _ => write!(f, "Unknown Notify Message Type {}", self.0)?,
         }
         Ok(())
@@ -1694,6 +1702,39 @@ impl<'a> PayloadNotify<'a> {
 
     fn read_value(&self) -> &[u8] {
         self.data
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct SignatureHashAlgorithm(u16);
+
+impl SignatureHashAlgorithm {
+    pub const RESERVED: SignatureHashAlgorithm = SignatureHashAlgorithm(0);
+    pub const SHA1: SignatureHashAlgorithm = SignatureHashAlgorithm(1);
+    pub const SHA2_256: SignatureHashAlgorithm = SignatureHashAlgorithm(2);
+    pub const SHA2_384: SignatureHashAlgorithm = SignatureHashAlgorithm(3);
+    pub const SHA2_512: SignatureHashAlgorithm = SignatureHashAlgorithm(4);
+
+    fn from_u16(value: u16) -> NotifyMessageType {
+        NotifyMessageType(value)
+    }
+
+    pub fn to_be_bytes(&self) -> [u8; 2] {
+        self.0.to_be_bytes()
+    }
+}
+
+impl fmt::Display for SignatureHashAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::RESERVED => write!(f, "RESERVED")?,
+            Self::SHA1 => write!(f, "SHA1")?,
+            Self::SHA2_256 => write!(f, "SHA2-256")?,
+            Self::SHA2_384 => write!(f, "SHA2-384")?,
+            Self::SHA2_512 => write!(f, "SHA2-512")?,
+            _ => write!(f, "Unknown Signature Hash Algorithm {}", self.0)?,
+        }
+        Ok(())
     }
 }
 

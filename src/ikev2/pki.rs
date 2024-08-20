@@ -6,7 +6,7 @@ use sha1::{Digest, Sha1};
 use x509_parser::{
     certificate,
     extensions::GeneralName,
-    oid_registry::{OID_PKCS1_RSAENCRYPTION, OID_SIG_ECDSA_WITH_SHA256},
+    oid_registry::{OID_KEY_TYPE_EC_PUBLIC_KEY, OID_SIG_ECDSA_WITH_SHA256},
     pem,
 };
 
@@ -93,7 +93,8 @@ impl PkiProcessing {
         if !client_cert.validity.is_valid() {
             return Err("Client certificate has invalid date".into());
         }
-        if client_cert.tbs_certificate.subject_pki.algorithm.algorithm != OID_PKCS1_RSAENCRYPTION {
+        if client_cert.tbs_certificate.subject_pki.algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY
+        {
             debug!(
                 "Certificate public key algorithm {} is not supported",
                 client_cert.tbs_certificate.subject_pki.algorithm.algorithm
@@ -144,17 +145,27 @@ impl PkiProcessing {
         })
     }
 
-    pub fn signature_length(&self) -> usize {
+    pub fn signature_length(&self, format: SignatureFormat) -> usize {
         if let Some(server_identity) = &self.server_identity {
-            server_identity.signature_length
+            let parameters_length = if format == SignatureFormat::AdditionalParameters {
+                1 + ASN1_IDENTIFIDER_ECDSA_WITH_SHA256.len()
+            } else {
+                0
+            };
+            parameters_length + server_identity.signature_length
         } else {
             0
         }
     }
 
-    pub fn sign_auth(&self, msg: &[u8], dest: &mut [u8]) -> Result<(), CertError> {
+    pub fn sign_auth(
+        &self,
+        format: SignatureFormat,
+        msg: &[u8],
+        dest: &mut [u8],
+    ) -> Result<usize, CertError> {
         if let Some(server_identity) = &self.server_identity {
-            server_identity.sign_message(msg, dest)
+            server_identity.sign_message(format, msg, dest)
         } else {
             Err("No server identity is configured".into())
         }
@@ -166,21 +177,54 @@ pub struct ClientCertificate {
     subject: String,
 }
 
+const ASN1_IDENTIFIDER_ECDSA_WITH_SHA256: [u8; 12] = [
+    0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+];
+
 impl ClientCertificate {
     pub fn subject(&self) -> &str {
         self.subject.as_str()
     }
 
-    pub fn verify_signature(&self, msg: &[u8], signature: &[u8]) -> Result<(), CertError> {
-        let verifying_key = signature::UnparsedPublicKey::new(
-            &signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
-            &self.public_key,
-        );
+    pub fn verify_signature(
+        &self,
+        format: SignatureFormat,
+        msg: &[u8],
+        signature: &[u8],
+    ) -> Result<(), CertError> {
+        let (algorithm, signature) = match format {
+            SignatureFormat::Default => (&signature::ECDSA_P256_SHA256_FIXED, signature),
+            SignatureFormat::AdditionalParameters => {
+                if signature.is_empty() {
+                    return Err("No ASN.1 length in Digital Signature".into());
+                }
+                let asn1_length = signature[0] as usize;
+                if signature.len() < 1 + asn1_length {
+                    return Err("Digital Signature ASN.1 AlgorithmIdentifier overflow".into());
+                }
+                let signature_oid = &signature[1..1 + asn1_length];
+                if signature_oid != &ASN1_IDENTIFIDER_ECDSA_WITH_SHA256 {
+                    debug!("Unsupported ASN.1 AlgorithmIdentifier {:?}", signature_oid,);
+                    return Err("Unsupported ASN.1 AlgorithmIdentifier".into());
+                }
+                (
+                    &signature::ECDSA_P256_SHA256_ASN1,
+                    &signature[1 + asn1_length..],
+                )
+            }
+        };
+        let verifying_key = signature::UnparsedPublicKey::new(algorithm, &self.public_key);
         verifying_key
             .verify(msg, signature)
             .map_err(|_| "Signature verification failed")?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SignatureFormat {
+    Default,
+    AdditionalParameters,
 }
 
 struct ClientValidation {
@@ -267,7 +311,8 @@ impl ClientValidation {
 struct ServerIdentity {
     public_cert_der: Vec<u8>,
     signature_length: usize,
-    key_pair: signature::RsaKeyPair,
+    key_pair_fixed: signature::EcdsaKeyPair,
+    key_pair_asn1: signature::EcdsaKeyPair,
 }
 
 impl ServerIdentity {
@@ -276,13 +321,25 @@ impl ServerIdentity {
         let public_cert_der = public_cert.contents;
 
         let (_, private_key_der) = pem::parse_x509_pem(private_key_pem)?;
-        let key_pair = signature::RsaKeyPair::from_pkcs8(&private_key_der.contents)
-            .map_err(|_| "Failed to parse RSA private key")?;
-        let signature_length = key_pair.public().modulus_len();
+        let rng = ring::rand::SystemRandom::new();
+        let key_pair_fixed = signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &private_key_der.contents,
+            &rng,
+        )
+        .map_err(|_| "Failed to parse ECDSA private key")?;
+        let key_pair_asn1 = signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &private_key_der.contents,
+            &rng,
+        )
+        .map_err(|_| "Failed to parse ECDSA private key")?;
+        let signature_length = 64;
         Ok(ServerIdentity {
             public_cert_der,
             signature_length,
-            key_pair,
+            key_pair_fixed,
+            key_pair_asn1,
         })
     }
 
@@ -290,15 +347,35 @@ impl ServerIdentity {
         &self.public_cert_der
     }
 
-    fn sign_message(&self, msg: &[u8], dest: &mut [u8]) -> Result<(), CertError> {
+    fn sign_message(
+        &self,
+        format: SignatureFormat,
+        msg: &[u8],
+        dest: &mut [u8],
+    ) -> Result<usize, CertError> {
         let rng = ring::rand::SystemRandom::new();
-        // TODO: This only works if https://www.rfc-editor.org/rfc/rfc7427.html is implemented correctly.
-        // Keep RSA on Windows if 16431 allows to use better ciphers?
-        // Windows uses authentication mode 9 in EC mode, macOS uses mode 14
-        self.key_pair
-            .sign(&signature::RSA_PKCS1_SHA256, &rng, msg, dest)
+        let key_pair = match format {
+            SignatureFormat::Default => &self.key_pair_fixed,
+            SignatureFormat::AdditionalParameters => &self.key_pair_asn1,
+        };
+        let signature = key_pair
+            .sign(&rng, msg)
             .map_err(|_| "Failed to sign message")?;
-        Ok(())
+        let signature_length = signature.as_ref().len();
+        match format {
+            SignatureFormat::Default => {
+                dest[..signature_length].copy_from_slice(signature.as_ref());
+                Ok(signature_length)
+            }
+            SignatureFormat::AdditionalParameters => {
+                let oid_length = ASN1_IDENTIFIDER_ECDSA_WITH_SHA256.len();
+                dest[0] = oid_length as u8;
+                dest[1..1 + oid_length].copy_from_slice(&ASN1_IDENTIFIDER_ECDSA_WITH_SHA256);
+                dest[1 + oid_length..1 + oid_length + signature_length]
+                    .copy_from_slice(signature.as_ref());
+                Ok(1 + oid_length + signature_length)
+            }
+        }
     }
 }
 
