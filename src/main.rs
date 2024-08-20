@@ -204,7 +204,7 @@ impl Args {
                     ),
                 };
             } else if action_type == ActionType::IkeV2 && name == "--key" {
-                match fs::read_to_string(value) {
+                match fs::read(value) {
                     Ok(cert) => private_key = Some(cert),
                     Err(err) => fail_with_error(
                         name,

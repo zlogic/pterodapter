@@ -35,7 +35,7 @@ pub struct Config {
     pub listen_ips: Vec<IpAddr>,
     pub hostname: Option<String>,
     pub root_ca: Option<Vec<u8>>,
-    pub server_cert: Option<(Vec<u8>, String)>,
+    pub server_cert: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 pub struct Server {
@@ -52,7 +52,7 @@ impl Server {
             config
                 .server_cert
                 .as_ref()
-                .map(|(public_cert, private_key)| (public_cert.as_ref(), private_key.as_str())),
+                .map(|(public_cert, private_key)| (public_cert.as_slice(), private_key.as_slice())),
         )?;
         Ok(Server {
             listen_ips: config.listen_ips,

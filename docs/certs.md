@@ -26,8 +26,7 @@ Generate server key
 
 ```shell
 SERVER_HOST=pterodapter.home
-openssl ecparam -name prime256v1 -genkey -out vpn-server.key.pem
-openssl req -new -x509 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-server.cert.pem -keyout vpn-server.key.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=${SERVER_HOST}" \
+openssl req -new -x509 -newkey -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-server.cert.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=${SERVER_HOST}" \
   -addext "subjectAltName = DNS:${SERVER_HOST}" -addext "extendedKeyUsage = serverAuth, 1.3.6.1.5.5.8.2.2"
 ```
 
@@ -45,8 +44,7 @@ Generate client key
 ```shell
 SERVER_HOST=pterodapter.home
 USERNAME="user@${SERVER_HOST}"
-openssl ecparam -name prime256v1 -genkey -out vpn-client.key.pem
-openssl req -new -x509 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-client.cert.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter Client/CN=${USERNAME}" \
+openssl req -new -x509 -newkey -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-client.cert.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter Client/CN=${USERNAME}" \
   -addext "subjectAltName = email:${USERNAME}" -addext "extendedKeyUsage = clientAuth" -addext "keyUsage = digitalSignature" -addext "basicConstraints = critical, CA:FALSE"
 ```
 
@@ -61,6 +59,12 @@ openssl pkcs12 -export -out vpn-client.pfx -inkey vpn-client.key.pem -in vpn-cli
 Import into the _Local Machine_ store, and let Windows automatically select certificate store.
 
 For more details on configuring Windows, check the [StrongSwan documentation](https://docs.strongswan.org/docs/5.9/interop/windowsMachineConf.html).
+
+To be able to use ECDSA certs, run the following command (replace `<name>` with the VPN connection name):
+
+```
+Set-VpnConnectionIPsecConfiguration -ConnectionName <name> -CipherTransformConstants AES256 -EncryptionMethod GCMAES256 -IntegrityCheckMethod SHA256 -DHGroup ECP256 -AuthenticationTransformConstants None -PfsGroup None
+```
 
 ### macOS
 

@@ -1,14 +1,7 @@
 use std::{error, fmt};
 
+use aws_lc_rs::signature;
 use log::debug;
-use p256::ecdsa::{self, DerSignature};
-use rsa::{
-    pkcs1v15,
-    pkcs8::{DecodePrivateKey, DecodePublicKey},
-    signature::{SignatureEncoding, Signer, Verifier},
-    traits::PublicKeyParts,
-    RsaPrivateKey, RsaPublicKey,
-};
 use sha1::{Digest, Sha1};
 use x509_parser::{
     certificate,
@@ -19,7 +12,6 @@ use x509_parser::{
 
 use super::message;
 
-#[derive(Clone)]
 pub struct PkiProcessing {
     server_id: Option<Vec<u8>>,
     client_validation: Option<ClientValidation>,
@@ -30,7 +22,7 @@ impl PkiProcessing {
     pub fn new(
         hostname: Option<&str>,
         root_ca: Option<&[u8]>,
-        server_cert: Option<(&[u8], &str)>,
+        server_cert: Option<(&[u8], &[u8])>,
     ) -> Result<PkiProcessing, CertError> {
         let client_validation = if let Some(root_ca) = root_ca {
             Some(ClientValidation::new(root_ca)?)
@@ -139,13 +131,15 @@ impl PkiProcessing {
         } else {
             client_cert.tbs_certificate.subject.to_string()
         };
-        let public_key_bytes = client_cert.tbs_certificate.public_key().raw;
-
-        let public_key = RsaPublicKey::from_public_key_der(public_key_bytes)?;
-        let verifying_key = pkcs1v15::VerifyingKey::new(public_key);
+        let public_key = client_cert
+            .tbs_certificate
+            .subject_pki
+            .subject_public_key
+            .data
+            .to_vec();
 
         Ok(ClientCertificate {
-            verifying_key,
+            public_key,
             subject,
         })
     }
@@ -168,7 +162,7 @@ impl PkiProcessing {
 }
 
 pub struct ClientCertificate {
-    verifying_key: pkcs1v15::VerifyingKey<Sha1>,
+    public_key: Vec<u8>,
     subject: String,
 }
 
@@ -178,18 +172,22 @@ impl ClientCertificate {
     }
 
     pub fn verify_signature(&self, msg: &[u8], signature: &[u8]) -> Result<(), CertError> {
-        let signature = pkcs1v15::Signature::try_from(signature)?;
-        self.verifying_key.verify(msg, &signature)?;
+        let verifying_key = signature::UnparsedPublicKey::new(
+            &signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY,
+            &self.public_key,
+        );
+        verifying_key
+            .verify(msg, signature)
+            .map_err(|_| "Signature verification failed")?;
         Ok(())
     }
 }
 
-#[derive(Clone)]
 struct ClientValidation {
     root_ca_issuer: Vec<u8>,
     root_ca_request: [u8; 20],
     root_ca_validity: x509_parser::certificate::Validity,
-    public_key: ecdsa::VerifyingKey,
+    root_ca_public_key: Vec<u8>,
 }
 
 impl ClientValidation {
@@ -197,19 +195,15 @@ impl ClientValidation {
         let (_, root_ca_der) = pem::parse_x509_pem(root_ca_pem)?;
         let root_ca = root_ca_der.parse_x509()?;
 
-        let root_ca_bytes = root_ca
+        let root_ca_public_key = root_ca
             .tbs_certificate
             .subject_pki
             .subject_public_key
             .data
-            .clone();
-        //    return Err("Root ca has invalid public key".into());
-        let public_key = ecdsa::VerifyingKey::try_from(root_ca_bytes.as_ref())?;
+            .to_vec();
 
-        let root_ca_issuer = Vec::from(root_ca.tbs_certificate.subject.as_raw());
+        let root_ca_issuer = root_ca.tbs_certificate.subject.as_raw().to_vec();
 
-        let mut root_ca_request = [0u8; 20];
-        root_ca_request.copy_from_slice(&root_ca.tbs_certificate.serial.to_bytes_be());
         let mut hasher = Sha1::new();
         hasher.update(root_ca.tbs_certificate.subject_pki.raw);
         let root_ca_request = hasher.finalize().into();
@@ -220,7 +214,7 @@ impl ClientValidation {
             root_ca_issuer,
             root_ca_request,
             root_ca_validity,
-            public_key,
+            root_ca_public_key,
         })
     }
 
@@ -251,8 +245,13 @@ impl ClientValidation {
             );
             return Err("Certificate signature algorithm is not supported".into());
         };
-        let signature = DerSignature::try_from(signature)?;
-        self.public_key.verify(&signed_data, &signature)?;
+        let public_key = signature::UnparsedPublicKey::new(
+            &signature::ECDSA_P256_SHA256_ASN1,
+            &self.root_ca_public_key,
+        );
+        public_key
+            .verify(&signed_data, &signature)
+            .map_err(|_| "Failed to verify client cert signature")?;
         if let Some(eku) = client_cert.extended_key_usage()? {
             if !eku.value.client_auth {
                 return Err("Certificate doesn't have Client Auth Extended Key Usage".into());
@@ -265,26 +264,25 @@ impl ClientValidation {
     }
 }
 
-#[derive(Clone)]
 struct ServerIdentity {
     public_cert_der: Vec<u8>,
     signature_length: usize,
-    signing_key: pkcs1v15::SigningKey<Sha1>,
+    key_pair: signature::RsaKeyPair,
 }
 
 impl ServerIdentity {
-    fn new(public_cert_pem: &[u8], private_key_pem: &str) -> Result<ServerIdentity, CertError> {
-        // TODO: if client requests cert, check if public key is signed by CA from client's CERTREQUEST.
+    fn new(public_cert_pem: &[u8], private_key_pem: &[u8]) -> Result<ServerIdentity, CertError> {
         let (_, public_cert) = pem::parse_x509_pem(public_cert_pem)?;
         let public_cert_der = public_cert.contents;
 
-        let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)?;
-        let signature_length = private_key.size();
-        let signing_key = pkcs1v15::SigningKey::<Sha1>::new(private_key);
+        let (_, private_key_der) = pem::parse_x509_pem(private_key_pem)?;
+        let key_pair = signature::RsaKeyPair::from_pkcs8(&private_key_der.contents)
+            .map_err(|_| "Failed to parse RSA private key")?;
+        let signature_length = key_pair.public_modulus_len();
         Ok(ServerIdentity {
             public_cert_der,
             signature_length,
-            signing_key,
+            key_pair,
         })
     }
 
@@ -293,8 +291,13 @@ impl ServerIdentity {
     }
 
     fn sign_message(&self, msg: &[u8], dest: &mut [u8]) -> Result<(), CertError> {
-        let signature = self.signing_key.try_sign(msg)?;
-        dest.copy_from_slice(&signature.to_bytes());
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        // TODO: This only works if https://www.rfc-editor.org/rfc/rfc7427.html is implemented correctly.
+        // Keep RSA on Windows if 16431 allows to use better ciphers?
+        // Windows uses authentication mode 9 in EC mode, macOS uses mode 14
+        self.key_pair
+            .sign(&signature::RSA_PKCS1_SHA256, &rng, msg, dest)
+            .map_err(|_| "Failed to sign message")?;
         Ok(())
     }
 }
@@ -305,10 +308,6 @@ pub enum CertError {
     NomPem(x509_parser::nom::Err<x509_parser::error::PEMError>),
     NomX509(x509_parser::nom::Err<x509_parser::error::X509Error>),
     X509(x509_parser::error::X509Error),
-    Pkcs8(rsa::pkcs8::Error),
-    Rsa(rsa::Error),
-    Ecdsa(p256::ecdsa::Error),
-    Spki(x509_cert::spki::Error),
 }
 
 impl fmt::Display for CertError {
@@ -318,10 +317,6 @@ impl fmt::Display for CertError {
             Self::NomPem(ref e) => write!(f, "PEM error: {}", e),
             Self::NomX509(ref e) => write!(f, "X509 error: {}", e),
             Self::X509(ref e) => write!(f, "X509 error: {}", e),
-            Self::Pkcs8(ref e) => write!(f, "Decode error: {}", e),
-            Self::Rsa(ref e) => write!(f, "Signature verification error: {}", e),
-            Self::Ecdsa(ref e) => write!(f, "Decode error: {}", e),
-            Self::Spki(ref e) => write!(f, "SPKI error: {}", e),
         }
     }
 }
@@ -333,10 +328,6 @@ impl error::Error for CertError {
             Self::NomPem(ref err) => Some(err),
             Self::NomX509(ref err) => Some(err),
             Self::X509(ref err) => Some(err),
-            Self::Pkcs8(ref err) => Some(err),
-            Self::Rsa(ref err) => Some(err),
-            Self::Ecdsa(ref err) => Some(err),
-            Self::Spki(ref err) => Some(err),
         }
     }
 }
@@ -344,18 +335,6 @@ impl error::Error for CertError {
 impl From<&'static str> for CertError {
     fn from(msg: &'static str) -> CertError {
         Self::Internal(msg)
-    }
-}
-
-impl From<rsa::pkcs8::Error> for CertError {
-    fn from(err: rsa::pkcs8::Error) -> CertError {
-        Self::Pkcs8(err)
-    }
-}
-
-impl From<rsa::Error> for CertError {
-    fn from(err: rsa::Error) -> CertError {
-        Self::Rsa(err)
     }
 }
 
@@ -374,17 +353,5 @@ impl From<x509_parser::nom::Err<x509_parser::error::X509Error>> for CertError {
 impl From<x509_parser::error::X509Error> for CertError {
     fn from(err: x509_parser::error::X509Error) -> CertError {
         Self::X509(err)
-    }
-}
-
-impl From<p256::ecdsa::Error> for CertError {
-    fn from(err: p256::ecdsa::Error) -> CertError {
-        Self::Ecdsa(err)
-    }
-}
-
-impl From<x509_cert::spki::Error> for CertError {
-    fn from(err: x509_cert::spki::Error) -> CertError {
-        Self::Spki(err)
     }
 }
