@@ -19,20 +19,17 @@ smoltcp = { version = "0.11", optional = true, default-features = false, feature
 aws-lc-rs = { version = "*", optional = true, default-features = false }
 x509-parser = { version = "0.16", optional = true, default-features = false, features = ["validate"] }
 
-sha1 = { version = "0.10", optional = true, default-features = false, features = ["oid"] }
+sha1 = { version = "0.10", optional = true, default-features = false }
 p256 = { version = "0.13", optional = true, default-features = false, features = ["arithmetic", "ecdsa"] }
 hmac = { version = "0.12", optional = true, default-features = false, features = ["reset"] }
 sha2 = { version = "0.10", optional = true, default-features = false }
-aes = { version = "0.8", optional = true, default-features = false }
 aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes"] }
-crypto-bigint = { version = "*", optional = true, default-features = false, features = ["rand"] }
-cipher = { version = "*", optional = true, default-features = false, features = ["block-padding"] }
-cbc = { version = "*", optional = true, default-features = false }
+cipher = { version = "*", optional = true, default-features = false }
 
 [features]
 default = ["proxy", "ikev2"]
 proxy = ["smoltcp"]
-ikev2 = ["aws-lc-rs", "x509-parser", "sha1", "p256", "hmac", "sha2", "aes", "aes-gcm", "crypto-bigint", "cipher", "cbc"]
+ikev2 = ["aws-lc-rs", "x509-parser", "sha1", "p256", "hmac", "sha2", "aes-gcm", "cipher"]
 
 [profile.release]
 strip = true

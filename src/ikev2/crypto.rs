@@ -1,27 +1,16 @@
-use aes::{
-    cipher::{BlockDecryptMut, BlockEncryptMut},
-    Aes256,
-};
 use aes_gcm::{
     aead::{AeadMutInPlace, Buffer},
     Aes256Gcm, Nonce,
-};
-use cipher::{block_padding, BlockSizeUser, InnerIvInit, Iv, IvSizeUser};
-use crypto_bigint::{
-    modular::constant_mod::{self, ResidueParams},
-    Encoding,
 };
 use hmac::{Hmac, Mac};
 use log::debug;
 use p256::{
     elliptic_curve::sec1::Tag as P256Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey,
 };
-use rand::Rng;
+use rand::{rngs::OsRng, Rng};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use std::{error, fmt, ops::Range};
-
-use crypto_bigint::{const_residue, impl_modulus, rand_core::OsRng, Random, U1024};
 
 use super::message;
 
@@ -122,7 +111,6 @@ impl TransformParameters {
         match self.auth {
             Some(ref auth) => match auth.transform_type {
                 message::TransformType::AUTH_HMAC_SHA2_256_128 => 256,
-                message::TransformType::AUTH_HMAC_SHA1_96 => 160,
                 _ => 0,
             },
             None => 0,
@@ -132,7 +120,6 @@ impl TransformParameters {
     pub fn auth_signature_length(&self) -> Option<usize> {
         match self.auth.as_ref()?.transform_type {
             message::TransformType::AUTH_HMAC_SHA2_256_128 => Some(128),
-            message::TransformType::AUTH_HMAC_SHA1_96 => Some(96),
             _ => None,
         }
     }
@@ -242,16 +229,8 @@ pub fn choose_sa_parameters(
                 match tt_type {
                     message::TransformType::PRF_HMAC_SHA2_256 => parameters.prf = Some(transform),
                     message::TransformType::NO_ESN => parameters.esn = Some(transform),
-                    // Valid macOS options.
                     message::TransformType::ENCR_AES_GCM_16 => parameters.enc = Some(transform),
                     message::TransformType::DH_256_ECP => parameters.dh = Some(transform),
-                    // Valid Windows options.
-                    message::TransformType::ENCR_AES_CBC => parameters.enc = Some(transform),
-                    message::TransformType::AUTH_HMAC_SHA2_256_128 => {
-                        parameters.auth = Some(transform)
-                    }
-                    message::TransformType::AUTH_HMAC_SHA1_96 => parameters.auth = Some(transform),
-                    message::TransformType::DH_1024_MODP => parameters.dh = Some(transform),
                     _ => return false,
                 }
                 true
@@ -261,15 +240,8 @@ pub fn choose_sa_parameters(
             }
 
             let enc = parameters.enc.as_ref()?;
-            // macOS compatibility.
             if enc.transform_type == message::TransformType::ENCR_AES_GCM_16
                 && (enc.key_length? != 256 || parameters.auth.is_some())
-            {
-                return None;
-            }
-            // Windows compatibility.
-            if enc.transform_type == message::TransformType::ENCR_AES_CBC
-                && (enc.key_length? != 256 || parameters.auth.is_none())
             {
                 return None;
             }
@@ -307,7 +279,6 @@ impl<const M: usize> Array<M> {
 }
 
 pub enum DHTransformType {
-    MODP1024(DHTransformMODP1024),
     ECP256(DHTransformECP256),
 }
 
@@ -329,15 +300,6 @@ pub trait DHTransform {
 impl DHTransformType {
     fn init(transform_type: message::TransformType) -> Result<DHTransformType, InitError> {
         match transform_type {
-            message::TransformType::DH_1024_MODP => {
-                let private_key = U1024::random(&mut OsRng);
-                // This calculates DH_MODP_GENERATOR_1024^private_key mod DHModulus1024.
-                let public_key = DH_MODP_RESIDUE_1024.pow(&private_key).retrieve();
-                Ok(DHTransformType::MODP1024(DHTransformMODP1024 {
-                    private_key,
-                    public_key,
-                }))
-            }
             message::TransformType::DH_256_ECP => {
                 let private_key = NonZeroScalar::random(&mut OsRng);
                 let public_key = PublicKey::from_secret_scalar(&private_key);
@@ -354,28 +316,24 @@ impl DHTransformType {
 impl DHTransform for DHTransformType {
     fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
         match self {
-            Self::MODP1024(ref dh) => dh.read_public_key(),
             Self::ECP256(ref dh) => dh.read_public_key(),
         }
     }
 
     fn key_length_bytes(&self) -> usize {
         match self {
-            Self::MODP1024(ref dh) => dh.key_length_bytes(),
             Self::ECP256(ref dh) => dh.key_length_bytes(),
         }
     }
 
     fn shared_key_length_bytes(&self) -> usize {
         match self {
-            Self::MODP1024(ref dh) => dh.shared_key_length_bytes(),
             Self::ECP256(ref dh) => dh.shared_key_length_bytes(),
         }
     }
 
     fn group_number(&self) -> u16 {
         match self {
-            Self::MODP1024(ref dh) => dh.group_number(),
             Self::ECP256(ref dh) => dh.group_number(),
         }
     }
@@ -385,51 +343,8 @@ impl DHTransform for DHTransformType {
         other_public_key: &[u8],
     ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
         match self {
-            Self::MODP1024(ref dh) => dh.compute_shared_secret(other_public_key),
             Self::ECP256(ref dh) => dh.compute_shared_secret(other_public_key),
         }
-    }
-}
-
-pub struct DHTransformMODP1024 {
-    public_key: U1024,
-    private_key: U1024,
-}
-
-impl DHTransform for DHTransformMODP1024 {
-    fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
-        let mut res = Array::new(self.key_length_bytes());
-        res.as_mut_slice()
-            .copy_from_slice(&self.public_key.to_be_bytes());
-        res
-    }
-
-    fn key_length_bytes(&self) -> usize {
-        1024 / 8
-    }
-
-    fn shared_key_length_bytes(&self) -> usize {
-        self.key_length_bytes()
-    }
-
-    fn group_number(&self) -> u16 {
-        message::TransformType::DH_1024_MODP.type_id().1
-    }
-
-    fn compute_shared_secret(
-        &self,
-        other_public_key: &[u8],
-    ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
-        let mut res = Array::new(self.shared_key_length_bytes());
-        if other_public_key.len() != self.key_length_bytes() {
-            return Err("MODP 1024 key length is not valid".into());
-        }
-        let other_public_key = U1024::from_be_slice(other_public_key);
-        let other_key_residue = const_residue!(other_public_key, DHModulus1024);
-        let shared_key = other_key_residue.pow(&self.private_key).retrieve();
-        res.as_mut_slice()
-            .copy_from_slice(&shared_key.to_be_bytes());
-        Ok(res)
     }
 }
 
@@ -482,7 +397,6 @@ impl DHTransform for DHTransformECP256 {
 }
 
 type HmacSha256 = Hmac<Sha256>;
-type HmacSha1 = Hmac<Sha1>;
 
 pub enum PseudorandomTransform {
     None,
@@ -640,7 +554,6 @@ impl DerivedKeys {
 enum Auth {
     None,
     HmacSha256tr128(AuthHmacSha256tr128),
-    HmacSha1tr96(AuthHmacSha1tr96),
 }
 
 impl Auth {
@@ -653,13 +566,6 @@ impl Auth {
                 })?;
                 Ok(Self::HmacSha256tr128(AuthHmacSha256tr128 { key }))
             }
-            Some(message::TransformType::AUTH_HMAC_SHA1_96) => {
-                let key = HmacSha1::new_from_slice(key).map_err(|err| {
-                    debug!("Failed to init SHA1-96 HMAC key: {}", err);
-                    InitError::new("Failed to init SHA1-96 HMAC key")
-                })?;
-                Ok(Self::HmacSha1tr96(AuthHmacSha1tr96 { key }))
-            }
             None => Ok(Self::None),
             _ => Err("Unsupported PRF".into()),
         }
@@ -668,7 +574,6 @@ impl Auth {
     pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
         match self {
             Self::HmacSha256tr128(ref auth) => auth.sign(data),
-            Self::HmacSha1tr96(ref auth) => auth.sign(data),
             Self::None => Ok(()),
         }
     }
@@ -676,7 +581,6 @@ impl Auth {
     pub fn validate(&self, data: &[u8]) -> bool {
         match self {
             Self::HmacSha256tr128(ref auth) => auth.validate(data),
-            Self::HmacSha1tr96(ref auth) => auth.validate(data),
             Self::None => true,
         }
     }
@@ -684,7 +588,6 @@ impl Auth {
     pub fn signature_length(&self) -> usize {
         match self {
             Self::HmacSha256tr128(ref auth) => auth.signature_length(),
-            Self::HmacSha1tr96(ref auth) => auth.signature_length(),
             Self::None => 0,
         }
     }
@@ -727,46 +630,6 @@ impl AuthHmacSha256tr128 {
 
     pub fn signature_length(&self) -> usize {
         128 / 8
-    }
-}
-
-struct AuthHmacSha1tr96 {
-    key: HmacSha1,
-}
-
-impl AuthHmacSha1tr96 {
-    pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
-        let signature_length = self.signature_length();
-        if data.len() < signature_length {
-            return Err("Not enough space to add signature".into());
-        }
-        let data_length = data.len() - signature_length;
-        let hash = {
-            let sign_data = &data[..data_length];
-            let mut hmac = self.key.clone();
-            hmac.update(sign_data);
-            hmac.finalize().into_bytes()
-        };
-        let dest = &mut data[data_length..];
-        dest.copy_from_slice(&hash[..signature_length]);
-        Ok(())
-    }
-
-    pub fn validate(&self, data: &[u8]) -> bool {
-        let signature_length = self.signature_length();
-        if data.len() < signature_length {
-            return false;
-        }
-        let received_signature = &data[data.len() - signature_length..];
-        let data = &data[..data.len() - signature_length];
-        let mut hmac = self.key.clone();
-        hmac.update(data);
-        let hash = hmac.finalize().into_bytes();
-        &hash[..signature_length] == received_signature
-    }
-
-    pub fn signature_length(&self) -> usize {
-        96 / 8
     }
 }
 
@@ -956,7 +819,6 @@ pub trait Encryption {
 }
 
 pub enum EncryptionType {
-    AesCbc256(EncryptionAesCbc256),
     AesGcm256(EncryptionAesGcm256),
 }
 
@@ -967,14 +829,6 @@ impl EncryptionType {
         padding: PaddingType,
     ) -> Result<EncryptionType, InitError> {
         match transform_type.transform_type {
-            message::TransformType::ENCR_AES_CBC => {
-                if transform_type.key_length != Some(256) {
-                    return Err("Unsupported key length".into());
-                }
-                let cipher = aes::cipher::KeyInit::new_from_slice(key)
-                    .map_err(|_| InitError::new("Failed to init AES CBC 256 cipher"))?;
-                Ok(Self::AesCbc256(EncryptionAesCbc256 { cipher, padding }))
-            }
             message::TransformType::ENCR_AES_GCM_16 => {
                 if transform_type.key_length != Some(256) {
                     return Err("Unsupported key length".into());
@@ -995,7 +849,6 @@ impl EncryptionType {
 
     fn encrypted_payload_length(&self, msg_len: usize) -> usize {
         match self {
-            Self::AesCbc256(ref enc) => enc.encrypted_payload_length(msg_len),
             Self::AesGcm256(ref enc) => enc.encrypted_payload_length(msg_len),
         }
     }
@@ -1007,7 +860,6 @@ impl EncryptionType {
         associated_data: &[u8],
     ) -> Result<(), CryptoError> {
         match self {
-            Self::AesCbc256(ref enc) => enc.encrypt(data, msg_len, associated_data),
             Self::AesGcm256(ref enc) => enc.encrypt(data, msg_len, associated_data),
         }
     }
@@ -1019,7 +871,6 @@ impl EncryptionType {
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
         match self {
-            Self::AesCbc256(ref dec) => dec.decrypt(data, msg_len, associated_data),
             Self::AesGcm256(ref dec) => dec.decrypt(data, msg_len, associated_data),
         }
     }
@@ -1080,88 +931,6 @@ impl PaddingType {
             Self::IKEv2 => 1,
             Self::Esp => 2,
         }
-    }
-}
-
-type AesCbc256Decryptor = cbc::Decryptor<Aes256>;
-type AesCbc256Encryptor = cbc::Encryptor<Aes256>;
-
-pub struct EncryptionAesCbc256 {
-    cipher: Aes256,
-    padding: PaddingType,
-}
-
-impl Encryption for EncryptionAesCbc256 {
-    fn encrypt(&self, data: &mut [u8], msg_len: usize, _: &[u8]) -> Result<(), CryptoError> {
-        let iv_size = AesCbc256Encryptor::iv_size();
-        let encrypted_payload_length = self.encrypted_payload_length(msg_len);
-        if data.len() < encrypted_payload_length {
-            return Err("Message length is too short".into());
-        }
-        let mut iv = Iv::<AesCbc256Encryptor>::default();
-        // Move message to the right to make space for the IV.
-        data.copy_within(..msg_len, iv_size);
-        let padded_msg_len = encrypted_payload_length - iv_size;
-        self.padding
-            .add_padding(&mut data[iv_size..encrypted_payload_length], msg_len)?;
-        rand::thread_rng()
-            .try_fill(iv.as_mut_slice())
-            .map_err(|err| {
-                debug!("Failed to generate IV for AES CBC 256: {}", err);
-                "Failed to generate IV for AES CBC 256"
-            })?;
-        data[..iv_size].copy_from_slice(iv.as_slice());
-        let block_encryptor = AesCbc256Encryptor::inner_iv_init(self.cipher.clone(), &iv);
-        let data_range = &mut data[iv_size..encrypted_payload_length];
-        block_encryptor
-            .encrypt_padded_mut::<block_padding::NoPadding>(data_range, padded_msg_len)
-            .map_err(|err| {
-                debug!("Failed to encode AES CBC 256 message: {}", err);
-                "Failed to encode AES CBC 256 message"
-            })?;
-        Ok(())
-    }
-
-    fn decrypt<'a>(
-        &self,
-        data: &'a mut [u8],
-        msg_len: usize,
-        _: &[u8],
-    ) -> Result<&'a [u8], CryptoError> {
-        let iv_size = AesCbc256Decryptor::iv_size();
-        if msg_len <= iv_size {
-            return Err("Message length is too short".into());
-        }
-        let block_decryptor =
-            match AesCbc256Decryptor::inner_iv_slice_init(self.cipher.clone(), &data[..iv_size]) {
-                Ok(dec) => dec,
-                Err(err) => {
-                    debug!("Failed to init AES CBC 256 IV: {}", err);
-                    return Err("Failed to init AES CBC 256 IV".into());
-                }
-            };
-        let data_range = &mut data[iv_size..msg_len];
-        let decrypted_slice = block_decryptor
-            .decrypt_padded_mut::<block_padding::NoPadding>(data_range)
-            .map_err(|err| {
-                debug!("Failed to decode AES CBC 256 message: {}", err);
-                "Failed to decode AES CBC 256 message"
-            })?;
-        self.padding.remove_padding(decrypted_slice)
-    }
-
-    fn encrypted_payload_length(&self, msg_len: usize) -> usize {
-        let iv_size = AesCbc256Encryptor::iv_size();
-        let block_size = AesCbc256Encryptor::block_size();
-        let msg_len = msg_len + self.padding.length();
-        let encrypted_size = (msg_len / block_size) * block_size;
-        let encrypted_size = if encrypted_size < msg_len {
-            encrypted_size + block_size
-        } else {
-            encrypted_size
-        };
-
-        iv_size + encrypted_size
     }
 }
 
@@ -1340,13 +1109,3 @@ impl From<&'static str> for CryptoError {
         CryptoError { msg }
     }
 }
-
-const DH_MODP_GENERATOR_1024: U1024 = U1024::from_u8(2);
-const DH_MODP_RESIDUE_1024: constant_mod::Residue<DHModulus1024, { U1024::LIMBS }> =
-    const_residue!(DH_MODP_GENERATOR_1024, DHModulus1024);
-
-impl_modulus!(
-    DHModulus1024,
-    U1024,
-    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF"
-);
