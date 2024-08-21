@@ -189,7 +189,7 @@ impl ClientCertificate {
                     return Err("Digital Signature ASN.1 AlgorithmIdentifier overflow".into());
                 }
                 let signature_oid = &signature[1..1 + asn1_length];
-                if signature_oid != &ASN1_IDENTIFIDER_ECDSA_WITH_SHA256 {
+                if signature_oid != ASN1_IDENTIFIDER_ECDSA_WITH_SHA256 {
                     debug!("Unsupported ASN.1 AlgorithmIdentifier {:?}", signature_oid,);
                     return Err("Unsupported ASN.1 AlgorithmIdentifier".into());
                 }
@@ -283,7 +283,7 @@ impl ClientValidation {
             &self.root_ca_public_key,
         );
         public_key
-            .verify(&signed_data, &signature)
+            .verify(signed_data, signature)
             .map_err(|_| "Failed to verify client cert signature")?;
         if let Some(eku) = client_cert.extended_key_usage()? {
             if !eku.value.client_auth {

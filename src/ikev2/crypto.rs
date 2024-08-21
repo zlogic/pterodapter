@@ -294,11 +294,14 @@ impl DHTransformType {
             message::TransformType::DH_256_ECP => {
                 let rng = ring::rand::SystemRandom::new();
                 let private_key =
-                    agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
-                        .map_err(|_| InitError::new("Failed to generate private ECDH key"))?;
-                let public_key = private_key
-                    .compute_public_key()
-                    .map_err(|_| InitError::new("Failed to compute public ECDH key"))?;
+                    match agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng) {
+                        Ok(private_key) => private_key,
+                        Err(_) => return Err("Failed to generate private ECDH key".into()),
+                    };
+                let public_key = match private_key.compute_public_key() {
+                    Ok(public_key) => public_key,
+                    Err(_) => return Err("Failed to compute public ECDH key".into()),
+                };
                 Ok(DHTransformType::ECP256(DHTransformECP256 {
                     private_key: Some(private_key),
                     public_key,
@@ -384,7 +387,7 @@ impl DHTransform for DHTransformECP256 {
             None => return Err("ECDH private key is already consumed".into()),
         };
         match agreement::agree_ephemeral(private_key, &other_public_key, |secret_point| {
-            res.as_mut_slice().copy_from_slice(&secret_point)
+            res.as_mut_slice().copy_from_slice(secret_point)
         }) {
             Ok(key) => key,
             Err(_) => {
@@ -397,7 +400,7 @@ impl DHTransform for DHTransformECP256 {
 
 pub enum PseudorandomTransform {
     None,
-    HmacSha256(hkdf::Prk, hmac::Key),
+    HmacSha256(hkdf::Prk, Box<hmac::Key>),
 }
 
 impl PseudorandomTransform {
@@ -409,7 +412,7 @@ impl PseudorandomTransform {
             message::TransformType::PRF_HMAC_SHA2_256 => {
                 let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, key);
                 let key = hmac::Key::new(hmac::HMAC_SHA256, key);
-                Ok(Self::HmacSha256(prk, key))
+                Ok(Self::HmacSha256(prk, Box::new(key)))
             }
             _ => Err("Unsupported PRF".into()),
         }
@@ -937,13 +940,14 @@ impl Encryption for EncryptionAesGcm256 {
             slice: &mut data[8..],
             len: msg_len,
         };
-        self.key
-            .seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(associated_data),
-                &mut buffer,
-            )
-            .map_err(|_| "Failed to encode AES GCM 16 256 message")?;
+        match self.key.seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(associated_data),
+            &mut buffer,
+        ) {
+            Ok(()) => {}
+            Err(_) => return Err("Failed to encode AES GCM 16 256 message".into()),
+        };
         Ok(())
     }
 
@@ -959,15 +963,14 @@ impl Encryption for EncryptionAesGcm256 {
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.salt);
         nonce[4..].copy_from_slice(&data[..8]);
-        let decrypted_data = self
-            .key
-            .open_in_place(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(associated_data),
-                &mut data[8..msg_len],
-            )
-            .map_err(|_| "Failed to decode AES GCM 16 256 message")?;
-        self.padding.remove_padding(decrypted_data)
+        match self.key.open_in_place(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(associated_data),
+            &mut data[8..msg_len],
+        ) {
+            Ok(decrypted_data) => self.padding.remove_padding(decrypted_data),
+            Err(_) => Err("Failed to decode AES GCM 16 256 message".into()),
+        }
     }
 
     fn encrypted_payload_length(&self, msg_len: usize) -> usize {
