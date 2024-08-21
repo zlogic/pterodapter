@@ -1,8 +1,7 @@
 use std::{error, fmt};
 
 use log::debug;
-use ring::signature;
-use sha1::{Digest, Sha1};
+use ring::{digest, signature};
 use x509_parser::{
     certificate,
     extensions::GeneralName,
@@ -145,19 +144,6 @@ impl PkiProcessing {
         })
     }
 
-    pub fn signature_length(&self, format: SignatureFormat) -> usize {
-        if let Some(server_identity) = &self.server_identity {
-            let parameters_length = if format == SignatureFormat::AdditionalParameters {
-                1 + ASN1_IDENTIFIDER_ECDSA_WITH_SHA256.len()
-            } else {
-                0
-            };
-            parameters_length + server_identity.signature_length
-        } else {
-            0
-        }
-    }
-
     pub fn sign_auth(
         &self,
         format: SignatureFormat,
@@ -248,9 +234,12 @@ impl ClientValidation {
 
         let root_ca_issuer = root_ca.tbs_certificate.subject.as_raw().to_vec();
 
-        let mut hasher = Sha1::new();
-        hasher.update(root_ca.tbs_certificate.subject_pki.raw);
-        let root_ca_request = hasher.finalize().into();
+        let mut root_ca_request = [0u8; 20];
+        let root_ca_hash = digest::digest(
+            &digest::SHA1_FOR_LEGACY_USE_ONLY,
+            root_ca.tbs_certificate.subject_pki.raw,
+        );
+        root_ca_request.copy_from_slice(root_ca_hash.as_ref());
 
         let root_ca_validity = root_ca.validity.clone();
 
@@ -310,7 +299,6 @@ impl ClientValidation {
 
 struct ServerIdentity {
     public_cert_der: Vec<u8>,
-    signature_length: usize,
     key_pair_fixed: signature::EcdsaKeyPair,
     key_pair_asn1: signature::EcdsaKeyPair,
 }
@@ -334,10 +322,8 @@ impl ServerIdentity {
             &rng,
         )
         .map_err(|_| "Failed to parse ECDSA private key")?;
-        let signature_length = 64;
         Ok(ServerIdentity {
             public_cert_der,
-            signature_length,
             key_pair_fixed,
             key_pair_asn1,
         })

@@ -2,19 +2,17 @@ use aes_gcm::{
     aead::{AeadMutInPlace, Buffer},
     Aes256Gcm, Nonce,
 };
-use hmac::{Hmac, Mac};
 use log::debug;
 use p256::{
     elliptic_curve::sec1::Tag as P256Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey,
 };
 use rand::{rngs::OsRng, Rng};
-use sha1::{Digest, Sha1};
-use sha2::Sha256;
+use ring::{digest, hkdf, hmac};
 use std::{error, fmt, ops::Range};
 
 use super::message;
 
-const MAX_DH_KEY_LENGTH: usize = 1024 / 8;
+const MAX_DH_KEY_LENGTH: usize = 64;
 const MAX_PRF_KEY_LENGTH: usize = 256 / 8;
 const MAX_AUTH_KEY_LENGTH: usize = 256 / 8;
 const MAX_ENCRYPTION_KEY_LENGTH: usize = 256 / 8;
@@ -396,11 +394,9 @@ impl DHTransform for DHTransformECP256 {
     }
 }
 
-type HmacSha256 = Hmac<Sha256>;
-
 pub enum PseudorandomTransform {
     None,
-    HmacSha256(HmacSha256),
+    HmacSha256(hkdf::Prk, hmac::Key),
 }
 
 impl PseudorandomTransform {
@@ -410,10 +406,9 @@ impl PseudorandomTransform {
     ) -> Result<PseudorandomTransform, InitError> {
         match transform_type {
             message::TransformType::PRF_HMAC_SHA2_256 => {
-                let core_wrapper = HmacSha256::new_from_slice(key)
-                    .map_err(|_| InitError::new("Failed to init HMAC SHA256 PRF"))?;
-                let hmac = core_wrapper;
-                Ok(Self::HmacSha256(hmac))
+                let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, key);
+                let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+                Ok(Self::HmacSha256(prk, key))
             }
             _ => Err("Unsupported PRF".into()),
         }
@@ -421,12 +416,10 @@ impl PseudorandomTransform {
 
     pub fn prf(&self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
         match self {
-            Self::HmacSha256(ref hmac) => {
-                let mut hmac = hmac.clone();
-                hmac.update(data);
-                let hash = hmac.finalize().into_bytes();
+            Self::HmacSha256(_, ref key) => {
+                let tag = hmac::sign(key, data);
                 let mut result = Array::new(self.key_length());
-                result.as_mut_slice().copy_from_slice(&hash);
+                result.as_mut_slice().copy_from_slice(tag.as_ref());
                 result
             }
             Self::None => Array::new(0),
@@ -435,30 +428,20 @@ impl PseudorandomTransform {
 
     fn derive_keys(&self, keys: &mut DerivedKeys, data: &[u8]) -> Result<(), InitError> {
         match self {
-            Self::HmacSha256(ref hmac) => {
-                let mut hmac = hmac.clone();
-                let mut next_data = vec![0u8; data.len() + self.key_length() + 1];
-                let mut cursor = 0;
-                // First T1 chunk.
-                next_data[0..data.len()].copy_from_slice(data);
-                next_data[data.len()] = 1;
-                hmac.update(&next_data[0..data.len() + 1]);
-                for t in 1..255 {
-                    let hash = hmac.finalize_reset().into_bytes();
-                    let dest_range = cursor..(cursor + hash.len()).min(keys.full_length());
-                    let src_range = ..dest_range.len();
-                    cursor = dest_range.end;
-                    keys.keys[dest_range].copy_from_slice(&hash[src_range]);
-                    if cursor >= keys.full_length() {
-                        break;
-                    }
-                    // Following T-chunks.
-                    next_data[0..hash.len()].copy_from_slice(&hash);
-                    next_data[hash.len()..hash.len() + data.len()].copy_from_slice(data);
-                    next_data[hash.len() + data.len()] = t + 1;
-                    hmac.update(&next_data);
+            Self::HmacSha256(ref prk, _) => {
+                let info = [data];
+                let length = keys.full_length();
+                let destination_length = length.0;
+                let okm = if let Ok(okm) = prk.expand(&info, length) {
+                    okm
+                } else {
+                    return Err("Failed to expand derived keys".into());
+                };
+                if okm.fill(&mut keys.keys[..destination_length]).is_ok() {
+                    Ok(())
+                } else {
+                    Err("Failed to fill derived keys".into())
                 }
-                Ok(())
             }
             Self::None => Err("PRF is none and cannot create new crypto stacks".into()),
         }
@@ -476,7 +459,7 @@ impl PseudorandomTransform {
 
     fn key_length(&self) -> usize {
         match self {
-            Self::HmacSha256(_) => 256 / 8,
+            Self::HmacSha256(_, _) => 256 / 8,
             Self::None => 0,
         }
     }
@@ -540,14 +523,23 @@ impl DerivedKeys {
         }
     }
 
-    fn full_length(&self) -> usize {
-        self.derive.len()
+    fn full_length(&self) -> DerivedKeysLength {
+        let length = self.derive.len()
             + self.auth_initiator.len()
             + self.auth_responder.len()
             + self.enc_initiator.len()
             + self.enc_responder.len()
             + self.prf_initiator.len()
-            + self.prf_responder.len()
+            + self.prf_responder.len();
+        DerivedKeysLength(length)
+    }
+}
+
+struct DerivedKeysLength(usize);
+
+impl hkdf::KeyType for DerivedKeysLength {
+    fn len(&self) -> usize {
+        self.0
     }
 }
 
@@ -560,10 +552,7 @@ impl Auth {
     fn init(transform_type: Option<message::TransformType>, key: &[u8]) -> Result<Auth, InitError> {
         match transform_type {
             Some(message::TransformType::AUTH_HMAC_SHA2_256_128) => {
-                let key = HmacSha256::new_from_slice(key).map_err(|err| {
-                    debug!("Failed to init SHA256-128 HMAC key: {}", err);
-                    InitError::new("Failed to init SHA256-128 HMAC key")
-                })?;
+                let key = hmac::Key::new(hmac::HMAC_SHA256, key);
                 Ok(Self::HmacSha256tr128(AuthHmacSha256tr128 { key }))
             }
             None => Ok(Self::None),
@@ -594,7 +583,7 @@ impl Auth {
 }
 
 struct AuthHmacSha256tr128 {
-    key: HmacSha256,
+    key: hmac::Key,
 }
 
 impl AuthHmacSha256tr128 {
@@ -604,14 +593,9 @@ impl AuthHmacSha256tr128 {
             return Err("Not enough space to add signature".into());
         }
         let data_length = data.len() - signature_length;
-        let hash = {
-            let sign_data = &data[..data_length];
-            let mut hmac = self.key.clone();
-            hmac.update(sign_data);
-            hmac.finalize().into_bytes()
-        };
+        let tag = hmac::sign(&self.key, &data[..data_length]);
         let dest = &mut data[data_length..];
-        dest.copy_from_slice(&hash[..signature_length]);
+        dest.copy_from_slice(&tag.as_ref()[..signature_length]);
         Ok(())
     }
 
@@ -622,10 +606,8 @@ impl AuthHmacSha256tr128 {
         }
         let received_signature = &data[data.len() - signature_length..];
         let data = &data[..data.len() - signature_length];
-        let mut hmac = self.key.clone();
-        hmac.update(data);
-        let hash = hmac.finalize().into_bytes();
-        &hash[..signature_length] == received_signature
+        let tag = hmac::sign(&self.key, data);
+        &tag.as_ref()[..signature_length] == received_signature
     }
 
     pub fn signature_length(&self) -> usize {
@@ -1021,10 +1003,11 @@ impl Encryption for EncryptionAesGcm256 {
     }
 }
 
-pub fn hash_sha1(data: &[u8]) -> [u8; 160 / 8] {
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    hasher.finalize().into()
+pub fn hash_sha1(data: &[u8]) -> [u8; 20] {
+    let mut result = [0u8; 20];
+    let hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data);
+    result.copy_from_slice(hash.as_ref());
+    result
 }
 
 pub struct UnsupportedTransform {}
