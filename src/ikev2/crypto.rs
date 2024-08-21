@@ -1,9 +1,6 @@
 use log::debug;
-use p256::{
-    elliptic_curve::sec1::Tag as P256Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey,
-};
-use rand::{rngs::OsRng, Rng};
-use ring::{aead, digest, hkdf, hmac};
+use rand::Rng;
+use ring::{aead, agreement, digest, hkdf, hmac};
 use std::{error, fmt, ops::Range};
 
 use super::message;
@@ -286,7 +283,7 @@ pub trait DHTransform {
     fn group_number(&self) -> u16;
 
     fn compute_shared_secret(
-        &self,
+        &mut self,
         other_public_key: &[u8],
     ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError>;
 }
@@ -295,10 +292,15 @@ impl DHTransformType {
     fn init(transform_type: message::TransformType) -> Result<DHTransformType, InitError> {
         match transform_type {
             message::TransformType::DH_256_ECP => {
-                let private_key = NonZeroScalar::random(&mut OsRng);
-                let public_key = PublicKey::from_secret_scalar(&private_key);
+                let rng = ring::rand::SystemRandom::new();
+                let private_key =
+                    agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
+                        .map_err(|_| InitError::new("Failed to generate private ECDH key"))?;
+                let public_key = private_key
+                    .compute_public_key()
+                    .map_err(|_| InitError::new("Failed to compute public ECDH key"))?;
                 Ok(DHTransformType::ECP256(DHTransformECP256 {
-                    private_key,
+                    private_key: Some(private_key),
                     public_key,
                 }))
             }
@@ -333,25 +335,25 @@ impl DHTransform for DHTransformType {
     }
 
     fn compute_shared_secret(
-        &self,
+        &mut self,
         other_public_key: &[u8],
     ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
         match self {
-            Self::ECP256(ref dh) => dh.compute_shared_secret(other_public_key),
+            Self::ECP256(ref mut dh) => dh.compute_shared_secret(other_public_key),
         }
     }
 }
 
 pub struct DHTransformECP256 {
-    private_key: NonZeroScalar,
-    public_key: PublicKey,
+    private_key: Option<agreement::EphemeralPrivateKey>,
+    public_key: agreement::PublicKey,
 }
 
 impl DHTransform for DHTransformECP256 {
     fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
         let mut res = Array::new(self.key_length_bytes());
         res.as_mut_slice()
-            .copy_from_slice(&EncodedPoint::from(&self.public_key).as_bytes()[1..]);
+            .copy_from_slice(&self.public_key.as_ref()[1..]);
         res
     }
 
@@ -368,24 +370,27 @@ impl DHTransform for DHTransformECP256 {
     }
 
     fn compute_shared_secret(
-        &self,
+        &mut self,
         other_public_key: &[u8],
     ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
         let mut res = Array::new(self.shared_key_length_bytes());
         let mut other_public_key_sec1 = [0u8; 1 + 64];
-        other_public_key_sec1[0] = P256Tag::Uncompressed.into();
+        other_public_key_sec1[0] = 0x04;
         other_public_key_sec1[1..].copy_from_slice(other_public_key);
-        let other_public_key = match PublicKey::from_sec1_bytes(&other_public_key_sec1) {
+        let other_public_key =
+            agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &other_public_key_sec1);
+        let private_key = match self.private_key.take() {
+            Some(private_key) => private_key,
+            None => return Err("ECDH private key is already consumed".into()),
+        };
+        match agreement::agree_ephemeral(private_key, &other_public_key, |secret_point| {
+            res.as_mut_slice().copy_from_slice(&secret_point)
+        }) {
             Ok(key) => key,
-            Err(err) => {
-                debug!("Failed to decode other public key {}", err);
-                return Err("Failed to decode other public key".into());
+            Err(_) => {
+                return Err("Failed to compute ECDH shared secret".into());
             }
         };
-        let public_point = ProjectivePoint::from(other_public_key.as_affine());
-        let secret_point = (&public_point * &self.private_key).to_affine();
-        res.as_mut_slice()
-            .copy_from_slice(&EncodedPoint::from(secret_point).compress().as_bytes()[1..]);
         Ok(res)
     }
 }
@@ -799,8 +804,10 @@ impl EncryptionType {
                 }
                 let mut salt = [0u8; 4];
                 salt.copy_from_slice(&key[32..]);
-                let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key[..32])
-                    .map_err(|_| InitError::new("Failed to init AES GCM 256 key"))?;
+                let key = match aead::UnboundKey::new(&aead::AES_256_GCM, &key[..32]) {
+                    Ok(key) => key,
+                    Err(_) => return Err(InitError::new("Failed to init AES GCM 256 key")),
+                };
                 let key = aead::LessSafeKey::new(key);
                 Ok(Self::AesGcm256(EncryptionAesGcm256 { key, salt, padding }))
             }

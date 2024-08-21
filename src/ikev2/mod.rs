@@ -798,7 +798,7 @@ impl IKEv2Session {
                 }
                 message::PayloadType::KEY_EXCHANGE => {
                     let kex = payload.to_key_exchange()?;
-                    if let Some(dh) = dh_transform.as_ref() {
+                    if let Some(ref mut dh) = dh_transform.as_mut() {
                         let public_key = dh.read_public_key();
                         shared_secret = match dh.compute_shared_secret(kex.read_value()) {
                             Ok(shared_secret) => Some(shared_secret),

@@ -19,12 +19,10 @@ smoltcp = { version = "0.11", optional = true, default-features = false, feature
 ring = { version = "*", optional = true, default-features = false }
 x509-parser = { version = "0.16", optional = true, default-features = false, features = ["validate"] }
 
-p256 = { version = "0.13", optional = true, default-features = false, features = ["arithmetic"] }
-
 [features]
 default = ["proxy", "ikev2"]
 proxy = ["smoltcp"]
-ikev2 = ["ring", "x509-parser", "p256"]
+ikev2 = ["ring", "x509-parser"]
 
 [profile.release]
 strip = true
