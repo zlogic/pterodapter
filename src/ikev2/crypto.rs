@@ -1,13 +1,9 @@
-use aes_gcm::{
-    aead::{AeadMutInPlace, Buffer},
-    Aes256Gcm, Nonce,
-};
 use log::debug;
 use p256::{
     elliptic_curve::sec1::Tag as P256Tag, EncodedPoint, NonZeroScalar, ProjectivePoint, PublicKey,
 };
 use rand::{rngs::OsRng, Rng};
-use ring::{digest, hkdf, hmac};
+use ring::{aead, digest, hkdf, hmac};
 use std::{error, fmt, ops::Range};
 
 use super::message;
@@ -758,27 +754,13 @@ impl AsMut<[u8]> for SliceBuffer<'_> {
     }
 }
 
-impl Buffer for SliceBuffer<'_> {
-    fn extend_from_slice(&mut self, other: &[u8]) -> aes_gcm::aead::Result<()> {
-        if self.len + other.len() <= self.slice.len() {
-            self.slice[self.len..self.len + other.len()].copy_from_slice(other);
-            self.len += other.len();
-            Ok(())
-        } else {
-            Err(aes_gcm::aead::Error)
-        }
-    }
-
-    fn truncate(&mut self, len: usize) {
-        self.len = len;
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
+impl<'a> Extend<&'a u8> for SliceBuffer<'_> {
+    fn extend<T: IntoIterator<Item = &'a u8>>(&mut self, iter: T) {
+        let remain = &mut self.slice[self.len..];
+        iter.into_iter().zip(remain).for_each(|(src, dst)| {
+            *dst = *src;
+            self.len += 1
+        });
     }
 }
 
@@ -815,15 +797,12 @@ impl EncryptionType {
                 if transform_type.key_length != Some(256) {
                     return Err("Unsupported key length".into());
                 }
-                let cipher = aes_gcm::KeyInit::new_from_slice(&key[..32])
-                    .map_err(|_| InitError::new("Failed to init AES GCM 256 cipher"))?;
                 let mut salt = [0u8; 4];
                 salt.copy_from_slice(&key[32..]);
-                Ok(Self::AesGcm256(EncryptionAesGcm256 {
-                    cipher,
-                    salt,
-                    padding,
-                }))
+                let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key[..32])
+                    .map_err(|_| InitError::new("Failed to init AES GCM 256 key"))?;
+                let key = aead::LessSafeKey::new(key);
+                Ok(Self::AesGcm256(EncryptionAesGcm256 { key, salt, padding }))
             }
             _ => Err("ENC not initialized".into()),
         }
@@ -917,7 +896,7 @@ impl PaddingType {
 }
 
 pub struct EncryptionAesGcm256 {
-    cipher: Aes256Gcm,
+    key: aead::LessSafeKey,
     salt: [u8; 4],
     padding: PaddingType,
 }
@@ -951,17 +930,13 @@ impl Encryption for EncryptionAesGcm256 {
             slice: &mut data[8..],
             len: msg_len,
         };
-        let mut cipher = self.cipher.clone();
-        cipher
-            .encrypt_in_place(
-                Nonce::from_slice(nonce.as_slice()),
-                associated_data,
+        self.key
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(associated_data),
                 &mut buffer,
             )
-            .map_err(|err| {
-                debug!("Failed to encode AES GCM 16 256 message: {}", err);
-                "Failed to encode AES GCM 16 256 message"
-            })?;
+            .map_err(|_| "Failed to encode AES GCM 16 256 message")?;
         Ok(())
     }
 
@@ -977,29 +952,21 @@ impl Encryption for EncryptionAesGcm256 {
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.salt);
         nonce[4..].copy_from_slice(&data[..8]);
-        let mut buffer = SliceBuffer {
-            slice: &mut data[8..],
-            len: msg_len - 8,
-        };
-        let mut cipher = self.cipher.clone();
-        cipher
-            .decrypt_in_place(
-                Nonce::from_slice(nonce.as_slice()),
-                associated_data,
-                &mut buffer,
+        let decrypted_data = self
+            .key
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(associated_data),
+                &mut data[8..msg_len],
             )
-            .map_err(|err| {
-                debug!("Failed to decode AES GCM 16 256 message: {}", err);
-                "Failed to decode AES GCM 16 256 message"
-            })?;
-        self.padding.remove_padding(&buffer.slice[..buffer.len])
+            .map_err(|_| "Failed to decode AES GCM 16 256 message")?;
+        self.padding.remove_padding(decrypted_data)
     }
 
     fn encrypted_payload_length(&self, msg_len: usize) -> usize {
-        const TAG_SIZE: usize = 16;
         // AES GCM is a stream cipher, encrypted payload will contain
-        // IV + message (with padding) + tag.
-        8 + msg_len + self.padding.length() + TAG_SIZE
+        // part of the nonce + message (with padding) + tag.
+        8 + msg_len + self.padding.length() + self.key.algorithm().tag_len()
     }
 }
 

@@ -20,12 +20,11 @@ ring = { version = "*", optional = true, default-features = false }
 x509-parser = { version = "0.16", optional = true, default-features = false, features = ["validate"] }
 
 p256 = { version = "0.13", optional = true, default-features = false, features = ["arithmetic"] }
-aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes"] }
 
 [features]
 default = ["proxy", "ikev2"]
 proxy = ["smoltcp"]
-ikev2 = ["ring", "x509-parser", "p256", "aes-gcm"]
+ikev2 = ["ring", "x509-parser", "p256"]
 
 [profile.release]
 strip = true
