@@ -186,7 +186,7 @@ impl Args {
             } else if action_type == ActionType::IkeV2 && name == "--id-hostname" {
                 id_hostname = Some(value.into());
             } else if action_type == ActionType::IkeV2 && name == "--cacert" {
-                match fs::read(value) {
+                match fs::read_to_string(value) {
                     Ok(cert) => root_ca = Some(cert),
                     Err(err) => fail_with_error(
                         name,
@@ -195,7 +195,7 @@ impl Args {
                     ),
                 };
             } else if action_type == ActionType::IkeV2 && name == "--cert" {
-                match fs::read(value) {
+                match fs::read_to_string(value) {
                     Ok(cert) => public_cert = Some(cert),
                     Err(err) => fail_with_error(
                         name,
@@ -204,7 +204,7 @@ impl Args {
                     ),
                 };
             } else if action_type == ActionType::IkeV2 && name == "--key" {
-                match fs::read(value) {
+                match fs::read_to_string(value) {
                     Ok(cert) => private_key = Some(cert),
                     Err(err) => fail_with_error(
                         name,
@@ -266,7 +266,7 @@ impl Args {
                 }
                 #[cfg(feature = "ikev2")]
                 {
-                    let server_cert = match (public_cert.clone(), private_key.clone()) {
+                    let server_cert = match (public_cert, private_key) {
                         (Some(public_cert), Some(private_key)) => Some((public_cert, private_key)),
                         _ => None,
                     };
@@ -277,7 +277,7 @@ impl Args {
                     let ikev2_config = ikev2::Config {
                         hostname: id_hostname.clone(),
                         listen_ips: listen_ips.clone(),
-                        root_ca: root_ca.clone(),
+                        root_ca,
                         server_cert,
                     };
                     let action = Action::IkeV2(Ikev2Config {

@@ -1,12 +1,12 @@
 use std::{error, fmt};
 
+use base64::engine::{general_purpose, Engine as _};
 use log::debug;
 use ring::{digest, signature};
 use x509_parser::{
     certificate,
     extensions::GeneralName,
     oid_registry::{OID_KEY_TYPE_EC_PUBLIC_KEY, OID_SIG_ECDSA_WITH_SHA256},
-    pem,
 };
 
 use super::message;
@@ -20,8 +20,8 @@ pub struct PkiProcessing {
 impl PkiProcessing {
     pub fn new(
         hostname: Option<&str>,
-        root_ca: Option<&[u8]>,
-        server_cert: Option<(&[u8], &[u8])>,
+        root_ca: Option<&str>,
+        server_cert: Option<(&str, &str)>,
     ) -> Result<PkiProcessing, CertError> {
         let client_validation = if let Some(root_ca) = root_ca {
             Some(ClientValidation::new(root_ca)?)
@@ -221,9 +221,9 @@ struct ClientValidation {
 }
 
 impl ClientValidation {
-    pub fn new(root_ca_pem: &[u8]) -> Result<ClientValidation, CertError> {
-        let (_, root_ca_der) = pem::parse_x509_pem(root_ca_pem)?;
-        let root_ca = root_ca_der.parse_x509()?;
+    pub fn new(root_ca_pem: &str) -> Result<ClientValidation, CertError> {
+        let root_ca_der = &pem_to_der(root_ca_pem, &PEM_SECTION_CERTIFICATE)?;
+        let (_, root_ca) = x509_parser::parse_x509_certificate(root_ca_der)?;
 
         let root_ca_public_key = root_ca
             .tbs_certificate
@@ -304,21 +304,20 @@ struct ServerIdentity {
 }
 
 impl ServerIdentity {
-    fn new(public_cert_pem: &[u8], private_key_pem: &[u8]) -> Result<ServerIdentity, CertError> {
-        let (_, public_cert) = pem::parse_x509_pem(public_cert_pem)?;
-        let public_cert_der = public_cert.contents;
+    fn new(public_cert_pem: &str, private_key_pem: &str) -> Result<ServerIdentity, CertError> {
+        let public_cert_der = pem_to_der(public_cert_pem, &PEM_SECTION_CERTIFICATE)?;
 
-        let (_, private_key_der) = pem::parse_x509_pem(private_key_pem)?;
+        let private_key_der = pem_to_der(private_key_pem, &PEM_SECTION_PRIVATE_KEY)?;
         let rng = ring::rand::SystemRandom::new();
         let key_pair_fixed = signature::EcdsaKeyPair::from_pkcs8(
             &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &private_key_der.contents,
+            &private_key_der,
             &rng,
         )
         .map_err(|_| "Failed to parse ECDSA private key")?;
         let key_pair_asn1 = signature::EcdsaKeyPair::from_pkcs8(
             &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            &private_key_der.contents,
+            &private_key_der,
             &rng,
         )
         .map_err(|_| "Failed to parse ECDSA private key")?;
@@ -365,12 +364,47 @@ impl ServerIdentity {
     }
 }
 
+struct PemSection {
+    begin: &'static str,
+    end: &'static str,
+}
+
+const PEM_SECTION_CERTIFICATE: PemSection = PemSection {
+    begin: "-----BEGIN CERTIFICATE-----",
+    end: "-----END CERTIFICATE-----",
+};
+const PEM_SECTION_PRIVATE_KEY: PemSection = PemSection {
+    begin: "-----BEGIN PRIVATE KEY-----",
+    end: "-----END PRIVATE KEY-----",
+};
+
+fn pem_to_der(pem: &str, section: &PemSection) -> Result<Vec<u8>, CertError> {
+    let mut inside_section = false;
+    let mut der_base64 = String::new();
+    for line in pem.lines() {
+        if !inside_section {
+            if line == section.begin {
+                inside_section = true;
+            }
+        } else {
+            if line == section.end {
+                return Ok(general_purpose::STANDARD.decode(&der_base64)?);
+            }
+            if inside_section {
+                der_base64.push_str(line);
+            }
+        }
+    }
+    Err("Malformed PEM certificate".into())
+}
+
 #[derive(Debug)]
 pub enum CertError {
     Internal(&'static str),
     NomPem(x509_parser::nom::Err<x509_parser::error::PEMError>),
     NomX509(x509_parser::nom::Err<x509_parser::error::X509Error>),
     X509(x509_parser::error::X509Error),
+    Base64(base64::DecodeError),
 }
 
 impl fmt::Display for CertError {
@@ -380,6 +414,7 @@ impl fmt::Display for CertError {
             Self::NomPem(ref e) => write!(f, "PEM error: {}", e),
             Self::NomX509(ref e) => write!(f, "X509 error: {}", e),
             Self::X509(ref e) => write!(f, "X509 error: {}", e),
+            Self::Base64(ref e) => write!(f, "Base64 decode error: {}", e),
         }
     }
 }
@@ -391,6 +426,7 @@ impl error::Error for CertError {
             Self::NomPem(ref err) => Some(err),
             Self::NomX509(ref err) => Some(err),
             Self::X509(ref err) => Some(err),
+            Self::Base64(_) => None,
         }
     }
 }
@@ -416,5 +452,11 @@ impl From<x509_parser::nom::Err<x509_parser::error::X509Error>> for CertError {
 impl From<x509_parser::error::X509Error> for CertError {
     fn from(err: x509_parser::error::X509Error) -> CertError {
         Self::X509(err)
+    }
+}
+
+impl From<base64::DecodeError> for CertError {
+    fn from(err: base64::DecodeError) -> CertError {
+        Self::Base64(err)
     }
 }

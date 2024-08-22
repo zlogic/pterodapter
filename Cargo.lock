@@ -483,6 +483,7 @@ dependencies = [
 name = "pterodapter"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "log",
  "rand",
  "ring",
@@ -490,6 +491,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "tokio-rustls",
+ "webpki",
  "x509-parser",
 ]
 
@@ -905,6 +907,16 @@ name = "wasi"
 version = "0.11.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
+
+[[package]]
+name = "webpki"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed63aea5ce73d0ff405984102c42de94fc55a6b75765d621c65262469b3c9b53"
+dependencies = [
+ "ring",
+ "untrusted",
+]
 
 [[package]]
 name = "webpki-roots"
