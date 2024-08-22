@@ -3,11 +3,8 @@ use std::{error, fmt};
 use base64::engine::{general_purpose, Engine as _};
 use log::debug;
 use ring::{digest, signature};
-use x509_parser::{
-    certificate,
-    extensions::GeneralName,
-    oid_registry::{OID_KEY_TYPE_EC_PUBLIC_KEY, OID_SIG_ECDSA_WITH_SHA256},
-};
+use tokio_rustls::rustls::pki_types;
+use x509_cert::{der::Decode as _, ext::pkix};
 
 use super::message;
 
@@ -32,6 +29,21 @@ impl PkiProcessing {
             Some(ServerIdentity::new(public_cert, private_key)?)
         } else {
             None
+        };
+
+        if let (Some(client_validation), Some(server_identity)) =
+            (&client_validation, &server_identity)
+        {
+            let server_cert_der =
+                pki_types::CertificateDer::from_slice(server_identity.public_cert_der.as_slice());
+            let server_cert = webpki::EndEntityCert::try_from(&server_cert_der).map_err(|err| {
+                debug!("Failed to parse server certificate: {}", err);
+                err
+            })?;
+            client_validation.verify_cert(&server_cert).map_err(|err| {
+                debug!("Failed to validate server certificate: {}", err);
+                err
+            })?;
         };
 
         let server_id = if let Some(hostname) = hostname {
@@ -68,7 +80,6 @@ impl PkiProcessing {
 
     pub fn server_cert(&self, certificate_request: &[u8]) -> Option<&[u8]> {
         if let Some(client_validation) = &self.client_validation {
-            // TODO: ensure that the server public cert is indeed signed by the root CA.
             if !certificate_request
                 .chunks(20)
                 .any(|ca| client_validation.root_ca_request == ca)
@@ -88,44 +99,50 @@ impl PkiProcessing {
         &self,
         client_cert_der: &[u8],
     ) -> Result<ClientCertificate, CertError> {
-        let (_, client_cert) = x509_parser::parse_x509_certificate(client_cert_der)?;
-        if !client_cert.validity.is_valid() {
-            return Err("Client certificate has invalid date".into());
-        }
-        if client_cert.tbs_certificate.subject_pki.algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY
-        {
-            debug!(
-                "Certificate public key algorithm {} is not supported",
-                client_cert.tbs_certificate.subject_pki.algorithm.algorithm
-            );
-            return Err("Certificate public key algorithm is not supported".into());
-        }
-
+        let client_cert_data = pki_types::CertificateDer::from(client_cert_der);
+        let client_cert = webpki::EndEntityCert::try_from(&client_cert_data)?;
         if let Some(client_validation) = &self.client_validation {
             client_validation.verify_cert(&client_cert)?;
         }
 
-        let subject_email =
-            if let Some(subject_alternative_name) = client_cert.subject_alternative_name()? {
-                subject_alternative_name
-                    .value
-                    .general_names
-                    .iter()
-                    .filter_map(|san| match san {
-                        GeneralName::RFC822Name(email) => Some(*email),
-                        _ => None,
-                    })
-                    .next()
-            } else {
-                None
-            };
-        let subject_cn = client_cert
-            .subject
-            .iter_common_name()
-            .filter_map(|entry| entry.as_str().ok())
+        let client_cert = x509_cert::Certificate::from_der(client_cert_der)?;
+        let san = client_cert
+            .tbs_certificate
+            .filter::<pkix::SubjectAltName>()
+            .into_iter()
+            .filter_map(|res| match res {
+                Ok((_, pkix::SubjectAltName(ref subject_alternative_name))) => {
+                    subject_alternative_name
+                        .iter()
+                        .filter_map(|general_name| match general_name {
+                            pkix::name::GeneralName::Rfc822Name(ref name) => Some(name.as_str()),
+                            pkix::name::GeneralName::DnsName(ref name) => Some(name.as_str()),
+                            pkix::name::GeneralName::UniformResourceIdentifier(ref name) => {
+                                Some(name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .next()
+                        .map(|name| name.to_string())
+                }
+                Err(err) => {
+                    debug!(
+                        "Failed to parse client cert Subject Alternative Names: {}",
+                        err
+                    );
+                    None
+                }
+            })
             .next();
-        let subject = if let Some(subject_email) = subject_email {
-            String::from(subject_email)
+        let subject_cn = client_cert
+            .tbs_certificate
+            .subject
+            .0
+            .iter()
+            .filter_map(|entry| format!("{}", entry).into())
+            .next();
+        let subject = if let Some(san) = san {
+            String::from(san)
         } else if let Some(subject_cn) = subject_cn {
             String::from(subject_cn)
         } else {
@@ -133,9 +150,8 @@ impl PkiProcessing {
         };
         let public_key = client_cert
             .tbs_certificate
-            .subject_pki
+            .subject_public_key_info
             .subject_public_key
-            .data
             .to_vec();
 
         Ok(ClientCertificate {
@@ -214,40 +230,27 @@ pub enum SignatureFormat {
 }
 
 struct ClientValidation {
-    root_ca_issuer: Vec<u8>,
+    root_ca_der: Vec<u8>,
     root_ca_request: [u8; 20],
-    root_ca_validity: x509_parser::certificate::Validity,
-    root_ca_public_key: Vec<u8>,
 }
 
 impl ClientValidation {
     pub fn new(root_ca_pem: &str) -> Result<ClientValidation, CertError> {
-        let root_ca_der = &pem_to_der(root_ca_pem, &PEM_SECTION_CERTIFICATE)?;
-        let (_, root_ca) = x509_parser::parse_x509_certificate(root_ca_der)?;
-
-        let root_ca_public_key = root_ca
-            .tbs_certificate
-            .subject_pki
-            .subject_public_key
-            .data
-            .to_vec();
-
-        let root_ca_issuer = root_ca.tbs_certificate.subject.as_raw().to_vec();
+        let root_ca_der = pem_to_der(root_ca_pem, &PEM_SECTION_CERTIFICATE)?;
+        let root_ca = pki_types::CertificateDer::from(root_ca_der.as_slice());
 
         let mut root_ca_request = [0u8; 20];
         let root_ca_hash = digest::digest(
             &digest::SHA1_FOR_LEGACY_USE_ONLY,
-            root_ca.tbs_certificate.subject_pki.raw,
+            webpki::EndEntityCert::try_from(&root_ca)?
+                .subject_public_key_info()
+                .as_ref(),
         );
         root_ca_request.copy_from_slice(root_ca_hash.as_ref());
 
-        let root_ca_validity = root_ca.validity.clone();
-
         Ok(ClientValidation {
-            root_ca_issuer,
+            root_ca_der,
             root_ca_request,
-            root_ca_validity,
-            root_ca_public_key,
         })
     }
 
@@ -255,44 +258,19 @@ impl ClientValidation {
         &self.root_ca_request
     }
 
-    fn verify_cert(&self, client_cert: &certificate::X509Certificate) -> Result<(), CertError> {
-        if client_cert.tbs_certificate.issuer.as_raw() != self.root_ca_issuer {
-            // This is probably unnecessary, just a quick check here.
-            debug!(
-                "Certificate is signed by {:?}, expecting {:?}",
-                client_cert.tbs_certificate.issuer.as_raw(),
-                self.root_ca_issuer
-            );
-            return Err("Certificate signed by another issuer".into());
-        };
-        if !self.root_ca_validity.is_valid() {
-            return Err("Root CA certificate has invalid date".into());
-        }
+    fn verify_cert(&self, client_cert: &webpki::EndEntityCert) -> Result<(), CertError> {
+        let root_ca_cert = pki_types::CertificateDer::from(self.root_ca_der.as_slice());
+        let root_ca_anchor = webpki::anchor_from_trusted_cert(&root_ca_cert)?;
 
-        let signed_data = client_cert.tbs_certificate.as_ref();
-        let signature = client_cert.signature_value.as_ref();
-        if client_cert.signature_algorithm.algorithm != OID_SIG_ECDSA_WITH_SHA256 {
-            debug!(
-                "Certificate signature algorithm {} is not supported",
-                client_cert.signature_algorithm.algorithm
-            );
-            return Err("Certificate signature algorithm is not supported".into());
-        };
-        let public_key = signature::UnparsedPublicKey::new(
-            &signature::ECDSA_P256_SHA256_ASN1,
-            &self.root_ca_public_key,
-        );
-        public_key
-            .verify(signed_data, signature)
-            .map_err(|_| "Failed to verify client cert signature")?;
-        if let Some(eku) = client_cert.extended_key_usage()? {
-            if !eku.value.client_auth {
-                return Err("Certificate doesn't have Client Auth Extended Key Usage".into());
-            }
-        } else {
-            return Err("Certificate doesn't specify Extended Key Usage".into());
-        }
-
+        let _ = client_cert.verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            &[root_ca_anchor],
+            &[],
+            pki_types::UnixTime::now(),
+            webpki::KeyUsage::client_auth(),
+            None,
+            None,
+        )?;
         Ok(())
     }
 }
@@ -401,9 +379,8 @@ fn pem_to_der(pem: &str, section: &PemSection) -> Result<Vec<u8>, CertError> {
 #[derive(Debug)]
 pub enum CertError {
     Internal(&'static str),
-    NomPem(x509_parser::nom::Err<x509_parser::error::PEMError>),
-    NomX509(x509_parser::nom::Err<x509_parser::error::X509Error>),
-    X509(x509_parser::error::X509Error),
+    Webpki(webpki::Error),
+    X509(x509_cert::der::Error),
     Base64(base64::DecodeError),
 }
 
@@ -411,8 +388,7 @@ impl fmt::Display for CertError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::NomPem(ref e) => write!(f, "PEM error: {}", e),
-            Self::NomX509(ref e) => write!(f, "X509 error: {}", e),
+            Self::Webpki(ref e) => write!(f, "WebPKI error: {}", e),
             Self::X509(ref e) => write!(f, "X509 error: {}", e),
             Self::Base64(ref e) => write!(f, "Base64 decode error: {}", e),
         }
@@ -423,9 +399,8 @@ impl error::Error for CertError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             Self::Internal(_) => None,
-            Self::NomPem(ref err) => Some(err),
-            Self::NomX509(ref err) => Some(err),
-            Self::X509(ref err) => Some(err),
+            Self::Webpki(ref err) => Some(err),
+            Self::X509(_) => None,
             Self::Base64(_) => None,
         }
     }
@@ -437,20 +412,14 @@ impl From<&'static str> for CertError {
     }
 }
 
-impl From<x509_parser::nom::Err<x509_parser::error::PEMError>> for CertError {
-    fn from(err: x509_parser::nom::Err<x509_parser::error::PEMError>) -> CertError {
-        Self::NomPem(err)
+impl From<webpki::Error> for CertError {
+    fn from(err: webpki::Error) -> CertError {
+        Self::Webpki(err)
     }
 }
 
-impl From<x509_parser::nom::Err<x509_parser::error::X509Error>> for CertError {
-    fn from(err: x509_parser::nom::Err<x509_parser::error::X509Error>) -> CertError {
-        Self::NomX509(err)
-    }
-}
-
-impl From<x509_parser::error::X509Error> for CertError {
-    fn from(err: x509_parser::error::X509Error) -> CertError {
+impl From<x509_cert::der::Error> for CertError {
+    fn from(err: x509_cert::der::Error) -> CertError {
         Self::X509(err)
     }
 }

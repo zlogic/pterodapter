@@ -7,13 +7,15 @@ openssl ecparam -name prime256v1 -genkey -out vpn-root.key.pem
 # openssl ec -in vpn-root.key.pem -pubout -out vpn-root.pub.pem
 ```
 
-Generate root CA certificate
+Generate root CA certificate:
 
 ```shell
 SERVER_HOST=pterodapter.home
 openssl req -new -x509 -key vpn-root.key.pem -out vpn-root.cert.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=Pterodapter Root CA" \
   -addext "basicConstraints = critical, CA:TRUE" -addext "nameConstraints = critical, permitted;DNS:${SERVER_HOST}, permitted;email:${SERVER_HOST}"
 ```
+
+rustls cannot verify email constraints; appending `;email:${SERVER_HOST}` to `nameConstraints` will fail validation.
 
 To import root CA in Windows, rename `vpn-root.cert.pem` to `vpn-root.cert.crt` and import it into the machine's _Trusted Root Certification Authorities_.
 Although importing a PFX bundle would import both the root and client certs into the right keystore.
@@ -27,7 +29,7 @@ Generate server key
 ```shell
 SERVER_HOST=pterodapter.home
 openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-server.cert.pem -keyout vpn-server.key.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=${SERVER_HOST}" \
-  -addext "subjectAltName = DNS:${SERVER_HOST}" -addext "extendedKeyUsage = serverAuth, 1.3.6.1.5.5.8.2.2"
+  -addext "subjectAltName = DNS:${SERVER_HOST}" -addext "extendedKeyUsage = serverAuth, 1.3.6.1.5.5.8.2.2" -addext "basicConstraints = critical, CA:FALSE"
 ```
 
 Convert server certificate to unencrypted form

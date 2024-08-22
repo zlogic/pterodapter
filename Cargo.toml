@@ -17,14 +17,14 @@ rand = { version = "0.8", default-features = false, features = ["std", "std_rng"
 smoltcp = { version = "0.11", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
 
 ring = { version = "*", optional = true, default-features = false }
-webpki = { version = "*", optional = true, default-features = false }
-base64 = { version = "*", optional = true, default-features = false, features = ["alloc"] }
-x509-parser = { version = "0.16", optional = true, default-features = false, features = ["validate"] }
+rustls-webpki = { version = "*", optional = true, default-features = false, features = ["alloc"] }
+base64 = { version = "*", optional = true, default-features = false, features = ["std"] }
+x509-cert = { version = "*", optional = true, default-features = false }
 
 [features]
 default = ["proxy", "ikev2"]
 proxy = ["smoltcp"]
-ikev2 = ["ring", "webpki", "base64", "x509-parser"]
+ikev2 = ["ring", "rustls-webpki", "base64", "x509-cert"]
 
 [profile.release]
 strip = true
