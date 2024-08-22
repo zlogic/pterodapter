@@ -1,9 +1,9 @@
-use std::{error, fmt};
+use std::{error, fmt, sync::Arc};
 
 use base64::engine::{general_purpose, Engine as _};
 use log::debug;
 use ring::{digest, signature};
-use tokio_rustls::rustls::pki_types;
+use tokio_rustls::rustls::{self, pki_types};
 use x509_cert::{der::Decode as _, ext::pkix};
 
 use super::message;
@@ -36,14 +36,12 @@ impl PkiProcessing {
         {
             let server_cert_der =
                 pki_types::CertificateDer::from_slice(server_identity.public_cert_der.as_slice());
-            let server_cert = webpki::EndEntityCert::try_from(&server_cert_der).map_err(|err| {
-                debug!("Failed to parse server certificate: {}", err);
-                err
-            })?;
-            client_validation.verify_cert(&server_cert).map_err(|err| {
-                debug!("Failed to validate server certificate: {}", err);
-                err
-            })?;
+            client_validation
+                .verify_server_cert(&server_cert_der)
+                .map_err(|err| {
+                    debug!("Failed to validate server certificate: {}", err);
+                    err
+                })?;
         };
 
         let server_id = if let Some(hostname) = hostname {
@@ -99,10 +97,9 @@ impl PkiProcessing {
         &self,
         client_cert_der: &[u8],
     ) -> Result<ClientCertificate, CertError> {
-        let client_cert_data = pki_types::CertificateDer::from(client_cert_der);
-        let client_cert = webpki::EndEntityCert::try_from(&client_cert_data)?;
+        let client_cert = pki_types::CertificateDer::from(client_cert_der);
         if let Some(client_validation) = &self.client_validation {
-            client_validation.verify_cert(&client_cert)?;
+            client_validation.verify_client_cert(&client_cert)?;
         }
 
         let client_cert = x509_cert::Certificate::from_der(client_cert_der)?;
@@ -123,7 +120,6 @@ impl PkiProcessing {
                             _ => None,
                         })
                         .next()
-                        .map(|name| name.to_string())
                 }
                 Err(err) => {
                     debug!(
@@ -230,8 +226,9 @@ pub enum SignatureFormat {
 }
 
 struct ClientValidation {
-    root_ca_der: Vec<u8>,
     root_ca_request: [u8; 20],
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    root_certs: Arc<rustls::RootCertStore>,
 }
 
 impl ClientValidation {
@@ -248,9 +245,15 @@ impl ClientValidation {
         );
         root_ca_request.copy_from_slice(root_ca_hash.as_ref());
 
+        let mut root_certs = rustls::RootCertStore::empty();
+        root_certs.add(root_ca)?;
+        let root_certs = Arc::new(root_certs);
+        let verifier = rustls::server::WebPkiClientVerifier::builder(root_certs.clone()).build()?;
+
         Ok(ClientValidation {
-            root_ca_der,
             root_ca_request,
+            verifier,
+            root_certs,
         })
     }
 
@@ -258,16 +261,20 @@ impl ClientValidation {
         &self.root_ca_request
     }
 
-    fn verify_cert(&self, client_cert: &webpki::EndEntityCert) -> Result<(), CertError> {
-        let root_ca_cert = pki_types::CertificateDer::from(self.root_ca_der.as_slice());
-        let root_ca_anchor = webpki::anchor_from_trusted_cert(&root_ca_cert)?;
+    fn verify_client_cert(&self, client_cert: &pki_types::CertificateDer) -> Result<(), CertError> {
+        self.verifier
+            .verify_client_cert(client_cert, &[], pki_types::UnixTime::now())?;
+        Ok(())
+    }
 
-        let _ = client_cert.verify_for_usage(
-            webpki::ALL_VERIFICATION_ALGS,
-            &[root_ca_anchor],
+    fn verify_server_cert(&self, server_cert: &pki_types::CertificateDer) -> Result<(), CertError> {
+        let server_cert = webpki::EndEntityCert::try_from(server_cert)?;
+        server_cert.verify_for_usage(
+            &webpki::ALL_VERIFICATION_ALGS,
+            self.root_certs.roots.as_slice(),
             &[],
             pki_types::UnixTime::now(),
-            webpki::KeyUsage::client_auth(),
+            webpki::KeyUsage::server_auth(),
             None,
             None,
         )?;
@@ -379,7 +386,9 @@ fn pem_to_der(pem: &str, section: &PemSection) -> Result<Vec<u8>, CertError> {
 #[derive(Debug)]
 pub enum CertError {
     Internal(&'static str),
+    Rustls(rustls::Error),
     Webpki(webpki::Error),
+    VerifierBuilder(rustls::server::VerifierBuilderError),
     X509(x509_cert::der::Error),
     Base64(base64::DecodeError),
 }
@@ -388,7 +397,9 @@ impl fmt::Display for CertError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
+            Self::Rustls(ref e) => write!(f, "Rustls error: {}", e),
             Self::Webpki(ref e) => write!(f, "WebPKI error: {}", e),
+            Self::VerifierBuilder(ref e) => write!(f, "Verifier Builder error: {}", e),
             Self::X509(ref e) => write!(f, "X509 error: {}", e),
             Self::Base64(ref e) => write!(f, "Base64 decode error: {}", e),
         }
@@ -399,7 +410,9 @@ impl error::Error for CertError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             Self::Internal(_) => None,
+            Self::Rustls(ref err) => Some(err),
             Self::Webpki(ref err) => Some(err),
+            Self::VerifierBuilder(ref err) => Some(err),
             Self::X509(_) => None,
             Self::Base64(_) => None,
         }
@@ -412,9 +425,21 @@ impl From<&'static str> for CertError {
     }
 }
 
+impl From<rustls::Error> for CertError {
+    fn from(err: rustls::Error) -> CertError {
+        Self::Rustls(err)
+    }
+}
+
 impl From<webpki::Error> for CertError {
     fn from(err: webpki::Error) -> CertError {
         Self::Webpki(err)
+    }
+}
+
+impl From<rustls::server::VerifierBuilderError> for CertError {
+    fn from(err: rustls::server::VerifierBuilderError) -> CertError {
+        Self::VerifierBuilder(err)
     }
 }
 
