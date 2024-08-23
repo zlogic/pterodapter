@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use rand::Rng;
 use std::{
     collections::{self, HashMap},
@@ -353,7 +353,7 @@ impl Sessions {
         self.half_sessions
             .retain(|(remote_addr, remote_spi), (_, expires_at)| {
                 if *expires_at + IKE_INIT_SA_EXPIRATION < now {
-                    debug!(
+                    info!(
                         "Deleting expired init session {} (SPI {:x})",
                         remote_addr, remote_spi
                     );
@@ -364,7 +364,7 @@ impl Sessions {
             });
         self.sessions.retain(|session_id, session| {
             if session.last_update + IKE_SESSION_EXPIRATION < now {
-                debug!(
+                info!(
                     "Deleting expired session with SPI {:x}-{:x} {:?}",
                     session_id.remote_spi, session_id.local_spi, session.user_id
                 );
@@ -448,15 +448,6 @@ impl Sessions {
 
         let response_bytes = &response_bytes[..response_len + start_offset];
 
-        {
-            // TODO: remove this debug code
-            let responser_msg =
-                message::InputMessage::from_datagram(&response_bytes[start_offset..])?;
-            debug!(
-                "Sending response to {}\n{:?}",
-                datagram.remote_addr, responser_msg
-            );
-        }
         // Response retransmissions are initiated by client.
         if !response_bytes.is_empty() {
             self.sockets
@@ -473,7 +464,7 @@ impl Sessions {
         let session = if let Some(session_id) = self.sessions.get_mut(&session_id) {
             session_id
         } else {
-            debug!(
+            warn!(
                 "Failed to find IKEv2 session {:x}-{:x} to process pending actions",
                 session_id.remote_spi, session_id.local_spi
             );
@@ -518,13 +509,14 @@ impl Sessions {
         };
         if let Some(sa) = self.security_associations.get(&sa_id) {
             let decrypted_data = sa.handle_esp(packet_bytes)?;
-            debug!(
+            trace!(
                 "Decrypted ESP packet from {}\n{:?}",
-                datagram.remote_addr, decrypted_data
+                datagram.remote_addr,
+                decrypted_data
             );
             Ok(())
         } else {
-            debug!(
+            warn!(
                 "Security Association {:x} from {} not found",
                 local_spi, datagram.remote_addr
             );
@@ -631,7 +623,7 @@ impl IKEv2Session {
                 self.process_create_child_sa_message(request, response)
             }
             _ => {
-                debug!("Unimplemented handler for message {}", exchange_type);
+                warn!("Unimplemented handler for message {}", exchange_type);
                 Err("Unimplemented message".into())
             }
         }?;
@@ -690,7 +682,7 @@ impl IKEv2Session {
         match crypto_stack.decrypt_data(decrypted_data, encrypted_data_len, associated_data) {
             Ok(decrypted_slice) => Ok(decrypted_slice),
             Err(err) => {
-                debug!("Failed to decrypt data: {}", err);
+                info!("Failed to decrypt data: {}", err);
                 Err("Failed to decrypt data".into())
             }
         }
@@ -733,8 +725,7 @@ impl IKEv2Session {
             crypto_stack
                 .encrypt_data(encrypt_data, encrypted_data_len, associated_data)
                 .map_err(|err| {
-                    // TODO: return error notification.
-                    debug!("Failed to encrypt data {}", err);
+                    warn!("Failed to encrypt data {}", err);
                     "Failed to encrypt data"
                 })?;
         }
@@ -742,7 +733,7 @@ impl IKEv2Session {
         crypto_stack
             .sign(&mut raw_data[..full_message_len])
             .map_err(|err| {
-                debug!("Failed to sign data {}", err);
+                warn!("Failed to sign data {}", err);
                 "Failed to sign data"
             })?;
 
@@ -768,11 +759,13 @@ impl IKEv2Session {
         let mut nonce_responder = None;
         let mut nonce_initiator = None;
         for payload in request.iter_payloads() {
-            let payload = if let Ok(payload) = payload {
-                payload
-            } else {
-                // TODO: return INVALID_SYNTAX notification.
-                continue;
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(err) => {
+                    // TODO: return INVALID_SYNTAX notification.
+                    info!("Received invalid payload: {}", err);
+                    continue;
+                }
             };
             // IKEv2 payloads need to be sent in a very specific order.
             // By the time the Nonce is reached, SA and KE should already be processed.
@@ -783,7 +776,7 @@ impl IKEv2Session {
                         if let Some(transform) = crypto::choose_sa_parameters(&sa) {
                             transform
                         } else {
-                            debug!("No compatible SA parameters found");
+                            warn!("No compatible SA parameters found");
                             // TODO: return NO_PROPOSAL_CHOSEN notification.
                             continue;
                         };
@@ -791,7 +784,7 @@ impl IKEv2Session {
                     match prop.create_dh() {
                         Ok(dh) => dh_transform = Some(dh),
                         Err(err) => {
-                            debug!("Failed to init DH {}", err)
+                            warn!("Failed to init DH: {}", err)
                         }
                     }
                     self.params = Some(prop);
@@ -804,7 +797,7 @@ impl IKEv2Session {
                             Ok(shared_secret) => Some(shared_secret),
                             Err(err) => {
                                 // TODO: return INVALID_KE_PAYLOAD notification.
-                                debug!("Failed to compute shared secret {}", err);
+                                warn!("Failed to compute shared secret: {}", err);
                                 continue;
                             }
                         };
@@ -845,7 +838,7 @@ impl IKEv2Session {
                     let params = if let Some(params) = self.params.as_ref() {
                         params
                     } else {
-                        debug!("Unspecified transform parametes");
+                        warn!("Unspecified transform parametes");
                         // TODO: return INVALID_SYNTAX notification.
                         continue;
                     };
@@ -854,31 +847,31 @@ impl IKEv2Session {
                     {
                         Ok(prf) => prf,
                         Err(err) => {
-                            debug!("Failed to init PRF transform for SKEYSEED {}", err);
-                            // TODO: return INVALID_SYNTAX notification.
+                            warn!("Failed to init PRF transform for SKEYSEED: {}", err);
+                            // TODO: return NO_PROPOSAL_CHOSEN notification.
                             continue;
                         }
                     };
                     let shared_secret = if let Some(ref shared_secret) = shared_secret {
                         shared_secret
                     } else {
-                        debug!("Unspecified shared secret");
-                        // TODO: return INVALID_SYNTAX notification.
+                        warn!("Unspecified shared secret");
+                        // TODO: return NO_PROPOSAL_CHOSEN notification.
                         continue;
                     };
                     let skeyseed = prf_transform.prf(shared_secret.as_slice());
                     let prf_transform = match params.create_prf(skeyseed.as_slice()) {
                         Ok(prf) => prf,
                         Err(err) => {
-                            debug!("Failed to init PRF transform for keying material {}", err);
-                            // TODO: return INVALID_SYNTAX notification.
+                            warn!("Failed to init PRF transform for keying material: {}", err);
+                            // TODO: return NO_PROPOSAL_CHOSEN notification.
                             continue;
                         }
                     };
                     match prf_transform.create_crypto_stack(params, &prf_key) {
                         Ok(crypto_stack) => self.crypto_stack = Some(crypto_stack),
                         Err(err) => {
-                            debug!("Failed to set up cryptography stack {}", err);
+                            warn!("Failed to set up cryptography stack: {}", err);
                             // TODO: return INVALID_SYNTAX notification.
                             continue;
                         }
@@ -887,7 +880,16 @@ impl IKEv2Session {
                         .next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
                     dest.copy_from_slice(nonce_local);
                 }
-                _ => {}
+                _ => {
+                    if payload.is_critical() {
+                        warn!(
+                            "Received critical, unsupported payload: {}",
+                            payload.payload_type()
+                        );
+                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
+                        return Err("Received critical, unsupported payload".into());
+                    }
+                }
             }
         }
 
@@ -999,11 +1001,13 @@ impl IKEv2Session {
         let mut decrypted_iter = None;
 
         for payload in request.iter_payloads() {
-            let payload = if let Ok(payload) = payload {
-                payload
-            } else {
-                // TODO: return INVALID_SYNTAX notification.
-                continue;
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(err) => {
+                    // TODO: return INVALID_SYNTAX notification.
+                    warn!("Received invalid payload: {}", err);
+                    continue;
+                }
             };
             if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
                 let encrypted_payload = payload.encrypted_data()?;
@@ -1038,17 +1042,17 @@ impl IKEv2Session {
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(err) => {
-                    debug!("Failed to read decrypted payload data {}", err);
-                    // TODO: return error notification.
+                    warn!("Failed to read decrypted payload data: {}", err);
+                    // TODO: return INVALID_SYNTAX notification.
                     continue;
                 }
             };
-            debug!("Decrypted payload\n {:?}", payload);
+            trace!("Decrypted payload\n {:?}", payload);
             match payload.payload_type() {
                 message::PayloadType::CERTIFICATE => {
                     let certificate = payload.to_certificate()?;
                     if certificate.encoding() != message::CertificateEncoding::X509_SIGNATURE {
-                        debug!(
+                        warn!(
                             "Certificate encoding {} is unsupported",
                             certificate.encoding()
                         );
@@ -1063,14 +1067,14 @@ impl IKEv2Session {
                     {
                         Ok(cert) => client_cert = Some(cert),
                         Err(err) => {
-                            debug!("Certificate is not valid: {}", err);
+                            warn!("Certificate is not valid: {}", err);
                         }
                     };
                 }
                 message::PayloadType::CERTIFICATE_REQUEST => {
                     let certreq = payload.to_certificate_request()?;
                     if certreq.read_encoding() != message::CertificateEncoding::X509_SIGNATURE {
-                        debug!(
+                        warn!(
                             "Certificate request encoding {} is unsupported",
                             certreq.read_encoding()
                         );
@@ -1082,7 +1086,7 @@ impl IKEv2Session {
                     match self.pki_processing.server_cert(certreq.read_value()) {
                         Some(cert) => server_cert = Some(cert),
                         None => {
-                            debug!("No certificates found for client's certificate request",);
+                            warn!("No certificates found for client's certificate request",);
                         }
                     };
                 }
@@ -1101,7 +1105,7 @@ impl IKEv2Session {
                             pki::SignatureFormat::AdditionalParameters,
                         )),
                         _ => {
-                            debug!(
+                            warn!(
                                 "Authentication method {} is unsupported",
                                 auth.read_method()
                             );
@@ -1116,7 +1120,7 @@ impl IKEv2Session {
                     let sa = payload.to_security_association()?;
                     transform_params = crypto::choose_sa_parameters(&sa);
                     if transform_params.is_none() {
-                        debug!("No compatible SA parameters found");
+                        warn!("No compatible SA parameters found");
                         continue;
                     };
                 }
@@ -1126,7 +1130,7 @@ impl IKEv2Session {
                         .iter_traffic_selectors()
                         .collect::<Result<Vec<_>, message::FormatError>>()
                         .map_err(|err| {
-                            debug!("Failed to decode initiator traffic selectors: {}", err);
+                            warn!("Failed to decode initiator traffic selectors: {}", err);
                             err
                         });
                     if let Ok(mut ts) = ts {
@@ -1142,7 +1146,7 @@ impl IKEv2Session {
                         .iter_traffic_selectors()
                         .collect::<Result<Vec<_>, message::FormatError>>()
                         .map_err(|err| {
-                            debug!("Failed to decode responder traffic selectors: {}", err);
+                            warn!("Failed to decode responder traffic selectors: {}", err);
                             err
                         });
                     if let Ok(mut ts) = ts {
@@ -1158,7 +1162,7 @@ impl IKEv2Session {
                             let attr = match attr {
                                 Ok(attr) => attr,
                                 Err(err) => {
-                                    debug!("Failed to decode configuration attribute: {}", err);
+                                    warn!("Failed to decode configuration attribute: {}", err);
                                     return false;
                                 }
                             };
@@ -1166,7 +1170,16 @@ impl IKEv2Session {
                                 == message::ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
                         })
                 }
-                _ => {}
+                _ => {
+                    if payload.is_critical() {
+                        warn!(
+                            "Received critical, unsupported payload: {}",
+                            payload.payload_type()
+                        );
+                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
+                        return Err("Received critical, unsupported payload".into());
+                    }
+                }
             }
         }
 
@@ -1201,7 +1214,7 @@ impl IKEv2Session {
             .try_for_each(|ts| ts.set_to_address(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))))
         {
             // TODO: return TS_UNACCEPTABLE notification.
-            debug!("Failed to narrow traffic selector: {}", err);
+            warn!("Failed to narrow traffic selector: {}", err);
             return Err("Failed to narrow traffic selector".into());
         }
 
@@ -1213,7 +1226,7 @@ impl IKEv2Session {
                 Ok(sa_session_id) => sa_session_id,
                 Err(err) => {
                     // TODO: return NO_PROPOSAL_CHOSEN notification.
-                    debug!("Transform has unsupporeted SPI for child SA: {}", err);
+                    warn!("Transform has unsupporeted SPI for child SA: {}", err);
                     return Err("Transform has unsupporeted SPI for child SA".into());
                 }
             };
@@ -1235,7 +1248,7 @@ impl IKEv2Session {
             &initiator_signed[..initiator_signed_len],
             &client_auth,
         ) {
-            debug!("Client authentication failed: {}", err);
+            warn!("Client authentication failed: {}", err);
             return Err("Client authentication failed".into());
         }
 
@@ -1297,7 +1310,7 @@ impl IKEv2Session {
         ) {
             Ok(crypto_stack) => crypto_stack,
             Err(err) => {
-                debug!("Failed to set up child cryptography stack: {}", err);
+                warn!("Failed to set up child cryptography stack: {}", err);
                 // TODO: return INVALID_SYNTAX notification.
                 return Err("Failed to set up child cryptography stack".into());
             }
@@ -1367,13 +1380,26 @@ impl IKEv2Session {
             // INFORMATIONAL payload is supposed to have an encrypted payload.
             return Ok(response.complete_message());
         };
-        for pl in decrypted_iter {
-            match pl {
-                Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
+        for payload in decrypted_iter {
+            let payload = match payload {
+                Ok(payload) => payload,
                 Err(err) => {
-                    debug!("Failed to read decrypted payload data {}", err);
-                    // TODO: return error notification.
+                    warn!("Failed to read decrypted payload data: {}", err);
+                    // TODO: return INVALID_SYNTAX notification.
                     continue;
+                }
+            };
+            trace!("Decrypted payload\n {:?}", payload);
+            match payload.payload_type() {
+                _ => {
+                    if payload.is_critical() {
+                        warn!(
+                            "Received critical, unsupported payload: {}",
+                            payload.payload_type()
+                        );
+                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
+                        return Err("Received critical, unsupported payload".into());
+                    }
                 }
             }
         }
@@ -1417,13 +1443,26 @@ impl IKEv2Session {
             // INFORMATIONAL payload is supposed to have an encrypted payload.
             return Ok(response.complete_message());
         };
-        for pl in decrypted_iter {
-            match pl {
-                Ok(pl) => debug!("Decrypted payload\n {:?}", pl),
+        for payload in decrypted_iter {
+            let payload = match payload {
+                Ok(payload) => payload,
                 Err(err) => {
-                    debug!("Failed to read decrypted payload data {}", err);
-                    // TODO: return error notification.
+                    warn!("Failed to read decrypted payload data: {}", err);
+                    // TODO: return INVALID_SYNTAX notification.
                     continue;
+                }
+            };
+            trace!("Decrypted payload\n {:?}", payload);
+            match payload.payload_type() {
+                _ => {
+                    if payload.is_critical() {
+                        warn!(
+                            "Received critical, unsupported payload: {}",
+                            payload.payload_type()
+                        );
+                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
+                        return Err("Received critical, unsupported payload".into());
+                    }
                 }
             }
         }
@@ -1519,7 +1558,7 @@ impl SecurityAssociation {
         ) {
             Ok(data) => Ok(data),
             Err(err) => {
-                debug!("Failed to decrypt ESP packet: {}", err);
+                warn!("Failed to decrypt ESP packet: {}", err);
                 Err("Failed to decrypt ESP packet".into())
             }
         }

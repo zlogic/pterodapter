@@ -1,4 +1,4 @@
-use log::debug;
+use log::warn;
 use rand::Rng;
 use ring::{aead, agreement, digest, hkdf, hmac};
 use std::{error, fmt, ops::Range};
@@ -929,10 +929,11 @@ impl Encryption for EncryptionAesGcm256 {
         nonce[..4].copy_from_slice(&self.salt);
         // Move message to the right to make space for the explicit nonce.
         data.copy_within(..msg_len, 8);
+        // TODO: use a counter, and fail when all values have been used. GCM ciphers should never reuse nonces.
         rand::thread_rng()
             .try_fill(&mut nonce[4..])
             .map_err(|err| {
-                debug!("Failed to generate nonce for AES GCM 16 256: {}", err);
+                warn!("Failed to generate nonce for AES GCM 16 256: {}", err);
                 "Failed to generate nonce for AES GCM 16 256"
             })?;
         data[..8].copy_from_slice(&nonce[4..]);

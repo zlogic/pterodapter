@@ -4,7 +4,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use log::debug;
+use log::{debug, warn};
 
 use super::crypto;
 
@@ -21,7 +21,7 @@ impl ExchangeType {
         if (Self::IKE_SA_INIT.0..=Self::INFORMATIONAL.0).contains(&value) {
             Ok(ExchangeType(value))
         } else {
-            debug!("Unsupported IKEv2 Exchange Type {}", value);
+            warn!("Unsupported IKEv2 Exchange Type {}", value);
             Err("Unsupported IKEv2 Exchange Type".into())
         }
     }
@@ -99,7 +99,7 @@ impl Spi {
         } else if spi.is_empty() {
             Ok(Self::None)
         } else {
-            debug!("Unexpected SPI size {}", spi.len());
+            warn!("Unexpected SPI size {}", spi.len());
             Err("Unexpected SPI size".into())
         }
     }
@@ -145,7 +145,7 @@ pub struct InputMessage<'a> {
 impl InputMessage<'_> {
     pub fn from_datagram(p: &[u8]) -> Result<InputMessage, FormatError> {
         if p.len() < 28 {
-            debug!("Not enough data in message");
+            warn!("Not enough data in message");
             Err("Not enough data in message".into())
         } else {
             Ok(InputMessage { data: p })
@@ -202,31 +202,31 @@ impl InputMessage<'_> {
         let is_sa_init = match self.read_exchange_type() {
             Ok(exchange_type) => exchange_type == ExchangeType::IKE_SA_INIT,
             Err(err) => {
-                debug!("Error parsing exchange type {}", err);
+                warn!("Error parsing exchange type {}", err);
                 valid = false;
                 false
             }
         };
         let message_id = self.read_message_id();
         if is_sa_init && message_id != 0 {
-            debug!("Message ID for IKE_SA_INIT is not 0: {}", message_id);
+            warn!("Message ID for IKE_SA_INIT is not 0: {}", message_id);
             valid = false;
         }
         if self.read_initiator_spi() == 0 {
-            debug!("Empty initiator SPI");
+            warn!("Empty initiator SPI");
             valid = false;
         }
         if is_sa_init && self.read_responder_spi() != 0 {
-            debug!("Unexpected, non-empty responder SPI");
+            warn!("Unexpected, non-empty responder SPI");
             valid = false;
         } else if !is_sa_init && self.read_responder_spi() == 0 {
-            debug!("Empty responder SPI");
+            warn!("Empty responder SPI");
             valid = false;
         }
         {
             let (major_version, minor_version) = self.read_version();
             if major_version != 2 {
-                debug!(
+                warn!(
                     "Unsupported major version {}.{}",
                     major_version, minor_version
                 );
@@ -234,13 +234,13 @@ impl InputMessage<'_> {
             }
         }
         if let Err(err) = self.read_flags() {
-            debug!("Error parsing flags {}", err);
+            warn!("Error parsing flags {}", err);
             valid = false;
         }
         {
             let client_length = self.read_length();
             if self.data.len() != client_length as usize {
-                debug!(
+                warn!(
                     "Packet length mismatch (received {} bytes, client specified {} bytes)",
                     self.data.len(),
                     client_length
@@ -643,6 +643,10 @@ impl Payload<'_> {
         self.payload_type
     }
 
+    pub fn is_critical(&self) -> bool {
+        self.critical
+    }
+
     pub fn to_security_association(&self) -> Result<PayloadSecurityAssociation, FormatError> {
         if self.payload_type == PayloadType::SECURITY_ASSOCIATION {
             Ok(PayloadSecurityAssociation { data: self.data })
@@ -760,7 +764,7 @@ impl<'a> Iterator for PayloadIter<'a> {
             return None;
         }
         if self.data.len() < 4 {
-            debug!("Not enough data in payload");
+            warn!("Not enough data in payload");
             return None;
         }
         let current_payload = self.next_payload;
@@ -773,7 +777,7 @@ impl<'a> Iterator for PayloadIter<'a> {
         payload_length.copy_from_slice(&self.data[2..4]);
         let payload_length = u16::from_be_bytes(payload_length) as usize;
         if data.len() < payload_length {
-            debug!("Payload overflow");
+            warn!("Payload overflow");
             return None;
         }
         self.data = &self.data[payload_length..];
@@ -782,7 +786,7 @@ impl<'a> Iterator for PayloadIter<'a> {
             0x00 => false,
             CRITICAL_BIT => true,
             _ => {
-                debug!(
+                warn!(
                     "Unsupported payload {} reserved flags: {}",
                     self.next_payload, payload_flags
                 );
@@ -840,7 +844,7 @@ impl PayloadType {
         {
             Ok(PayloadType(value))
         } else {
-            debug!("Unsupported IKEv2 Payload Type {}", value);
+            warn!("Unsupported IKEv2 Payload Type {}", value);
             Err("Unsupported IKEv2 Payload Type".into())
         }
     }
@@ -897,7 +901,7 @@ impl IPSecProtocolID {
         if (Self::IKE.0..=Self::ESP.0).contains(&value) {
             Ok(IPSecProtocolID(value))
         } else {
-            debug!("Unsupported IKEv2 IPSec Protocol ID {}", value);
+            warn!("Unsupported IKEv2 IPSec Protocol ID {}", value);
             Err("Unsupported IKEv2 IPSec Protocol ID".into())
         }
     }
@@ -928,7 +932,7 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             return None;
         }
         if self.data.len() < 8 {
-            debug!("Not enough data in security association");
+            warn!("Not enough data in security association");
             return None;
         }
         let last_substruct = self.data[0];
@@ -940,18 +944,18 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             return None;
         }
         if last_substruct == 2 && proposal_length >= self.data.len() {
-            debug!("Unexpected proposal last substruc {}", last_substruct);
+            warn!("Unexpected proposal last substruct {}", last_substruct);
             return None;
         }
         if self.data.len() < proposal_length {
-            debug!("Proposal overflow");
+            warn!("Proposal overflow");
             return None;
         }
         let data = self.data;
         self.data = &self.data[proposal_length..];
         let proposal_num = data[4];
         if proposal_num != self.next_proposal_num {
-            debug!(
+            warn!(
                 "Unexpected proposal num {} (should be {})",
                 proposal_num, self.next_proposal_num
             );
@@ -961,14 +965,14 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
         let protocol_id = match IPSecProtocolID::from_u8(data[5]) {
             Ok(protocol_id) => protocol_id,
             Err(err) => {
-                debug!("Unsupported protocol ID: {}", err);
+                warn!("Unsupported protocol ID: {}", err);
                 return Some(Err("Unsupported protocol ID".into()));
             }
         };
         let spi_size = data[6] as usize;
         let num_transforms = data[7] as usize;
         if data.len() < 8 + spi_size {
-            debug!("Proposal SPI overflow");
+            warn!("Proposal SPI overflow");
             return None;
         }
         let spi = &data[8..8 + spi_size];
@@ -1084,7 +1088,7 @@ impl TransformType {
             4 => Ok(Self::DiffieHellman(transform_id)),
             5 => Ok(Self::ExtendedSequenceNumbers(transform_id)),
             _ => {
-                debug!(
+                warn!(
                     "Unsupported IKEv2 Transform Type {} ID {}",
                     transform_type, transform_id
                 );
@@ -1172,7 +1176,7 @@ impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.data.is_empty() {
             if self.num_transforms != 0 {
-                debug!("Packet is missing {} transforms", self.num_transforms);
+                warn!("Packet is missing {} transforms", self.num_transforms);
             }
             return None;
         }

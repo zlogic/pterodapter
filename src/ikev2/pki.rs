@@ -1,7 +1,7 @@
 use std::{error, fmt, sync::Arc};
 
 use base64::engine::{general_purpose, Engine as _};
-use log::debug;
+use log::warn;
 use ring::{digest, signature};
 use tokio_rustls::rustls::{self, pki_types};
 use x509_cert::{der::Decode as _, ext::pkix};
@@ -39,7 +39,7 @@ impl PkiProcessing {
             client_validation
                 .verify_server_cert(&server_cert_der)
                 .map_err(|err| {
-                    debug!("Failed to validate server certificate: {}", err);
+                    warn!("Failed to validate server certificate: {}", err);
                     err
                 })?;
         };
@@ -122,7 +122,7 @@ impl PkiProcessing {
                         .next()
                 }
                 Err(err) => {
-                    debug!(
+                    warn!(
                         "Failed to parse client cert Subject Alternative Names: {}",
                         err
                     );
@@ -202,7 +202,7 @@ impl ClientCertificate {
                 }
                 let signature_oid = &signature[1..1 + asn1_length];
                 if signature_oid != ASN1_IDENTIFIDER_ECDSA_WITH_SHA256 {
-                    debug!("Unsupported ASN.1 AlgorithmIdentifier {:?}", signature_oid,);
+                    warn!("Unsupported ASN.1 AlgorithmIdentifier {:?}", signature_oid,);
                     return Err("Unsupported ASN.1 AlgorithmIdentifier".into());
                 }
                 (
