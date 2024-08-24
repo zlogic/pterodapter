@@ -108,19 +108,21 @@ impl PkiProcessing {
             .filter::<pkix::SubjectAltName>()
             .into_iter()
             .filter_map(|res| match res {
-                Ok((_, pkix::SubjectAltName(ref subject_alternative_name))) => {
-                    subject_alternative_name
-                        .iter()
-                        .filter_map(|general_name| match general_name {
-                            pkix::name::GeneralName::Rfc822Name(ref name) => Some(name.as_str()),
-                            pkix::name::GeneralName::DnsName(ref name) => Some(name.as_str()),
-                            pkix::name::GeneralName::UniformResourceIdentifier(ref name) => {
-                                Some(name.as_str())
-                            }
-                            _ => None,
-                        })
-                        .next()
-                }
+                Ok((_, pkix::SubjectAltName(subject_alternative_name))) => subject_alternative_name
+                    .iter()
+                    .filter_map(|general_name| match general_name {
+                        pkix::name::GeneralName::Rfc822Name(ref name) => {
+                            Some(name.as_str().to_string())
+                        }
+                        pkix::name::GeneralName::DnsName(ref name) => {
+                            Some(name.as_str().to_string())
+                        }
+                        pkix::name::GeneralName::UniformResourceIdentifier(ref name) => {
+                            Some(name.as_str().to_string())
+                        }
+                        _ => None,
+                    })
+                    .next(),
                 Err(err) => {
                     warn!(
                         "Failed to parse client cert Subject Alternative Names: {}",
@@ -138,7 +140,7 @@ impl PkiProcessing {
             .filter_map(|entry| format!("{}", entry).into())
             .next();
         let subject = if let Some(san) = san {
-            String::from(san)
+            san
         } else if let Some(subject_cn) = subject_cn {
             String::from(subject_cn)
         } else {
@@ -148,6 +150,7 @@ impl PkiProcessing {
             .tbs_certificate
             .subject_public_key_info
             .subject_public_key
+            .raw_bytes()
             .to_vec();
 
         Ok(ClientCertificate {
