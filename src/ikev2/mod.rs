@@ -43,6 +43,7 @@ pub struct Config {
 pub struct Server {
     listen_ips: Vec<IpAddr>,
     pki_processing: Arc<pki::PkiProcessing>,
+    command_sender: Option<mpsc::Sender<SessionMessage>>,
     handles: Vec<JoinHandle<Result<(), IKEv2Error>>>,
 }
 
@@ -59,6 +60,7 @@ impl Server {
         Ok(Server {
             listen_ips: config.listen_ips,
             pki_processing: Arc::new(pki_processing),
+            command_sender: None,
             handles: vec![],
         })
     }
@@ -101,34 +103,41 @@ impl Server {
         }
     }
 
-    pub fn terminate(&mut self) -> Result<(), IKEv2Error> {
-        // TODO: send command to Sessions to Delete all IKE sessions.
-        self.handles.iter().for_each(|handle| handle.abort());
+    pub async fn terminate(&mut self) -> Result<(), IKEv2Error> {
+        match self.command_sender {
+            Some(ref command_sender) => {
+                if command_sender.send(SessionMessage::Shutdown).await.is_err() {
+                    return Err("Command channel closed".into());
+                }
+            }
+            None => return Err("Shutdown already in progress".into()),
+        }
+        for handle in self.handles.drain(..self.handles.len()) {
+            if let Err(err) = handle.await {
+                warn!("Error returned when shutting down: {}", err);
+            }
+        }
         Ok(())
     }
 
     pub async fn start(&mut self) -> Result<(), IKEv2Error> {
         let sockets = Arc::new(Sockets::new(&self.listen_ips).await?);
-        let sessions = Sessions::new(self.pki_processing.clone(), sockets.clone());
+        let mut sessions = Sessions::new(self.pki_processing.clone(), sockets.clone());
         let rt = runtime::Handle::current();
-        let mut handles = sockets
-            .iter_sockets()
-            .map(|(listen_addr, socket)| {
-                rt.spawn(Server::listen_socket(
-                    socket.clone(),
-                    *listen_addr,
-                    sessions.create_sender(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        handles.push(rt.spawn(Server::send_timer_ticks(
+        // Non-critical futures sockets will be terminated by Tokio during the shutdown_timeout phase.
+        sockets.iter_sockets().for_each(|(listen_addr, socket)| {
+            rt.spawn(Server::listen_socket(
+                socket.clone(),
+                *listen_addr,
+                sessions.create_sender(),
+            ));
+        });
+        rt.spawn(Server::send_timer_ticks(
             Duration::from_secs(15),
             sessions.create_sender(),
-        )));
-        handles.push(rt.spawn(async move {
-            let mut sessions = sessions;
-            sessions.process_messages().await
-        }));
+        ));
+        self.command_sender = Some(sessions.create_sender());
+        self.handles = vec![rt.spawn(async move { sessions.process_messages().await })];
         Ok(())
     }
 }
@@ -206,12 +215,21 @@ impl Hash for SessionID {
 
 impl SessionID {
     fn from_message(message: &message::InputMessage) -> Result<SessionID, message::FormatError> {
-        let remote_spi = message.read_initiator_spi();
-        let local_spi = message.read_responder_spi();
+        let (remote_spi, local_spi) = if message.read_flags()?.has(message::Flags::INITIATOR) {
+            (message.read_initiator_spi(), message.read_responder_spi())
+        } else {
+            (message.read_responder_spi(), message.read_initiator_spi())
+        };
         Ok(SessionID {
             remote_spi,
             local_spi,
         })
+    }
+}
+
+impl fmt::Display for SessionID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:x}-{:x}", self.remote_spi, self.local_spi)
     }
 }
 
@@ -288,6 +306,7 @@ impl UdpDatagram {
 enum SessionMessage {
     UdpDatagram(UdpDatagram),
     CleanupTimer,
+    Shutdown,
 }
 
 struct Sessions {
@@ -298,6 +317,7 @@ struct Sessions {
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
     tx: mpsc::Sender<SessionMessage>,
     rx: mpsc::Receiver<SessionMessage>,
+    shutdown: bool,
 }
 
 impl Sessions {
@@ -311,6 +331,7 @@ impl Sessions {
             half_sessions: HashMap::new(),
             tx,
             rx,
+            shutdown: false,
         }
     }
 
@@ -318,7 +339,12 @@ impl Sessions {
         self.tx.clone()
     }
 
-    fn get_init_session(&mut self, remote_spi: u64, remote_addr: SocketAddr) -> SessionID {
+    fn get_init_session(
+        &mut self,
+        remote_spi: u64,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> SessionID {
         let now = Instant::now();
         let half_key = (remote_addr, remote_spi);
         let new_session_id = (rand::thread_rng().gen::<u64>(), now);
@@ -339,7 +365,13 @@ impl Sessions {
         // TODO: get address from FortiVPN, or through a custom config variable.
         let internal_addr = IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10));
         self.sessions.entry(session_id).or_insert_with(|| {
-            IKEv2Session::new(remote_addr, internal_addr, self.pki_processing.clone())
+            IKEv2Session::new(
+                session_id,
+                remote_addr,
+                local_addr,
+                internal_addr,
+                self.pki_processing.clone(),
+            )
         });
         session_id
     }
@@ -348,7 +380,7 @@ impl Sessions {
         self.sessions.get_mut(&id)
     }
 
-    fn cleanup(&mut self) {
+    async fn cleanup(&mut self) {
         let now = Instant::now();
         self.half_sessions
             .retain(|(remote_addr, remote_spi), (_, expires_at)| {
@@ -365,8 +397,8 @@ impl Sessions {
         self.sessions.retain(|session_id, session| {
             if session.last_update + IKE_SESSION_EXPIRATION < now {
                 info!(
-                    "Deleting expired session with SPI {:x}-{:x} {:?}",
-                    session_id.remote_spi, session_id.local_spi, session.user_id
+                    "Deleting expired session with SPI {} {:?}",
+                    session_id, session.user_id
                 );
                 false
             } else {
@@ -378,6 +410,22 @@ impl Sessions {
                 session.last_response = None;
             }
         });
+        if self.shutdown {
+            for (session_id, session) in self.sessions.iter_mut() {
+                if let Err(err) = session.start_request_delete_ike() {
+                    warn!(
+                        "Failed to prepare Delete request to session {}: {}",
+                        session_id, err
+                    );
+                }
+                if let Err(err) = session.send_last_request(&self.sockets).await {
+                    warn!(
+                        "Failed to prepare Delete request to session {}: {}",
+                        session_id, err
+                    );
+                }
+            }
+        }
     }
 
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
@@ -392,10 +440,18 @@ impl Sessions {
                     }
                 }
                 SessionMessage::CleanupTimer => {
-                    self.cleanup();
+                    self.cleanup().await;
+                }
+                SessionMessage::Shutdown => {
+                    self.shutdown = true;
+                    self.cleanup().await;
                 }
             }
+            if self.shutdown && self.sessions.is_empty() {
+                break;
+            }
         }
+        debug!("Shutdown completed");
         Ok(())
     }
 
@@ -426,7 +482,16 @@ impl Sessions {
             == message::ExchangeType::IKE_SA_INIT
             && ikev2_request.read_message_id() == 0
         {
-            self.get_init_session(ikev2_request.read_initiator_spi(), datagram.remote_addr)
+            if self.shutdown {
+                return Err(
+                    "Ignoring IKE_SA_INIT request, because a shutdown is in progress".into(),
+                );
+            }
+            self.get_init_session(
+                ikev2_request.read_initiator_spi(),
+                datagram.remote_addr,
+                datagram.local_addr,
+            )
         } else {
             SessionID::from_message(&ikev2_request)?
         };
@@ -437,22 +502,28 @@ impl Sessions {
         };
         let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
         let start_offset = if datagram.is_non_esp() { 4 } else { 0 };
-        let mut ikev2_response = message::MessageWriter::new(&mut response_bytes[start_offset..])?;
 
-        let response_len = session.process_message(
-            session_id,
-            datagram.remote_addr,
-            &ikev2_request,
-            &mut ikev2_response,
-        )?;
+        if ikev2_request.read_flags()?.has(message::Flags::RESPONSE) {
+            session.process_response(datagram.remote_addr, datagram.local_addr, &ikev2_request)?;
+        } else {
+            let mut ikev2_response =
+                message::MessageWriter::new(&mut response_bytes[start_offset..])?;
 
-        let response_bytes = &response_bytes[..response_len + start_offset];
+            let response_len = session.process_request(
+                datagram.remote_addr,
+                datagram.local_addr,
+                &ikev2_request,
+                &mut ikev2_response,
+            )?;
 
-        // Response retransmissions are initiated by client.
-        if !response_bytes.is_empty() {
-            self.sockets
-                .send_datagram(&datagram.local_addr, &datagram.remote_addr, response_bytes)
-                .await?;
+            let response_bytes = &response_bytes[..response_len + start_offset];
+
+            // Response retransmissions are initiated by client.
+            if !response_bytes.is_empty() {
+                self.sockets
+                    .send_datagram(&datagram.local_addr, &datagram.remote_addr, response_bytes)
+                    .await?;
+            }
         }
 
         self.process_pending_actions(session_id);
@@ -465,22 +536,44 @@ impl Sessions {
             session_id
         } else {
             warn!(
-                "Failed to find IKEv2 session {:x}-{:x} to process pending actions",
-                session_id.remote_spi, session_id.local_spi
+                "Failed to find IKEv2 session {} to process pending actions",
+                session_id
             );
             return;
         };
 
+        let mut delete_session = false;
         session
             .pending_actions
             .drain(..)
             .for_each(|action| match action {
+                IKEv2PendingAction::DeleteHalfOpenSession(remote_addr, remote_spi) => {
+                    if self
+                        .half_sessions
+                        .remove(&(remote_addr, remote_spi))
+                        .is_some()
+                    {
+                        debug!(
+                            "Cleaned up completed init session {} (SPI {:x})",
+                            remote_addr, remote_spi
+                        );
+                    }
+                }
                 IKEv2PendingAction::CreateChildSA(mut session_id, security_association) => {
                     session_id.remote_addr = session.remote_addr;
                     self.security_associations
                         .insert(session_id, security_association);
                 }
-            })
+                IKEv2PendingAction::DeleteIKESession => {
+                    // TODO: also delete Child SAs (have IKE send IKEv2PendingAction per child SA?).
+                    delete_session = true;
+                }
+            });
+        if delete_session {
+            if self.sessions.remove(&session_id).is_some() {
+                info!("Deleted IKEv2 session {}", session_id);
+            }
+        }
     }
 
     async fn process_esp_packet(&mut self, datagram: &mut UdpDatagram) -> Result<(), IKEv2Error> {
@@ -537,14 +630,19 @@ enum SessionState {
     Empty,
     InitSA(InitSAContext),
     Established,
+    Deleting,
 }
 
 enum IKEv2PendingAction {
+    DeleteHalfOpenSession(SocketAddr, u64),
     CreateChildSA(SecurityAssociationID, SecurityAssociation),
+    DeleteIKESession,
 }
 
 struct IKEv2Session {
+    session_id: SessionID,
     remote_addr: SocketAddr,
+    local_addr: SocketAddr,
     state: SessionState,
     internal_addr: IpAddr,
     pki_processing: Arc<pki::PkiProcessing>,
@@ -552,19 +650,26 @@ struct IKEv2Session {
     crypto_stack: Option<crypto::CryptoStack>,
     user_id: Option<String>,
     last_update: Instant,
-    last_message_id: u32,
+    remote_message_id: u32,
+    local_message_id: u32,
     last_response: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
+    last_request: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
+    sent_request: Option<RequestContext>,
     pending_actions: Vec<IKEv2PendingAction>,
 }
 
 impl IKEv2Session {
     fn new(
+        session_id: SessionID,
         remote_addr: SocketAddr,
+        local_addr: SocketAddr,
         internal_addr: IpAddr,
         pki_processing: Arc<pki::PkiProcessing>,
     ) -> IKEv2Session {
         IKEv2Session {
+            session_id,
             remote_addr,
+            local_addr,
             state: SessionState::Empty,
             internal_addr,
             pki_processing,
@@ -572,27 +677,30 @@ impl IKEv2Session {
             crypto_stack: None,
             user_id: None,
             last_update: Instant::now(),
-            last_message_id: 0,
+            remote_message_id: 0,
+            local_message_id: 0,
             last_response: None,
+            last_request: None,
+            sent_request: None,
             pending_actions: vec![],
         }
     }
 
-    fn process_message(
+    fn process_request(
         &mut self,
-        session_id: SessionID,
         remote_addr: SocketAddr,
+        local_addr: SocketAddr,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
         // TODO: return error if payload type is critical but not recognized
         self.last_update = Instant::now();
         let message_id = request.read_message_id();
-        if message_id < self.last_message_id {
+        if message_id < self.remote_message_id {
             // This is an outdated retransmission, nothing to do.
             return Ok(0);
         }
-        if message_id == self.last_message_id {
+        if message_id == self.remote_message_id {
             // Retransmit last response if available.
             if let Some(last_response) = self.last_response {
                 let len = last_response.1;
@@ -604,23 +712,21 @@ impl IKEv2Session {
         let exchange_type = request.read_exchange_type()?;
 
         response.write_header(
-            session_id.remote_spi,
-            session_id.local_spi,
+            self.session_id.remote_spi,
+            self.session_id.local_spi,
             exchange_type,
             false,
             request.read_message_id(),
         )?;
 
         let response_length = match exchange_type {
-            message::ExchangeType::IKE_SA_INIT => {
-                self.process_sa_init_message(session_id, request, response)
-            }
-            message::ExchangeType::IKE_AUTH => self.process_auth_message(request, response),
+            message::ExchangeType::IKE_SA_INIT => self.process_sa_init_request(request, response),
+            message::ExchangeType::IKE_AUTH => self.process_auth_request(request, response),
             message::ExchangeType::INFORMATIONAL => {
-                self.process_informational_message(request, response)
+                self.process_informational_request(request, response)
             }
             message::ExchangeType::CREATE_CHILD_SA => {
-                self.process_create_child_sa_message(request, response)
+                self.process_create_child_sa_request(request, response)
             }
             _ => {
                 warn!("Unimplemented handler for message {}", exchange_type);
@@ -638,10 +744,11 @@ impl IKEv2Session {
                 .copy_from_slice(&response.raw_data()[..response_length]);
             self.last_response = Some(last_response);
         };
-        self.last_message_id = message_id;
+        self.remote_message_id = message_id;
 
         // Update remote address if client changed IP or switched to another NAT port.
         self.remote_addr = remote_addr;
+        self.local_addr = local_addr;
 
         Ok(response_length)
     }
@@ -740,15 +847,14 @@ impl IKEv2Session {
         Ok(full_message_len)
     }
 
-    fn process_sa_init_message(
+    fn process_sa_init_request(
         &mut self,
-        session_id: SessionID,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
         response.write_header(
-            session_id.remote_spi,
-            session_id.local_spi,
+            self.session_id.remote_spi,
+            self.session_id.local_spi,
             message::ExchangeType::IKE_SA_INIT,
             false,
             request.read_message_id(),
@@ -830,10 +936,10 @@ impl IKEv2Session {
                         .copy_from_slice(nonce_local);
                     prf_key_cursor += nonce_local.len();
                     prf_key[prf_key_cursor..prf_key_cursor + 8]
-                        .copy_from_slice(&session_id.remote_spi.to_be_bytes());
+                        .copy_from_slice(&self.session_id.remote_spi.to_be_bytes());
                     prf_key_cursor += 8;
                     prf_key[prf_key_cursor..prf_key_cursor + 8]
-                        .copy_from_slice(&session_id.local_spi.to_be_bytes());
+                        .copy_from_slice(&self.session_id.local_spi.to_be_bytes());
 
                     let params = if let Some(params) = self.params.as_ref() {
                         params
@@ -879,6 +985,20 @@ impl IKEv2Session {
                     let dest = response
                         .next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
                     dest.copy_from_slice(nonce_local);
+                }
+                message::PayloadType::NOTIFY => {
+                    let notify = payload.to_notify()?;
+                    if notify.message_type()
+                        == message::NotifyMessageType::SIGNATURE_HASH_ALGORITHMS
+                    {
+                        let supports_sha256 = notify
+                            .to_signature_hash_algorithms()?
+                            .any(|alg| alg == message::SignatureHashAlgorithm::SHA2_256);
+                        if !supports_sha256 {
+                            // TODO: return NO_PROPOSAL_CHOSEN notification.
+                            return Err("No supported signature hash algorithms".into());
+                        }
+                    }
                 }
                 _ => {
                     if payload.is_critical() {
@@ -975,11 +1095,16 @@ impl IKEv2Session {
         Ok(response_length)
     }
 
-    fn process_auth_message(
+    fn process_auth_request(
         &mut self,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
+        self.pending_actions
+            .push(IKEv2PendingAction::DeleteHalfOpenSession(
+                self.remote_addr,
+                self.session_id.remote_spi,
+            ));
         let ctx = match self.state {
             SessionState::InitSA(ref ctx) => ctx.clone(),
             _ => {
@@ -1347,7 +1472,89 @@ impl IKEv2Session {
         self.complete_encrypted_payload(response)
     }
 
-    fn process_informational_message(
+    fn process_informational_request(
+        &mut self,
+        request: &message::InputMessage,
+        response: &mut message::MessageWriter,
+    ) -> Result<usize, IKEv2Error> {
+        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
+        let mut decrypted_iter = None;
+
+        for payload in request.iter_payloads() {
+            let payload = if let Ok(payload) = payload {
+                payload
+            } else {
+                // TODO: return INVALID_SYNTAX notification.
+                continue;
+            };
+            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
+                let encrypted_payload = payload.encrypted_data()?;
+                let decrypted_slice = self.process_encrypted_payload(
+                    request,
+                    &encrypted_payload,
+                    &mut decrypted_data,
+                )?;
+                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
+            }
+        }
+
+        let mut delete_spi = vec![];
+
+        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
+            decrypted_iter
+        } else {
+            // TODO: return INVALID_SYNTAX notification.
+            // INFORMATIONAL payload is supposed to have an encrypted payload.
+            return Ok(response.complete_message());
+        };
+        for payload in decrypted_iter {
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!("Failed to read decrypted payload data: {}", err);
+                    // TODO: return INVALID_SYNTAX notification.
+                    continue;
+                }
+            };
+            trace!("Decrypted payload\n {:?}", payload);
+            match payload.payload_type() {
+                message::PayloadType::DELETE => {
+                    let delete = payload.to_delete()?;
+                    delete_spi = delete.iter_spi().collect::<Vec<_>>();
+                }
+                _ => {
+                    if payload.is_critical() {
+                        warn!(
+                            "Received critical, unsupported payload: {}",
+                            payload.payload_type()
+                        );
+                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
+                        return Err("Received critical, unsupported payload".into());
+                    }
+                }
+            }
+        }
+
+        // For now, no data is processed.
+        response.start_encrypted_payload()?;
+
+        if !delete_spi.is_empty() {
+            // TODO: process deletion of child SAs.
+            response.write_notify_payload(
+                None,
+                &[],
+                message::NotifyMessageType::INVALID_SPI,
+                &[],
+            )?;
+        } else {
+            self.pending_actions
+                .push(IKEv2PendingAction::DeleteIKESession);
+        }
+
+        self.complete_encrypted_payload(response)
+    }
+
+    fn process_create_child_sa_request(
         &mut self,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
@@ -1377,7 +1584,7 @@ impl IKEv2Session {
             decrypted_iter
         } else {
             // TODO: return INVALID_SYNTAX notification.
-            // INFORMATIONAL payload is supposed to have an encrypted payload.
+            // CREATE_CHILD_SA payload is supposed to have an encrypted payload.
             return Ok(response.complete_message());
         };
         for payload in decrypted_iter {
@@ -1410,15 +1617,87 @@ impl IKEv2Session {
         self.complete_encrypted_payload(response)
     }
 
-    fn process_create_child_sa_message(
+    fn start_request(
         &mut self,
-        request: &message::InputMessage,
-        response: &mut message::MessageWriter,
-    ) -> Result<usize, IKEv2Error> {
+        exchange_type: message::ExchangeType,
+        command_generator: impl FnOnce(&mut message::MessageWriter) -> Result<(), IKEv2Error>,
+    ) -> Result<(), IKEv2Error> {
+        if self.sent_request.is_some() || self.last_request.is_some() {
+            return Err("Already processing another command".into());
+        }
+        let mut request_bytes = [0u8; MAX_DATAGRAM_SIZE];
+        // Requests will always be sent to the ESP port.
+        let start_offset = if self.remote_addr.port() == IKEV2_NAT_PORT {
+            4
+        } else {
+            0
+        };
+        let mut ikev2_request = message::MessageWriter::new(&mut request_bytes[start_offset..])?;
+        ikev2_request.write_header(
+            self.session_id.remote_spi,
+            self.session_id.local_spi,
+            exchange_type,
+            true,
+            self.local_message_id,
+        )?;
+        ikev2_request.start_encrypted_payload()?;
+        command_generator(&mut ikev2_request)?;
+        let request_len = self.complete_encrypted_payload(&mut ikev2_request)?;
+
+        self.last_request = Some((request_bytes, request_len + start_offset));
+        Ok(())
+    }
+
+    fn start_request_delete_ike(&mut self) -> Result<(), IKEv2Error> {
+        match self.state {
+            SessionState::Empty | SessionState::InitSA(_) | SessionState::Deleting => {
+                debug!("Received Delete request for a non-established session, ignoring");
+                return Ok(());
+            }
+            SessionState::Established => {}
+        }
+        self.start_request(message::ExchangeType::INFORMATIONAL, |writer| {
+            Ok(writer.write_delete_payload(message::IPSecProtocolID::IKE, &[])?)
+        })?;
+        self.state = SessionState::Deleting;
+        self.sent_request = Some(RequestContext::DeleteIKEv2);
+        Ok(())
+    }
+
+    async fn send_last_request(&self, sockets: &Sockets) -> Result<(), IKEv2Error> {
+        if let Some((request_bytes, request_len)) = self.last_request {
+            debug!(
+                "Restransmitting request {} for session {}",
+                self.local_message_id, self.session_id
+            );
+            sockets
+                .send_datagram(
+                    &self.local_addr,
+                    &self.remote_addr,
+                    &request_bytes[..request_len],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn process_response(
+        &mut self,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
+        response: &message::InputMessage,
+    ) -> Result<(), IKEv2Error> {
+        // TODO: return error if payload type is critical but not recognized
+        self.last_update = Instant::now();
+        let message_id = response.read_message_id();
+        if message_id < self.local_message_id {
+            // This is an outdated retransmission, nothing to do.
+            return Ok(());
+        }
+
         let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
         let mut decrypted_iter = None;
-
-        for payload in request.iter_payloads() {
+        for payload in response.iter_payloads() {
             let payload = if let Ok(payload) = payload {
                 payload
             } else {
@@ -1428,22 +1707,52 @@ impl IKEv2Session {
             if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
                 let encrypted_payload = payload.encrypted_data()?;
                 let decrypted_slice = self.process_encrypted_payload(
-                    request,
+                    response,
                     &encrypted_payload,
                     &mut decrypted_data,
                 )?;
                 decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
             }
         }
-
         let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
             decrypted_iter
         } else {
             // TODO: return INVALID_SYNTAX notification.
-            // INFORMATIONAL payload is supposed to have an encrypted payload.
-            return Ok(response.complete_message());
+            // Responses are always sent encrypted.
+            return Err("Response has no encrypted payload".into());
         };
-        for payload in decrypted_iter {
+
+        let exchange_type = response.read_exchange_type()?;
+        match exchange_type {
+            message::ExchangeType::INFORMATIONAL => {
+                self.process_informational_response(decrypted_iter)
+            }
+            _ => {
+                warn!(
+                    "Unimplemented response handler for message {}",
+                    exchange_type
+                );
+                Err("Unimplemented response message".into())
+            }
+        }?;
+
+        // Remove last request to stop retransmissions.
+        self.local_message_id += 1;
+        self.last_request = None;
+        self.sent_request = None;
+
+        // Update remote address if client changed IP or switched to another NAT port.
+        self.remote_addr = remote_addr;
+        self.local_addr = local_addr;
+
+        Ok(())
+    }
+
+    fn process_informational_response(
+        &mut self,
+        payloads: message::PayloadIter,
+    ) -> Result<(), IKEv2Error> {
+        for payload in payloads {
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(err) => {
@@ -1452,7 +1761,6 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            trace!("Decrypted payload\n {:?}", payload);
             match payload.payload_type() {
                 _ => {
                     if payload.is_critical() {
@@ -1466,12 +1774,21 @@ impl IKEv2Session {
                 }
             }
         }
-
-        // For now, no data is processed.
-        response.start_encrypted_payload()?;
-
-        self.complete_encrypted_payload(response)
+        match self.sent_request {
+            Some(RequestContext::DeleteIKEv2) => {
+                self.pending_actions
+                    .push(IKEv2PendingAction::DeleteIKESession);
+            }
+            None => {
+                return Err("Received response for a non-existing request".into());
+            }
+        }
+        Ok(())
     }
+}
+
+enum RequestContext {
+    DeleteIKEv2,
 }
 
 fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: u16) -> [u8; 20] {
@@ -1538,7 +1855,7 @@ impl SecurityAssociation {
         let mut sequence_id = [0u8; 4];
         sequence_id.copy_from_slice(&data[4..8]);
         // TODO: validate that sequence ID is not reused, as defined in https://datatracker.ietf.org/doc/html/rfc6479
-        let sequence_id = u32::from_be_bytes(sequence_id);
+        // let sequence_id = u32::from_be_bytes(sequence_id);
         let signed_data_len = data.len() - self.signature_length;
         let valid_signature = self.crypto_stack.validate_signature(data);
         if !valid_signature {

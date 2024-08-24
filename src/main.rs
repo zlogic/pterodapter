@@ -394,15 +394,15 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         cancel_flag.store(true, atomic::Ordering::Relaxed);
         let _ = shutdown_sender.send(());
     });
+
     rt.block_on(async move {
         let _ = shutdown_receiver.await;
+        cancel_handle.abort();
+        info!("Started shutdown");
+        if let Err(err) = server.terminate().await {
+            eprintln!("Failed to terminate server: {}", err);
+        };
     });
-
-    if let Err(err) = server.terminate() {
-        eprintln!("Failed to terminate server: {}", err);
-    };
-
-    cancel_handle.abort();
     rt.shutdown_timeout(Duration::from_secs(60));
 
     info!("Stopped server");

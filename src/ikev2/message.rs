@@ -41,12 +41,12 @@ impl fmt::Display for ExchangeType {
 }
 
 #[derive(PartialEq, Eq)]
-struct Flags(u8);
+pub struct Flags(u8);
 
 impl Flags {
-    const INITIATOR: Flags = Flags(1 << 3);
+    pub const INITIATOR: Flags = Flags(1 << 3);
     const VERSION: Flags = Flags(1 << 4);
-    const RESPONSE: Flags = Flags(1 << 5);
+    pub const RESPONSE: Flags = Flags(1 << 5);
 
     fn from_u8(value: u8) -> Result<Flags, FormatError> {
         const RESERVED_MASK: u8 = !Flags::INITIATOR.0 & !Flags::VERSION.0 & !Flags::RESPONSE.0;
@@ -57,7 +57,7 @@ impl Flags {
         Ok(Flags(value))
     }
 
-    fn has(&self, flag: Flags) -> bool {
+    pub fn has(&self, flag: Flags) -> bool {
         self.0 & flag.0 != 0
     }
 }
@@ -66,12 +66,16 @@ impl fmt::Display for Flags {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.has(Flags::INITIATOR) {
             f.write_str("Initiator")?;
+        } else {
+            f.write_str("Responder")?;
         }
         if self.has(Flags::VERSION) {
             f.write_str("Version")?;
         }
         if self.has(Flags::RESPONSE) {
             f.write_str("Response")?;
+        } else {
+            f.write_str("Request")?;
         }
         Ok(())
     }
@@ -179,7 +183,7 @@ impl InputMessage<'_> {
         ExchangeType::from_u8(self.data[18])
     }
 
-    fn read_flags(&self) -> Result<Flags, FormatError> {
+    pub fn read_flags(&self) -> Result<Flags, FormatError> {
         Flags::from_u8(self.data[19])
     }
 
@@ -321,7 +325,8 @@ impl MessageWriter<'_> {
         self.dest[17] = 2 << 4;
         self.dest[18] = exchange_type.0;
         self.dest[19] = if is_request {
-            Flags::INITIATOR.0
+            // Since all IKE SAs are established by client, all flags should be empty.
+            0
         } else {
             Flags::RESPONSE.0
         };
@@ -459,6 +464,32 @@ impl MessageWriter<'_> {
         next_payload_slice[4..4 + spi.len()].copy_from_slice(spi);
         next_payload_slice[4 + spi.len()..].copy_from_slice(data);
         Ok(())
+    }
+
+    pub fn write_delete_payload(
+        &mut self,
+        protocol_id: IPSecProtocolID,
+        spi: &[Spi],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let spi_size = match protocol_id {
+            IPSecProtocolID::IKE => 0,
+            IPSecProtocolID::AH | IPSecProtocolID::ESP => 4,
+            _ => 0,
+        };
+        let next_payload_slice =
+            self.next_payload_slice(PayloadType::DELETE, 4 + spi_size * spi.len())?;
+        next_payload_slice[0] = protocol_id.0;
+        next_payload_slice[1] = spi_size as u8;
+        next_payload_slice[2..4].copy_from_slice(&(spi.len() as u16).to_be_bytes());
+        spi.iter().enumerate().try_for_each(|(i, spi)| {
+            let start_index = 4 + i * spi_size;
+            if spi.length() == spi_size {
+                spi.write_to(&mut next_payload_slice[start_index..start_index + spi.length()]);
+                Ok(())
+            } else {
+                Err(NotEnoughSpaceError {})
+            }
+        })
     }
 
     pub fn write_traffic_selector_payload(
@@ -705,11 +736,19 @@ impl Payload<'_> {
         }
     }
 
-    fn to_notify(&self) -> Result<PayloadNotify, FormatError> {
+    pub fn to_notify(&self) -> Result<PayloadNotify, FormatError> {
         if self.payload_type == PayloadType::NOTIFY {
             PayloadNotify::from_payload(self.data)
         } else {
             Err("Payload type is not NOTIFY".into())
+        }
+    }
+
+    pub fn to_delete(&self) -> Result<PayloadDelete, FormatError> {
+        if self.payload_type == PayloadType::DELETE {
+            PayloadDelete::from_payload(self.data)
+        } else {
+            Err("Payload type is not DELETE".into())
         }
     }
 
@@ -1581,7 +1620,7 @@ impl<'a> PayloadNonce<'a> {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NotifyMessageType(u16);
 
 impl NotifyMessageType {
@@ -1668,7 +1707,7 @@ impl fmt::Display for NotifyMessageType {
     }
 }
 
-struct PayloadNotify<'a> {
+pub struct PayloadNotify<'a> {
     protocol_id: Option<IPSecProtocolID>,
     message_type: NotifyMessageType,
     spi: &'a [u8],
@@ -1679,7 +1718,7 @@ impl<'a> PayloadNotify<'a> {
     fn from_payload(data: &'a [u8]) -> Result<PayloadNotify<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in notify payload");
-            return Err("Not enough data in key exchange payload".into());
+            return Err("Not enough data in notify payload".into());
         }
         let protocol_id = data[0];
         let protocol_id = if protocol_id != 0 {
@@ -1704,8 +1743,22 @@ impl<'a> PayloadNotify<'a> {
         })
     }
 
+    pub fn message_type(&self) -> NotifyMessageType {
+        self.message_type
+    }
+
     fn read_value(&self) -> &[u8] {
         self.data
+    }
+
+    pub fn to_signature_hash_algorithms(&self) -> Result<SignatureHashAlgorithmIter, FormatError> {
+        if self.message_type != NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
+            Err("Notify type is not SIGNATURE_HASH_ALGORITHMS".into())
+        } else if self.data.len() % 2 != 0 {
+            Err("SIGNATURE_HASH_ALGORITHMS has an unsupported format".into())
+        } else {
+            Ok(SignatureHashAlgorithmIter { data: self.data })
+        }
     }
 }
 
@@ -1719,8 +1772,8 @@ impl SignatureHashAlgorithm {
     pub const SHA2_384: SignatureHashAlgorithm = SignatureHashAlgorithm(3);
     pub const SHA2_512: SignatureHashAlgorithm = SignatureHashAlgorithm(4);
 
-    fn from_u16(value: u16) -> NotifyMessageType {
-        NotifyMessageType(value)
+    fn from_u16(value: u16) -> SignatureHashAlgorithm {
+        SignatureHashAlgorithm(value)
     }
 
     pub fn to_be_bytes(&self) -> [u8; 2] {
@@ -1739,6 +1792,94 @@ impl fmt::Display for SignatureHashAlgorithm {
             _ => write!(f, "Unknown Signature Hash Algorithm {}", self.0)?,
         }
         Ok(())
+    }
+}
+
+pub struct SignatureHashAlgorithmIter<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Iterator for SignatureHashAlgorithmIter<'a> {
+    type Item = SignatureHashAlgorithm;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data.is_empty() {
+            return None;
+        }
+        // The data length is pre-validated.
+        let mut hash_algorithm = [0u8; 2];
+        hash_algorithm.copy_from_slice(&self.data[..2]);
+        let hash_algorithm = u16::from_be_bytes(hash_algorithm);
+
+        self.data = &self.data[2..];
+        let hash_algorithm = SignatureHashAlgorithm::from_u16(hash_algorithm);
+
+        Some(hash_algorithm)
+    }
+}
+
+pub struct PayloadDelete<'a> {
+    protocol_id: IPSecProtocolID,
+    data: &'a [u8],
+}
+
+impl<'a> PayloadDelete<'a> {
+    fn from_payload(data: &'a [u8]) -> Result<PayloadDelete<'a>, FormatError> {
+        if data.len() < 4 {
+            debug!("Not enough data in delete payload");
+            return Err("Not enough data in delete payload".into());
+        }
+        let protocol_id = IPSecProtocolID::from_u8(data[0])?;
+        let spi_size = data[1] as usize;
+        let mut spi_count = [0u8; 2];
+        spi_count.copy_from_slice(&data[2..4]);
+        let spi_count = u16::from_be_bytes(spi_count) as usize;
+        if protocol_id == IPSecProtocolID::IKE {
+            return if spi_size == 0 && spi_count == 0 {
+                Ok(PayloadDelete {
+                    protocol_id,
+                    data: &[],
+                })
+            } else {
+                Err("IKE delete payload has additional unsupported SPIs".into())
+            };
+        }
+        if spi_size != 4 {
+            return Err("Unsupported SPI size in delete payload".into());
+        }
+        if data.len() != 4 + spi_size * spi_count {
+            return Err("Delete SPI size mismatch".into());
+        }
+        Ok(PayloadDelete {
+            protocol_id,
+            data: &data[4..],
+        })
+    }
+
+    pub fn iter_spi(&self) -> DeleteSpiIter {
+        DeleteSpiIter { data: self.data }
+    }
+}
+
+pub struct DeleteSpiIter<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Iterator for DeleteSpiIter<'a> {
+    type Item = Spi;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data.is_empty() {
+            return None;
+        }
+        // All protocols use 4-byte SPIs (IKE has none); the data length is pre-validated.
+        let mut spi = [0u8; 4];
+        spi.copy_from_slice(&self.data[..4]);
+        let spi = Spi::U32(u32::from_be_bytes(spi));
+
+        self.data = &self.data[4..];
+
+        Some(spi)
     }
 }
 
@@ -2223,14 +2364,36 @@ impl fmt::Debug for Payload<'_> {
         } else if let Ok(pl_nonce) = self.to_nonce() {
             writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
         } else if let Ok(pl_notify) = self.to_notify() {
-            writeln!(
-                f,
-                "    Notify protocol ID {:?} SPI {:?} type {} value {:?}",
-                pl_notify.protocol_id,
-                pl_notify.spi,
-                pl_notify.message_type,
-                pl_notify.read_value(),
-            )?;
+            if pl_notify.message_type == NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
+                write!(
+                    f,
+                    "    Notify protocol ID {:?} SPI {:?} type {} list",
+                    pl_notify.protocol_id, pl_notify.spi, pl_notify.message_type,
+                )?;
+                if let Ok(hash_algorithms) = pl_notify.to_signature_hash_algorithms() {
+                    for alg in hash_algorithms {
+                        write!(f, " {}", alg)?;
+                    }
+                } else {
+                    write!(f, " error")?;
+                }
+                writeln!(f)?;
+            } else {
+                writeln!(
+                    f,
+                    "    Notify protocol ID {:?} SPI {:?} type {} value {:?}",
+                    pl_notify.protocol_id,
+                    pl_notify.spi,
+                    pl_notify.message_type,
+                    pl_notify.read_value(),
+                )?;
+            }
+        } else if let Ok(pl_delete) = self.to_delete() {
+            writeln!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
+            for delete_spi in pl_delete.iter_spi() {
+                write!(f, " {}", delete_spi)?;
+            }
+            writeln!(f)?;
         } else if let Ok(pl_ts) = self.to_traffic_selector() {
             for ts in pl_ts.iter_traffic_selectors() {
                 let ts = match ts {
