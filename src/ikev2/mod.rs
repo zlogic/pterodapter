@@ -12,6 +12,7 @@ use std::{
 use tokio::{net::UdpSocket, runtime, sync::mpsc, task::JoinHandle, time};
 
 mod crypto;
+mod esp;
 mod message;
 mod pki;
 
@@ -32,6 +33,7 @@ const MAX_SIGNATURE_LENGTH: usize = 1 + 12 + 72;
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 const IKE_SESSION_EXPIRATION: Duration = Duration::from_secs(60 * 15);
 const IKE_RESPONSE_EXPIRATION: Duration = Duration::from_secs(60);
+// TODO: set a time limit instead of retransmission limit.
 const IKE_RETRANSMISSIONS_LIMIT: usize = 5;
 
 pub struct Config {
@@ -234,47 +236,6 @@ impl fmt::Display for SessionID {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SecurityAssociationID {
-    remote_spi: u32,
-    local_spi: u32,
-    remote_addr: SocketAddr,
-}
-
-impl PartialEq for SecurityAssociationID {
-    fn eq(&self, other: &Self) -> bool {
-        // Ignore remote SPI, as ESP packets only include destination SPI.
-        self.local_spi == other.local_spi && self.remote_addr == other.remote_addr
-    }
-}
-
-impl Eq for SecurityAssociationID {}
-
-impl Hash for SecurityAssociationID {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.local_spi.hash(state);
-        self.remote_addr.hash(state);
-    }
-}
-
-impl SecurityAssociationID {
-    fn from_transform_params(
-        remote_addr: SocketAddr,
-        transform_params: &crypto::TransformParameters,
-    ) -> Result<SecurityAssociationID, IKEv2Error> {
-        match (transform_params.remote_spi(), transform_params.local_spi()) {
-            (message::Spi::U32(remote_spi), message::Spi::U32(local_spi)) => {
-                Ok(SecurityAssociationID {
-                    remote_spi,
-                    local_spi,
-                    remote_addr,
-                })
-            }
-            _ => Err("Security Association has unsupported SPI types".into()),
-        }
-    }
-}
-
 struct UdpDatagram {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
@@ -315,7 +276,7 @@ struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Arc<Sockets>,
     sessions: HashMap<SessionID, IKEv2Session>,
-    security_associations: HashMap<SecurityAssociationID, SecurityAssociation>,
+    security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
     tx: mpsc::Sender<SessionMessage>,
     rx: mpsc::Receiver<SessionMessage>,
@@ -576,8 +537,7 @@ impl Sessions {
                         );
                     }
                 }
-                IKEv2PendingAction::CreateChildSA(mut session_id, security_association) => {
-                    session_id.remote_addr = session.remote_addr;
+                IKEv2PendingAction::CreateChildSA(session_id, security_association) => {
                     self.security_associations
                         .insert(session_id, security_association);
                 }
@@ -654,11 +614,7 @@ impl Sessions {
         let mut local_spi = [0u8; 4];
         local_spi.copy_from_slice(&packet_bytes[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
-        let sa_id = SecurityAssociationID {
-            remote_spi: 0,
-            local_spi,
-            remote_addr: datagram.remote_addr,
-        };
+        let sa_id = esp::SecurityAssociationID::from_datagram(local_spi, datagram.remote_addr);
         if let Some(sa) = self.security_associations.get(&sa_id) {
             let decrypted_data = sa.handle_esp(packet_bytes)?;
             trace!(
@@ -694,7 +650,7 @@ enum SessionState {
 
 enum IKEv2PendingAction {
     DeleteHalfOpenSession(SocketAddr, u64),
-    CreateChildSA(SecurityAssociationID, SecurityAssociation),
+    CreateChildSA(esp::SecurityAssociationID, esp::SecurityAssociation),
     DeleteIKESession,
 }
 
@@ -782,7 +738,9 @@ impl IKEv2Session {
 
         let response_length = match exchange_type {
             message::ExchangeType::IKE_SA_INIT => self.process_sa_init_request(request, response),
-            message::ExchangeType::IKE_AUTH => self.process_auth_request(request, response),
+            message::ExchangeType::IKE_AUTH => {
+                self.process_auth_request(remote_addr, local_addr, request, response)
+            }
             message::ExchangeType::INFORMATIONAL => {
                 self.process_informational_request(request, response)
             }
@@ -1158,6 +1116,8 @@ impl IKEv2Session {
 
     fn process_auth_request(
         &mut self,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, IKEv2Error> {
@@ -1407,7 +1367,7 @@ impl IKEv2Session {
         let local_spi = message::Spi::U32(rand::thread_rng().gen::<u32>());
         transform_params.set_local_spi(local_spi);
         let sa_session_id =
-            match SecurityAssociationID::from_transform_params(self.remote_addr, &transform_params)
+            match esp::SecurityAssociationID::from_transform_params(remote_addr, &transform_params)
             {
                 Ok(sa_session_id) => sa_session_id,
                 Err(err) => {
@@ -1508,8 +1468,14 @@ impl IKEv2Session {
         response.write_traffic_selector_payload(true, &ts_remote)?;
         response.write_traffic_selector_payload(false, &ts_local)?;
 
-        let child_sa =
-            SecurityAssociation::new(ts_local, ts_remote, child_crypto_stack, &transform_params);
+        let child_sa = esp::SecurityAssociation::new(
+            ts_local,
+            ts_remote,
+            local_addr,
+            remote_addr,
+            child_crypto_stack,
+            &transform_params,
+        );
         self.pending_actions
             .push(IKEv2PendingAction::CreateChildSA(sa_session_id, child_sa));
 
@@ -1882,83 +1848,13 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     crypto::hash_sha1(src_data)
 }
 
-struct SecurityAssociation {
-    ts_local: Vec<message::TrafficSelector>,
-    ts_remote: Vec<message::TrafficSelector>,
-    crypto_stack: crypto::CryptoStack,
-    signature_length: usize,
-}
-
-impl SecurityAssociation {
-    fn new(
-        ts_local: Vec<message::TrafficSelector>,
-        ts_remote: Vec<message::TrafficSelector>,
-        crypto_stack: crypto::CryptoStack,
-        params: &crypto::TransformParameters,
-    ) -> SecurityAssociation {
-        let signature_length = if let Some(signature_length) = params.auth_signature_length() {
-            signature_length / 8
-        } else {
-            0
-        };
-        SecurityAssociation {
-            ts_local,
-            ts_remote,
-            crypto_stack,
-            signature_length,
-        }
-    }
-
-    fn contains(&self, remote_addr: &SocketAddr, local_addr: &SocketAddr) -> bool {
-        self.ts_local.iter().any(|ts_local| {
-            ts_local.addr_range().contains(&local_addr.ip())
-                && ts_local.port_range().contains(&local_addr.port())
-        }) && self.ts_remote.iter().any(|ts_remote| {
-            ts_remote.addr_range().contains(&remote_addr.ip())
-                && ts_remote.port_range().contains(&remote_addr.port())
-        })
-    }
-
-    fn handle_esp<'a>(&self, data: &'a mut [u8]) -> Result<&'a [u8], IKEv2Error> {
-        if data.len() < 8 + self.signature_length {
-            return Err("Not enough data in ESP packet".into());
-        }
-        let mut sequence_id = [0u8; 4];
-        sequence_id.copy_from_slice(&data[4..8]);
-        // TODO: validate that sequence ID is not reused, as defined in https://datatracker.ietf.org/doc/html/rfc6479
-        // let sequence_id = u32::from_be_bytes(sequence_id);
-        let signed_data_len = data.len() - self.signature_length;
-        let valid_signature = self.crypto_stack.validate_signature(data);
-        if !valid_signature {
-            return Err("Packet has invalid signature".into());
-        }
-        let mut associated_data = [0u8; 8];
-        let associated_data = if self.signature_length == 0 {
-            associated_data.copy_from_slice(&data[0..8]);
-            &associated_data[..]
-        } else {
-            &[]
-        };
-        match self.crypto_stack.decrypt_data(
-            &mut data[8..signed_data_len],
-            signed_data_len - 8,
-            associated_data,
-        ) {
-            Ok(data) => Ok(data),
-            Err(err) => {
-                warn!("Failed to decrypt ESP packet: {}", err);
-                Err("Failed to decrypt ESP packet".into())
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum IKEv2Error {
     Internal(&'static str),
     Format(message::FormatError),
     NotEnoughSpace(message::NotEnoughSpaceError),
     CertError(pki::CertError),
+    Esp(esp::EspError),
     Join(tokio::task::JoinError),
     Io(io::Error),
 }
@@ -1970,6 +1866,7 @@ impl fmt::Display for IKEv2Error {
             Self::Format(ref e) => write!(f, "Format error: {}", e),
             Self::NotEnoughSpace(_) => write!(f, "Not enough space error"),
             Self::CertError(ref e) => write!(f, "PKI cert error: {}", e),
+            Self::Esp(ref e) => write!(f, "ESP error: {}", e),
             Self::Join(ref e) => write!(f, "Tokio join error: {}", e),
             Self::Io(ref e) => {
                 write!(f, "IO error: {}", e)
@@ -1985,6 +1882,7 @@ impl error::Error for IKEv2Error {
             Self::Format(ref err) => Some(err),
             Self::NotEnoughSpace(ref err) => Some(err),
             Self::CertError(ref err) => Some(err),
+            Self::Esp(ref err) => Some(err),
             Self::Join(ref err) => Some(err),
             Self::Io(ref err) => Some(err),
         }
@@ -2012,6 +1910,12 @@ impl From<message::NotEnoughSpaceError> for IKEv2Error {
 impl From<pki::CertError> for IKEv2Error {
     fn from(err: pki::CertError) -> IKEv2Error {
         Self::CertError(err)
+    }
+}
+
+impl From<esp::EspError> for IKEv2Error {
+    fn from(err: esp::EspError) -> IKEv2Error {
+        Self::Esp(err)
     }
 }
 
