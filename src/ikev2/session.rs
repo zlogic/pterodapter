@@ -1044,7 +1044,7 @@ impl IKEv2Session {
             response.write_notify_payload(
                 None,
                 &[],
-                message::NotifyMessageType::INVALID_SPI,
+                message::NotifyMessageType::CHILD_SA_NOT_FOUND,
                 &[],
             )?;
         } else {
