@@ -106,7 +106,6 @@ impl PkiProcessing {
         let san = client_cert
             .tbs_certificate
             .filter::<pkix::SubjectAltName>()
-            .into_iter()
             .filter_map(|res| match res {
                 Ok((_, pkix::SubjectAltName(subject_alternative_name))) => subject_alternative_name
                     .iter()
@@ -142,7 +141,7 @@ impl PkiProcessing {
         let subject = if let Some(san) = san {
             san
         } else if let Some(subject_cn) = subject_cn {
-            String::from(subject_cn)
+            subject_cn
         } else {
             client_cert.tbs_certificate.subject.to_string()
         };
@@ -273,7 +272,7 @@ impl ClientValidation {
     fn verify_server_cert(&self, server_cert: &pki_types::CertificateDer) -> Result<(), CertError> {
         let server_cert = webpki::EndEntityCert::try_from(server_cert)?;
         server_cert.verify_for_usage(
-            &webpki::ALL_VERIFICATION_ALGS,
+            webpki::ALL_VERIFICATION_ALGS,
             self.root_certs.roots.as_slice(),
             &[],
             pki_types::UnixTime::now(),

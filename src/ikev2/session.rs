@@ -156,7 +156,7 @@ impl IKEv2Session {
     }
 
     pub fn user_id(&self) -> Option<&str> {
-        self.user_id.as_ref().map(|user_id| user_id.as_str())
+        self.user_id.as_deref()
     }
 
     pub fn handle_response_expiration(&mut self, now: time::Instant) {

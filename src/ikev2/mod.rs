@@ -488,10 +488,8 @@ impl Sessions {
                     delete_session = true;
                 }
             });
-        if delete_session {
-            if self.sessions.remove(&session_id).is_some() {
-                info!("Deleted IKEv2 session {}", session_id);
-            }
+        if delete_session && self.sessions.remove(&session_id).is_some() {
+            info!("Deleted IKEv2 session {}", session_id);
         }
     }
 
