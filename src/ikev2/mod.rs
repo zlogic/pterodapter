@@ -290,12 +290,14 @@ impl Sessions {
     async fn cleanup(&mut self) {
         let now = Instant::now();
         self.half_sessions
-            .retain(|(remote_addr, remote_spi), (_, expires_at)| {
+            .retain(|(remote_addr, remote_spi), (local_spi, expires_at)| {
                 if *expires_at + IKE_INIT_SA_EXPIRATION < now {
                     info!(
                         "Deleting expired init session {} (SPI {:x})",
                         remote_addr, remote_spi
                     );
+                    self.sessions
+                        .remove(&session::SessionID::new(*remote_spi, *local_spi));
                     false
                 } else {
                     true
