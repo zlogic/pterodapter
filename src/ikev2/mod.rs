@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, runtime, sync::mpsc, task::JoinHandle, time};
+use tokio::{net::UdpSocket, runtime, sync::mpsc, task::JoinSet, time};
 
 mod crypto;
 mod esp;
@@ -35,7 +35,7 @@ pub struct Server {
     listen_ips: Vec<IpAddr>,
     pki_processing: Arc<pki::PkiProcessing>,
     command_sender: Option<mpsc::Sender<SessionMessage>>,
-    handles: Vec<JoinHandle<Result<(), IKEv2Error>>>,
+    join_set: JoinSet<Result<(), IKEv2Error>>,
 }
 
 impl Server {
@@ -52,7 +52,7 @@ impl Server {
             listen_ips: config.listen_ips,
             pki_processing: Arc::new(pki_processing),
             command_sender: None,
-            handles: vec![],
+            join_set: JoinSet::new(),
         })
     }
 
@@ -103,8 +103,8 @@ impl Server {
             }
             None => return Err("Shutdown already in progress".into()),
         }
-        for handle in self.handles.drain(..self.handles.len()) {
-            if let Err(err) = handle.await {
+        while let Some(res) = self.join_set.join_next().await {
+            if let Err(err) = res {
                 warn!("Error returned when shutting down: {}", err);
             }
         }
@@ -128,7 +128,8 @@ impl Server {
             sessions.create_sender(),
         ));
         self.command_sender = Some(sessions.create_sender());
-        self.handles = vec![rt.spawn(async move { sessions.process_messages().await })];
+        self.join_set
+            .spawn_on(async move { sessions.process_messages().await }, &rt);
         Ok(())
     }
 }
