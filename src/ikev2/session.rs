@@ -1217,14 +1217,24 @@ impl IKEv2Session {
                 }
             })
             .next();
-        let next_ip = if let Some(next_ip) = next_ip {
-            next_ip
+        let full_ts = message::TrafficSelector::from_ip_range(
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))..=IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+        )?;
+        let accepts_all_traffic = self.child_sas.iter().any(|child_sa| {
+            child_sa
+                .ts_local
+                .iter()
+                .any(|ts_local| *ts_local == full_ts)
+        });
+        // Prepare create_child_sa request.
+        let next_ts = if let Some(next_ip) = next_ip {
+            message::TrafficSelector::from_ip_range(*next_ip..=*next_ip)?
+        } else if tunnel_ips.is_empty() && !accepts_all_traffic {
+            full_ts.clone()
         } else {
             // There's a traffic selector for every tunneled IP.
             return Ok(None);
         };
-        // Prepare create_child_sa request.
-        let next_ts = message::TrafficSelector::from_ip_range(*next_ip..=*next_ip)?;
         let mut nonce_local = [0u8; MAX_NONCE];
         rand::thread_rng().fill(nonce_local.as_mut_slice());
         let local_spi = rand::thread_rng().gen::<u32>();
@@ -1242,10 +1252,6 @@ impl IKEv2Session {
             dest.copy_from_slice(nonce_local.as_slice());
 
             writer.write_traffic_selector_payload(true, &[next_ts.clone()])?;
-            let full_ts = message::TrafficSelector::from_ip_range(
-                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
-                    ..=IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
-            )?;
             Ok(writer.write_traffic_selector_payload(false, &[full_ts])?)
         })?;
         self.sent_request = Some(RequestContext::CreateChildSA(
