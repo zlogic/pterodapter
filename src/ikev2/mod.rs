@@ -23,17 +23,20 @@ const IKEV2_LISTEN_PORTS: [u16; 2] = [IKEV2_PORT, IKEV2_NAT_PORT];
 const MAX_DATAGRAM_SIZE: usize = 4096;
 
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
+const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub struct Config {
     pub listen_ips: Vec<IpAddr>,
     pub hostname: Option<String>,
     pub root_ca: Option<String>,
     pub server_cert: Option<(String, String)>,
+    pub tunnel_domains: Vec<String>,
 }
 
 pub struct Server {
     listen_ips: Vec<IpAddr>,
     pki_processing: Arc<pki::PkiProcessing>,
+    tunnel_domains: Vec<String>,
     command_sender: Option<mpsc::Sender<SessionMessage>>,
     join_set: JoinSet<Result<(), IKEv2Error>>,
 }
@@ -51,6 +54,7 @@ impl Server {
         Ok(Server {
             listen_ips: config.listen_ips,
             pki_processing: Arc::new(pki_processing),
+            tunnel_domains: config.tunnel_domains,
             command_sender: None,
             join_set: JoinSet::new(),
         })
@@ -113,7 +117,9 @@ impl Server {
 
     pub async fn start(&mut self) -> Result<(), IKEv2Error> {
         let sockets = Arc::new(Sockets::new(&self.listen_ips).await?);
-        let mut sessions = Sessions::new(self.pki_processing.clone(), sockets.clone());
+        let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
+        let tunnel_ips = split_routes.refresh_addresses().await?;
+        let mut sessions = Sessions::new(self.pki_processing.clone(), sockets.clone(), tunnel_ips);
         let rt = runtime::Handle::current();
         // Non-critical futures sockets will be terminated by Tokio during the shutdown_timeout phase.
         sockets.iter_sockets().for_each(|(listen_addr, socket)| {
@@ -127,6 +133,23 @@ impl Server {
             Duration::from_secs(15),
             sessions.create_sender(),
         ));
+        let command_sender = sessions.create_sender();
+        rt.spawn(async move {
+            let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
+            loop {
+                delay.tick().await;
+                let tunnel_ips = match split_routes.refresh_addresses().await {
+                    Ok(tunnel_ips) => tunnel_ips,
+                    Err(err) => {
+                        warn!("Failed to refresh IP addresses for split routes: {}", err);
+                        continue;
+                    }
+                };
+                let _ = command_sender
+                    .send(SessionMessage::UpdateSplitRoutes(tunnel_ips))
+                    .await;
+            }
+        });
         self.command_sender = Some(sessions.create_sender());
         self.join_set
             .spawn_on(async move { sessions.process_messages().await }, &rt);
@@ -218,11 +241,13 @@ enum SessionMessage {
     RetransmitRequest(session::SessionID, u32),
     CleanupTimer,
     Shutdown,
+    UpdateSplitRoutes(Vec<IpAddr>),
 }
 
 struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Arc<Sockets>,
+    tunnel_ips: Vec<IpAddr>,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
@@ -232,11 +257,16 @@ struct Sessions {
 }
 
 impl Sessions {
-    fn new(pki_processing: Arc<pki::PkiProcessing>, sockets: Arc<Sockets>) -> Sessions {
+    fn new(
+        pki_processing: Arc<pki::PkiProcessing>,
+        sockets: Arc<Sockets>,
+        tunnel_ips: Vec<IpAddr>,
+    ) -> Sessions {
         let (tx, rx) = mpsc::channel(100);
         Sessions {
             pki_processing,
             sockets,
+            tunnel_ips,
             sessions: HashMap::new(),
             security_associations: HashMap::new(),
             half_sessions: HashMap::new(),
@@ -288,7 +318,7 @@ impl Sessions {
         self.sessions.get_mut(&id)
     }
 
-    async fn cleanup(&mut self) {
+    fn cleanup(&mut self, rt: &runtime::Handle) {
         let now = Instant::now();
         self.half_sessions
             .retain(|(remote_addr, remote_spi), (local_spi, expires_at)| {
@@ -307,7 +337,7 @@ impl Sessions {
         self.sessions.retain(|session_id, session| {
             if session.is_expired(now) {
                 info!(
-                    "Deleting expired session with SPI {} {:?}",
+                    "Deleting expired session with SPI {} {}",
                     session_id,
                     session.user_id().unwrap_or("Unknown")
                 );
@@ -334,18 +364,52 @@ impl Sessions {
                         continue;
                     }
                 };
-                if let Err(err) = session.send_last_request(&self.sockets, message_id).await {
-                    warn!(
-                        "Failed to send Delete request to session {}: {}",
-                        session_id, err
-                    );
-                }
-                let _ = self
-                    .tx
-                    .send(SessionMessage::RetransmitRequest(*session_id, message_id))
-                    .await;
+                let sender = self.tx.clone();
+                let session_id = session_id.clone();
+                rt.spawn(async move {
+                    let _ = sender
+                        .send(SessionMessage::RetransmitRequest(session_id, message_id))
+                        .await;
+                });
             }
         }
+    }
+
+    async fn update_all_split_routes(&mut self) {
+        let session_ids = self.sessions.keys().map(|key| *key).collect::<Vec<_>>();
+        let rt = runtime::Handle::current();
+        for session_id in session_ids {
+            if let Err(err) = self.update_split_routes(&session_id, &rt) {
+                warn!(
+                    "Failed to update split routes for session {}: {}",
+                    session_id, err
+                );
+            }
+        }
+    }
+
+    fn update_split_routes(
+        &mut self,
+        session_id: &session::SessionID,
+        rt: &runtime::Handle,
+    ) -> Result<(), IKEv2Error> {
+        let session = if let Some(session) = self.sessions.get_mut(session_id) {
+            session
+        } else {
+            return Err("Session for updating split routes not found".into());
+        };
+        let message_id = match session.update_split_routes(&self.tunnel_ips)? {
+            Some(message_id) => message_id,
+            None => return Ok(()),
+        };
+        let sender = self.tx.clone();
+        let session_id = session_id.clone();
+        rt.spawn(async move {
+            sender
+                .send(SessionMessage::RetransmitRequest(session_id, message_id))
+                .await
+        });
+        Ok(())
     }
 
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
@@ -360,14 +424,20 @@ impl Sessions {
                     }
                 }
                 SessionMessage::CleanupTimer => {
-                    self.cleanup().await;
+                    let rt = runtime::Handle::current();
+                    self.cleanup(&rt);
+                }
+                SessionMessage::UpdateSplitRoutes(tunnel_ips) => {
+                    self.tunnel_ips = tunnel_ips;
+                    self.update_all_split_routes().await;
                 }
                 SessionMessage::RetransmitRequest(session_id, message_id) => {
                     self.retransmit_request(session_id, message_id).await;
                 }
                 SessionMessage::Shutdown => {
                     self.shutdown = true;
-                    self.cleanup().await;
+                    let rt = runtime::Handle::current();
+                    self.cleanup(&rt);
                 }
             }
             if self.shutdown && self.sessions.is_empty() {
@@ -490,6 +560,15 @@ impl Sessions {
                     // TODO: also delete Child SAs (have IKE send IKEv2PendingAction per child SA?).
                     delete_session = true;
                 }
+                session::IKEv2PendingAction::UpdateSplitRoutes => {
+                    let rt = runtime::Handle::current();
+                    if let Err(err) = self.update_split_routes(&session_id, &rt) {
+                        warn!(
+                            "Failed to update split routes for session {}: {}",
+                            session_id, err
+                        );
+                    }
+                }
             });
         if delete_session && self.sessions.remove(&session_id).is_some() {
             info!("Deleted IKEv2 session {}", session_id);
@@ -500,11 +579,15 @@ impl Sessions {
         let session = if let Some(session) = self.sessions.get_mut(&session_id) {
             session
         } else {
+            debug!(
+                "Failed to retransmit request: missing session {}",
+                session_id
+            );
             return;
         };
         if let Err(err) = session.send_last_request(&self.sockets, message_id).await {
             warn!(
-                "Failed to retransmit last reqeust to session {}: {}",
+                "Failed to retransmit last request to session {}: {}",
                 session_id, err
             );
         }
@@ -551,8 +634,7 @@ impl Sessions {
         let mut local_spi = [0u8; 4];
         local_spi.copy_from_slice(&packet_bytes[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
-        let sa_id = esp::SecurityAssociationID::from_datagram(local_spi, datagram.remote_addr);
-        if let Some(sa) = self.security_associations.get(&sa_id) {
+        if let Some(sa) = self.security_associations.get(&local_spi) {
             let decrypted_data = sa.handle_esp(packet_bytes)?;
             trace!(
                 "Decrypted ESP packet from {}\n{:?}",
@@ -567,6 +649,34 @@ impl Sessions {
             );
             Err("Security Association not found".into())
         }
+    }
+}
+
+struct SplitRouteRegistry {
+    tunnel_domains: Vec<String>,
+}
+
+impl SplitRouteRegistry {
+    fn new(tunnel_domains: Vec<String>) -> SplitRouteRegistry {
+        SplitRouteRegistry { tunnel_domains }
+    }
+
+    async fn refresh_addresses(&mut self) -> Result<Vec<IpAddr>, IKEv2Error> {
+        // Use a predefined port just in case.
+        let addresses = self
+            .tunnel_domains
+            .iter()
+            .map(|domain| tokio::net::lookup_host((domain.clone(), 80)))
+            .collect::<Vec<_>>();
+
+        let mut ip_addresses = vec![];
+        for addrs in addresses.into_iter() {
+            addrs
+                .await?
+                .into_iter()
+                .for_each(|addr| ip_addresses.push(addr.ip()));
+        }
+        Ok(ip_addresses)
     }
 }
 

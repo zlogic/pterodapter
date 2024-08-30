@@ -1,58 +1,10 @@
-use std::{
-    error, fmt,
-    hash::{Hash, Hasher},
-    net::SocketAddr,
-};
+use std::{error, fmt, net::SocketAddr};
 
 use log::warn;
 
 use super::{crypto, message};
 
-#[derive(Clone, Copy)]
-pub struct SecurityAssociationID {
-    local_spi: u32,
-    remote_addr: SocketAddr,
-}
-
-impl SecurityAssociationID {
-    pub fn from_datagram(local_spi: u32, remote_addr: SocketAddr) -> SecurityAssociationID {
-        SecurityAssociationID {
-            local_spi,
-            remote_addr,
-        }
-    }
-}
-
-impl PartialEq for SecurityAssociationID {
-    fn eq(&self, other: &Self) -> bool {
-        // Ignore remote SPI, as ESP packets only include destination SPI.
-        self.local_spi == other.local_spi && self.remote_addr == other.remote_addr
-    }
-}
-
-impl Eq for SecurityAssociationID {}
-
-impl Hash for SecurityAssociationID {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.local_spi.hash(state);
-        self.remote_addr.hash(state);
-    }
-}
-
-impl SecurityAssociationID {
-    pub fn from_transform_params(
-        remote_addr: SocketAddr,
-        transform_params: &crypto::TransformParameters,
-    ) -> Result<SecurityAssociationID, EspError> {
-        match transform_params.local_spi() {
-            message::Spi::U32(local_spi) => Ok(SecurityAssociationID {
-                local_spi,
-                remote_addr,
-            }),
-            _ => Err("Security Association has unsupported local SPI type".into()),
-        }
-    }
-}
+pub type SecurityAssociationID = u32;
 
 pub struct SecurityAssociation {
     ts_local: Vec<message::TrafficSelector>,
@@ -129,6 +81,11 @@ impl SecurityAssociation {
             }
         }
     }
+}
+
+pub fn ts_accepts(ts: &[message::TrafficSelector], addr: &SocketAddr) -> bool {
+    ts.iter()
+        .any(|ts| ts.addr_range().contains(&addr.ip()) && ts.port_range().contains(&addr.port()))
 }
 
 #[derive(Debug)]

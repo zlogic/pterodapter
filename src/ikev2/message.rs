@@ -338,15 +338,8 @@ impl MessageWriter<'_> {
         Ok(())
     }
 
-    pub fn write_accept_proposal(
-        &mut self,
-        proposal_num: u8,
-        proposal: &crypto::TransformParameters,
-    ) -> Result<(), NotEnoughSpaceError> {
-        const ATTRIBUTE_FORMAT_TV: u16 = 1 << 15;
-        const ATTRIBUTE_TYPE_KEY_LENGTH: [u8; 2] =
-            (TransformAttributeType::KEY_LENGTH.0 | ATTRIBUTE_FORMAT_TV).to_be_bytes();
-        let (num_transforms, data_len) = proposal
+    fn sa_parameters_len(params: &crypto::TransformParameters) -> (usize, usize) {
+        let (num_transforms, data_len) = params
             .iter_parameters()
             .map(|param| {
                 if param.key_length().is_some() {
@@ -356,17 +349,28 @@ impl MessageWriter<'_> {
                 }
             })
             .fold((0, 0), |acc, e| (acc.0 + e.0, acc.1 + e.1));
+        let proposal_len = 8 + params.local_spi().length() + data_len;
+        (num_transforms, proposal_len)
+    }
+
+    fn write_sa_params(
+        dest: &mut [u8],
+        proposal_num: u8,
+        proposal: &crypto::TransformParameters,
+        is_last: bool,
+    ) -> usize {
+        const ATTRIBUTE_FORMAT_TV: u16 = 1 << 15;
+        const ATTRIBUTE_TYPE_KEY_LENGTH: [u8; 2] =
+            (TransformAttributeType::KEY_LENGTH.0 | ATTRIBUTE_FORMAT_TV).to_be_bytes();
+        let (num_transforms, proposal_len) = Self::sa_parameters_len(proposal);
         let spi = proposal.local_spi();
-        let proposal_len = 8 + spi.length() + data_len;
-        let next_payload_slice =
-            self.next_payload_slice(PayloadType::SECURITY_ASSOCIATION, proposal_len)?;
-        next_payload_slice[0] = 0;
-        next_payload_slice[2..4].copy_from_slice(&(proposal_len as u16).to_be_bytes());
-        next_payload_slice[4] = proposal_num;
-        next_payload_slice[5] = proposal.protocol_id().0;
-        next_payload_slice[6] = spi.length() as u8;
-        next_payload_slice[7] = num_transforms as u8;
-        spi.write_to(&mut next_payload_slice[8..8 + spi.length()]);
+        dest[0] = if is_last { 0 } else { 2 };
+        dest[2..4].copy_from_slice(&(proposal_len as u16).to_be_bytes());
+        dest[4] = proposal_num;
+        dest[5] = proposal.protocol_id().0;
+        dest[6] = spi.length() as u8;
+        dest[7] = num_transforms as u8;
+        spi.write_to(&mut dest[8..8 + spi.length()]);
         let mut next_payload_offset = 8 + spi.length();
         proposal
             .iter_parameters()
@@ -377,8 +381,8 @@ impl MessageWriter<'_> {
                 } else {
                     8
                 };
-                let next_payload_slice = &mut next_payload_slice
-                    [next_payload_offset..next_payload_offset + transform_len];
+                let next_payload_slice =
+                    &mut dest[next_payload_offset..next_payload_offset + transform_len];
                 next_payload_offset += transform_len;
                 next_payload_slice[0] = if i + 1 < num_transforms { 3 } else { 0 };
                 next_payload_slice[1] = 0;
@@ -392,6 +396,25 @@ impl MessageWriter<'_> {
                     next_payload_slice[10..12].copy_from_slice(&key_length.to_be_bytes());
                 }
             });
+        proposal_len
+    }
+
+    pub fn write_security_association(
+        &mut self,
+        proposals: &[(u8, &crypto::TransformParameters)],
+    ) -> Result<(), NotEnoughSpaceError> {
+        let proposals_len = proposals
+            .iter()
+            .map(|params| Self::sa_parameters_len(params.1).1)
+            .sum();
+        let mut next_payload_slice =
+            self.next_payload_slice(PayloadType::SECURITY_ASSOCIATION, proposals_len)?;
+        for (proposal_num, proposal) in proposals {
+            let is_last = *proposal_num as usize == proposals.len();
+            let proposal_len =
+                Self::write_sa_params(next_payload_slice, *proposal_num, proposal, is_last);
+            next_payload_slice = &mut next_payload_slice[proposal_len..];
+        }
         Ok(())
     }
 
@@ -1968,6 +1991,7 @@ impl fmt::Display for IPProtocolType {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct TrafficSelector {
     ts_type: TrafficSelectorType,
     ip_protocol: IPProtocolType,
@@ -1976,6 +2000,22 @@ pub struct TrafficSelector {
 }
 
 impl TrafficSelector {
+    pub fn from_ip_range(
+        addr_range: RangeInclusive<IpAddr>,
+    ) -> Result<TrafficSelector, FormatError> {
+        let ts_type = match (addr_range.start(), addr_range.end()) {
+            (IpAddr::V4(_), IpAddr::V4(_)) => TrafficSelectorType::TS_IPV4_ADDR_RANGE,
+            (IpAddr::V6(_), IpAddr::V6(_)) => TrafficSelectorType::TS_IPV6_ADDR_RANGE,
+            _ => return Err("Traffic selector has incompatible start/end address types".into()),
+        };
+        Ok(TrafficSelector {
+            ts_type,
+            ip_protocol: IPProtocolType::ANY,
+            addr: addr_range,
+            port: 0..=u16::MAX,
+        })
+    }
+
     pub fn ts_type(&self) -> TrafficSelectorType {
         self.ts_type
     }
@@ -2389,7 +2429,7 @@ impl fmt::Debug for Payload<'_> {
                 )?;
             }
         } else if let Ok(pl_delete) = self.to_delete() {
-            writeln!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
+            write!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
             for delete_spi in pl_delete.iter_spi() {
                 write!(f, " {}", delete_spi)?;
             }

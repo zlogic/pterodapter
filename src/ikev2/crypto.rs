@@ -14,6 +14,7 @@ const MAX_KEY_MATERIAL_LENGTH: usize = MAX_PRF_KEY_LENGTH
     + MAX_ENCRYPTION_KEY_LENGTH * 2
     + MAX_PRF_KEY_LENGTH * 2;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Transform {
     transform_type: message::TransformType,
     key_length: Option<u16>,
@@ -29,6 +30,7 @@ impl Transform {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TransformParameters {
     enc: Option<Transform>,
     prf: Option<Transform>,
@@ -245,6 +247,116 @@ pub fn choose_sa_parameters(
             Some((parameters, prop.proposal_num()))
         })
         .next()
+}
+
+pub fn offer_esp_sa_parameters(local_spi: u32) -> Vec<TransformParameters> {
+    let parameters = TransformParameters {
+        enc: Some(Transform {
+            transform_type: message::TransformType::ENCR_AES_GCM_16,
+            key_length: Some(256),
+        }),
+        prf: None,
+        auth: None,
+        dh: None,
+        esn: Some(Transform {
+            transform_type: message::TransformType::NO_ESN,
+            key_length: None,
+        }),
+        protocol_id: message::IPSecProtocolID::ESP,
+        local_spi: message::Spi::U32(local_spi),
+        remote_spi: message::Spi::U32(local_spi),
+    };
+    vec![parameters]
+}
+
+pub fn confirm_accepted_proposal(
+    offered_parameters: &[TransformParameters],
+    sa: &message::PayloadSecurityAssociation,
+) -> Option<TransformParameters> {
+    let mut sa_iter = sa.iter_proposals();
+    let prop = sa_iter.next()?;
+    if sa_iter.next().is_some() {
+        return None;
+    }
+    let prop = prop.ok()?;
+    let selected_proposal =
+        if (1..offered_parameters.len() as u8 + 1).contains(&prop.proposal_num()) {
+            prop.proposal_num() as usize - 1
+        } else {
+            return None;
+        };
+    let proposed = &offered_parameters[selected_proposal];
+    let proposed = TransformParameters {
+        enc: proposed.enc,
+        prf: proposed.prf,
+        auth: proposed.auth,
+        dh: proposed.dh,
+        esn: proposed.esn,
+        protocol_id: proposed.protocol_id,
+        local_spi: proposed.local_spi,
+        remote_spi: prop.spi(),
+    };
+    let mut accepted = TransformParameters {
+        enc: None,
+        prf: None,
+        auth: None,
+        dh: None,
+        esn: None,
+        protocol_id: prop.protocol_id(),
+        local_spi: proposed.local_spi,
+        remote_spi: prop.spi(),
+    };
+
+    let valid = prop.iter_transforms().all(|tt| {
+        let tt = if let Ok(tt) = tt {
+            tt
+        } else {
+            return false;
+        };
+        let mut attrs = tt.iter_attributes();
+        let key_length = attrs
+            .next()
+            .map(|attr| match attr {
+                Ok(attr) => {
+                    if attr.attribute_type() == message::TransformAttributeType::KEY_LENGTH {
+                        let mut key_length = [0u8; 2];
+                        key_length.copy_from_slice(attr.value());
+                        let key_length = u16::from_be_bytes(key_length);
+                        Some(key_length)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            })
+            .flatten();
+        let accepted_transform = Transform {
+            transform_type: tt.transform_type(),
+            key_length,
+        };
+        match tt.transform_type() {
+            message::TransformType::Encryption(_) => accepted.enc = Some(accepted_transform),
+            message::TransformType::PseudorandomFunction(_) => {
+                accepted.prf = Some(accepted_transform)
+            }
+            message::TransformType::IntegrityAlgorithm(_) => {
+                accepted.auth = Some(accepted_transform)
+            }
+            message::TransformType::DiffieHellman(_) => accepted.dh = Some(accepted_transform),
+            message::TransformType::ExtendedSequenceNumbers(_) => {
+                accepted.esn = Some(accepted_transform)
+            }
+        }
+        attrs.next().is_none()
+    });
+    if !valid {
+        return None;
+    }
+    if accepted != proposed {
+        return None;
+    }
+
+    Some(proposed)
 }
 
 pub struct Array<const M: usize> {
@@ -505,13 +617,18 @@ impl DerivedKeys {
         }
     }
 
-    fn new_esp(params: &TransformParameters) -> DerivedKeys {
+    fn new_esp(params: &TransformParameters, is_initiator: bool) -> DerivedKeys {
         let enc_key_length = (params.enc_key_length() + params.enc_key_salt_length()) / 8;
         let auth_key_length = params.auth_key_length() / 8;
         let enc_initiator = 0..enc_key_length;
         let auth_initiator = enc_initiator.end..enc_initiator.end + auth_key_length;
         let enc_responder = auth_initiator.end..auth_initiator.end + enc_key_length;
         let auth_responder = enc_responder.end..enc_responder.end + auth_key_length;
+        let (auth_initiator, enc_initiator, auth_responder, enc_responder) = if is_initiator {
+            (auth_responder, enc_responder, auth_initiator, enc_initiator)
+        } else {
+            (auth_initiator, enc_initiator, auth_responder, enc_responder)
+        };
         let derive = 0..0;
         let prf_initiator = 0..0;
         let prf_responder = 0..0;
@@ -673,9 +790,10 @@ impl CryptoStack {
     pub fn create_child_stack(
         &self,
         params: &TransformParameters,
+        is_initiator: bool,
         data: &[u8],
     ) -> Result<CryptoStack, InitError> {
-        let mut keys = DerivedKeys::new_esp(params);
+        let mut keys = DerivedKeys::new_esp(params, is_initiator);
         self.prf_child_sa.derive_keys(&mut keys, data)?;
         let enc = params
             .enc

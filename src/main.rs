@@ -46,14 +46,15 @@ Options:\
 \n      --log-level=<LOG_LEVEL>   Log level [default: info]\
 \n      --listen-address=<IP>     Listen IP address [default: :::5328]\
 \n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
-\n      --pac-file=<PATH>         (Optional) Path to pac file (available at /proxy.pac)\
 \n      --tunnel-domain=<SUFFIX>  (Optional) Forward only subdomains to VPN, other domains will use direct connection; can be specified multiple times\
+\n      --pac-file=<PATH>         (Optional) Path to pac file (available at /proxy.pac)\
 \n\n\
 > pterodapter [OPTIONS] ikev2\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>   Log level [default: info]\
 \n      --listen-ip=<IP>          Listen IP address, multiple options can be provided [default: ::]\
 \n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --tunnel-domain=<DOMAIN>  (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
 \n      --id-hostname=<FQDN>      Hostname for identification [default: pterodapter]\
 \n      --cacert=<FILENAME>       Path to root CA certificate (in PKCS 8 PEM format)\
 \n      --cert=<FILENAME>         Path to public certificate (in PKCS 8 PEM format)\
@@ -168,10 +169,10 @@ impl Args {
                         format_args!("Failed to parse destination address: {}", err),
                     ),
                 };
+            } else if name == "--tunnel-domain" {
+                tunnel_domains.push(value.into());
             } else if action_type == ActionType::Proxy && name == "--pac-file" {
                 pac_path = Some(value.into());
-            } else if action_type == ActionType::Proxy && name == "--tunnel-domain" {
-                tunnel_domains.push(value.into());
             } else if action_type == ActionType::IkeV2 && name == "--listen-ip" {
                 match IpAddr::from_str(value) {
                     Ok(ip) => {
@@ -279,6 +280,7 @@ impl Args {
                         listen_ips: listen_ips.clone(),
                         root_ca,
                         server_cert,
+                        tunnel_domains,
                     };
                     let action = Action::IkeV2(Ikev2Config {
                         ikev2: ikev2_config,

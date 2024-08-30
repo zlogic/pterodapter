@@ -93,6 +93,7 @@ enum SessionState {
 pub enum IKEv2PendingAction {
     DeleteHalfOpenSession(SocketAddr, u64),
     CreateChildSA(esp::SecurityAssociationID, esp::SecurityAssociation),
+    UpdateSplitRoutes,
     DeleteIKESession,
 }
 
@@ -107,6 +108,7 @@ pub struct IKEv2Session {
     local_addr: SocketAddr,
     state: SessionState,
     internal_addr: IpAddr,
+    child_sas: Vec<ChildSA>,
     pki_processing: Arc<pki::PkiProcessing>,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
@@ -135,6 +137,7 @@ impl IKEv2Session {
             local_addr,
             state: SessionState::Empty,
             internal_addr,
+            child_sas: vec![],
             pki_processing,
             params: None,
             crypto_stack: None,
@@ -379,7 +382,8 @@ impl IKEv2Session {
                             // TODO: return NO_PROPOSAL_CHOSEN notification.
                             continue;
                         };
-                    response.write_accept_proposal(proposal_num, &prop)?;
+                    let accept_proposal = [(proposal_num, &prop)];
+                    response.write_security_association(&accept_proposal)?;
                     match prop.create_dh() {
                         Ok(dh) => dh_transform = Some(dh),
                         Err(err) => {
@@ -831,25 +835,19 @@ impl IKEv2Session {
         // TODO: use the client's IP address.
         if let Err(err) = ts_local
             .iter_mut()
-            .try_for_each(|ts| ts.set_to_address(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))))
+            .try_for_each(|ts| ts.set_to_address(self.internal_addr))
         {
             // TODO: return TS_UNACCEPTABLE notification.
             warn!("Failed to narrow traffic selector: {}", err);
             return Err("Failed to narrow traffic selector".into());
         }
 
-        let local_spi = message::Spi::U32(rand::thread_rng().gen::<u32>());
-        transform_params.set_local_spi(local_spi);
-        let sa_session_id =
-            match esp::SecurityAssociationID::from_transform_params(remote_addr, &transform_params)
-            {
-                Ok(sa_session_id) => sa_session_id,
-                Err(err) => {
-                    // TODO: return NO_PROPOSAL_CHOSEN notification.
-                    warn!("Transform has unsupporeted SPI for child SA: {}", err);
-                    return Err("Transform has unsupporeted SPI for child SA".into());
-                }
-            };
+        let local_spi = rand::thread_rng().gen::<u32>();
+        transform_params.set_local_spi(message::Spi::U32(local_spi));
+        let remote_spi = match transform_params.remote_spi() {
+            message::Spi::U32(remote_spi) => remote_spi,
+            _ => return Err("Security Association has unsupported remote SPI type".into()),
+        };
 
         let initiator_signed_len =
             ctx.message_initiator.len() + ctx.nonce_responder.len() + prf_key_len;
@@ -924,23 +922,33 @@ impl IKEv2Session {
 
         let child_crypto_stack = match crypto_stack.create_child_stack(
             &transform_params,
+            false,
             [ctx.nonce_initiator, ctx.nonce_responder]
                 .concat()
                 .as_slice(),
         ) {
             Ok(crypto_stack) => crypto_stack,
             Err(err) => {
-                warn!("Failed to set up child cryptography stack: {}", err);
+                warn!("Failed to set up child SA cryptography stack: {}", err);
                 // TODO: return INVALID_SYNTAX notification.
-                return Err("Failed to set up child cryptography stack".into());
+                return Err("Failed to set up child SA cryptography stack".into());
             }
         };
 
-        response.write_accept_proposal(proposal_num, &transform_params)?;
+        let accept_proposal = [(proposal_num, &transform_params)];
+        response.write_security_association(&accept_proposal)?;
 
         // TODO: will macOS or Windows accept more traffic selectors?
         response.write_traffic_selector_payload(true, &ts_remote)?;
         response.write_traffic_selector_payload(false, &ts_local)?;
+
+        let child_sa = ChildSA {
+            local_spi,
+            remote_spi,
+            ts_local: ts_local.clone(),
+            ts_remote: ts_remote.clone(),
+        };
+        self.child_sas.push(child_sa);
 
         let child_sa = esp::SecurityAssociation::new(
             ts_local,
@@ -951,7 +959,9 @@ impl IKEv2Session {
             &transform_params,
         );
         self.pending_actions
-            .push(IKEv2PendingAction::CreateChildSA(sa_session_id, child_sa));
+            .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
+        self.pending_actions
+            .push(IKEv2PendingAction::UpdateSplitRoutes);
 
         self.complete_encrypted_payload(response)
     }
@@ -1178,6 +1188,74 @@ impl IKEv2Session {
         Ok(message_id)
     }
 
+    pub fn update_split_routes(
+        &mut self,
+        tunnel_ips: &[IpAddr],
+    ) -> Result<Option<u32>, SessionError> {
+        match self.state {
+            SessionState::Empty | SessionState::InitSA(_) | SessionState::Deleting => {
+                return Err(
+                    "Received Update Spit Routes action for a non-established session, ignoring"
+                        .into(),
+                );
+            }
+            SessionState::Established => {}
+        }
+
+        let next_ip = tunnel_ips
+            .iter()
+            .filter_map(|tunnel_ip| {
+                let addr = SocketAddr::from((tunnel_ip.clone(), 0));
+                if !self
+                    .child_sas
+                    .iter()
+                    .any(|child_sa| child_sa.accepts(&addr))
+                {
+                    Some(tunnel_ip)
+                } else {
+                    None
+                }
+            })
+            .next();
+        let next_ip = if let Some(next_ip) = next_ip {
+            next_ip
+        } else {
+            // There's a traffic selector for every tunneled IP.
+            return Ok(None);
+        };
+        // Prepare create_child_sa request.
+        let next_ts = message::TrafficSelector::from_ip_range(*next_ip..=*next_ip)?;
+        let mut nonce_local = [0u8; MAX_NONCE];
+        rand::thread_rng().fill(nonce_local.as_mut_slice());
+        let local_spi = rand::thread_rng().gen::<u32>();
+        let transform_parameters = crypto::offer_esp_sa_parameters(local_spi);
+        let transform_params = transform_parameters
+            .iter()
+            .enumerate()
+            .map(|(proposal_num, params)| (proposal_num as u8 + 1, params))
+            .collect::<Vec<_>>();
+
+        let message_id = self.start_request(message::ExchangeType::CREATE_CHILD_SA, |writer| {
+            writer.write_security_association(&transform_params)?;
+
+            let dest = writer.next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
+            dest.copy_from_slice(nonce_local.as_slice());
+
+            writer.write_traffic_selector_payload(true, &[next_ts.clone()])?;
+            let full_ts = message::TrafficSelector::from_ip_range(
+                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
+                    ..=IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+            )?;
+            Ok(writer.write_traffic_selector_payload(false, &[full_ts])?)
+        })?;
+        self.sent_request = Some(RequestContext::CreateChildSA(
+            transform_parameters,
+            nonce_local,
+            local_spi,
+        ));
+        Ok(Some(message_id))
+    }
+
     pub async fn send_last_request(
         &mut self,
         sockets: &Sockets,
@@ -1249,6 +1327,9 @@ impl IKEv2Session {
             message::ExchangeType::INFORMATIONAL => {
                 self.process_informational_response(decrypted_iter)
             }
+            message::ExchangeType::CREATE_CHILD_SA => {
+                self.process_create_child_sa_response(decrypted_iter)
+            }
             _ => {
                 warn!(
                     "Unimplemented response handler for message {}",
@@ -1284,6 +1365,7 @@ impl IKEv2Session {
                     continue;
                 }
             };
+            trace!("Decrypted payload\n {:?}", payload);
             match payload.payload_type() {
                 _ => {
                     if payload.is_critical() {
@@ -1297,10 +1379,14 @@ impl IKEv2Session {
                 }
             }
         }
-        match self.sent_request {
+        let sent_request = self.sent_request.take();
+        match sent_request {
             Some(RequestContext::DeleteIKEv2) => {
                 self.pending_actions
                     .push(IKEv2PendingAction::DeleteIKESession);
+            }
+            Some(RequestContext::CreateChildSA(_, _, _)) => {
+                return Err("INFORMATIONAL response received, was expecting CREATE_CHILD_SA".into())
             }
             None => {
                 return Err("Received response for a non-existing request".into());
@@ -1308,10 +1394,157 @@ impl IKEv2Session {
         }
         Ok(())
     }
+
+    fn process_create_child_sa_response(
+        &mut self,
+        payloads: message::PayloadIter,
+    ) -> Result<(), SessionError> {
+        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
+            crypto_stack
+        } else {
+            return Err("Crypto stack not initialized".into());
+        };
+        let (offered_params, nonce_initiator, local_spi) = match self.sent_request {
+            Some(RequestContext::CreateChildSA(ref offered_params, ref nonce_local, local_spi)) => {
+                (offered_params, nonce_local, local_spi)
+            }
+            Some(RequestContext::DeleteIKEv2) => {
+                return Err("CREATE_CHILD_SA response received, was expecting INFORMATIONAL".into())
+            }
+            None => {
+                return Err("Received response for a non-existing request".into());
+            }
+        };
+        let mut transform_params = None;
+        let mut nonce_responder = None;
+        let mut ts_remote = vec![];
+        let mut ts_local = vec![];
+        for payload in payloads {
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!("Failed to read decrypted payload data: {}", err);
+                    continue;
+                }
+            };
+            trace!("Decrypted payload\n {:?}", payload);
+            match payload.payload_type() {
+                message::PayloadType::SECURITY_ASSOCIATION => {
+                    let sa = payload.to_security_association()?;
+                    let prop = if let Some(transform) =
+                        crypto::confirm_accepted_proposal(offered_params, &sa)
+                    {
+                        transform
+                    } else {
+                        warn!("No proposals accepted by remote side");
+                        continue;
+                    };
+                    transform_params = Some(prop);
+                }
+                message::PayloadType::NONCE => {
+                    let nonce = payload.to_nonce()?;
+                    nonce_responder = Some(nonce.read_value().to_vec());
+                }
+                message::PayloadType::TRAFFIC_SELECTOR_INITIATOR => {
+                    let ts = payload
+                        .to_traffic_selector()?
+                        .iter_traffic_selectors()
+                        .collect::<Result<Vec<_>, message::FormatError>>()
+                        .map_err(|err| {
+                            warn!("Failed to decode initiator traffic selectors: {}", err);
+                            err
+                        });
+                    if let Ok(mut ts) = ts {
+                        ts.retain(|ts| {
+                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
+                        });
+                        ts_local = ts
+                    }
+                }
+                message::PayloadType::TRAFFIC_SELECTOR_RESPONDER => {
+                    let ts = payload
+                        .to_traffic_selector()?
+                        .iter_traffic_selectors()
+                        .collect::<Result<Vec<_>, message::FormatError>>()
+                        .map_err(|err| {
+                            warn!("Failed to decode responder traffic selectors: {}", err);
+                            err
+                        });
+                    if let Ok(mut ts) = ts {
+                        ts.retain(|ts| {
+                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
+                        });
+                        ts_remote = ts
+                    }
+                }
+                _ => {
+                    if payload.is_critical() {
+                        warn!(
+                            "Received critical, unsupported payload: {}",
+                            payload.payload_type()
+                        );
+                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
+                        return Err("Received critical, unsupported payload".into());
+                    }
+                }
+            }
+        }
+
+        let transform_params = if let Some(params) = transform_params {
+            params
+        } else {
+            return Err("Unacceptable Security Association proposals".into());
+        };
+        let remote_spi = match transform_params.remote_spi() {
+            message::Spi::U32(remote_spi) => remote_spi,
+            _ => return Err("Security Association has unsupported remote SPI type".into()),
+        };
+        let nonce_responder = if let Some(nonce) = nonce_responder {
+            nonce
+        } else {
+            return Err("No nonce provided in response".into());
+        };
+        let child_crypto_stack = match crypto_stack.create_child_stack(
+            &transform_params,
+            true,
+            [nonce_initiator, nonce_responder.as_slice()]
+                .concat()
+                .as_slice(),
+        ) {
+            Ok(crypto_stack) => crypto_stack,
+            Err(err) => {
+                warn!("Failed to set up child SA cryptography stack: {}", err);
+                return Err("Failed to set up child SA cryptography stack".into());
+            }
+        };
+        let child_sa = ChildSA {
+            local_spi,
+            remote_spi,
+            ts_local: ts_local.clone(),
+            ts_remote: ts_remote.clone(),
+        };
+        self.child_sas.push(child_sa);
+
+        let child_sa = esp::SecurityAssociation::new(
+            ts_local,
+            ts_remote,
+            self.local_addr,
+            self.remote_addr,
+            child_crypto_stack,
+            &transform_params,
+        );
+        self.pending_actions
+            .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
+        self.pending_actions
+            .push(IKEv2PendingAction::UpdateSplitRoutes);
+
+        Ok(())
+    }
 }
 
 pub enum RequestContext {
     DeleteIKEv2,
+    CreateChildSA(Vec<crypto::TransformParameters>, [u8; MAX_NONCE], u32),
 }
 
 fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: u16) -> [u8; 20] {
@@ -1334,11 +1567,25 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     crypto::hash_sha1(src_data)
 }
 
+struct ChildSA {
+    local_spi: u32,
+    remote_spi: u32,
+    ts_local: Vec<message::TrafficSelector>,
+    ts_remote: Vec<message::TrafficSelector>,
+}
+
+impl ChildSA {
+    fn accepts(&self, addr: &SocketAddr) -> bool {
+        esp::ts_accepts(&self.ts_local, addr)
+    }
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     Internal(&'static str),
     Format(message::FormatError),
     NotEnoughSpace(message::NotEnoughSpaceError),
+    CryptoInit(crypto::InitError),
     CertError(pki::CertError),
 }
 
@@ -1348,6 +1595,7 @@ impl fmt::Display for SessionError {
             Self::Internal(msg) => f.write_str(msg),
             Self::Format(ref e) => write!(f, "Format error: {}", e),
             Self::NotEnoughSpace(_) => write!(f, "Not enough space error"),
+            Self::CryptoInit(ref e) => write!(f, "Crypto init error: {}", e),
             Self::CertError(ref e) => write!(f, "PKI cert error: {}", e),
         }
     }
@@ -1359,6 +1607,7 @@ impl error::Error for SessionError {
             Self::Internal(_msg) => None,
             Self::Format(ref err) => Some(err),
             Self::NotEnoughSpace(ref err) => Some(err),
+            Self::CryptoInit(ref err) => Some(err),
             Self::CertError(ref err) => Some(err),
         }
     }
@@ -1379,6 +1628,12 @@ impl From<message::FormatError> for SessionError {
 impl From<message::NotEnoughSpaceError> for SessionError {
     fn from(err: message::NotEnoughSpaceError) -> SessionError {
         Self::NotEnoughSpace(err)
+    }
+}
+
+impl From<crypto::InitError> for SessionError {
+    fn from(err: crypto::InitError) -> SessionError {
+        Self::CryptoInit(err)
     }
 }
 
