@@ -1308,6 +1308,8 @@ impl IKEv2Session {
                 );
             }
         };
+        let create_child_sa = rekey_child_sa.is_none()
+            && transform_params.protocol_id() == message::IPSecProtocolID::ESP;
         let new_crypto_stack = {
             let shared_secret = if let Some(ref shared_secret) = shared_secret {
                 shared_secret.as_slice()
@@ -1316,7 +1318,7 @@ impl IKEv2Session {
                 &[]
             };
             let prf_key = [shared_secret, &nonce_initiator, &nonce_responder].concat();
-            let crypto_stack = if rekey_child_sa.is_some() {
+            let crypto_stack = if rekey_child_sa.is_some() || create_child_sa {
                 crypto_stack.create_child_stack(&transform_params, &prf_key)
             } else {
                 crypto_stack.create_rekey_stack(&transform_params, &prf_key)
@@ -1338,6 +1340,7 @@ impl IKEv2Session {
             return Err("No traffic selectors offered by client".into());
         }
         if let Some(old_spi) = rekey_child_sa {
+            debug!("Rekeying child SA");
             let local_spi = rand::thread_rng().gen::<u32>();
             transform_params.set_local_spi(message::Spi::U32(local_spi));
             let old_spi = match old_spi {
@@ -1373,7 +1376,30 @@ impl IKEv2Session {
             );
             self.pending_actions
                 .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
+        } else if create_child_sa {
+            debug!("Creating new child SA");
+            let local_spi = rand::thread_rng().gen::<u32>();
+            transform_params.set_local_spi(message::Spi::U32(local_spi));
+            let remote_spi = match transform_params.remote_spi() {
+                message::Spi::U32(remote_spi) => remote_spi,
+                _ => return Err("Security Association has unsupported remote SPI type".into()),
+            };
+            self.child_sas.insert(ChildSessionID {
+                remote_spi,
+                local_spi,
+            });
+            let child_sa = esp::SecurityAssociation::new(
+                ts_local.clone(),
+                ts_remote.clone(),
+                self.local_addr,
+                self.remote_addr,
+                new_crypto_stack,
+                &transform_params,
+            );
+            self.pending_actions
+                .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
         } else {
+            debug!("Rekeying IKEv2 session");
             let local_spi = rand::thread_rng().gen::<u64>();
             transform_params.set_local_spi(message::Spi::U64(local_spi));
             let remote_spi = match transform_params.remote_spi() {

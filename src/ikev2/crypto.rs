@@ -469,6 +469,15 @@ impl PseudorandomTransform {
             Self::None => 0,
         }
     }
+
+    fn transform_type(&self) -> Option<message::TransformType> {
+        match self {
+            PseudorandomTransform::None => None,
+            PseudorandomTransform::HmacSha256(_, _) => {
+                Some(message::TransformType::PRF_HMAC_SHA2_256)
+            }
+        }
+    }
 }
 
 pub struct DerivedKeys {
@@ -730,11 +739,13 @@ impl CryptoStack {
     ) -> Result<CryptoStack, InitError> {
         let mut new_derive_key = DerivedKeys::new_rekey(params);
         self.prf_child_sa.derive_keys(&mut new_derive_key, data)?;
-        let prf = params
-            .prf
-            .as_ref()
-            .ok_or("Undefined pseudorandom transform parameters for rekeying")?
-            .transform_type;
+        let prf = if let Some(prf) = params.prf.as_ref() {
+            prf.transform_type
+        } else if let Some(transform_type) = self.prf_responder.transform_type() {
+            transform_type
+        } else {
+            return Err("Undefined pseudorandom transform parameters for rekeying".into());
+        };
         let prf_child_sa =
             PseudorandomTransform::init(prf, &new_derive_key.keys[new_derive_key.derive.clone()])?;
         let mut keys = DerivedKeys::new_ikev2(params);
