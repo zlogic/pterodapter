@@ -21,7 +21,7 @@ const MAX_SIGNATURE_LENGTH: usize = 1 + 12 + 72;
 
 const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;
 
-const IKE_SESSION_EXPIRATION: time::Duration = time::Duration::from_secs(60 * 15);
+const IKE_SESSION_EXPIRATION: time::Duration = time::Duration::from_secs(60 * 60);
 const IKE_RESPONSE_EXPIRATION: time::Duration = time::Duration::from_secs(60);
 // TODO: set a time limit instead of retransmission limit.
 const IKE_RETRANSMISSIONS_LIMIT: usize = 5;
