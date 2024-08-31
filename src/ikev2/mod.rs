@@ -355,6 +355,17 @@ impl Sessions {
                     session_id,
                     session.user_id().unwrap_or("Unknown")
                 );
+                session
+                    .get_local_sa_spis()
+                    .into_iter()
+                    .for_each(|local_spi| {
+                        if self.security_associations.remove(&local_spi).is_some() {
+                            info!(
+                                "Deleted Security Association {:x} from expired session {}",
+                                local_spi, session_id
+                            );
+                        }
+                    });
                 false
             } else {
                 true
@@ -518,13 +529,12 @@ impl Sessions {
             }
         }
 
-        let rt = runtime::Handle::current();
-        self.process_pending_actions(session_id, &rt);
+        self.process_pending_actions(session_id);
 
         Ok(())
     }
 
-    fn process_pending_actions(&mut self, session_id: session::SessionID, rt: &runtime::Handle) {
+    fn process_pending_actions(&mut self, session_id: session::SessionID) {
         let session = if let Some(session_id) = self.sessions.get_mut(&session_id) {
             session_id
         } else {
@@ -556,35 +566,12 @@ impl Sessions {
                     self.security_associations
                         .insert(session_id, security_association);
                 }
-                session::IKEv2PendingAction::DeleteIKESession(duration) => {
-                    // TODO: also delete Child SAs (have IKE send IKEv2PendingAction per child SA?).
-                    if duration.is_zero() {
-                        delete_session = true;
-                    } else {
-                        let timer = tokio::time::sleep(duration);
-                        let tx = self.tx.clone();
-                        rt.spawn(async move {
-                            timer.await;
-                            debug!("Sending delayed IKEv2 session deletion request");
-                            let _ = tx
-                                .send(SessionMessage::DeleteIKEv2Session(session_id))
-                                .await;
-                        });
-                    }
+                session::IKEv2PendingAction::DeleteIKESession => {
+                    delete_session = true;
                 }
-                session::IKEv2PendingAction::DeleteChildSA(session_id, duration) => {
-                    if duration.is_zero() {
-                        self.security_associations.remove(&session_id);
-                    } else {
-                        let timer = tokio::time::sleep(duration);
-                        let tx = self.tx.clone();
-                        rt.spawn(async move {
-                            timer.await;
-                            debug!("Sending delayed ESP session deletion request");
-                            let _ = tx
-                                .send(SessionMessage::DeleteSecurityAssociation(session_id))
-                                .await;
-                        });
+                session::IKEv2PendingAction::DeleteChildSA(session_id) => {
+                    if self.security_associations.remove(&session_id).is_some() {
+                        info!("Deleted Security Association {:x}", session_id)
                     }
                 }
                 session::IKEv2PendingAction::CreateIKEv2Session(session_id, session) => {

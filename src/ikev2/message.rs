@@ -2403,17 +2403,14 @@ impl fmt::Debug for Payload<'_> {
         } else if let Ok(pl_nonce) = self.to_nonce() {
             writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
         } else if let Ok(pl_notify) = self.to_notify() {
+            write!(f, "    Notify protocol ID ")?;
+            match pl_notify.protocol_id {
+                Some(protocol) => write!(f, "{}", protocol)?,
+                None => write!(f, "None")?,
+            }
+            write!(f, " SPI {} type {}", pl_notify.spi, pl_notify.message_type,)?;
             if pl_notify.message_type == NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
-                write!(f, "    Notify protocol ID ")?;
-                match pl_notify.protocol_id {
-                    Some(protocol) => protocol.fmt(f)?,
-                    None => "None".fmt(f)?,
-                }
-                write!(
-                    f,
-                    " SPI {} type {} list",
-                    pl_notify.spi, pl_notify.message_type,
-                )?;
+                write!(f, " list",)?;
                 if let Ok(hash_algorithms) = pl_notify.to_signature_hash_algorithms() {
                     for alg in hash_algorithms {
                         write!(f, " {}", alg)?;
@@ -2423,14 +2420,7 @@ impl fmt::Debug for Payload<'_> {
                 }
                 writeln!(f)?;
             } else {
-                writeln!(
-                    f,
-                    "    Notify protocol ID {:?} SPI {:?} type {} value {:?}",
-                    pl_notify.protocol_id,
-                    pl_notify.spi,
-                    pl_notify.message_type,
-                    pl_notify.read_value(),
-                )?;
+                writeln!(f, " value {:?}", pl_notify.read_value(),)?;
             }
         } else if let Ok(pl_delete) = self.to_delete() {
             write!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
