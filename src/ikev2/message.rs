@@ -2032,13 +2032,8 @@ impl TrafficSelector {
         &self.port
     }
 
-    pub fn set_to_address(&mut self, addr: IpAddr) -> Result<(), FormatError> {
-        if self.addr.contains(&addr) {
-            self.addr = addr..=addr;
-            Ok(())
-        } else {
-            Err("Narrowed address doesn't fit range".into())
-        }
+    pub fn contains(&self, other: &TrafficSelector) -> bool {
+        self.addr.contains(other.addr.start()) && self.addr.contains(other.addr.end())
     }
 }
 

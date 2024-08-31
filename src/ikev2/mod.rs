@@ -118,8 +118,13 @@ impl Server {
     pub async fn start(&mut self) -> Result<(), IKEv2Error> {
         let sockets = Arc::new(Sockets::new(&self.listen_ips).await?);
         let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
-        let tunnel_ips = split_routes.refresh_addresses().await?;
-        let mut sessions = Sessions::new(self.pki_processing.clone(), sockets.clone(), tunnel_ips);
+        let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
+        let mut sessions = Sessions::new(
+            self.pki_processing.clone(),
+            sockets.clone(),
+            tunnel_ips,
+            traffic_selectors,
+        );
         let rt = runtime::Handle::current();
         // Non-critical futures sockets will be terminated by Tokio during the shutdown_timeout phase.
         sockets.iter_sockets().for_each(|(listen_addr, socket)| {
@@ -138,15 +143,18 @@ impl Server {
             let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
             loop {
                 delay.tick().await;
-                let tunnel_ips = match split_routes.refresh_addresses().await {
-                    Ok(tunnel_ips) => tunnel_ips,
+                let (tunnel_ips, traffic_selectors) = match split_routes.refresh_addresses().await {
+                    Ok(split_routes) => split_routes,
                     Err(err) => {
                         warn!("Failed to refresh IP addresses for split routes: {}", err);
                         continue;
                     }
                 };
                 let _ = command_sender
-                    .send(SessionMessage::UpdateSplitRoutes(tunnel_ips))
+                    .send(SessionMessage::UpdateSplitRoutes(
+                        tunnel_ips,
+                        traffic_selectors,
+                    ))
                     .await;
             }
         });
@@ -241,13 +249,14 @@ enum SessionMessage {
     RetransmitRequest(session::SessionID, u32),
     CleanupTimer,
     Shutdown,
-    UpdateSplitRoutes(Vec<IpAddr>),
+    UpdateSplitRoutes(Vec<IpAddr>, Vec<message::TrafficSelector>),
 }
 
 struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Arc<Sockets>,
     tunnel_ips: Vec<IpAddr>,
+    traffic_selectors: Vec<message::TrafficSelector>,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
@@ -261,12 +270,14 @@ impl Sessions {
         pki_processing: Arc<pki::PkiProcessing>,
         sockets: Arc<Sockets>,
         tunnel_ips: Vec<IpAddr>,
+        traffic_selectors: Vec<message::TrafficSelector>,
     ) -> Sessions {
         let (tx, rx) = mpsc::channel(100);
         Sessions {
             pki_processing,
             sockets,
             tunnel_ips,
+            traffic_selectors,
             sessions: HashMap::new(),
             security_associations: HashMap::new(),
             half_sessions: HashMap::new(),
@@ -309,6 +320,7 @@ impl Sessions {
                 local_addr,
                 internal_addr,
                 self.pki_processing.clone(),
+                &self.traffic_selectors,
             )
         });
         session_id
@@ -376,40 +388,14 @@ impl Sessions {
     }
 
     async fn update_all_split_routes(&mut self) {
-        let session_ids = self.sessions.keys().map(|key| *key).collect::<Vec<_>>();
-        let rt = runtime::Handle::current();
-        for session_id in session_ids {
-            if let Err(err) = self.update_split_routes(&session_id, &rt) {
+        for (session_id, session) in self.sessions.iter_mut() {
+            if let Err(err) = session.update_split_routes(&self.tunnel_ips) {
                 warn!(
                     "Failed to update split routes for session {}: {}",
                     session_id, err
                 );
             }
         }
-    }
-
-    fn update_split_routes(
-        &mut self,
-        session_id: &session::SessionID,
-        rt: &runtime::Handle,
-    ) -> Result<(), IKEv2Error> {
-        let session = if let Some(session) = self.sessions.get_mut(session_id) {
-            session
-        } else {
-            return Err("Session for updating split routes not found".into());
-        };
-        let message_id = match session.update_split_routes(&self.tunnel_ips)? {
-            Some(message_id) => message_id,
-            None => return Ok(()),
-        };
-        let sender = self.tx.clone();
-        let session_id = session_id.clone();
-        rt.spawn(async move {
-            sender
-                .send(SessionMessage::RetransmitRequest(session_id, message_id))
-                .await
-        });
-        Ok(())
     }
 
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
@@ -427,8 +413,9 @@ impl Sessions {
                     let rt = runtime::Handle::current();
                     self.cleanup(&rt);
                 }
-                SessionMessage::UpdateSplitRoutes(tunnel_ips) => {
+                SessionMessage::UpdateSplitRoutes(tunnel_ips, traffic_selectors) => {
                     self.tunnel_ips = tunnel_ips;
+                    self.traffic_selectors = traffic_selectors;
                     self.update_all_split_routes().await;
                 }
                 SessionMessage::RetransmitRequest(session_id, message_id) => {
@@ -560,15 +547,6 @@ impl Sessions {
                     // TODO: also delete Child SAs (have IKE send IKEv2PendingAction per child SA?).
                     delete_session = true;
                 }
-                session::IKEv2PendingAction::UpdateSplitRoutes => {
-                    let rt = runtime::Handle::current();
-                    if let Err(err) = self.update_split_routes(&session_id, &rt) {
-                        warn!(
-                            "Failed to update split routes for session {}: {}",
-                            session_id, err
-                        );
-                    }
-                }
             });
         if delete_session && self.sessions.remove(&session_id).is_some() {
             info!("Deleted IKEv2 session {}", session_id);
@@ -661,7 +639,9 @@ impl SplitRouteRegistry {
         SplitRouteRegistry { tunnel_domains }
     }
 
-    async fn refresh_addresses(&mut self) -> Result<Vec<IpAddr>, IKEv2Error> {
+    async fn refresh_addresses(
+        &mut self,
+    ) -> Result<(Vec<IpAddr>, Vec<message::TrafficSelector>), IKEv2Error> {
         // Use a predefined port just in case.
         let addresses = self
             .tunnel_domains
@@ -676,7 +656,21 @@ impl SplitRouteRegistry {
                 .into_iter()
                 .for_each(|addr| ip_addresses.push(addr.ip()));
         }
-        Ok(ip_addresses)
+        if ip_addresses.is_empty() {
+            let full_ts = message::TrafficSelector::from_ip_range(
+                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
+                    ..=IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+            )?;
+            Ok((ip_addresses, vec![full_ts]))
+        } else {
+            let traffic_selectors = ip_addresses
+                .iter()
+                .map(|ip_address| {
+                    message::TrafficSelector::from_ip_range(*ip_address..=*ip_address)
+                })
+                .collect::<Result<Vec<message::TrafficSelector>, message::FormatError>>()?;
+            Ok((ip_addresses, traffic_selectors))
+        }
     }
 }
 

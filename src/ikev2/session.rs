@@ -3,7 +3,7 @@ use rand::Rng;
 use std::{
     error, fmt,
     hash::{Hash, Hasher},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{self, Instant},
 };
@@ -93,7 +93,6 @@ enum SessionState {
 pub enum IKEv2PendingAction {
     DeleteHalfOpenSession(SocketAddr, u64),
     CreateChildSA(esp::SecurityAssociationID, esp::SecurityAssociation),
-    UpdateSplitRoutes,
     DeleteIKESession,
 }
 
@@ -108,7 +107,7 @@ pub struct IKEv2Session {
     local_addr: SocketAddr,
     state: SessionState,
     internal_addr: IpAddr,
-    child_sas: Vec<ChildSA>,
+    ts_local: Vec<message::TrafficSelector>,
     pki_processing: Arc<pki::PkiProcessing>,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
@@ -130,6 +129,7 @@ impl IKEv2Session {
         local_addr: SocketAddr,
         internal_addr: IpAddr,
         pki_processing: Arc<pki::PkiProcessing>,
+        ts_local: &[message::TrafficSelector],
     ) -> IKEv2Session {
         IKEv2Session {
             session_id,
@@ -137,7 +137,7 @@ impl IKEv2Session {
             local_addr,
             state: SessionState::Empty,
             internal_addr,
-            child_sas: vec![],
+            ts_local: ts_local.to_vec(),
             pki_processing,
             params: None,
             crypto_stack: None,
@@ -832,15 +832,15 @@ impl IKEv2Session {
             // TODO: return TS_UNACCEPTABLE notification.
             return Err("No traffic selectors offered by client".into());
         }
-        // TODO: use the client's IP address.
-        if let Err(err) = ts_local
-            .iter_mut()
-            .try_for_each(|ts| ts.set_to_address(self.internal_addr))
-        {
+        if !self.ts_local.iter().all(|local_ts| {
+            ts_local
+                .iter()
+                .any(|client_ts| client_ts.contains(local_ts))
+        }) {
             // TODO: return TS_UNACCEPTABLE notification.
-            warn!("Failed to narrow traffic selector: {}", err);
             return Err("Failed to narrow traffic selector".into());
         }
+        let ts_local = &self.ts_local;
 
         let local_spi = rand::thread_rng().gen::<u32>();
         transform_params.set_local_spi(message::Spi::U32(local_spi));
@@ -922,7 +922,6 @@ impl IKEv2Session {
 
         let child_crypto_stack = match crypto_stack.create_child_stack(
             &transform_params,
-            false,
             [ctx.nonce_initiator, ctx.nonce_responder]
                 .concat()
                 .as_slice(),
@@ -940,18 +939,10 @@ impl IKEv2Session {
 
         // TODO: will macOS or Windows accept more traffic selectors?
         response.write_traffic_selector_payload(true, &ts_remote)?;
-        response.write_traffic_selector_payload(false, &ts_local)?;
-
-        let child_sa = ChildSA {
-            local_spi,
-            remote_spi,
-            ts_local: ts_local.clone(),
-            ts_remote: ts_remote.clone(),
-        };
-        self.child_sas.push(child_sa);
+        response.write_traffic_selector_payload(false, ts_local)?;
 
         let child_sa = esp::SecurityAssociation::new(
-            ts_local,
+            ts_local.clone(),
             ts_remote,
             local_addr,
             remote_addr,
@@ -960,8 +951,6 @@ impl IKEv2Session {
         );
         self.pending_actions
             .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
-        self.pending_actions
-            .push(IKEv2PendingAction::UpdateSplitRoutes);
 
         self.complete_encrypted_payload(response)
     }
@@ -1188,78 +1177,17 @@ impl IKEv2Session {
         Ok(message_id)
     }
 
-    pub fn update_split_routes(
-        &mut self,
-        tunnel_ips: &[IpAddr],
-    ) -> Result<Option<u32>, SessionError> {
-        match self.state {
-            SessionState::Empty | SessionState::InitSA(_) | SessionState::Deleting => {
-                return Err(
-                    "Received Update Spit Routes action for a non-established session, ignoring"
-                        .into(),
-                );
+    pub fn update_split_routes(&mut self, tunnel_ips: &[IpAddr]) -> Result<(), SessionError> {
+        for tunnel_ip in tunnel_ips {
+            let addr = SocketAddr::from((tunnel_ip.clone(), 0));
+            if !esp::ts_accepts(&self.ts_local, &addr) {
+                info!("Adding traffic selector for IP {}", tunnel_ip);
+                self.ts_local.push(message::TrafficSelector::from_ip_range(
+                    *tunnel_ip..=*tunnel_ip,
+                )?)
             }
-            SessionState::Established => {}
         }
-
-        let next_ip = tunnel_ips
-            .iter()
-            .filter_map(|tunnel_ip| {
-                let addr = SocketAddr::from((tunnel_ip.clone(), 0));
-                if !self
-                    .child_sas
-                    .iter()
-                    .any(|child_sa| child_sa.accepts(&addr))
-                {
-                    Some(tunnel_ip)
-                } else {
-                    None
-                }
-            })
-            .next();
-        let full_ts = message::TrafficSelector::from_ip_range(
-            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))..=IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
-        )?;
-        let accepts_all_traffic = self.child_sas.iter().any(|child_sa| {
-            child_sa
-                .ts_local
-                .iter()
-                .any(|ts_local| *ts_local == full_ts)
-        });
-        // Prepare create_child_sa request.
-        let next_ts = if let Some(next_ip) = next_ip {
-            message::TrafficSelector::from_ip_range(*next_ip..=*next_ip)?
-        } else if tunnel_ips.is_empty() && !accepts_all_traffic {
-            full_ts.clone()
-        } else {
-            // There's a traffic selector for every tunneled IP.
-            return Ok(None);
-        };
-        let mut nonce_local = [0u8; MAX_NONCE];
-        rand::thread_rng().fill(nonce_local.as_mut_slice());
-        let local_spi = rand::thread_rng().gen::<u32>();
-        let transform_parameters = crypto::offer_esp_sa_parameters(local_spi);
-        let transform_params = transform_parameters
-            .iter()
-            .enumerate()
-            .map(|(proposal_num, params)| (proposal_num as u8 + 1, params))
-            .collect::<Vec<_>>();
-
-        let message_id = self.start_request(message::ExchangeType::CREATE_CHILD_SA, |writer| {
-            writer.write_security_association(&transform_params)?;
-
-            let dest = writer.next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
-            dest.copy_from_slice(nonce_local.as_slice());
-
-            writer.write_traffic_selector_payload(true, &[next_ts.clone()])?;
-            Ok(writer.write_traffic_selector_payload(false, &[full_ts])?)
-        })?;
-        self.sent_request = Some(RequestContext::CreateChildSA(
-            transform_parameters,
-            nonce_local,
-            local_spi,
-        ));
-        Ok(Some(message_id))
+        Ok(())
     }
 
     pub async fn send_last_request(
@@ -1333,9 +1261,6 @@ impl IKEv2Session {
             message::ExchangeType::INFORMATIONAL => {
                 self.process_informational_response(decrypted_iter)
             }
-            message::ExchangeType::CREATE_CHILD_SA => {
-                self.process_create_child_sa_response(decrypted_iter)
-            }
             _ => {
                 warn!(
                     "Unimplemented response handler for message {}",
@@ -1391,9 +1316,6 @@ impl IKEv2Session {
                 self.pending_actions
                     .push(IKEv2PendingAction::DeleteIKESession);
             }
-            Some(RequestContext::CreateChildSA(_, _, _)) => {
-                return Err("INFORMATIONAL response received, was expecting CREATE_CHILD_SA".into())
-            }
             None => {
                 return Err("Received response for a non-existing request".into());
             }
@@ -1411,9 +1333,6 @@ impl IKEv2Session {
             return Err("Crypto stack not initialized".into());
         };
         let (offered_params, nonce_initiator, local_spi) = match self.sent_request {
-            Some(RequestContext::CreateChildSA(ref offered_params, ref nonce_local, local_spi)) => {
-                (offered_params, nonce_local, local_spi)
-            }
             Some(RequestContext::DeleteIKEv2) => {
                 return Err("CREATE_CHILD_SA response received, was expecting INFORMATIONAL".into())
             }
@@ -1512,7 +1431,6 @@ impl IKEv2Session {
         };
         let child_crypto_stack = match crypto_stack.create_child_stack(
             &transform_params,
-            true,
             [nonce_initiator, nonce_responder.as_slice()]
                 .concat()
                 .as_slice(),
@@ -1523,13 +1441,6 @@ impl IKEv2Session {
                 return Err("Failed to set up child SA cryptography stack".into());
             }
         };
-        let child_sa = ChildSA {
-            local_spi,
-            remote_spi,
-            ts_local: ts_local.clone(),
-            ts_remote: ts_remote.clone(),
-        };
-        self.child_sas.push(child_sa);
 
         let child_sa = esp::SecurityAssociation::new(
             ts_local,
@@ -1541,8 +1452,6 @@ impl IKEv2Session {
         );
         self.pending_actions
             .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
-        self.pending_actions
-            .push(IKEv2PendingAction::UpdateSplitRoutes);
 
         Ok(())
     }
@@ -1550,7 +1459,6 @@ impl IKEv2Session {
 
 pub enum RequestContext {
     DeleteIKEv2,
-    CreateChildSA(Vec<crypto::TransformParameters>, [u8; MAX_NONCE], u32),
 }
 
 fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: u16) -> [u8; 20] {
@@ -1571,19 +1479,6 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     let src_data = &src_data[..16 + addr_len + 2];
 
     crypto::hash_sha1(src_data)
-}
-
-struct ChildSA {
-    local_spi: u32,
-    remote_spi: u32,
-    ts_local: Vec<message::TrafficSelector>,
-    ts_remote: Vec<message::TrafficSelector>,
-}
-
-impl ChildSA {
-    fn accepts(&self, addr: &SocketAddr) -> bool {
-        esp::ts_accepts(&self.ts_local, addr)
-    }
 }
 
 #[derive(Debug)]

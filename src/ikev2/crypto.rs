@@ -617,18 +617,13 @@ impl DerivedKeys {
         }
     }
 
-    fn new_esp(params: &TransformParameters, is_initiator: bool) -> DerivedKeys {
+    fn new_esp(params: &TransformParameters) -> DerivedKeys {
         let enc_key_length = (params.enc_key_length() + params.enc_key_salt_length()) / 8;
         let auth_key_length = params.auth_key_length() / 8;
         let enc_initiator = 0..enc_key_length;
         let auth_initiator = enc_initiator.end..enc_initiator.end + auth_key_length;
         let enc_responder = auth_initiator.end..auth_initiator.end + enc_key_length;
         let auth_responder = enc_responder.end..enc_responder.end + auth_key_length;
-        let (auth_initiator, enc_initiator, auth_responder, enc_responder) = if is_initiator {
-            (auth_responder, enc_responder, auth_initiator, enc_initiator)
-        } else {
-            (auth_initiator, enc_initiator, auth_responder, enc_responder)
-        };
         let derive = 0..0;
         let prf_initiator = 0..0;
         let prf_responder = 0..0;
@@ -790,10 +785,9 @@ impl CryptoStack {
     pub fn create_child_stack(
         &self,
         params: &TransformParameters,
-        is_initiator: bool,
         data: &[u8],
     ) -> Result<CryptoStack, InitError> {
-        let mut keys = DerivedKeys::new_esp(params, is_initiator);
+        let mut keys = DerivedKeys::new_esp(params);
         self.prf_child_sa.derive_keys(&mut keys, data)?;
         let enc = params
             .enc
