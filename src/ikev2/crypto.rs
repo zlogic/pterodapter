@@ -617,6 +617,22 @@ impl DerivedKeys {
         }
     }
 
+    fn new_rekey(params: &TransformParameters) -> DerivedKeys {
+        let derive_key_length = params.prf_key_length() / 8;
+        let derive = 0..derive_key_length;
+        let empty_range = derive.end..derive.end;
+        DerivedKeys {
+            keys: [0u8; MAX_KEY_MATERIAL_LENGTH],
+            derive,
+            auth_initiator: empty_range.clone(),
+            auth_responder: empty_range.clone(),
+            enc_initiator: empty_range.clone(),
+            enc_responder: empty_range.clone(),
+            prf_initiator: empty_range.clone(),
+            prf_responder: empty_range.clone(),
+        }
+    }
+
     fn new_esp(params: &TransformParameters) -> DerivedKeys {
         let enc_key_length = (params.enc_key_length() + params.enc_key_salt_length()) / 8;
         let auth_key_length = params.auth_key_length() / 8;
@@ -814,6 +830,56 @@ impl CryptoStack {
             )?,
             prf_initiator: PseudorandomTransform::None,
             prf_responder: PseudorandomTransform::None,
+        })
+    }
+
+    pub fn create_rekey_stack(
+        &self,
+        params: &TransformParameters,
+        data: &[u8],
+    ) -> Result<CryptoStack, InitError> {
+        let mut new_derive_key = DerivedKeys::new_rekey(params);
+        self.prf_child_sa.derive_keys(&mut new_derive_key, data)?;
+        let prf = params
+            .prf
+            .as_ref()
+            .ok_or("Undefined pseudorandom transform parameters for rekeying")?
+            .transform_type;
+        let prf_child_sa =
+            PseudorandomTransform::init(prf, &new_derive_key.keys[new_derive_key.derive.clone()])?;
+        let mut keys = DerivedKeys::new_ikev2(params);
+        prf_child_sa.derive_keys(&mut keys, data)?;
+        let enc = params
+            .enc
+            .as_ref()
+            .ok_or("Undefined encryption parameters")?;
+        let auth = params
+            .auth
+            .as_ref()
+            .map(|transform| transform.transform_type);
+        let padding = PaddingType::from_transform(params)?;
+        Ok(CryptoStack {
+            prf_child_sa,
+            auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
+            auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
+            enc_initiator: EncryptionType::init(
+                enc,
+                &keys.keys[keys.enc_initiator.clone()],
+                padding,
+            )?,
+            enc_responder: EncryptionType::init(
+                enc,
+                &keys.keys[keys.enc_responder.clone()],
+                padding,
+            )?,
+            prf_initiator: PseudorandomTransform::init(
+                prf,
+                &keys.keys[keys.prf_initiator.clone()],
+            )?,
+            prf_responder: PseudorandomTransform::init(
+                prf,
+                &keys.keys[keys.prf_responder.clone()],
+            )?,
         })
     }
 

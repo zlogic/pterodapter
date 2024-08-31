@@ -250,6 +250,8 @@ enum SessionMessage {
     CleanupTimer,
     Shutdown,
     UpdateSplitRoutes(Vec<IpAddr>, Vec<message::TrafficSelector>),
+    DeleteIKEv2Session(session::SessionID),
+    DeleteSecurityAssociation(esp::SecurityAssociationID),
 }
 
 struct Sessions {
@@ -413,6 +415,16 @@ impl Sessions {
                     let rt = runtime::Handle::current();
                     self.cleanup(&rt);
                 }
+                SessionMessage::DeleteIKEv2Session(session_id) => {
+                    if self.sessions.remove(&session_id).is_some() {
+                        info!("Deleted IKEv2 session {}", session_id);
+                    }
+                }
+                SessionMessage::DeleteSecurityAssociation(session_id) => {
+                    if self.security_associations.remove(&session_id).is_some() {
+                        info!("Deleted Security Association {:x}", session_id);
+                    }
+                }
                 SessionMessage::UpdateSplitRoutes(tunnel_ips, traffic_selectors) => {
                     self.tunnel_ips = tunnel_ips;
                     self.traffic_selectors = traffic_selectors;
@@ -506,12 +518,13 @@ impl Sessions {
             }
         }
 
-        self.process_pending_actions(session_id);
+        let rt = runtime::Handle::current();
+        self.process_pending_actions(session_id, &rt);
 
         Ok(())
     }
 
-    fn process_pending_actions(&mut self, session_id: session::SessionID) {
+    fn process_pending_actions(&mut self, session_id: session::SessionID, rt: &runtime::Handle) {
         let session = if let Some(session_id) = self.sessions.get_mut(&session_id) {
             session_id
         } else {
@@ -543,9 +556,39 @@ impl Sessions {
                     self.security_associations
                         .insert(session_id, security_association);
                 }
-                session::IKEv2PendingAction::DeleteIKESession => {
+                session::IKEv2PendingAction::DeleteIKESession(duration) => {
                     // TODO: also delete Child SAs (have IKE send IKEv2PendingAction per child SA?).
-                    delete_session = true;
+                    if duration.is_zero() {
+                        delete_session = true;
+                    } else {
+                        let timer = tokio::time::sleep(duration);
+                        let tx = self.tx.clone();
+                        rt.spawn(async move {
+                            timer.await;
+                            debug!("Sending delayed IKEv2 session deletion request");
+                            let _ = tx
+                                .send(SessionMessage::DeleteIKEv2Session(session_id))
+                                .await;
+                        });
+                    }
+                }
+                session::IKEv2PendingAction::DeleteChildSA(session_id, duration) => {
+                    if duration.is_zero() {
+                        self.security_associations.remove(&session_id);
+                    } else {
+                        let timer = tokio::time::sleep(duration);
+                        let tx = self.tx.clone();
+                        rt.spawn(async move {
+                            timer.await;
+                            debug!("Sending delayed ESP session deletion request");
+                            let _ = tx
+                                .send(SessionMessage::DeleteSecurityAssociation(session_id))
+                                .await;
+                        });
+                    }
+                }
+                session::IKEv2PendingAction::CreateIKEv2Session(session_id, session) => {
+                    self.sessions.insert(session_id, session);
                 }
             });
         if delete_session && self.sessions.remove(&session_id).is_some() {
@@ -602,9 +645,10 @@ impl Sessions {
                 .send_datagram(&datagram.local_addr, &datagram.remote_addr, &[0xff])
                 .await?);
         }
-        debug!(
+        trace!(
             "Received ESP packet from {}\n{:?}",
-            datagram.remote_addr, packet_bytes,
+            datagram.remote_addr,
+            packet_bytes,
         );
         if packet_bytes.len() < 8 {
             return Err("Not enough data in ESP packet".into());

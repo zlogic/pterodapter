@@ -25,6 +25,8 @@ const IKE_RESPONSE_EXPIRATION: time::Duration = time::Duration::from_secs(60);
 // TODO: set a time limit instead of retransmission limit.
 const IKE_RETRANSMISSIONS_LIMIT: usize = 5;
 
+const IKE_REKEY_DURATION: time::Duration = time::Duration::from_secs(60);
+
 #[derive(Clone, Copy)]
 pub struct SessionID {
     remote_spi: u64,
@@ -88,12 +90,15 @@ enum SessionState {
     InitSA(InitSAContext),
     Established,
     Deleting,
+    Rekeyed,
 }
 
 pub enum IKEv2PendingAction {
     DeleteHalfOpenSession(SocketAddr, u64),
     CreateChildSA(esp::SecurityAssociationID, esp::SecurityAssociation),
-    DeleteIKESession,
+    DeleteChildSA(esp::SecurityAssociationID, time::Duration),
+    CreateIKEv2Session(SessionID, IKEv2Session),
+    DeleteIKESession(time::Duration),
 }
 
 pub enum NextRetransmission {
@@ -201,6 +206,15 @@ impl IKEv2Session {
                 response.raw_data_mut()[..len].copy_from_slice(&last_response.0[..len]);
                 return Ok(len);
             }
+        }
+        match self.state {
+            SessionState::Rekeyed => {
+                return Err("Session is rekeyed and no longer accepts new requests".into());
+            }
+            SessionState::Empty
+            | SessionState::InitSA(_)
+            | SessionState::Established
+            | SessionState::Deleting => {}
         }
 
         let exchange_type = request.read_exchange_type()?;
@@ -382,8 +396,7 @@ impl IKEv2Session {
                             // TODO: return NO_PROPOSAL_CHOSEN notification.
                             continue;
                         };
-                    let accept_proposal = [(proposal_num, &prop)];
-                    response.write_security_association(&accept_proposal)?;
+                    response.write_security_association(&[(&prop, proposal_num)])?;
                     match prop.create_dh() {
                         Ok(dh) => dh_transform = Some(dh),
                         Err(err) => {
@@ -607,8 +620,11 @@ impl IKEv2Session {
         let ctx = match self.state {
             SessionState::InitSA(ref ctx) => ctx.clone(),
             _ => {
-                return self
-                    .process_auth_failed_response(response, "Session is not in init state".into());
+                return self.process_failed_response(
+                    response,
+                    message::NotifyMessageType::AUTHENTICATION_FAILED,
+                    "Session is not in init state".into(),
+                );
             }
         };
         let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
@@ -680,8 +696,9 @@ impl IKEv2Session {
                             "Certificate encoding {} is unsupported",
                             certificate.encoding()
                         );
-                        return self.process_auth_failed_response(
+                        return self.process_failed_response(
                             response,
+                            message::NotifyMessageType::AUTHENTICATION_FAILED,
                             "Certificate encoding is unsupported".into(),
                         );
                     }
@@ -702,8 +719,9 @@ impl IKEv2Session {
                             "Certificate request encoding {} is unsupported",
                             certreq.read_encoding()
                         );
-                        return self.process_auth_failed_response(
+                        return self.process_failed_response(
                             response,
+                            message::NotifyMessageType::AUTHENTICATION_FAILED,
                             "Certificate request encoding is unsupported".into(),
                         );
                     }
@@ -733,8 +751,9 @@ impl IKEv2Session {
                                 "Authentication method {} is unsupported",
                                 auth.read_method()
                             );
-                            return self.process_auth_failed_response(
+                            return self.process_failed_response(
                                 response,
+                                message::NotifyMessageType::AUTHENTICATION_FAILED,
                                 "Authentication method is unsupported".into(),
                             );
                         }
@@ -810,17 +829,29 @@ impl IKEv2Session {
         let client_cert = if let Some(cert) = client_cert {
             cert
         } else {
-            return self.process_auth_failed_response(response, "Client provided no cert".into());
+            return self.process_failed_response(
+                response,
+                message::NotifyMessageType::AUTHENTICATION_FAILED,
+                "Client provided no cert".into(),
+            );
         };
         let (client_auth, signature_format) = if let Some(auth) = client_auth {
             auth
         } else {
-            return self.process_auth_failed_response(response, "Client provided no auth".into());
+            return self.process_failed_response(
+                response,
+                message::NotifyMessageType::AUTHENTICATION_FAILED,
+                "Client provided no auth".into(),
+            );
         };
         let id_initiator = if let Some(id) = id_initiator {
             id
         } else {
-            return self.process_auth_failed_response(response, "Client provided no ID".into());
+            return self.process_failed_response(
+                response,
+                message::NotifyMessageType::AUTHENTICATION_FAILED,
+                "Client provided no ID".into(),
+            );
         };
         let (mut transform_params, proposal_num) = if let Some(params) = transform_params {
             params
@@ -934,8 +965,7 @@ impl IKEv2Session {
             }
         };
 
-        let accept_proposal = [(proposal_num, &transform_params)];
-        response.write_security_association(&accept_proposal)?;
+        response.write_security_association(&[(&transform_params, proposal_num)])?;
 
         // TODO: will macOS or Windows accept more traffic selectors?
         response.write_traffic_selector_payload(true, &ts_remote)?;
@@ -955,19 +985,17 @@ impl IKEv2Session {
         self.complete_encrypted_payload(response)
     }
 
-    fn process_auth_failed_response(
+    fn process_failed_response(
         &self,
         response: &mut message::MessageWriter,
-        _err: SessionError,
+        reason: message::NotifyMessageType,
+        err: SessionError,
     ) -> Result<usize, SessionError> {
         response.start_encrypted_payload()?;
 
-        response.write_notify_payload(
-            None,
-            &[],
-            message::NotifyMessageType::AUTHENTICATION_FAILED,
-            &[],
-        )?;
+        debug!("Request failed, sending error response: {}", err);
+
+        response.write_notify_payload(None, &[], reason, &[])?;
 
         self.complete_encrypted_payload(response)
     }
@@ -1035,7 +1063,6 @@ impl IKEv2Session {
             }
         }
 
-        // For now, no data is processed.
         response.start_encrypted_payload()?;
 
         if !delete_spi.is_empty() {
@@ -1048,7 +1075,7 @@ impl IKEv2Session {
             )?;
         } else {
             self.pending_actions
-                .push(IKEv2PendingAction::DeleteIKESession);
+                .push(IKEv2PendingAction::DeleteIKESession(time::Duration::ZERO));
         }
 
         self.complete_encrypted_payload(response)
@@ -1059,6 +1086,12 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, SessionError> {
+        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
+            crypto_stack
+        } else {
+            return Err("Crypto stack not initialized".into());
+        };
+
         let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
         let mut decrypted_iter = None;
 
@@ -1087,6 +1120,16 @@ impl IKEv2Session {
             // CREATE_CHILD_SA payload is supposed to have an encrypted payload.
             return Ok(response.complete_message());
         };
+
+        let mut rekey_child_sa = None;
+        let mut dh_transform = None;
+        let mut transform_params = None;
+        let mut public_key = None;
+        let mut shared_secret = None;
+        let mut new_crypto_stack = None;
+        let mut nonce_responder = None;
+        let mut ts_remote = vec![];
+        let mut ts_local = vec![];
         for payload in decrypted_iter {
             let payload = match payload {
                 Ok(payload) => payload,
@@ -1098,6 +1141,126 @@ impl IKEv2Session {
             };
             trace!("Decrypted payload\n {:?}", payload);
             match payload.payload_type() {
+                message::PayloadType::NOTIFY => {
+                    let notify = payload.to_notify()?;
+                    if notify.message_type() == message::NotifyMessageType::REKEY_SA {
+                        rekey_child_sa = Some(notify.spi());
+                    }
+                }
+                message::PayloadType::SECURITY_ASSOCIATION => {
+                    let sa = payload.to_security_association()?;
+                    transform_params = crypto::choose_sa_parameters(&sa);
+                    let prop = match transform_params {
+                        Some(params) => params.0,
+                        None => {
+                            warn!("No compatible SA parameters found");
+                            continue;
+                        }
+                    };
+                    match prop.create_dh() {
+                        Ok(dh) => dh_transform = Some(dh),
+                        Err(err) => {
+                            warn!("Failed to init DH: {}", err)
+                        }
+                    }
+                }
+                message::PayloadType::KEY_EXCHANGE => {
+                    let kex = payload.to_key_exchange()?;
+                    if let Some(ref mut dh) = dh_transform.as_mut() {
+                        public_key = Some(dh.read_public_key());
+                        shared_secret = match dh.compute_shared_secret(kex.read_value()) {
+                            Ok(shared_secret) => Some(shared_secret),
+                            Err(err) => {
+                                // TODO: return INVALID_KE_PAYLOAD notification.
+                                warn!("Failed to compute shared secret: {}", err);
+                                continue;
+                            }
+                        };
+                    }
+                }
+                message::PayloadType::NONCE => {
+                    let nonce = payload.to_nonce()?;
+                    let nonce_remote = nonce.read_value();
+                    let mut nonce_local = [0u8; MAX_NONCE];
+                    let nonce_local = &mut nonce_local[..nonce_remote.len()];
+                    rand::thread_rng().fill(nonce_local);
+                    nonce_responder = {
+                        let mut nonce_responder = vec![0; nonce_local.len()];
+                        nonce_responder.copy_from_slice(nonce_local);
+                        Some(nonce_responder)
+                    };
+                    let shared_secret = if let Some(ref shared_secret) = shared_secret {
+                        shared_secret.as_slice()
+                    } else {
+                        warn!("Unspecified shared secret");
+                        // TODO: return NO_PROPOSAL_CHOSEN notification.
+                        continue;
+                    };
+                    let mut prf_key =
+                        vec![0; shared_secret.len() + nonce_remote.len() + nonce_local.len()];
+                    let mut prf_key_cursor = 0;
+                    prf_key[prf_key_cursor..prf_key_cursor + shared_secret.len()]
+                        .copy_from_slice(&shared_secret);
+                    prf_key_cursor += shared_secret.len();
+                    prf_key[prf_key_cursor..prf_key_cursor + nonce_remote.len()]
+                        .copy_from_slice(nonce_remote);
+                    prf_key_cursor += nonce_remote.len();
+                    prf_key[prf_key_cursor..prf_key_cursor + nonce_local.len()]
+                        .copy_from_slice(nonce_local);
+
+                    let (params, _) = if let Some(params) = transform_params.as_ref() {
+                        params
+                    } else {
+                        warn!("Unspecified transform parametes");
+                        // TODO: return INVALID_SYNTAX notification.
+                        continue;
+                    };
+                    let crypto_stack = if rekey_child_sa.is_some() {
+                        crypto_stack.create_child_stack(params, &prf_key)
+                    } else {
+                        crypto_stack.create_rekey_stack(params, &prf_key)
+                    };
+                    new_crypto_stack = match crypto_stack {
+                        Ok(crypto_stack) => Some(crypto_stack),
+                        Err(err) => {
+                            warn!("Failed to rekey crypto stack: {}", err);
+                            // TODO: return INVALID_SYNTAX notification.
+                            continue;
+                        }
+                    };
+                }
+                message::PayloadType::TRAFFIC_SELECTOR_INITIATOR => {
+                    let ts = payload
+                        .to_traffic_selector()?
+                        .iter_traffic_selectors()
+                        .collect::<Result<Vec<_>, message::FormatError>>()
+                        .map_err(|err| {
+                            warn!("Failed to decode initiator traffic selectors: {}", err);
+                            err
+                        });
+                    if let Ok(mut ts) = ts {
+                        ts.retain(|ts| {
+                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
+                        });
+                        ts_remote = ts
+                    }
+                }
+                message::PayloadType::TRAFFIC_SELECTOR_RESPONDER => {
+                    let ts = payload
+                        .to_traffic_selector()?
+                        .iter_traffic_selectors()
+                        .collect::<Result<Vec<_>, message::FormatError>>()
+                        .map_err(|err| {
+                            warn!("Failed to decode responder traffic selectors: {}", err);
+                            err
+                        });
+                    if let Ok(mut ts) = ts {
+                        ts.retain(|ts| {
+                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
+                        });
+                        ts_local = ts
+                    }
+                }
                 _ => {
                     if payload.is_critical() {
                         warn!(
@@ -1111,8 +1274,127 @@ impl IKEv2Session {
             }
         }
 
-        // For now, no data is processed.
+        let nonce_responder = if let Some(nonce_responder) = nonce_responder {
+            nonce_responder
+        } else {
+            return self.process_failed_response(
+                response,
+                message::NotifyMessageType::INVALID_SYNTAX,
+                "Client provided no nonce".into(),
+            );
+        };
+        let (mut transform_params, proposal_num) = if let Some(params) = transform_params {
+            params
+        } else {
+            return self.process_failed_response(
+                response,
+                message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
+                "Unacceptable Security Association proposals".into(),
+            );
+        };
+        let dh_group = if let Some(dh) = dh_transform {
+            dh.group_number()
+        } else {
+            return self.process_failed_response(
+                response,
+                message::NotifyMessageType::INVALID_KE_PAYLOAD,
+                "DH is not initialized".into(),
+            );
+        };
+        let public_key = if let Some(public_key) = public_key {
+            public_key
+        } else {
+            return self.process_failed_response(
+                response,
+                message::NotifyMessageType::INVALID_KE_PAYLOAD,
+                "Public key is not initialized".into(),
+            );
+        };
+        if rekey_child_sa.is_some() && (ts_local.is_empty() || ts_remote.is_empty()) {
+            // TODO: return TS_UNACCEPTABLE notification.
+            return Err("No traffic selectors offered by client".into());
+        }
+        let new_crypto_stack = if let Some(crypto_stack) = new_crypto_stack {
+            crypto_stack
+        } else {
+            return Err("Failed to init new crypto stack".into());
+        };
+        if let Some(old_spi) = rekey_child_sa {
+            let local_spi = rand::thread_rng().gen::<u32>();
+            transform_params.set_local_spi(message::Spi::U32(local_spi));
+            let old_spi = match old_spi {
+                message::Spi::U32(old_spi) => old_spi,
+                _ => return Err("Security Association has unsupported REKEY_SA SPI type".into()),
+            };
+            let remote_spi = match transform_params.remote_spi() {
+                message::Spi::U32(remote_spi) => remote_spi,
+                _ => return Err("Security Association has unsupported remote SPI type".into()),
+            };
+            // FIXME: might need to use old remote SPI here.
+            let child_sa = esp::SecurityAssociation::new(
+                ts_local.clone(),
+                ts_remote.clone(),
+                self.local_addr,
+                self.remote_addr,
+                new_crypto_stack,
+                &transform_params,
+            );
+            self.pending_actions
+                .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
+            self.pending_actions.push(IKEv2PendingAction::DeleteChildSA(
+                old_spi,
+                IKE_REKEY_DURATION,
+            ));
+        } else {
+            let local_spi = rand::thread_rng().gen::<u64>();
+            transform_params.set_local_spi(message::Spi::U64(local_spi));
+            let remote_spi = match transform_params.remote_spi() {
+                message::Spi::U64(remote_spi) => remote_spi,
+                _ => return Err("Security Association has unsupported remote SPI type".into()),
+            };
+            let session_id = SessionID::new(remote_spi, local_spi);
+            let new_session = IKEv2Session {
+                session_id,
+                remote_addr: self.remote_addr,
+                local_addr: self.local_addr,
+                state: SessionState::Established,
+                internal_addr: self.internal_addr,
+                ts_local: self.ts_local.clone(),
+                pki_processing: self.pki_processing.clone(),
+                params: Some(transform_params),
+                crypto_stack: Some(new_crypto_stack),
+                user_id: self.user_id.clone(),
+                last_update: self.last_update,
+                remote_message_id: 0,
+                local_message_id: 0,
+                last_response: None,
+                last_request: None,
+                sent_request: None,
+                request_retransmit: 0,
+                pending_actions: vec![],
+            };
+            self.pending_actions
+                .push(IKEv2PendingAction::CreateIKEv2Session(
+                    session_id,
+                    new_session,
+                ));
+            self.pending_actions
+                .push(IKEv2PendingAction::DeleteIKESession(IKE_REKEY_DURATION));
+            self.state = SessionState::Rekeyed;
+        }
+
         response.start_encrypted_payload()?;
+
+        response.write_security_association(&[(&transform_params, proposal_num)])?;
+        let dest =
+            response.next_payload_slice(message::PayloadType::NONCE, nonce_responder.len())?;
+        dest.copy_from_slice(nonce_responder.as_slice());
+        response.write_key_exchange_payload(dh_group, public_key.as_slice())?;
+
+        if rekey_child_sa.is_some() {
+            response.write_traffic_selector_payload(true, &ts_remote)?;
+            response.write_traffic_selector_payload(false, &self.ts_local)?;
+        }
 
         self.complete_encrypted_payload(response)
     }
@@ -1162,7 +1444,10 @@ impl IKEv2Session {
 
     pub fn start_request_delete_ike(&mut self) -> Result<u32, SessionError> {
         match self.state {
-            SessionState::Empty | SessionState::InitSA(_) | SessionState::Deleting => {
+            SessionState::Empty
+            | SessionState::InitSA(_)
+            | SessionState::Deleting
+            | SessionState::Rekeyed => {
                 return Err(
                     "Received Delete request for a non-established session, ignoring".into(),
                 );
@@ -1314,7 +1599,7 @@ impl IKEv2Session {
         match sent_request {
             Some(RequestContext::DeleteIKEv2) => {
                 self.pending_actions
-                    .push(IKEv2PendingAction::DeleteIKESession);
+                    .push(IKEv2PendingAction::DeleteIKESession(time::Duration::ZERO));
             }
             None => {
                 return Err("Received response for a non-existing request".into());

@@ -401,15 +401,15 @@ impl MessageWriter<'_> {
 
     pub fn write_security_association(
         &mut self,
-        proposals: &[(u8, &crypto::TransformParameters)],
+        proposals: &[(&crypto::TransformParameters, u8)],
     ) -> Result<(), NotEnoughSpaceError> {
         let proposals_len = proposals
             .iter()
-            .map(|params| Self::sa_parameters_len(params.1).1)
+            .map(|params| Self::sa_parameters_len(params.0).1)
             .sum();
         let mut next_payload_slice =
             self.next_payload_slice(PayloadType::SECURITY_ASSOCIATION, proposals_len)?;
-        for (proposal_num, proposal) in proposals {
+        for (proposal, proposal_num) in proposals {
             let is_last = *proposal_num as usize == proposals.len();
             let proposal_len =
                 Self::write_sa_params(next_payload_slice, *proposal_num, proposal, is_last);
@@ -1733,7 +1733,7 @@ impl fmt::Display for NotifyMessageType {
 pub struct PayloadNotify<'a> {
     protocol_id: Option<IPSecProtocolID>,
     message_type: NotifyMessageType,
-    spi: &'a [u8],
+    spi: Spi,
     data: &'a [u8],
 }
 
@@ -1757,7 +1757,7 @@ impl<'a> PayloadNotify<'a> {
         message_type.copy_from_slice(&data[2..4]);
         let message_type = u16::from_be_bytes(message_type);
         let message_type = NotifyMessageType::from_u16(message_type);
-        let spi = &data[4..4 + spi_size];
+        let spi = Spi::from_slice(&data[4..4 + spi_size])?;
         Ok(PayloadNotify {
             protocol_id,
             message_type,
@@ -1768,6 +1768,10 @@ impl<'a> PayloadNotify<'a> {
 
     pub fn message_type(&self) -> NotifyMessageType {
         self.message_type
+    }
+
+    pub fn spi(&self) -> Spi {
+        self.spi
     }
 
     fn read_value(&self) -> &[u8] {
@@ -2400,10 +2404,15 @@ impl fmt::Debug for Payload<'_> {
             writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
         } else if let Ok(pl_notify) = self.to_notify() {
             if pl_notify.message_type == NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
+                write!(f, "    Notify protocol ID ")?;
+                match pl_notify.protocol_id {
+                    Some(protocol) => protocol.fmt(f)?,
+                    None => "None".fmt(f)?,
+                }
                 write!(
                     f,
-                    "    Notify protocol ID {:?} SPI {:?} type {} list",
-                    pl_notify.protocol_id, pl_notify.spi, pl_notify.message_type,
+                    " SPI {} type {} list",
+                    pl_notify.spi, pl_notify.message_type,
                 )?;
                 if let Ok(hash_algorithms) = pl_notify.to_signature_hash_algorithms() {
                     for alg in hash_algorithms {
