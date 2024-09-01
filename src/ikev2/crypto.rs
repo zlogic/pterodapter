@@ -469,15 +469,6 @@ impl PseudorandomTransform {
             Self::None => 0,
         }
     }
-
-    fn transform_type(&self) -> Option<message::TransformType> {
-        match self {
-            PseudorandomTransform::None => None,
-            PseudorandomTransform::HmacSha256(_, _) => {
-                Some(message::TransformType::PRF_HMAC_SHA2_256)
-            }
-        }
-    }
 }
 
 pub struct DerivedKeys {
@@ -513,22 +504,6 @@ impl DerivedKeys {
             enc_responder,
             prf_initiator,
             prf_responder,
-        }
-    }
-
-    fn new_rekey(params: &TransformParameters) -> DerivedKeys {
-        let derive_key_length = params.prf_key_length() / 8;
-        let derive = 0..derive_key_length;
-        let empty_range = derive.end..derive.end;
-        DerivedKeys {
-            keys: [0u8; MAX_KEY_MATERIAL_LENGTH],
-            derive,
-            auth_initiator: empty_range.clone(),
-            auth_responder: empty_range.clone(),
-            enc_initiator: empty_range.clone(),
-            enc_responder: empty_range.clone(),
-            prf_initiator: empty_range.clone(),
-            prf_responder: empty_range.clone(),
         }
     }
 
@@ -735,53 +710,15 @@ impl CryptoStack {
     pub fn create_rekey_stack(
         &self,
         params: &TransformParameters,
-        data: &[u8],
+        skeyseed: &[u8],
+        prf_key: &[u8],
     ) -> Result<CryptoStack, InitError> {
-        let mut new_derive_key = DerivedKeys::new_rekey(params);
-        self.prf_child_sa.derive_keys(&mut new_derive_key, data)?;
-        let prf = if let Some(prf) = params.prf.as_ref() {
-            prf.transform_type
-        } else if let Some(transform_type) = self.prf_responder.transform_type() {
-            transform_type
-        } else {
-            return Err("Undefined pseudorandom transform parameters for rekeying".into());
-        };
-        let prf_child_sa =
-            PseudorandomTransform::init(prf, &new_derive_key.keys[new_derive_key.derive.clone()])?;
-        let mut keys = DerivedKeys::new_ikev2(params);
-        prf_child_sa.derive_keys(&mut keys, data)?;
-        let enc = params
-            .enc
-            .as_ref()
-            .ok_or("Undefined encryption parameters")?;
-        let auth = params
-            .auth
-            .as_ref()
-            .map(|transform| transform.transform_type);
-        let padding = PaddingType::from_transform(params)?;
-        Ok(CryptoStack {
-            prf_child_sa,
-            auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
-            auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
-            enc_initiator: EncryptionType::init(
-                enc,
-                &keys.keys[keys.enc_initiator.clone()],
-                padding,
-            )?,
-            enc_responder: EncryptionType::init(
-                enc,
-                &keys.keys[keys.enc_responder.clone()],
-                padding,
-            )?,
-            prf_initiator: PseudorandomTransform::init(
-                prf,
-                &keys.keys[keys.prf_initiator.clone()],
-            )?,
-            prf_responder: PseudorandomTransform::init(
-                prf,
-                &keys.keys[keys.prf_responder.clone()],
-            )?,
-        })
+        let prf_transform = params.create_prf(skeyseed)?;
+        prf_transform.create_crypto_stack(params, &prf_key)
+    }
+
+    pub fn rekey_skeyseed(&self, skeyseed_input: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
+        self.prf_child_sa.prf(skeyseed_input)
     }
 
     pub fn encrypted_payload_length(&self, msg_len: usize) -> usize {

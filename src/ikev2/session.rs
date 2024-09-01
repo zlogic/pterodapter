@@ -208,6 +208,7 @@ impl IKEv2Session {
                 return Ok(len);
             }
         }
+        /*
         match self.state {
             SessionState::Rekeyed => {
                 return Err("Session is rekeyed and no longer accepts new requests".into());
@@ -217,6 +218,7 @@ impl IKEv2Session {
             | SessionState::Established
             | SessionState::Deleting => {}
         }
+        */
 
         let exchange_type = request.read_exchange_type()?;
 
@@ -1321,7 +1323,21 @@ impl IKEv2Session {
             let crypto_stack = if rekey_child_sa.is_some() || create_child_sa {
                 crypto_stack.create_child_stack(&transform_params, &prf_key)
             } else {
-                crypto_stack.create_rekey_stack(&transform_params, &prf_key)
+                let skeyseed = crypto_stack.rekey_skeyseed(&prf_key);
+                let remote_spi = transform_params.remote_spi();
+                let local_spi = transform_params.local_spi();
+                let mut spi_slice = [0u8; 8 + 8];
+                remote_spi.write_to(&mut spi_slice[0..remote_spi.length()]);
+                local_spi.write_to(
+                    &mut spi_slice[remote_spi.length()..remote_spi.length() + local_spi.length()],
+                );
+                let prf_key = [
+                    nonce_initiator.as_slice(),
+                    nonce_responder.as_slice(),
+                    &spi_slice[..remote_spi.length() + local_spi.length()],
+                ]
+                .concat();
+                crypto_stack.create_rekey_stack(&transform_params, skeyseed.as_slice(), &prf_key)
             };
             match crypto_stack {
                 Ok(crypto_stack) => crypto_stack,
