@@ -89,7 +89,6 @@ enum SessionState {
     InitSA(InitSAContext),
     Established,
     Deleting,
-    Rekeyed,
 }
 
 pub enum IKEv2PendingAction {
@@ -208,17 +207,6 @@ impl IKEv2Session {
                 return Ok(len);
             }
         }
-        /*
-        match self.state {
-            SessionState::Rekeyed => {
-                return Err("Session is rekeyed and no longer accepts new requests".into());
-            }
-            SessionState::Empty
-            | SessionState::InitSA(_)
-            | SessionState::Established
-            | SessionState::Deleting => {}
-        }
-        */
 
         let exchange_type = request.read_exchange_type()?;
 
@@ -1321,11 +1309,14 @@ impl IKEv2Session {
             };
             let prf_key = [shared_secret, &nonce_initiator, &nonce_responder].concat();
             let crypto_stack = if rekey_child_sa.is_some() || create_child_sa {
+                let local_spi = rand::thread_rng().gen::<u32>();
+                transform_params.set_local_spi(message::Spi::U32(local_spi));
                 crypto_stack.create_child_stack(&transform_params, &prf_key)
             } else {
+                let local_spi = message::Spi::U64(rand::thread_rng().gen::<u64>());
+                transform_params.set_local_spi(local_spi);
                 let skeyseed = crypto_stack.rekey_skeyseed(&prf_key);
                 let remote_spi = transform_params.remote_spi();
-                let local_spi = transform_params.local_spi();
                 let mut spi_slice = [0u8; 8 + 8];
                 remote_spi.write_to(&mut spi_slice[0..remote_spi.length()]);
                 local_spi.write_to(
@@ -1357,8 +1348,6 @@ impl IKEv2Session {
         }
         if let Some(old_spi) = rekey_child_sa {
             debug!("Rekeying child SA");
-            let local_spi = rand::thread_rng().gen::<u32>();
-            transform_params.set_local_spi(message::Spi::U32(local_spi));
             let old_spi = match old_spi {
                 message::Spi::U32(old_spi) => old_spi,
                 _ => return Err("Security Association has unsupported REKEY_SA SPI type".into()),
@@ -1374,10 +1363,13 @@ impl IKEv2Session {
                     "Cannot find child SA to rekey".into(),
                 );
             };
-            let remote_spi = match transform_params.remote_spi() {
-                message::Spi::U32(remote_spi) => remote_spi,
-                _ => return Err("Security Association has unsupported remote SPI type".into()),
-            };
+            let (remote_spi, local_spi) =
+                match (transform_params.remote_spi(), transform_params.local_spi()) {
+                    (message::Spi::U32(remote_spi), message::Spi::U32(local_spi)) => {
+                        (remote_spi, local_spi)
+                    }
+                    _ => return Err("Security Association has unsupported remote SPI type".into()),
+                };
             self.child_sas.insert(ChildSessionID {
                 remote_spi,
                 local_spi,
@@ -1416,12 +1408,13 @@ impl IKEv2Session {
                 .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
         } else {
             debug!("Rekeying IKEv2 session");
-            let local_spi = rand::thread_rng().gen::<u64>();
-            transform_params.set_local_spi(message::Spi::U64(local_spi));
-            let remote_spi = match transform_params.remote_spi() {
-                message::Spi::U64(remote_spi) => remote_spi,
-                _ => return Err("Security Association has unsupported remote SPI type".into()),
-            };
+            let (remote_spi, local_spi) =
+                match (transform_params.remote_spi(), transform_params.local_spi()) {
+                    (message::Spi::U64(remote_spi), message::Spi::U64(local_spi)) => {
+                        (remote_spi, local_spi)
+                    }
+                    _ => return Err("Security Association has unsupported remote SPI type".into()),
+                };
             let session_id = SessionID::new(remote_spi, local_spi);
             let new_session = IKEv2Session {
                 session_id,
@@ -1449,7 +1442,6 @@ impl IKEv2Session {
                     session_id,
                     new_session,
                 ));
-            self.state = SessionState::Rekeyed;
         }
 
         response.start_encrypted_payload()?;
@@ -1515,10 +1507,7 @@ impl IKEv2Session {
 
     pub fn start_request_delete_ike(&mut self) -> Result<u32, SessionError> {
         match self.state {
-            SessionState::Empty
-            | SessionState::InitSA(_)
-            | SessionState::Deleting
-            | SessionState::Rekeyed => {
+            SessionState::Empty | SessionState::InitSA(_) | SessionState::Deleting => {
                 return Err(
                     "Received Delete request for a non-established session, ignoring".into(),
                 );
