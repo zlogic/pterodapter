@@ -95,7 +95,7 @@ impl Spi {
             value.copy_from_slice(spi);
             let value = u32::from_be_bytes(value);
             Ok(Self::U32(value))
-        } else if spi.len() == 4 {
+        } else if spi.len() == 8 {
             let mut value = [0u8; 8];
             value.copy_from_slice(spi);
             let value = u64::from_be_bytes(value);
