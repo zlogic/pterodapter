@@ -108,7 +108,7 @@ impl Spi {
         }
     }
 
-    fn write_to(&self, dest: &mut [u8]) {
+    pub fn write_to(&self, dest: &mut [u8]) {
         match *self {
             Self::None => {}
             Self::U32(val) => dest.copy_from_slice(&val.to_be_bytes()),

@@ -109,7 +109,7 @@ pub struct IKEv2Session {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
     state: SessionState,
-    internal_addr: IpAddr,
+    internal_addr: Option<IpAddr>,
     ts_local: Vec<message::TrafficSelector>,
     child_sas: HashSet<ChildSessionID>,
     pki_processing: Arc<pki::PkiProcessing>,
@@ -131,7 +131,6 @@ impl IKEv2Session {
         session_id: SessionID,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
-        internal_addr: IpAddr,
         pki_processing: Arc<pki::PkiProcessing>,
         ts_local: &[message::TrafficSelector],
     ) -> IKEv2Session {
@@ -140,7 +139,7 @@ impl IKEv2Session {
             remote_addr,
             local_addr,
             state: SessionState::Empty,
-            internal_addr,
+            internal_addr: None,
             ts_local: ts_local.to_vec(),
             child_sas: HashSet::new(),
             pki_processing,
@@ -183,6 +182,10 @@ impl IKEv2Session {
             next_retransmission.saturating_sub(jitter)..=next_retransmission.saturating_add(jitter),
         );
         NextRetransmission::Delay(time::Duration::from_millis(next_delay))
+    }
+
+    pub fn update_internal_addr(&mut self, internal_addr: IpAddr) {
+        self.internal_addr = Some(internal_addr);
     }
 
     pub fn process_request(
@@ -936,7 +939,17 @@ impl IKEv2Session {
         };
 
         if ipv4_address_requested {
-            response.write_configuration_payload(self.internal_addr)?;
+            if let Some(internal_addr) = self.internal_addr {
+                response.write_configuration_payload(internal_addr)?;
+            } else {
+                warn!("No IP address is available, notifying client");
+                response.write_notify_payload(
+                    None,
+                    &[],
+                    message::NotifyMessageType::INTERNAL_ADDRESS_FAILURE,
+                    &[],
+                )?;
+            }
         }
 
         let child_crypto_stack = match crypto_stack.create_child_stack(
@@ -964,6 +977,8 @@ impl IKEv2Session {
             ts_remote,
             local_addr,
             remote_addr,
+            local_spi,
+            remote_spi,
             child_crypto_stack,
             &transform_params,
         );
@@ -1379,6 +1394,8 @@ impl IKEv2Session {
                 ts_remote.clone(),
                 self.local_addr,
                 self.remote_addr,
+                local_spi,
+                remote_spi,
                 new_crypto_stack,
                 &transform_params,
             );
@@ -1401,6 +1418,8 @@ impl IKEv2Session {
                 ts_remote.clone(),
                 self.local_addr,
                 self.remote_addr,
+                local_spi,
+                remote_spi,
                 new_crypto_stack,
                 &transform_params,
             );

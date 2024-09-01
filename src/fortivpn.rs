@@ -17,6 +17,7 @@ use tokio_rustls::rustls;
 use crate::http;
 use crate::ppp;
 
+#[derive(Clone)]
 pub struct Config {
     pub tls_config: Arc<rustls::client::ClientConfig>,
     pub destination_addr: SocketAddr,
@@ -608,6 +609,10 @@ impl FortiVPNTunnel {
         Ok(())
     }
 
+    pub async fn peek_recv(&mut self) -> Result<(), FortiError> {
+        self.ppp_state.peek_data(&mut self.socket).await
+    }
+
     pub async fn try_next_ip_packet(
         &mut self,
         timeout: Option<Duration>,
@@ -661,13 +666,14 @@ impl FortiVPNTunnel {
                 return Err("Unknown PPP protocol, possibly a framing error".into());
             }
         };
-        let length = Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, dest).await?;
         match protocol {
             ppp::Protocol::LCP => {
                 self.process_control_packet().await?;
                 Ok(0)
             }
-            ppp::Protocol::IPV4 | ppp::Protocol::IPV6 => Ok(length),
+            ppp::Protocol::IPV4 | ppp::Protocol::IPV6 => {
+                Ok(Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, dest).await?)
+            }
             _ => {
                 info!("Received unexpected PPP packet {}, ignoring", protocol);
                 Ok(0)
@@ -749,7 +755,7 @@ impl PPPState {
         }
     }
 
-    async fn read_header(&mut self, socket: &mut BufTlsStream) -> Result<(), FortiError> {
+    async fn peek_data(&mut self, socket: &mut BufTlsStream) -> Result<(), FortiError> {
         if self.bytes_remaining > 0 {
             return Ok(());
         }
@@ -772,6 +778,11 @@ impl PPPState {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn read_header(&mut self, socket: &mut BufTlsStream) -> Result<(), FortiError> {
+        self.peek_data(socket).await?;
         self.validate_link(socket).await?;
 
         let mut ppp_size = [0u8; 2];

@@ -726,12 +726,12 @@ impl CryptoStack {
             + self.auth_responder.signature_length()
     }
 
-    pub fn encrypt_data(
+    pub fn encrypt_data<'a>(
         &self,
-        data: &mut [u8],
+        data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<(), CryptoError> {
+    ) -> Result<&'a [u8], CryptoError> {
         self.enc_responder.encrypt(data, msg_len, associated_data)
     }
 
@@ -789,12 +789,12 @@ impl<'a> Extend<&'a u8> for SliceBuffer<'_> {
 }
 
 pub trait Encryption {
-    fn encrypt(
+    fn encrypt<'a>(
         &self,
-        data: &mut [u8],
+        data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<(), CryptoError>;
+    ) -> Result<&'a [u8], CryptoError>;
 
     fn decrypt<'a>(
         &self,
@@ -840,12 +840,12 @@ impl EncryptionType {
         }
     }
 
-    fn encrypt(
+    fn encrypt<'a>(
         &self,
-        data: &mut [u8],
+        data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<(), CryptoError> {
+    ) -> Result<&'a [u8], CryptoError> {
         match self {
             Self::AesGcm256(ref enc) => enc.encrypt(data, msg_len, associated_data),
         }
@@ -907,7 +907,14 @@ impl PaddingType {
             }
             Self::Esp => {
                 // TODO: specify protocol type from https://datatracker.ietf.org/doc/html/rfc4303#section-2.6 externally?
+                data[data.len() - 1] = 4; //IPv4 for now
                 data[data.len() - 2] = padding_length;
+                // RFC 4303 Section 2.4 requires alignment and specific contents for the padding field.
+                let padding_range = msg_len..data.len() - 2;
+                data[padding_range]
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, pad)| *pad = i as u8 + 1);
             }
         }
         Ok(())
@@ -919,6 +926,22 @@ impl PaddingType {
             Self::Esp => 2,
         }
     }
+
+    fn pad_to_boundary(&self, msg_len: usize) -> usize {
+        let padded_len = msg_len + self.length();
+        match self {
+            Self::IKEv2 => padded_len,
+            Self::Esp => {
+                const BOUNDARY: usize = 8;
+                let padded_boundary = (padded_len / BOUNDARY) * BOUNDARY;
+                if padded_boundary < padded_len {
+                    padded_boundary + BOUNDARY
+                } else {
+                    padded_boundary
+                }
+            }
+        }
+    }
 }
 
 pub struct EncryptionAesGcm256 {
@@ -928,19 +951,20 @@ pub struct EncryptionAesGcm256 {
 }
 
 impl Encryption for EncryptionAesGcm256 {
-    fn encrypt(
+    fn encrypt<'a>(
         &self,
-        data: &mut [u8],
+        data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<(), CryptoError> {
+    ) -> Result<&'a [u8], CryptoError> {
         if data.len() < self.encrypted_payload_length(msg_len) {
             return Err("Message length is too short".into());
         }
         // Pad length.
+        let padded_length = self.padding.pad_to_boundary(msg_len);
         self.padding
-            .add_padding(&mut data[..msg_len + 1], msg_len)?;
-        let msg_len = msg_len + 1;
+            .add_padding(&mut data[..padded_length], msg_len)?;
+        let msg_len = padded_length;
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.salt);
         // Move message to the right to make space for the explicit nonce.
@@ -962,10 +986,13 @@ impl Encryption for EncryptionAesGcm256 {
             aead::Aad::from(associated_data),
             &mut buffer,
         ) {
-            Ok(()) => {}
+            Ok(()) => {
+                let buffer_len = 8 + buffer.len;
+                let buffer = &data[..buffer_len];
+                Ok(buffer)
+            }
             Err(_) => return Err("Failed to encode AES GCM 16 256 message".into()),
-        };
-        Ok(())
+        }
     }
 
     fn decrypt<'a>(
@@ -993,7 +1020,7 @@ impl Encryption for EncryptionAesGcm256 {
     fn encrypted_payload_length(&self, msg_len: usize) -> usize {
         // AES GCM is a stream cipher, encrypted payload will contain
         // part of the nonce + message (with padding) + tag.
-        8 + msg_len + self.padding.length() + self.key.algorithm().tag_len()
+        8 + self.padding.pad_to_boundary(msg_len) + self.key.algorithm().tag_len()
     }
 }
 

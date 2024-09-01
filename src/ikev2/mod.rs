@@ -7,7 +7,15 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, runtime, sync::mpsc, task::JoinSet, time};
+use tokio::{
+    net::UdpSocket,
+    runtime,
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+    time,
+};
+
+use crate::fortivpn;
 
 mod crypto;
 mod esp;
@@ -21,9 +29,14 @@ const IKEV2_LISTEN_PORTS: [u16; 2] = [IKEV2_PORT, IKEV2_NAT_PORT];
 
 // TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
 const MAX_DATAGRAM_SIZE: usize = 4096;
+// Use 1500 as max MTU, real value is likely lower.
+const MAX_ESP_PACKET_SIZE: usize = 1500;
 
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+const VPN_ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
+const VPN_ECHO_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Config {
     pub listen_ips: Vec<IpAddr>,
@@ -79,9 +92,7 @@ impl Server {
                 local_addr: listen_addr,
                 request: buf,
             });
-            dest.send(msg)
-                .await
-                .map_err(|_| IKEv2Error::Internal("Channel closed"))?;
+            dest.send(msg).await.map_err(|_| "Channel closed")?;
         }
     }
 
@@ -94,7 +105,7 @@ impl Server {
             interval.tick().await;
             dest.send(SessionMessage::CleanupTimer)
                 .await
-                .map_err(|_| IKEv2Error::Internal("Channel closed"))?;
+                .map_err(|_| "Channel closed")?;
         }
     }
 
@@ -107,6 +118,7 @@ impl Server {
             }
             None => return Err("Shutdown already in progress".into()),
         }
+        self.command_sender = None;
         while let Some(res) = self.join_set.join_next().await {
             if let Err(err) = res {
                 warn!("Error returned when shutting down: {}", err);
@@ -115,13 +127,18 @@ impl Server {
         Ok(())
     }
 
-    pub async fn start(&mut self) -> Result<(), IKEv2Error> {
+    pub async fn start(&mut self, fortivpn_config: fortivpn::Config) -> Result<(), IKEv2Error> {
+        if self.command_sender.is_some() {
+            return Err("Server already started".into());
+        }
         let sockets = Arc::new(Sockets::new(&self.listen_ips).await?);
         let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
         let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
+        let vpn_service = FortiService::new(fortivpn_config);
         let mut sessions = Sessions::new(
             self.pki_processing.clone(),
             sockets.clone(),
+            vpn_service,
             tunnel_ips,
             traffic_selectors,
         );
@@ -247,16 +264,16 @@ impl UdpDatagram {
 enum SessionMessage {
     UdpDatagram(UdpDatagram),
     RetransmitRequest(session::SessionID, u32),
+    VpnPacket(Vec<u8>),
     CleanupTimer,
     Shutdown,
     UpdateSplitRoutes(Vec<IpAddr>, Vec<message::TrafficSelector>),
-    DeleteIKEv2Session(session::SessionID),
-    DeleteSecurityAssociation(esp::SecurityAssociationID),
 }
 
 struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Arc<Sockets>,
+    vpn_service: FortiService,
     tunnel_ips: Vec<IpAddr>,
     traffic_selectors: Vec<message::TrafficSelector>,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
@@ -271,6 +288,7 @@ impl Sessions {
     fn new(
         pki_processing: Arc<pki::PkiProcessing>,
         sockets: Arc<Sockets>,
+        vpn_service: FortiService,
         tunnel_ips: Vec<IpAddr>,
         traffic_selectors: Vec<message::TrafficSelector>,
     ) -> Sessions {
@@ -278,6 +296,7 @@ impl Sessions {
         Sessions {
             pki_processing,
             sockets,
+            vpn_service,
             tunnel_ips,
             traffic_selectors,
             sessions: HashMap::new(),
@@ -313,14 +332,11 @@ impl Sessions {
             })
             .or_insert_with(|| new_session_id);
         let session_id = session::SessionID::new(remote_spi, existing_half_session.0);
-        // TODO: get address from FortiVPN, or through a custom config variable.
-        let internal_addr = IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10));
         self.sessions.entry(session_id).or_insert_with(|| {
             session::IKEv2Session::new(
                 session_id,
                 remote_addr,
                 local_addr,
-                internal_addr,
                 self.pki_processing.clone(),
                 &self.traffic_selectors,
             )
@@ -412,6 +428,7 @@ impl Sessions {
     }
 
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
+        self.vpn_service.start(self.create_sender()).await?;
         while let Some(message) = self.rx.recv().await {
             match message {
                 SessionMessage::UdpDatagram(mut datagram) => {
@@ -422,19 +439,14 @@ impl Sessions {
                         );
                     }
                 }
+                SessionMessage::VpnPacket(data) => {
+                    if let Err(err) = self.process_vpn_packet(data).await {
+                        warn!("Failed to process VPN packet: {}", err);
+                    }
+                }
                 SessionMessage::CleanupTimer => {
                     let rt = runtime::Handle::current();
                     self.cleanup(&rt);
-                }
-                SessionMessage::DeleteIKEv2Session(session_id) => {
-                    if self.sessions.remove(&session_id).is_some() {
-                        info!("Deleted IKEv2 session {}", session_id);
-                    }
-                }
-                SessionMessage::DeleteSecurityAssociation(session_id) => {
-                    if self.security_associations.remove(&session_id).is_some() {
-                        info!("Deleted Security Association {:x}", session_id);
-                    }
                 }
                 SessionMessage::UpdateSplitRoutes(tunnel_ips, traffic_selectors) => {
                     self.tunnel_ips = tunnel_ips;
@@ -454,6 +466,7 @@ impl Sessions {
                 break;
             }
         }
+        self.vpn_service.terminate().await?;
         debug!("Shutdown completed");
         Ok(())
     }
@@ -498,11 +511,22 @@ impl Sessions {
         } else {
             session::SessionID::from_message(&ikev2_request)?
         };
+        let client_ip = if ikev2_request.read_exchange_type()? == message::ExchangeType::IKE_AUTH
+            && !ikev2_request.read_flags()?.has(message::Flags::RESPONSE)
+        {
+            self.vpn_service.client_ip().await?
+        } else {
+            None
+        };
         let session = if let Some(session) = self.get(session_id) {
             session
         } else {
             return Err("Session not found".into());
         };
+        if let Some(client_ip) = client_ip {
+            session.update_internal_addr(client_ip);
+        }
+
         let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
         let start_offset = if datagram.is_non_esp() { 4 } else { 0 };
 
@@ -624,7 +648,7 @@ impl Sessions {
     }
 
     async fn process_esp_packet(&mut self, datagram: &mut UdpDatagram) -> Result<(), IKEv2Error> {
-        let packet_bytes = datagram.request.as_mut_slice();
+        let packet_bytes = datagram.request.as_slice();
         if packet_bytes == [0xff] {
             debug!("Received ESP NAT keepalive from {}", datagram.remote_addr);
             return Ok(self
@@ -644,13 +668,24 @@ impl Sessions {
         local_spi.copy_from_slice(&packet_bytes[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
         if let Some(sa) = self.security_associations.get(&local_spi) {
-            let decrypted_data = sa.handle_esp(packet_bytes)?;
+            let packet_bytes = datagram.request.as_mut_slice();
+            let decrypted_slice = sa.handle_esp(packet_bytes)?;
             trace!(
                 "Decrypted ESP packet from {}\n{:?}",
                 datagram.remote_addr,
-                decrypted_data
+                decrypted_slice
             );
-            Ok(())
+            if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
+                warn!(
+                    "Decrypted packet size {} exceeds MTU {}",
+                    decrypted_slice.len(),
+                    MAX_ESP_PACKET_SIZE
+                );
+                return Err("Decrypted ESP packet size exceeds MTU".into());
+            }
+            let mut decrypted_data = Vec::with_capacity(MAX_ESP_PACKET_SIZE);
+            decrypted_data.extend_from_slice(decrypted_slice);
+            self.vpn_service.send_packet(decrypted_data).await
         } else {
             warn!(
                 "Security Association {:x} from {} not found",
@@ -659,6 +694,289 @@ impl Sessions {
             Err("Security Association not found".into())
         }
     }
+
+    async fn process_vpn_packet(&mut self, mut data: Vec<u8>) -> Result<(), IKEv2Error> {
+        // TODO: select SA based on packet data.
+        // TODO: log protocol & address data
+        trace!("Received packet from VPN\n{:?}", data);
+        if let Some(sa) = self.security_associations.values_mut().next() {
+            let msg_len = data.len();
+            if data.len() >= MAX_ESP_PACKET_SIZE {
+                return Err("Vector doesn't have capacity for ESP headers".into());
+            }
+            data.resize(MAX_ESP_PACKET_SIZE, 0);
+            let encrypted_data = sa.handle_vpn(data.as_mut_slice(), msg_len)?;
+            trace!(
+                "Encrypted VPN packet to {}\n{:?}",
+                sa.remote_addr(),
+                encrypted_data
+            );
+            self.sockets
+                .send_datagram(&sa.local_addr(), &sa.remote_addr(), encrypted_data)
+                .await?;
+            Ok(())
+        } else {
+            Err("Target Security Association not found".into())
+        }
+    }
+}
+
+struct FortiService {
+    config: Option<fortivpn::Config>,
+    command_sender: Option<mpsc::Sender<FortiServiceCommand>>,
+    join_set: JoinSet<Result<(), IKEv2Error>>,
+}
+
+impl FortiService {
+    fn new(config: fortivpn::Config) -> FortiService {
+        FortiService {
+            config: Some(config),
+            command_sender: None,
+            join_set: JoinSet::new(),
+        }
+    }
+
+    async fn connect(
+        config: fortivpn::Config,
+    ) -> Result<fortivpn::FortiVPNTunnel, fortivpn::FortiError> {
+        let sslvpn_cookie = fortivpn::get_oauth_cookie(&config).await?;
+        fortivpn::FortiVPNTunnel::new(&config, sslvpn_cookie).await
+    }
+
+    async fn process_echo(
+        forti_client: &mut fortivpn::FortiVPNTunnel,
+        last_echo_sent: time::Instant,
+    ) -> Result<(), IKEv2Error> {
+        forti_client.send_echo_request().await?;
+        if forti_client.last_echo_reply() + VPN_ECHO_TIMEOUT < last_echo_sent {
+            Err("No echo replies received".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn peek_vpn(forti_client: &mut fortivpn::FortiVPNTunnel) -> Option<FortiServiceCommand> {
+        if let Err(err) = forti_client.peek_recv().await {
+            debug!("Failed to check if VPN has data available: {}", err);
+        }
+        Some(FortiServiceCommand::ReceivePacket)
+    }
+
+    async fn read_vpn_packet(
+        forti_client: &mut fortivpn::FortiVPNTunnel,
+    ) -> Result<Vec<u8>, fortivpn::FortiError> {
+        let mut buffer = [0u8; MAX_ESP_PACKET_SIZE];
+        match forti_client.try_read_packet(&mut buffer, None).await {
+            Ok(msg_len) => {
+                if msg_len > 0 {
+                    let mut packet_buffer = Vec::with_capacity(MAX_ESP_PACKET_SIZE);
+                    packet_buffer.extend_from_slice(&buffer[..msg_len]);
+                    Ok(packet_buffer)
+                } else {
+                    Ok(vec![])
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn run(
+        config: fortivpn::Config,
+        tx: mpsc::Sender<FortiServiceCommand>,
+        mut rx: mpsc::Receiver<FortiServiceCommand>,
+        sessions_tx: mpsc::Sender<SessionMessage>,
+    ) -> Result<(), IKEv2Error> {
+        loop {
+            // Spawn a new connection task.
+            let connect_handle = {
+                let rt = runtime::Handle::current();
+                let tx = tx.clone();
+                let config = config.clone();
+                rt.spawn(async move {
+                    let result = Self::connect(config).await;
+                    let _ = tx.send(FortiServiceCommand::HandleConnection(result)).await;
+                })
+            };
+            let mut res = None;
+            // Wait for async events or the connection to open.
+            while let Some(command) = rx.recv().await {
+                match command {
+                    FortiServiceCommand::HandleConnection(forti_client) => {
+                        res = Some(forti_client);
+                        break;
+                    }
+                    FortiServiceCommand::Shutdown => return Ok(()),
+                    FortiServiceCommand::SendPacket(_) => {
+                        debug!("Received packet for closed FortiClient channel");
+                    }
+                    FortiServiceCommand::ReceivePacket => {
+                        debug!("Received packet from closed FortiClient channel");
+                    }
+                    FortiServiceCommand::SendEcho => {}
+                    FortiServiceCommand::RequestIp(tx) => {
+                        debug!("Received IP request for closed FortiClient channel");
+                        let _ = tx.send(None);
+                    }
+                }
+            }
+            connect_handle.abort();
+            let mut forti_client = match res.unwrap() {
+                Ok(forti_client) => forti_client,
+                Err(err) => {
+                    debug!("Error occurred when connecting to FortiClient: {}", err);
+                    continue;
+                }
+            };
+            let keepalive_timer = {
+                let rt = runtime::Handle::current();
+                let tx = tx.clone();
+                rt.spawn(async move {
+                    let mut interval = tokio::time::interval(VPN_ECHO_SEND_INTERVAL);
+                    loop {
+                        interval.tick().await;
+                        let _ = tx.send(FortiServiceCommand::SendEcho).await;
+                    }
+                })
+            };
+            // Handle connection until it drops.
+            let mut last_echo_sent = time::Instant::now();
+            while let Some(command) =
+                crate::futures::select(rx.recv(), Self::peek_vpn(&mut forti_client)).await
+            {
+                match command {
+                    FortiServiceCommand::SendPacket(data) => {
+                        if let Err(err) = forti_client.send_packet(&data).await {
+                            warn!("Failed to send packet to VPN: {}", err);
+                            break;
+                        };
+                        if let Err(err) = forti_client.flush().await {
+                            warn!("Failed to flush VPN stream: {}", err);
+                            break;
+                        }
+                    }
+                    FortiServiceCommand::ReceivePacket => {
+                        let data = match Self::read_vpn_packet(&mut forti_client).await {
+                            Ok(data) => data,
+                            Err(err) => {
+                                warn!("Failed to receive packet from VPN: {}", err);
+                                break;
+                            }
+                        };
+                        if !data.is_empty() {
+                            let _ = sessions_tx.send(SessionMessage::VpnPacket(data)).await;
+                        }
+                    }
+                    FortiServiceCommand::SendEcho => {
+                        let next_echo_sent = time::Instant::now();
+                        if let Err(err) =
+                            Self::process_echo(&mut forti_client, last_echo_sent).await
+                        {
+                            warn!("Echo request timed out: {}", err);
+                            break;
+                        }
+                        last_echo_sent = next_echo_sent;
+                    }
+                    FortiServiceCommand::RequestIp(tx) => {
+                        let _ = tx.send(Some(forti_client.ip_addr()));
+                    }
+                    FortiServiceCommand::Shutdown => {
+                        forti_client.terminate().await?;
+                        return Ok(());
+                    }
+                    FortiServiceCommand::HandleConnection(forti_client) => {
+                        warn!("Received unexpected new connection, closing");
+                        let mut forti_client = match forti_client {
+                            Ok(forti_client) => forti_client,
+                            Err(err) => {
+                                debug!("Error occurred when connecting to FortiClient: {}", err);
+                                continue;
+                            }
+                        };
+                        if let Err(err) = forti_client.terminate().await {
+                            warn!("Failed to terminate VPN client connection: {}", err);
+                        }
+                    }
+                }
+            }
+            keepalive_timer.abort();
+            if let Err(err) = forti_client.terminate().await {
+                warn!("Failed to terminate VPN client connection: {}", err);
+            }
+        }
+    }
+
+    async fn start(&mut self, sessions_tx: mpsc::Sender<SessionMessage>) -> Result<(), IKEv2Error> {
+        if self.command_sender.is_some() {
+            return Err("VPN client service is already started".into());
+        }
+        let config = if let Some(config) = self.config.take() {
+            config
+        } else {
+            return Err("VPN client config is already consumed".into());
+        };
+        let (tx, rx) = mpsc::channel(100);
+        self.command_sender = Some(tx.clone());
+        let rt = runtime::Handle::current();
+        self.join_set
+            .spawn_on(Self::run(config, tx, rx, sessions_tx), &rt);
+
+        Ok(())
+    }
+
+    async fn send_packet(&self, data: Vec<u8>) -> Result<(), IKEv2Error> {
+        if let Some(tx) = self.command_sender.as_ref() {
+            Ok(tx
+                .send(FortiServiceCommand::SendPacket(data))
+                .await
+                .map_err(|_| "VPN client command channel closed")?)
+        } else {
+            Err("VPN client service is not running".into())
+        }
+    }
+
+    async fn client_ip(&self) -> Result<Option<IpAddr>, IKEv2Error> {
+        if let Some(command_sender) = self.command_sender.as_ref() {
+            let (tx, rx) = oneshot::channel();
+            command_sender
+                .send(FortiServiceCommand::RequestIp(tx))
+                .await
+                .map_err(|_| "VPN client command channel closed")?;
+            Ok(rx.await.map_err(|_| "IP address receiver closed")?)
+        } else {
+            Err("VPN client service is not running".into())
+        }
+    }
+
+    async fn terminate(&mut self) -> Result<(), IKEv2Error> {
+        match self.command_sender {
+            Some(ref command_sender) => {
+                if command_sender
+                    .send(FortiServiceCommand::Shutdown)
+                    .await
+                    .is_err()
+                {
+                    return Err("Command channel closed".into());
+                }
+            }
+            None => return Err("Shutdown already in progress".into()),
+        }
+        self.command_sender = None;
+        while let Some(res) = self.join_set.join_next().await {
+            if let Err(err) = res {
+                warn!("Error returned when stopping VPN client: {}", err);
+            }
+        }
+        Ok(())
+    }
+}
+
+enum FortiServiceCommand {
+    HandleConnection(Result<fortivpn::FortiVPNTunnel, fortivpn::FortiError>),
+    RequestIp(oneshot::Sender<Option<IpAddr>>),
+    SendPacket(Vec<u8>),
+    ReceivePacket,
+    SendEcho,
+    Shutdown,
 }
 
 struct SplitRouteRegistry {
@@ -751,6 +1069,7 @@ pub enum IKEv2Error {
     CertError(pki::CertError),
     Session(session::SessionError),
     Esp(esp::EspError),
+    Forti(fortivpn::FortiError),
     SendError(SendError),
     Join(tokio::task::JoinError),
     Io(io::Error),
@@ -765,6 +1084,9 @@ impl fmt::Display for IKEv2Error {
             Self::CertError(ref e) => write!(f, "PKI cert error: {}", e),
             Self::Session(ref e) => write!(f, "IKEv2 session error: {}", e),
             Self::Esp(ref e) => write!(f, "ESP error: {}", e),
+            Self::Forti(ref e) => {
+                write!(f, "VPN error: {}", e)
+            }
             Self::SendError(ref e) => write!(f, "Send error: {}", e),
             Self::Join(ref e) => write!(f, "Tokio join error: {}", e),
             Self::Io(ref e) => {
@@ -783,6 +1105,7 @@ impl error::Error for IKEv2Error {
             Self::CertError(ref err) => Some(err),
             Self::Session(ref err) => Some(err),
             Self::Esp(ref err) => Some(err),
+            Self::Forti(ref err) => Some(err),
             Self::SendError(ref err) => Some(err),
             Self::Join(ref err) => Some(err),
             Self::Io(ref err) => Some(err),
@@ -823,6 +1146,12 @@ impl From<session::SessionError> for IKEv2Error {
 impl From<esp::EspError> for IKEv2Error {
     fn from(err: esp::EspError) -> IKEv2Error {
         Self::Esp(err)
+    }
+}
+
+impl From<fortivpn::FortiError> for IKEv2Error {
+    fn from(err: fortivpn::FortiError) -> IKEv2Error {
+        Self::Forti(err)
     }
 }
 
