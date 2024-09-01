@@ -15,6 +15,7 @@ ExecStart=/var/home/core/pterodapter/pterodapter --log-level=trace --listen-ip=:
     --cacert=vpn-root.cert.pem --cert=vpn-server.cert.pem --key=vpn-server.key.pem\\
     --tunnel-domain=gitlab.example.com --tunnel-domain=jenkins.example.com\\
     ikev2
+KillSignal=SIGINT
 KillMode=process
 Restart=on-failure
 
