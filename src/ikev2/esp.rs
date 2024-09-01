@@ -110,7 +110,7 @@ impl SecurityAssociation {
         if data.len() < msg_len + 8 + self.signature_length {
             return Err("Not enough data in ESP packet".into());
         }
-        if self.local_seq >= u32::MAX {
+        if self.local_seq == u32::MAX {
             return Err("Sequence number overflow".into());
         }
         data.copy_within(..msg_len, 8);
