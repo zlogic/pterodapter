@@ -300,10 +300,10 @@ impl IKEv2Session {
     }
 
     fn complete_encrypted_payload(
-        &self,
+        &mut self,
         response: &mut message::MessageWriter,
     ) -> Result<usize, SessionError> {
-        let crypto_stack = if let Some(crypto_stack) = &self.crypto_stack {
+        let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
             crypto_stack
         } else {
             return Err("Crypto stack not initialized".into());
@@ -989,7 +989,7 @@ impl IKEv2Session {
     }
 
     fn process_failed_response(
-        &self,
+        &mut self,
         response: &mut message::MessageWriter,
         reason: message::NotifyMessageType,
         err: SessionError,

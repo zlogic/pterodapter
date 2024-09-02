@@ -1,5 +1,4 @@
 use log::warn;
-use rand::Rng;
 use ring::{aead, agreement, digest, hkdf, hmac};
 use std::{error, fmt, ops::Range};
 
@@ -727,7 +726,7 @@ impl CryptoStack {
     }
 
     pub fn encrypt_data<'a>(
-        &self,
+        &mut self,
         data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
@@ -790,7 +789,7 @@ impl<'a> Extend<&'a u8> for SliceBuffer<'_> {
 
 pub trait Encryption {
     fn encrypt<'a>(
-        &self,
+        &mut self,
         data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
@@ -828,7 +827,12 @@ impl EncryptionType {
                     Err(_) => return Err(InitError::new("Failed to init AES GCM 256 key")),
                 };
                 let key = aead::LessSafeKey::new(key);
-                Ok(Self::AesGcm256(EncryptionAesGcm256 { key, salt, padding }))
+                Ok(Self::AesGcm256(EncryptionAesGcm256 {
+                    key,
+                    salt,
+                    padding,
+                    iv: 0,
+                }))
             }
             _ => Err("ENC not initialized".into()),
         }
@@ -841,13 +845,13 @@ impl EncryptionType {
     }
 
     fn encrypt<'a>(
-        &self,
+        &mut self,
         data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
         match self {
-            Self::AesGcm256(ref enc) => enc.encrypt(data, msg_len, associated_data),
+            Self::AesGcm256(ref mut enc) => enc.encrypt(data, msg_len, associated_data),
         }
     }
 
@@ -957,17 +961,24 @@ pub struct EncryptionAesGcm256 {
     key: aead::LessSafeKey,
     salt: [u8; 4],
     padding: PaddingType,
+    iv: u64,
 }
 
 impl Encryption for EncryptionAesGcm256 {
     fn encrypt<'a>(
-        &self,
+        &mut self,
         data: &'a mut [u8],
         msg_len: usize,
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
         if data.len() < self.encrypted_payload_length(msg_len) {
             return Err("Message length is too short".into());
+        }
+        if self.iv == u64::MAX {
+            // Reusing an IV/nonce is a security risk - XOR can provide some hints on message contents.
+            // Reusing nonces in GCM can also reveal the private key.
+            // Windows IKEv2 client works the same way (GCM IV is the same as the ESP message counter).
+            return Err("AES GCM 16 256 IV counter reached limit, rekeying is required".into());
         }
         // Pad length.
         let padded_length = self.padding.pad_to_boundary(msg_len);
@@ -979,12 +990,8 @@ impl Encryption for EncryptionAesGcm256 {
         // Move message to the right to make space for the explicit nonce.
         data.copy_within(..msg_len, 8);
         // TODO: use a counter, and fail when all values have been used. GCM ciphers should never reuse nonces.
-        rand::thread_rng()
-            .try_fill(&mut nonce[4..])
-            .map_err(|err| {
-                warn!("Failed to generate nonce for AES GCM 16 256: {}", err);
-                "Failed to generate nonce for AES GCM 16 256"
-            })?;
+        nonce[4..12].copy_from_slice(&self.iv.to_be_bytes());
+        self.iv += 1;
         data[..8].copy_from_slice(&nonce[4..]);
         let mut buffer = SliceBuffer {
             slice: &mut data[8..],
