@@ -37,7 +37,6 @@ const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 const VPN_ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
 const VPN_ECHO_TIMEOUT: Duration = Duration::from_secs(60);
-const VPN_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 
 pub struct Config {
     pub listen_ips: Vec<IpAddr>,
@@ -813,7 +812,7 @@ impl FortiService {
                     FortiServiceCommand::ReceivePacket => {
                         debug!("Received packet from closed FortiClient channel");
                     }
-                    FortiServiceCommand::SendEcho | FortiServiceCommand::Flush => {}
+                    FortiServiceCommand::SendEcho => {}
                     FortiServiceCommand::RequestIp(tx) => {
                         debug!("Received IP request for closed FortiClient channel");
                         let _ = tx.send(None);
@@ -839,17 +838,6 @@ impl FortiService {
                     }
                 })
             };
-            let flush_timer = {
-                let rt = runtime::Handle::current();
-                let tx = tx.clone();
-                rt.spawn(async move {
-                    let mut interval = tokio::time::interval(VPN_FLUSH_INTERVAL);
-                    loop {
-                        interval.tick().await;
-                        let _ = tx.send(FortiServiceCommand::Flush).await;
-                    }
-                })
-            };
             // Handle connection until it drops.
             let mut last_echo_sent = time::Instant::now();
             while let Some(command) =
@@ -861,8 +849,6 @@ impl FortiService {
                             warn!("Failed to send packet to VPN: {}", err);
                             break;
                         };
-                    }
-                    FortiServiceCommand::Flush => {
                         if let Err(err) = forti_client.flush().await {
                             warn!("Failed to flush VPN stream: {}", err);
                             break;
@@ -913,7 +899,6 @@ impl FortiService {
                 }
             }
             keepalive_timer.abort();
-            flush_timer.abort();
             if let Err(err) = forti_client.terminate().await {
                 warn!("Failed to terminate VPN client connection: {}", err);
             }
@@ -991,7 +976,6 @@ enum FortiServiceCommand {
     SendPacket(Vec<u8>),
     ReceivePacket,
     SendEcho,
-    Flush,
     Shutdown,
 }
 
