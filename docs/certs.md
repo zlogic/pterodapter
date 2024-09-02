@@ -28,15 +28,13 @@ Generate server key
 
 ```shell
 SERVER_HOST=pterodapter.home
-openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-server.cert.pem -keyout vpn-server.key.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=${SERVER_HOST}" \
-  -addext "subjectAltName = DNS:${SERVER_HOST}" -addext "extendedKeyUsage = serverAuth, 1.3.6.1.5.5.8.2.2" -addext "basicConstraints = critical, CA:FALSE"
-```
-
-Convert server certificate to unencrypted form
-
-```shell
-openssl pkcs8 -nocrypt -topk8 -in vpn-server.key.pem -out vpn-server.pkcs8.pem
-mv vpn-server.pkcs8.pem vpn-server.key.pem
+openssl req -new -nodes -newkey ec:<(openssl ecparam -name prime256v1) -out vpn-server.csr.pem -keyout vpn-server.key.pem -days 730 -subj "/C=NL/O=Pterodapter/CN=${SERVER_HOST}"
+openssl x509 -req -CAcreateserial -sha256 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -in vpn-server.csr.pem -out vpn-server.cert.pem -days 730 \
+  -extensions v3_req -extfile <(echo "[ v3_req ]
+subjectAltName = DNS:${SERVER_HOST}
+extendedKeyUsage = serverAuth, 1.3.6.1.5.5.8.2.2
+basicConstraints = critical, CA:FALSE")
+rm vpn-server.csr.pem
 ```
 
 ## Client certificates
@@ -45,9 +43,15 @@ Generate client key
 
 ```shell
 SERVER_HOST=pterodapter.home
-USERNAME="user@${SERVER_HOST}"
-openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -out vpn-client.cert.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter Client/CN=${USERNAME}" \
-  -addext "subjectAltName = email:${USERNAME}" -addext "extendedKeyUsage = clientAuth" -addext "keyUsage = digitalSignature" -addext "basicConstraints = critical, CA:FALSE"
+USER_EMAIL="user@${SERVER_HOST}"
+openssl req -new -newkey ec:<(openssl ecparam -name prime256v1) -out vpn-client.csr.pem -keyout vpn-client.key.pem -days 730 -subj "/C=NL/O=Pterodapter Client/CN=${USER_EMAIL}"
+openssl x509 -req -CAcreateserial -sha256 -CA vpn-root.cert.pem -CAkey vpn-root.key.pem -in vpn-client.csr.pem -out vpn-client.cert.pem -days 730 \
+  -extensions v3_req -extfile <(echo "[ v3_req ]
+subjectAltName = email:${USER_EMAIL}
+extendedKeyUsage = clientAuth
+keyUsage = digitalSignature
+basicConstraints = critical, CA:FALSE")
+rm vpn-client.csr.pem
 ```
 
 ### Windows
