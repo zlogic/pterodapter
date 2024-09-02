@@ -704,7 +704,7 @@ impl Sessions {
             if data.len() >= MAX_ESP_PACKET_SIZE {
                 return Err("Vector doesn't have capacity for ESP headers".into());
             }
-            data.resize(MAX_ESP_PACKET_SIZE, 0);
+            data.resize(sa.encoded_length(data.len()), 0);
             let encrypted_data = sa.handle_vpn(data.as_mut_slice(), msg_len)?;
             trace!(
                 "Encrypted VPN packet to {}\n{:?}",

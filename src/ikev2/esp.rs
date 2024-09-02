@@ -55,8 +55,8 @@ impl SecurityAssociation {
         self.remote_addr
     }
 
-    pub fn headers_size(&self) -> usize {
-        8 + self.signature_length
+    pub fn encoded_length(&self, msg_len: usize) -> usize {
+        8 + self.crypto_stack.encrypted_payload_length(msg_len)
     }
 
     fn contains(&self, remote_addr: &SocketAddr, local_addr: &SocketAddr) -> bool {
