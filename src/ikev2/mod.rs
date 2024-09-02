@@ -265,6 +265,7 @@ enum SessionMessage {
     UdpDatagram(UdpDatagram),
     RetransmitRequest(session::SessionID, u32),
     VpnPacket(Vec<u8>),
+    VpnDisconnected,
     CleanupTimer,
     Shutdown,
     UpdateSplitRoutes(Vec<IpAddr>, Vec<message::TrafficSelector>),
@@ -391,28 +392,32 @@ impl Sessions {
             session.handle_response_expiration(now);
         });
         if self.shutdown {
-            for (session_id, session) in self.sessions.iter_mut() {
-                if session.is_deleting_request() {
+            self.delete_all_sessions(rt);
+        }
+    }
+
+    fn delete_all_sessions(&mut self, rt: &runtime::Handle) {
+        for (session_id, session) in self.sessions.iter_mut() {
+            if session.is_deleting_request() {
+                continue;
+            }
+            let message_id = match session.start_request_delete_ike() {
+                Ok(message_id) => message_id,
+                Err(err) => {
+                    warn!(
+                        "Failed to prepare Delete request to session {}: {}",
+                        session_id, err
+                    );
                     continue;
                 }
-                let message_id = match session.start_request_delete_ike() {
-                    Ok(message_id) => message_id,
-                    Err(err) => {
-                        warn!(
-                            "Failed to prepare Delete request to session {}: {}",
-                            session_id, err
-                        );
-                        continue;
-                    }
-                };
-                let sender = self.tx.clone();
-                let session_id = session_id.clone();
-                rt.spawn(async move {
-                    let _ = sender
-                        .send(SessionMessage::RetransmitRequest(session_id, message_id))
-                        .await;
-                });
-            }
+            };
+            let sender = self.tx.clone();
+            let session_id = session_id.clone();
+            rt.spawn(async move {
+                let _ = sender
+                    .send(SessionMessage::RetransmitRequest(session_id, message_id))
+                    .await;
+            });
         }
     }
 
@@ -443,6 +448,10 @@ impl Sessions {
                     if let Err(err) = self.process_vpn_packet(data).await {
                         warn!("Failed to process VPN packet: {}", err);
                     }
+                }
+                SessionMessage::VpnDisconnected => {
+                    let rt = runtime::Handle::current();
+                    self.delete_all_sessions(&rt);
                 }
                 SessionMessage::CleanupTimer => {
                     let rt = runtime::Handle::current();
@@ -902,6 +911,7 @@ impl FortiService {
             if let Err(err) = forti_client.terminate().await {
                 warn!("Failed to terminate VPN client connection: {}", err);
             }
+            let _ = sessions_tx.send(SessionMessage::VpnDisconnected).await;
         }
     }
 
