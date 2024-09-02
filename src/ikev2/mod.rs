@@ -849,8 +849,10 @@ impl FortiService {
             };
             // Handle connection until it drops.
             let mut last_echo_sent = time::Instant::now();
-            while let Some(command) =
-                crate::futures::select(rx.recv(), Self::peek_vpn(&mut forti_client)).await
+            let mut selector = crate::futures::RoundRobinSelector::new();
+            while let Some(command) = selector
+                .select(rx.recv(), Self::peek_vpn(&mut forti_client))
+                .await
             {
                 match command {
                     FortiServiceCommand::SendPacket(data) => {
