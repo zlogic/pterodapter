@@ -906,8 +906,17 @@ impl PaddingType {
                 data[data.len() - 1] = padding_length;
             }
             Self::Esp => {
-                // TODO: specify protocol type from https://datatracker.ietf.org/doc/html/rfc4303#section-2.6 externally?
-                data[data.len() - 1] = 4; //IPv4 for now
+                // Try to detect IP protocol type based on
+                // https://datatracker.ietf.org/doc/html/rfc4303#section-2.6
+                // ESP sends L3 traffic, which can only be IP packets.
+                data[data.len() - 1] = match data[0] >> 4 {
+                    4 => 4,  //IPv4
+                    6 => 41, //IPv6
+                    _ => {
+                        warn!("ESP IP packet is not a supported IP version: {:x}", data[0]);
+                        return Err("Unsupported IP prococol version".into());
+                    }
+                };
                 data[data.len() - 2] = padding_length;
                 // RFC 4303 Section 2.4 requires alignment and specific contents for the padding field.
                 let padding_range = msg_len..data.len() - 2;
