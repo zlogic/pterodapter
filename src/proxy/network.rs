@@ -555,7 +555,7 @@ impl phy::Device for VpnDevice<'_> {
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut caps = phy::DeviceCapabilities::default();
-        caps.max_transmission_unit = self.vpn.mtu();
+        caps.max_transmission_unit = self.vpn.mtu() as usize;
         caps.max_burst_size = Some(DEVICE_BUFFERS_COUNT / 2);
         caps.medium = phy::Medium::Ip;
         caps.checksum.ipv4 = phy::Checksum::Both;

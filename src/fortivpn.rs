@@ -22,11 +22,18 @@ pub struct Config {
     pub tls_config: Arc<rustls::client::ClientConfig>,
     pub destination_addr: SocketAddr,
     pub destination_hostport: String,
+    pub mtu: u16,
 }
 
-// TODO: allow this to be configured.
 // PPP_MTU specifies is the MTU excluding IP, TCP, TLS, FortiVPN and PPP encapsulation headers.
-const PPP_MTU: u16 = 1500 - 20 - 20 - 5 - 6 - 4;
+// When running locally, using this MTU adjusts to the FortiVPN stream MTU.
+pub const PPP_MTU: u16 = 1500 - 20 - 20 - 5 - 6 - 4;
+
+// ESP_MTU specifies the typical MTU used by most IKEv2 clients.
+// By aligning to this value, fragmentation can be significantly reduced.
+pub const ESP_MTU: u16 = 1280;
+
+const MAX_MTU: usize = PPP_MTU as usize;
 
 // TODO: check how FortiVPN chooses the listen port - is it fixed or sent as a parameter?
 const REDIRECT_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8020);
@@ -127,7 +134,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
 pub struct FortiVPNTunnel {
     socket: BufTlsStream,
     addr: IpAddr,
-    mtu: usize,
+    mtu: u16,
     ppp_state: PPPState,
     ppp_magic: u32,
     ppp_identifier: u8,
@@ -147,13 +154,14 @@ impl FortiVPNTunnel {
         let addr = Self::request_vpn_allocation(domain, &mut socket, &cookie).await?;
         Self::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
 
+        let mtu = config.mtu;
         let mut ppp_state = PPPState::new();
-        let ppp_magic = Self::start_ppp(&mut socket, &mut ppp_state).await?;
+        let ppp_magic = Self::start_ppp(&mut socket, &mut ppp_state, mtu).await?;
         Self::start_ipcp(&mut socket, &mut ppp_state, addr).await?;
         Ok(FortiVPNTunnel {
             socket,
             addr,
-            mtu: PPP_MTU as usize,
+            mtu,
             ppp_state,
             ppp_magic,
             ppp_identifier: 2,
@@ -165,7 +173,7 @@ impl FortiVPNTunnel {
         self.addr
     }
 
-    pub fn mtu(&self) -> usize {
+    pub fn mtu(&self) -> u16 {
         self.mtu
     }
 
@@ -228,6 +236,7 @@ impl FortiVPNTunnel {
     async fn start_ppp(
         socket: &mut BufTlsStream,
         ppp_state: &mut PPPState,
+        mtu: u16,
     ) -> Result<u32, FortiError> {
         // Open PPP link; 200 bytes should fit any PPP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
@@ -236,7 +245,7 @@ impl FortiVPNTunnel {
         let identifier = 1;
         let magic = rand::thread_rng().gen::<u32>();
         let opts = [
-            ppp::LcpOptionData::MaximumReceiveUnit(PPP_MTU),
+            ppp::LcpOptionData::MaximumReceiveUnit(mtu),
             ppp::LcpOptionData::MagicNumber(magic),
         ];
         let length =
@@ -310,8 +319,8 @@ impl FortiVPNTunnel {
                                 }
                             };
                             match opt {
-                                ppp::LcpOptionData::MaximumReceiveUnit(mtu) => {
-                                    if mtu <= PPP_MTU {
+                                ppp::LcpOptionData::MaximumReceiveUnit(offered_mtu) => {
+                                    if offered_mtu <= mtu {
                                         Ok(opt)
                                     } else {
                                         debug!("Remote side sent unacceptable MTU: {}", mtu);
@@ -684,7 +693,7 @@ impl FortiVPNTunnel {
     pub async fn terminate(&mut self) -> Result<(), FortiError> {
         let mut req = [0u8; 4];
         // Ensure that any stray IP packets are accepted.
-        let mut resp = [0u8; PPP_MTU as usize + 8];
+        let mut resp = [0u8; MAX_MTU as usize + 8];
         let length = ppp::encode_lcp_data(
             &mut req,
             ppp::LcpCode::TERMINATE_REQUEST,

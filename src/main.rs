@@ -231,10 +231,15 @@ impl Args {
                 }
             };
 
+        let mtu = match action_type {
+            ActionType::Proxy => fortivpn::PPP_MTU,
+            ActionType::IkeV2 => fortivpn::ESP_MTU,
+        };
         let fortivpn_config = fortivpn::Config {
             destination_addr,
             destination_hostport,
             tls_config,
+            mtu,
         };
 
         match action_type {
