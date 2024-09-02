@@ -874,7 +874,9 @@ impl FortiService {
                             }
                         };
                         if !data.is_empty() {
-                            let _ = sessions_tx.send(SessionMessage::VpnPacket(data)).await;
+                            let rt = runtime::Handle::current();
+                            let tx = sessions_tx.clone();
+                            rt.spawn(async move { tx.send(SessionMessage::VpnPacket(data)).await });
                         }
                     }
                     FortiServiceCommand::SendEcho => {
@@ -937,10 +939,10 @@ impl FortiService {
 
     async fn send_packet(&self, data: Vec<u8>) -> Result<(), IKEv2Error> {
         if let Some(tx) = self.command_sender.as_ref() {
-            Ok(tx
-                .send(FortiServiceCommand::SendPacket(data))
-                .await
-                .map_err(|_| "VPN client command channel closed")?)
+            let rt = runtime::Handle::current();
+            let tx = tx.clone();
+            rt.spawn(async move { tx.send(FortiServiceCommand::SendPacket(data)).await });
+            Ok(())
         } else {
             Err("VPN client service is not running".into())
         }
