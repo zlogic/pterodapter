@@ -280,6 +280,7 @@ struct Sessions {
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
+    reserved_spi: Option<session::ReservedSpi>,
     tx: mpsc::Sender<SessionMessage>,
     rx: mpsc::Receiver<SessionMessage>,
     shutdown: bool,
@@ -303,6 +304,7 @@ impl Sessions {
             sessions: HashMap::new(),
             security_associations: HashMap::new(),
             half_sessions: HashMap::new(),
+            reserved_spi: None,
             tx,
             rx,
             shutdown: false,
@@ -316,12 +318,13 @@ impl Sessions {
     fn get_init_session(
         &mut self,
         remote_spi: u64,
+        local_spi: u64,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
     ) -> session::SessionID {
         let now = Instant::now();
         let half_key = (remote_addr, remote_spi);
-        let new_session_id = (rand::thread_rng().gen::<u64>(), now);
+        let new_session_id = (local_spi, now);
         let existing_half_session = self
             .half_sessions
             .entry(half_key)
@@ -432,6 +435,27 @@ impl Sessions {
         }
     }
 
+    fn reserve_session_ids(&mut self) -> session::ReservedSpi {
+        let mut reserved_spi = if let Some(reserved_spi) = self.reserved_spi.take() {
+            reserved_spi
+        } else {
+            session::ReservedSpi::new()
+        };
+        while reserved_spi.needs_ike() {
+            let next_id = rand::thread_rng().gen::<u64>();
+            if !self.sessions.keys().any(|key| key.local_spi() == next_id) {
+                reserved_spi.add_ike(next_id);
+            }
+        }
+        while reserved_spi.needs_esp() {
+            let next_id = rand::thread_rng().gen::<u32>();
+            if !self.security_associations.keys().any(|key| *key == next_id) {
+                reserved_spi.add_esp(next_id);
+            }
+        }
+        reserved_spi
+    }
+
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
         self.vpn_service.start(self.create_sender()).await?;
         while let Some(message) = self.rx.recv().await {
@@ -512,8 +536,16 @@ impl Sessions {
                     "Ignoring IKE_SA_INIT request, because a shutdown is in progress".into(),
                 );
             }
+            let mut reserved_spi = self.reserve_session_ids();
+            let local_spi = if let Some(local_spi) = reserved_spi.take_ike() {
+                local_spi
+            } else {
+                return Err("No pre-generated IKE SA ID available".into());
+            };
+            self.reserved_spi = Some(reserved_spi);
             self.get_init_session(
                 ikev2_request.read_initiator_spi(),
+                local_spi,
                 datagram.remote_addr,
                 datagram.local_addr,
             )
@@ -527,6 +559,7 @@ impl Sessions {
         } else {
             None
         };
+        let mut reserved_spi = self.reserve_session_ids();
         let session = if let Some(session) = self.get(session_id) {
             session
         } else {
@@ -550,7 +583,9 @@ impl Sessions {
                 datagram.local_addr,
                 &ikev2_request,
                 &mut ikev2_response,
+                &mut reserved_spi,
             )?;
+            self.reserved_spi = Some(reserved_spi);
 
             let response_bytes = &response_bytes[..response_len + start_offset];
 

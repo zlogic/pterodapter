@@ -989,7 +989,6 @@ impl Encryption for EncryptionAesGcm256 {
         nonce[..4].copy_from_slice(&self.salt);
         // Move message to the right to make space for the explicit nonce.
         data.copy_within(..msg_len, 8);
-        // TODO: use a counter, and fail when all values have been used. GCM ciphers should never reuse nonces.
         nonce[4..12].copy_from_slice(&self.iv.to_be_bytes());
         self.iv += 1;
         data[..8].copy_from_slice(&nonce[4..]);

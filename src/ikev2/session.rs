@@ -68,6 +68,10 @@ impl SessionID {
             local_spi,
         })
     }
+
+    pub fn local_spi(&self) -> u64 {
+        self.local_spi
+    }
 }
 
 impl fmt::Display for SessionID {
@@ -194,6 +198,7 @@ impl IKEv2Session {
         local_addr: SocketAddr,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
+        new_ids: &mut ReservedSpi,
     ) -> Result<usize, SessionError> {
         // TODO: return error if payload type is critical but not recognized
         self.last_update = Instant::now();
@@ -224,13 +229,13 @@ impl IKEv2Session {
         let response_length = match exchange_type {
             message::ExchangeType::IKE_SA_INIT => self.process_sa_init_request(request, response),
             message::ExchangeType::IKE_AUTH => {
-                self.process_auth_request(remote_addr, local_addr, request, response)
+                self.process_auth_request(remote_addr, local_addr, request, response, new_ids)
             }
             message::ExchangeType::INFORMATIONAL => {
                 self.process_informational_request(request, response)
             }
             message::ExchangeType::CREATE_CHILD_SA => {
-                self.process_create_child_sa_request(request, response)
+                self.process_create_child_sa_request(request, response, new_ids)
             }
             _ => {
                 warn!("Unimplemented handler for message {}", exchange_type);
@@ -598,6 +603,7 @@ impl IKEv2Session {
         local_addr: SocketAddr,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
+        new_ids: &mut ReservedSpi,
     ) -> Result<usize, SessionError> {
         self.pending_actions
             .push(IKEv2PendingAction::DeleteHalfOpenSession(
@@ -860,7 +866,12 @@ impl IKEv2Session {
         }
         let ts_local = &self.ts_local;
 
-        let local_spi = rand::thread_rng().gen::<u32>();
+        let local_spi = if let Some(local_spi) = new_ids.take_esp() {
+            local_spi
+        } else {
+            // TODO: return NO_PROPOSAL_CHOSEN notification.
+            return Err("No pre-generated SA ID available".into());
+        };
         transform_params.set_local_spi(message::Spi::U32(local_spi));
         let remote_spi = match transform_params.remote_spi() {
             message::Spi::U32(remote_spi) => remote_spi,
@@ -1122,6 +1133,7 @@ impl IKEv2Session {
         &mut self,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
+        new_ids: &mut ReservedSpi,
     ) -> Result<usize, SessionError> {
         let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
             crypto_stack
@@ -1324,11 +1336,19 @@ impl IKEv2Session {
             };
             let prf_key = [shared_secret, &nonce_initiator, &nonce_responder].concat();
             let crypto_stack = if rekey_child_sa.is_some() || create_child_sa {
-                let local_spi = rand::thread_rng().gen::<u32>();
+                let local_spi = if let Some(local_spi) = new_ids.take_esp() {
+                    local_spi
+                } else {
+                    return Err("No pre-generated SA ID available".into());
+                };
                 transform_params.set_local_spi(message::Spi::U32(local_spi));
                 crypto_stack.create_child_stack(&transform_params, &prf_key)
             } else {
-                let local_spi = message::Spi::U64(rand::thread_rng().gen::<u64>());
+                let local_spi = if let Some(local_spi) = new_ids.take_ike() {
+                    message::Spi::U64(local_spi)
+                } else {
+                    return Err("No pre-generated IKE SA ID available".into());
+                };
                 transform_params.set_local_spi(local_spi);
                 let skeyseed = crypto_stack.rekey_skeyseed(&prf_key);
                 let remote_spi = transform_params.remote_spi();
@@ -1403,7 +1423,11 @@ impl IKEv2Session {
                 .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
         } else if create_child_sa {
             debug!("Creating new child SA");
-            let local_spi = rand::thread_rng().gen::<u32>();
+            let local_spi = if let Some(local_spi) = new_ids.take_esp() {
+                local_spi
+            } else {
+                return Err("No pre-generated SA ID available".into());
+            };
             transform_params.set_local_spi(message::Spi::U32(local_spi));
             let remote_spi = match transform_params.remote_spi() {
                 message::Spi::U32(remote_spi) => remote_spi,
@@ -1717,6 +1741,44 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
     let src_data = &src_data[..16 + addr_len + 2];
 
     crypto::hash_sha1(src_data)
+}
+
+pub struct ReservedSpi {
+    ike: Option<u64>,
+    esp: Option<u32>,
+}
+
+impl ReservedSpi {
+    pub fn new() -> ReservedSpi {
+        ReservedSpi {
+            ike: None,
+            esp: None,
+        }
+    }
+
+    pub fn needs_ike(&self) -> bool {
+        self.ike.is_none()
+    }
+
+    pub fn needs_esp(&self) -> bool {
+        self.esp.is_none()
+    }
+
+    pub fn add_ike(&mut self, value: u64) {
+        self.ike = Some(value)
+    }
+
+    pub fn add_esp(&mut self, value: u32) {
+        self.esp = Some(value)
+    }
+
+    pub fn take_ike(&mut self) -> Option<u64> {
+        self.ike.take()
+    }
+
+    fn take_esp(&mut self) -> Option<u32> {
+        self.esp.take()
+    }
 }
 
 #[derive(Clone, Copy)]
