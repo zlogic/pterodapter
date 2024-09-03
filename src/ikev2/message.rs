@@ -1977,7 +1977,7 @@ impl IPProtocolType {
     pub const TCP: IPProtocolType = IPProtocolType(6);
     pub const UDP: IPProtocolType = IPProtocolType(17);
 
-    fn from_u8(value: u8) -> IPProtocolType {
+    pub fn from_u8(value: u8) -> IPProtocolType {
         IPProtocolType(value)
     }
 }

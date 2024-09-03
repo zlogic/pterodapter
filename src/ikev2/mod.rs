@@ -719,6 +719,11 @@ impl Sessions {
                 datagram.remote_addr,
                 decrypted_slice
             );
+            let hdr = esp::IpHeader::from_packet(decrypted_slice)?;
+            trace!("IP header {}", hdr);
+            if !sa.accepts_esp_to_vpn(&hdr) {
+                return Err("ESP packet dropped by traffic selector".into());
+            }
             if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
                 warn!(
                     "Decrypted packet size {} exceeds MTU {}",
@@ -740,10 +745,22 @@ impl Sessions {
     }
 
     async fn process_vpn_packet(&mut self, mut data: Vec<u8>) -> Result<(), IKEv2Error> {
-        // TODO: select SA based on packet data.
-        // TODO: log protocol & address data
-        trace!("Received packet from VPN\n{:?}", data);
-        if let Some(sa) = self.security_associations.values_mut().next() {
+        let hdr = match esp::IpHeader::from_packet(&data) {
+            Ok(hdr) => hdr,
+            Err(err) => {
+                warn!(
+                    "Failed to read header in IP packet from VPN: {}\n{:?}",
+                    err, data
+                );
+                return Err("Failed to read header in IP packet from VPN".into());
+            }
+        };
+        trace!("Received packet from VPN {}\n{:?}", hdr, data);
+        if let Some(sa) = self
+            .security_associations
+            .values_mut()
+            .find(|sa| sa.accepts_vpn_to_esp(&hdr))
+        {
             let msg_len = data.len();
             if data.len() >= MAX_ESP_PACKET_SIZE {
                 return Err("Vector doesn't have capacity for ESP headers".into());
@@ -760,7 +777,7 @@ impl Sessions {
                 .await?;
             Ok(())
         } else {
-            Err("Target Security Association not found".into())
+            Err("No matchig Security Associations found".into())
         }
     }
 }
