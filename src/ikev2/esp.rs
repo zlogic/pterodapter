@@ -64,6 +64,12 @@ impl SecurityAssociation {
         8 + self.crypto_stack.encrypted_payload_length(msg_len)
     }
 
+    pub fn max_sequence_number(&self) -> u32 {
+        self.replay_window
+            .last_seq
+            .map_or(self.local_seq, |remote_seq| remote_seq.max(self.local_seq))
+    }
+
     pub fn accepts_esp_to_vpn(&self, hdr: &IpHeader) -> bool {
         ts_accepts_header(&self.ts_local, &hdr, TsCheck::Destination)
             && ts_accepts_header(&self.ts_remote, &hdr, TsCheck::Source)

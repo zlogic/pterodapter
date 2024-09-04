@@ -760,10 +760,20 @@ impl Sessions {
             }
         };
         trace!("Received packet from VPN {}\n{:?}", hdr, data);
+        // Prefer SA with lower sequence number - but only if it's active.
+        // Might be a better idea to instead just use a counter?
         if let Some(sa) = self
             .security_associations
             .values_mut()
-            .find(|sa| sa.accepts_vpn_to_esp(&hdr))
+            .filter(|sa| sa.accepts_vpn_to_esp(&hdr))
+            .reduce(|a, b| {
+                let a_seq = a.max_sequence_number();
+                if a_seq > 0 && a_seq < b.max_sequence_number() {
+                    a
+                } else {
+                    b
+                }
+            })
         {
             let msg_len = data.len();
             if data.len() >= MAX_ESP_PACKET_SIZE {
