@@ -715,7 +715,7 @@ impl Sessions {
         let mut local_spi = [0u8; 4];
         local_spi.copy_from_slice(&packet_bytes[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
-        if let Some(sa) = self.security_associations.get(&local_spi) {
+        if let Some(sa) = self.security_associations.get_mut(&local_spi) {
             let packet_bytes = datagram.request.as_mut_slice();
             let decrypted_slice = sa.handle_esp(packet_bytes)?;
             trace!(
@@ -781,7 +781,7 @@ impl Sessions {
                 .await?;
             Ok(())
         } else {
-            Err("No matchig Security Associations found".into())
+            Err("No matching Security Associations found".into())
         }
     }
 }

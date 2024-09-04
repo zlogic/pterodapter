@@ -18,6 +18,7 @@ pub struct SecurityAssociation {
     signature_length: usize,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
+    replay_window: ReplayWindow,
     local_seq: u32,
 }
 
@@ -46,6 +47,7 @@ impl SecurityAssociation {
             remote_addr,
             crypto_stack,
             signature_length,
+            replay_window: ReplayWindow::new(),
             local_seq: 0,
         }
     }
@@ -72,7 +74,7 @@ impl SecurityAssociation {
             && ts_accepts_header(&self.ts_local, &hdr, TsCheck::Source)
     }
 
-    pub fn handle_esp<'a>(&self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
+    pub fn handle_esp<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
         if data.len() < 8 + self.signature_length {
             return Err("Not enough data in ESP packet".into());
         }
@@ -82,10 +84,12 @@ impl SecurityAssociation {
         if self.local_spi != local_spi {
             return Err("Received packet for another local SPI".into());
         }
-        let mut sequence_id = [0u8; 4];
-        sequence_id.copy_from_slice(&data[4..8]);
-        // TODO: validate that sequence ID is not reused, as defined in https://datatracker.ietf.org/doc/html/rfc6479
-        // let sequence_id = u32::from_be_bytes(sequence_id);
+        let mut sequence_number = [0u8; 4];
+        sequence_number.copy_from_slice(&data[4..8]);
+        let sequence_number = u32::from_be_bytes(sequence_number);
+        if !self.replay_window.is_unique(sequence_number) {
+            return Err("Received packet with replayed Sequence Number".into());
+        }
         let signed_data_len = data.len() - self.signature_length;
         let valid_signature = self.crypto_stack.validate_signature(data);
         if !valid_signature {
@@ -103,10 +107,13 @@ impl SecurityAssociation {
             signed_data_len - 8,
             associated_data,
         ) {
-            Ok(data) => Ok(data),
+            Ok(data) => {
+                self.replay_window.update(sequence_number);
+                Ok(data)
+            }
             Err(err) => {
                 warn!("Failed to decrypt ESP packet: {}", err);
-                Err("Failed to decrypt ESP packet".into())
+                return Err("Failed to decrypt ESP packet".into());
             }
         }
     }
@@ -349,6 +356,76 @@ impl fmt::Display for IpHeader {
             write!(f, "{}", self.dst_addr)?;
         }
         Ok(())
+    }
+}
+
+const REPLAY_WINDOW_SIZE: usize = 1024;
+const REPLAY_WINDOW_BLOCK_SIZE: usize = usize::BITS as usize;
+
+struct ReplayWindow {
+    last_seq: Option<u32>,
+    window: [usize; REPLAY_WINDOW_SIZE / REPLAY_WINDOW_BLOCK_SIZE],
+}
+
+impl ReplayWindow {
+    fn new() -> ReplayWindow {
+        // Inspired by RFC 6479 (but better :).
+        ReplayWindow {
+            last_seq: None,
+            window: [0usize; REPLAY_WINDOW_SIZE / REPLAY_WINDOW_BLOCK_SIZE],
+        }
+    }
+
+    fn is_unique(&self, seq_num: u32) -> bool {
+        let last_seq = if let Some(last_seq) = self.last_seq {
+            last_seq
+        } else {
+            // First packet.
+            return true;
+        };
+        if seq_num > last_seq {
+            // Higher than all all previously received packets.
+            return true;
+        }
+        if seq_num == u32::MAX {
+            // Maxed out, cannot continue further.
+            return false;
+        }
+        if seq_num.abs_diff(last_seq) as usize > REPLAY_WINDOW_SIZE {
+            // Behind window, too old.
+            return false;
+        };
+
+        // For this to work correctly, REPLAY_WINDOW_SIZE must be a multiple of REPLAY_WINDOW_BLOCK_SIZE.
+        // In case bit shifting consumes multiple cycles, consider using a static lookup table?
+        let bit_mask = 1 << (seq_num as usize % REPLAY_WINDOW_BLOCK_SIZE);
+        let block_index = (seq_num as usize % REPLAY_WINDOW_SIZE) / REPLAY_WINDOW_BLOCK_SIZE;
+
+        self.window[block_index] & bit_mask == 0
+    }
+
+    fn update(&mut self, seq_num: u32) {
+        let current_block_index = if let Some(last_seq) = self.last_seq {
+            (last_seq as usize % REPLAY_WINDOW_SIZE) / REPLAY_WINDOW_BLOCK_SIZE
+        } else {
+            // First packet.
+            0
+        };
+
+        let bit_mask = 1 << (seq_num as usize % REPLAY_WINDOW_BLOCK_SIZE);
+        let block_index = (seq_num as usize % REPLAY_WINDOW_SIZE) / REPLAY_WINDOW_BLOCK_SIZE;
+
+        // This is 0 if seq_num is behind last_seq; wrapping prevents unnecessary loops.
+        let add_blocks = block_index.saturating_sub(current_block_index) % self.window.len();
+        for i in 1..=add_blocks {
+            self.window[(current_block_index + i) % self.window.len()] = 0;
+        }
+        self.window[block_index] |= bit_mask;
+
+        self.last_seq = self
+            .last_seq
+            .map(|last_seq| seq_num.max(last_seq))
+            .or(Some(seq_num))
     }
 }
 
