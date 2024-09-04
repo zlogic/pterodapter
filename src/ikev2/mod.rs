@@ -556,10 +556,11 @@ impl Sessions {
         } else {
             session::SessionID::from_message(&ikev2_request)?
         };
-        let client_ip = if ikev2_request.read_exchange_type()? == message::ExchangeType::IKE_AUTH
+        let ip_configuration = if ikev2_request.read_exchange_type()?
+            == message::ExchangeType::IKE_AUTH
             && !ikev2_request.read_flags()?.has(message::Flags::RESPONSE)
         {
-            self.vpn_service.client_ip().await?
+            self.vpn_service.ip_configuration().await?
         } else {
             None
         };
@@ -569,8 +570,8 @@ impl Sessions {
         } else {
             return Err("Session not found".into());
         };
-        if let Some(client_ip) = client_ip {
-            session.update_internal_addr(client_ip);
+        if let Some((client_ip, dns_addrs)) = ip_configuration {
+            session.update_ip(client_ip, dns_addrs);
         }
 
         let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
@@ -888,7 +889,7 @@ impl FortiService {
                         debug!("Received packet from closed FortiClient channel");
                     }
                     FortiServiceCommand::SendEcho => {}
-                    FortiServiceCommand::RequestIp(tx) => {
+                    FortiServiceCommand::RequestIpConfiguration(tx) => {
                         debug!("Received IP request for closed FortiClient channel");
                         let _ = tx.send(None);
                     }
@@ -955,8 +956,9 @@ impl FortiService {
                         }
                         last_echo_sent = next_echo_sent;
                     }
-                    FortiServiceCommand::RequestIp(tx) => {
-                        let _ = tx.send(Some(forti_client.ip_addr()));
+                    FortiServiceCommand::RequestIpConfiguration(tx) => {
+                        let _ =
+                            tx.send(Some((forti_client.ip_addr(), forti_client.dns().to_vec())));
                     }
                     FortiServiceCommand::Shutdown => {
                         forti_client.terminate().await?;
@@ -1014,11 +1016,11 @@ impl FortiService {
         }
     }
 
-    async fn client_ip(&self) -> Result<Option<IpAddr>, IKEv2Error> {
+    async fn ip_configuration(&self) -> Result<Option<(IpAddr, Vec<IpAddr>)>, IKEv2Error> {
         if let Some(command_sender) = self.command_sender.as_ref() {
             let (tx, rx) = oneshot::channel();
             command_sender
-                .send(FortiServiceCommand::RequestIp(tx))
+                .send(FortiServiceCommand::RequestIpConfiguration(tx))
                 .await
                 .map_err(|_| "VPN client command channel closed")?;
             Ok(rx.await.map_err(|_| "IP address receiver closed")?)
@@ -1052,7 +1054,7 @@ impl FortiService {
 
 enum FortiServiceCommand {
     HandleConnection(Result<fortivpn::FortiVPNTunnel, fortivpn::FortiError>),
-    RequestIp(oneshot::Sender<Option<IpAddr>>),
+    RequestIpConfiguration(oneshot::Sender<Option<(IpAddr, Vec<IpAddr>)>>),
     SendPacket(Vec<u8>),
     ReceivePacket,
     SendEcho,

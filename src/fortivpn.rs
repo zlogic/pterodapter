@@ -131,9 +131,14 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     Ok(cookie)
 }
 
+struct IpConfig {
+    addr: IpAddr,
+    dns: Vec<IpAddr>,
+}
+
 pub struct FortiVPNTunnel {
     socket: BufTlsStream,
-    addr: IpAddr,
+    ip_config: IpConfig,
     mtu: u16,
     ppp_state: PPPState,
     ppp_magic: u32,
@@ -151,16 +156,16 @@ impl FortiVPNTunnel {
         let mut socket =
             Self::connect(&config.destination_addr, domain, config.tls_config.clone()).await?;
         debug!("Connected to VPN host");
-        let addr = Self::request_vpn_allocation(domain, &mut socket, &cookie).await?;
+        let ip_config = Self::request_vpn_allocation(domain, &mut socket, &cookie).await?;
         Self::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
 
         let mtu = config.mtu;
         let mut ppp_state = PPPState::new();
         let ppp_magic = Self::start_ppp(&mut socket, &mut ppp_state, mtu).await?;
-        Self::start_ipcp(&mut socket, &mut ppp_state, addr).await?;
+        Self::start_ipcp(&mut socket, &mut ppp_state, ip_config.addr).await?;
         Ok(FortiVPNTunnel {
             socket,
-            addr,
+            ip_config,
             mtu,
             ppp_state,
             ppp_magic,
@@ -170,7 +175,11 @@ impl FortiVPNTunnel {
     }
 
     pub fn ip_addr(&self) -> IpAddr {
-        self.addr
+        self.ip_config.addr
+    }
+
+    pub fn dns(&self) -> &[IpAddr] {
+        &self.ip_config.dns
     }
 
     pub fn mtu(&self) -> u16 {
@@ -194,7 +203,7 @@ impl FortiVPNTunnel {
         domain: &str,
         socket: &mut BufTlsStream,
         cookie: &str,
-    ) -> Result<IpAddr, FortiError> {
+    ) -> Result<IpConfig, FortiError> {
         let req = http::build_request("GET /remote/fortisslvpn_xml", domain, Some(cookie), 0);
         socket.write_all(req.as_bytes()).await?;
         socket.flush().await?;
@@ -203,24 +212,50 @@ impl FortiVPNTunnel {
         http::validate_response_code(&headers)?;
         let content = http::read_content(socket, headers.as_str()).await?;
 
-        const IPV4_ADDRESS_PREFIX: &str = "<assigned-addr ipv4='";
-        let ipv4_addr_start = if let Some(start) = content.find(IPV4_ADDRESS_PREFIX) {
-            start
-        } else {
-            debug!("Unsupported config format: {}", content);
-            return Err("Cannot find IPv4 address in config".into());
+        let addr = {
+            const IPV4_ADDRESS_PREFIX: &str = "<assigned-addr ipv4='";
+            let ipv4_addr_start = if let Some(start) = content.find(IPV4_ADDRESS_PREFIX) {
+                start
+            } else {
+                debug!("Unsupported config format: {}", content);
+                return Err("Cannot find IPv4 address in config".into());
+            };
+            let content = &content[ipv4_addr_start + IPV4_ADDRESS_PREFIX.len()..];
+            let ipv4_addr_end = if let Some(start) = content.find("'") {
+                start
+            } else {
+                debug!("Unsupported config format: {}", content);
+                return Err("Cannot find IPv4 address in config".into());
+            };
+            IpAddr::from_str(&content[..ipv4_addr_end]).map_err(|err| {
+                debug!("Failed to parse IPv4 address: {}", err);
+                "Failed to parse IPv4 address"
+            })?
         };
-        let content = &content[ipv4_addr_start + IPV4_ADDRESS_PREFIX.len()..];
-        let ipv4_addr_end = if let Some(start) = content.find("'") {
-            start
-        } else {
-            debug!("Unsupported config format: {}", content);
-            return Err("Cannot find IPv4 address in config".into());
-        };
-        Ok(IpAddr::from_str(&content[..ipv4_addr_end]).map_err(|err| {
-            debug!("Failed to parse IPv4 address: {}", err);
-            "Failed to parse IPv4 address"
-        })?)
+
+        const DNS_PREFIX: &str = "<dns ip='";
+        let mut dns = vec![];
+        let mut content = content.as_str();
+        loop {
+            let dns_start = if let Some(start) = content.find(DNS_PREFIX) {
+                start
+            } else {
+                break;
+            };
+            content = &content[dns_start + DNS_PREFIX.len()..];
+            let dns_end = if let Some(start) = content.find("'") {
+                start
+            } else {
+                debug!("Unsupported config format: {}", content);
+                return Err("Cannot find DNS address in config".into());
+            };
+            let dns_addr = IpAddr::from_str(&content[..dns_end]).map_err(|err| {
+                debug!("Failed to parse DNS address: {}", err);
+                "Failed to parse DNS address"
+            })?;
+            dns.push(dns_addr);
+        }
+        Ok(IpConfig { addr, dns })
     }
 
     async fn start_vpn_tunnel(

@@ -114,6 +114,7 @@ pub struct IKEv2Session {
     local_addr: SocketAddr,
     state: SessionState,
     internal_addr: Option<IpAddr>,
+    dns_addrs: Vec<IpAddr>,
     ts_local: Vec<message::TrafficSelector>,
     child_sas: HashSet<ChildSessionID>,
     pki_processing: Arc<pki::PkiProcessing>,
@@ -144,6 +145,7 @@ impl IKEv2Session {
             local_addr,
             state: SessionState::Empty,
             internal_addr: None,
+            dns_addrs: vec![],
             ts_local: ts_local.to_vec(),
             child_sas: HashSet::new(),
             pki_processing,
@@ -188,8 +190,9 @@ impl IKEv2Session {
         NextRetransmission::Delay(time::Duration::from_millis(next_delay))
     }
 
-    pub fn update_internal_addr(&mut self, internal_addr: IpAddr) {
+    pub fn update_ip(&mut self, internal_addr: IpAddr, dns_addrs: Vec<IpAddr>) {
         self.internal_addr = Some(internal_addr);
+        self.dns_addrs = dns_addrs;
     }
 
     pub fn process_request(
@@ -951,7 +954,7 @@ impl IKEv2Session {
 
         if ipv4_address_requested {
             if let Some(internal_addr) = self.internal_addr {
-                response.write_configuration_payload(internal_addr)?;
+                response.write_configuration_payload(internal_addr, &self.dns_addrs)?;
             } else {
                 warn!("No IP address is available, notifying client");
                 response.write_notify_payload(
@@ -1463,6 +1466,7 @@ impl IKEv2Session {
                 session_id,
                 remote_addr: self.remote_addr,
                 local_addr: self.local_addr,
+                dns_addrs: self.dns_addrs.clone(),
                 state: SessionState::Established,
                 internal_addr: self.internal_addr,
                 ts_local: self.ts_local.clone(),

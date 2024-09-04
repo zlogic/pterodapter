@@ -578,17 +578,29 @@ impl MessageWriter<'_> {
         Ok(())
     }
 
-    pub fn write_configuration_payload(&mut self, addr: IpAddr) -> Result<(), NotEnoughSpaceError> {
+    pub fn write_configuration_payload(
+        &mut self,
+        addr: IpAddr,
+        dns: &[IpAddr],
+    ) -> Result<(), NotEnoughSpaceError> {
         let addr_length = match addr {
             IpAddr::V4(_) => (4 + 4) * 2,
             IpAddr::V6(_) => 4 + 17,
         };
+        let dns_length = dns
+            .iter()
+            .map(|dns| match dns {
+                IpAddr::V4(_) => 4 + 4,
+                IpAddr::V6(_) => 4 + 16,
+            })
+            .sum::<usize>();
+
         let next_payload_slice =
-            self.next_payload_slice(PayloadType::CONFIGURATION, 4 + addr_length)?;
+            self.next_payload_slice(PayloadType::CONFIGURATION, 4 + addr_length + dns_length)?;
         next_payload_slice[0] = ConfigurationType::CFG_REPLY.0;
 
         // Write IP address.
-        let data = &mut next_payload_slice[4..4 + addr_length];
+        let mut data = &mut next_payload_slice[4..];
         match addr {
             IpAddr::V4(addr) => {
                 data[0..2].copy_from_slice(
@@ -606,6 +618,7 @@ impl MessageWriter<'_> {
                 );
                 data[10..12].copy_from_slice(&4u16.to_be_bytes());
                 data[12..16].fill_with(|| 255);
+                data = &mut data[16..];
             }
             IpAddr::V6(addr) => {
                 data[0..2].copy_from_slice(
@@ -617,8 +630,30 @@ impl MessageWriter<'_> {
                 data[4..20].copy_from_slice(&addr.octets());
                 // Assume only current address can be reached.
                 data[20] = 128;
+                data = &mut data[21..];
             }
         };
+        // Write all DNS servers.
+        for addr in dns {
+            match addr {
+                IpAddr::V4(addr) => {
+                    data[0..2].copy_from_slice(
+                        &ConfigurationAttributeType::INTERNAL_IP4_DNS.0.to_be_bytes(),
+                    );
+                    data[2..4].copy_from_slice(&4u16.to_be_bytes());
+                    data[4..8].copy_from_slice(&addr.octets());
+                    data = &mut data[8..];
+                }
+                IpAddr::V6(addr) => {
+                    data[0..2].copy_from_slice(
+                        &ConfigurationAttributeType::INTERNAL_IP6_DNS.0.to_be_bytes(),
+                    );
+                    data[2..4].copy_from_slice(&16u16.to_be_bytes());
+                    data[4..20].copy_from_slice(&addr.octets());
+                    data = &mut data[20..];
+                }
+            }
+        }
 
         Ok(())
     }
