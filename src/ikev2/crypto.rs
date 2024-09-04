@@ -990,6 +990,7 @@ impl Encryption for EncryptionAesGcm256 {
         // Move message to the right to make space for the explicit nonce.
         data.copy_within(..msg_len, 8);
         nonce[4..12].copy_from_slice(&self.iv.to_be_bytes());
+        // Instead of a counter, using LFSR could also work.
         self.iv += 1;
         data[..8].copy_from_slice(&nonce[4..]);
         let mut buffer = SliceBuffer {

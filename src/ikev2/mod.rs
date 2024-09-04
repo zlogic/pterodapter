@@ -449,6 +449,10 @@ impl Sessions {
         }
         while reserved_spi.needs_esp() {
             let next_id = rand::thread_rng().gen::<u32>();
+            if (0..255).contains(&next_id) {
+                // RFC 9333, section 3 states these SPI values are reserved and should not be used.
+                continue;
+            }
             if !self.security_associations.keys().any(|key| *key == next_id) {
                 reserved_spi.add_esp(next_id);
             }
