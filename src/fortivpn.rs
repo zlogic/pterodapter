@@ -8,7 +8,7 @@ use std::{
 use log::{debug, info, warn};
 use rand::Rng;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     time::{Duration, Instant},
 };
@@ -61,7 +61,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
             return Err("Failed to accept incoming connection".into());
         }
     };
-    let mut socket = BufStream::new(socket);
+    let mut socket = BufReader::new(socket);
     let headers = http::read_headers(&mut socket).await?;
     let token_id = headers.lines().next().and_then(|line| {
         if !line.starts_with("GET /?id=") {
@@ -196,7 +196,7 @@ impl FortiVPNTunnel {
 
         let socket = TcpStream::connect(&hostport).await?;
         let socket = connector.connect(dnsname, socket).await?;
-        Ok(BufStream::new(socket))
+        Ok(BufReader::new(socket))
     }
 
     async fn request_vpn_allocation(
@@ -536,16 +536,18 @@ impl FortiVPNTunnel {
         ppp_data: &[u8],
     ) -> Result<(), FortiError> {
         // FortiVPN encapsulation.
-        let mut packet_header = [0u8; 8];
+        let mut packet = [0u8; 8 + MAX_MTU];
         let ppp_packet_length = ppp_data.len() + 2;
-        packet_header[..2].copy_from_slice(&(6 + ppp_packet_length as u16).to_be_bytes());
-        packet_header[2..4].copy_from_slice(&[0x50, 0x50]);
-        packet_header[4..6].copy_from_slice(&(ppp_packet_length as u16).to_be_bytes());
+        packet[0..2].copy_from_slice(&(6 + ppp_packet_length as u16).to_be_bytes());
+        packet[2..4].copy_from_slice(&[0x50, 0x50]);
+        packet[4..6].copy_from_slice(&(ppp_packet_length as u16).to_be_bytes());
         // PPP encapsulation.
-        packet_header[6..].copy_from_slice(&protocol.value().to_be_bytes());
+        packet[6..8].copy_from_slice(&protocol.value().to_be_bytes());
 
-        socket.write_all(&packet_header).await?;
-        Ok(socket.write_all(ppp_data).await?)
+        // Data.
+        packet[8..8 + ppp_data.len()].copy_from_slice(ppp_data);
+        let packet = &packet[..8 + ppp_data.len()];
+        Ok(socket.write_all(packet).await?)
     }
 
     async fn read_ppp_packet(
@@ -897,7 +899,7 @@ impl PPPState {
     }
 }
 
-type BufTlsStream = BufStream<tokio_rustls::client::TlsStream<TcpStream>>;
+type BufTlsStream = BufReader<tokio_rustls::client::TlsStream<TcpStream>>;
 
 #[derive(Debug)]
 pub enum FortiError {
