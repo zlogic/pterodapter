@@ -415,7 +415,7 @@ impl Sessions {
                 }
             };
             let sender = self.tx.clone();
-            let session_id = session_id.clone();
+            let session_id = *session_id;
             rt.spawn(async move {
                 let _ = sender
                     .send(SessionMessage::RetransmitRequest(session_id, message_id))
@@ -637,7 +637,7 @@ impl Sessions {
                 }
                 session::IKEv2PendingAction::CreateChildSA(session_id, security_association) => {
                     self.security_associations
-                        .insert(session_id, security_association);
+                        .insert(session_id, *security_association);
                 }
                 session::IKEv2PendingAction::DeleteIKESession => {
                     delete_session = true;
@@ -1078,10 +1078,7 @@ impl SplitRouteRegistry {
 
         let mut ip_addresses = vec![];
         for addrs in addresses.into_iter() {
-            addrs
-                .await?
-                .into_iter()
-                .for_each(|addr| ip_addresses.push(addr.ip()));
+            addrs.await?.for_each(|addr| ip_addresses.push(addr.ip()));
         }
         if ip_addresses.is_empty() {
             let full_ts = message::TrafficSelector::from_ip_range(

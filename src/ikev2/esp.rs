@@ -24,12 +24,8 @@ pub struct SecurityAssociation {
 
 impl SecurityAssociation {
     pub fn new(
-        ts_local: Vec<message::TrafficSelector>,
-        ts_remote: Vec<message::TrafficSelector>,
-        local_addr: SocketAddr,
-        remote_addr: SocketAddr,
-        local_spi: u32,
-        remote_spi: u32,
+        local_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
+        remote_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
         crypto_stack: crypto::CryptoStack,
         params: &crypto::TransformParameters,
     ) -> SecurityAssociation {
@@ -38,6 +34,8 @@ impl SecurityAssociation {
         } else {
             0
         };
+        let (ts_local, local_addr, local_spi) = local_config;
+        let (ts_remote, remote_addr, remote_spi) = remote_config;
         SecurityAssociation {
             ts_local,
             ts_remote,
@@ -71,13 +69,13 @@ impl SecurityAssociation {
     }
 
     pub fn accepts_esp_to_vpn(&self, hdr: &IpHeader) -> bool {
-        ts_accepts_header(&self.ts_local, &hdr, TsCheck::Destination)
-            && ts_accepts_header(&self.ts_remote, &hdr, TsCheck::Source)
+        ts_accepts_header(&self.ts_local, hdr, TsCheck::Destination)
+            && ts_accepts_header(&self.ts_remote, hdr, TsCheck::Source)
     }
 
     pub fn accepts_vpn_to_esp(&self, hdr: &IpHeader) -> bool {
-        ts_accepts_header(&self.ts_remote, &hdr, TsCheck::Destination)
-            && ts_accepts_header(&self.ts_local, &hdr, TsCheck::Source)
+        ts_accepts_header(&self.ts_remote, hdr, TsCheck::Destination)
+            && ts_accepts_header(&self.ts_local, hdr, TsCheck::Source)
     }
 
     pub fn handle_esp<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
@@ -119,7 +117,7 @@ impl SecurityAssociation {
             }
             Err(err) => {
                 warn!("Failed to decrypt ESP packet: {}", err);
-                return Err("Failed to decrypt ESP packet".into());
+                Err("Failed to decrypt ESP packet".into())
             }
         }
     }
@@ -148,7 +146,7 @@ impl SecurityAssociation {
         };
         match self
             .crypto_stack
-            .encrypt_data(&mut data[8..], msg_len, &associated_data)
+            .encrypt_data(&mut data[8..], msg_len, associated_data)
         {
             Ok(encrypted_data) => {
                 let encrypted_data_len = 8 + encrypted_data.len();
@@ -254,7 +252,7 @@ impl IpHeader {
             6 => Self::from_ipv6_packet(data),
             _ => {
                 warn!("ESP IP packet is not a supported IP version: {:x}", data[0]);
-                return Err("Unsupported IP prococol version".into());
+                Err("Unsupported IP prococol version".into())
             }
         }
     }

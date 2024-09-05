@@ -29,14 +29,12 @@ impl RoundRobinSelector {
                 } else {
                     Poll::Pending
                 }
+            } else if let Poll::Ready(r) = b.as_mut().poll(cx) {
+                Poll::Ready(r)
+            } else if let Poll::Ready(r) = a.as_mut().poll(cx) {
+                Poll::Ready(r)
             } else {
-                if let Poll::Ready(r) = b.as_mut().poll(cx) {
-                    Poll::Ready(r)
-                } else if let Poll::Ready(r) = a.as_mut().poll(cx) {
-                    Poll::Ready(r)
-                } else {
-                    Poll::Pending
-                }
+                Poll::Pending
             }
         })
     }

@@ -97,7 +97,7 @@ enum SessionState {
 
 pub enum IKEv2PendingAction {
     DeleteHalfOpenSession(SocketAddr, u64),
-    CreateChildSA(esp::SecurityAssociationID, esp::SecurityAssociation),
+    CreateChildSA(esp::SecurityAssociationID, Box<esp::SecurityAssociation>),
     DeleteChildSA(esp::SecurityAssociationID),
     CreateIKEv2Session(SessionID, IKEv2Session),
     DeleteIKESession,
@@ -987,17 +987,15 @@ impl IKEv2Session {
         response.write_traffic_selector_payload(false, ts_local)?;
 
         let child_sa = esp::SecurityAssociation::new(
-            ts_local.clone(),
-            ts_remote,
-            local_addr,
-            remote_addr,
-            local_spi,
-            remote_spi,
+            (ts_local.clone(), local_addr, local_spi),
+            (ts_remote, remote_addr, remote_spi),
             child_crypto_stack,
             &transform_params,
         );
-        self.pending_actions
-            .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
+        self.pending_actions.push(IKEv2PendingAction::CreateChildSA(
+            local_spi,
+            Box::new(child_sa),
+        ));
 
         self.complete_encrypted_payload(response)
     }
@@ -1413,17 +1411,15 @@ impl IKEv2Session {
                 local_spi,
             });
             let child_sa = esp::SecurityAssociation::new(
-                ts_local.clone(),
-                ts_remote.clone(),
-                self.local_addr,
-                self.remote_addr,
-                local_spi,
-                remote_spi,
+                (ts_local.clone(), self.local_addr, local_spi),
+                (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
             );
-            self.pending_actions
-                .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
+            self.pending_actions.push(IKEv2PendingAction::CreateChildSA(
+                local_spi,
+                Box::new(child_sa),
+            ));
         } else if create_child_sa {
             debug!("Creating new child SA");
             let local_spi = if let Some(local_spi) = new_ids.take_esp() {
@@ -1441,17 +1437,15 @@ impl IKEv2Session {
                 local_spi,
             });
             let child_sa = esp::SecurityAssociation::new(
-                ts_local.clone(),
-                ts_remote.clone(),
-                self.local_addr,
-                self.remote_addr,
-                local_spi,
-                remote_spi,
+                (ts_local.clone(), self.local_addr, local_spi),
+                (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
             );
-            self.pending_actions
-                .push(IKEv2PendingAction::CreateChildSA(local_spi, child_sa));
+            self.pending_actions.push(IKEv2PendingAction::CreateChildSA(
+                local_spi,
+                Box::new(child_sa),
+            ));
         } else {
             debug!("Rekeying IKEv2 session");
             let (remote_spi, local_spi) =
@@ -1514,10 +1508,7 @@ impl IKEv2Session {
     }
 
     pub fn is_deleting_request(&mut self) -> bool {
-        match self.sent_request {
-            Some(RequestContext::DeleteIKEv2) => true,
-            _ => false,
-        }
+        matches!(self.sent_request, Some(RequestContext::DeleteIKEv2))
     }
 
     fn start_request(
@@ -1571,7 +1562,7 @@ impl IKEv2Session {
 
     pub fn update_split_routes(&mut self, tunnel_ips: &[IpAddr]) -> Result<(), SessionError> {
         for tunnel_ip in tunnel_ips {
-            let addr = SocketAddr::from((tunnel_ip.clone(), 0));
+            let addr = SocketAddr::from((*tunnel_ip, 0));
             if !esp::ts_accepts(&self.ts_local, &addr) {
                 info!("Adding traffic selector for IP {}", tunnel_ip);
                 self.ts_local.push(message::TrafficSelector::from_ip_range(
@@ -1689,17 +1680,14 @@ impl IKEv2Session {
                 }
             };
             trace!("Decrypted payload\n {:?}", payload);
-            match payload.payload_type() {
-                _ => {
-                    if payload.is_critical() {
-                        warn!(
-                            "Received critical, unsupported payload: {}",
-                            payload.payload_type()
-                        );
-                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
-                        return Err("Received critical, unsupported payload".into());
-                    }
-                }
+            // No payloads are parsed here, so only critical ones are checked.
+            if payload.is_critical() {
+                warn!(
+                    "Received critical, unsupported payload: {}",
+                    payload.payload_type()
+                );
+                // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
+                return Err("Received critical, unsupported payload".into());
             }
         }
         let sent_request = self.sent_request.take();

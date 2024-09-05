@@ -713,7 +713,7 @@ impl CryptoStack {
         prf_key: &[u8],
     ) -> Result<CryptoStack, InitError> {
         let prf_transform = params.create_prf(skeyseed)?;
-        prf_transform.create_crypto_stack(params, &prf_key)
+        prf_transform.create_crypto_stack(params, prf_key)
     }
 
     pub fn rekey_skeyseed(&self, skeyseed_input: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
@@ -1007,7 +1007,7 @@ impl Encryption for EncryptionAesGcm256 {
                 let buffer = &data[..buffer_len];
                 Ok(buffer)
             }
-            Err(_) => return Err("Failed to encode AES GCM 16 256 message".into()),
+            Err(_) => Err("Failed to encode AES GCM 16 256 message".into()),
         }
     }
 

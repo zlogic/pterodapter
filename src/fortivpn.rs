@@ -236,12 +236,7 @@ impl FortiVPNTunnel {
         const DNS_PREFIX: &str = "<dns ip='";
         let mut dns = vec![];
         let mut content = content.as_str();
-        loop {
-            let dns_start = if let Some(start) = content.find(DNS_PREFIX) {
-                start
-            } else {
-                break;
-            };
+        while let Some(dns_start) = content.find(DNS_PREFIX) {
             content = &content[dns_start + DNS_PREFIX.len()..];
             let dns_end = if let Some(start) = content.find("'") {
                 start
@@ -730,7 +725,7 @@ impl FortiVPNTunnel {
     pub async fn terminate(&mut self) -> Result<(), FortiError> {
         let mut req = [0u8; 4];
         // Ensure that any stray IP packets are accepted.
-        let mut resp = [0u8; MAX_MTU as usize + 8];
+        let mut resp = [0u8; MAX_MTU + 8];
         let length = ppp::encode_lcp_data(
             &mut req,
             ppp::LcpCode::TERMINATE_REQUEST,
