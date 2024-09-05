@@ -294,7 +294,7 @@ impl Sessions {
         tunnel_ips: Vec<IpAddr>,
         traffic_selectors: Vec<message::TrafficSelector>,
     ) -> Sessions {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(32);
         Sessions {
             pki_processing,
             sockets,
@@ -996,7 +996,7 @@ impl FortiService {
         } else {
             return Err("VPN client config is already consumed".into());
         };
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(32);
         self.command_sender = Some(tx.clone());
         let rt = runtime::Handle::current();
         self.join_set
