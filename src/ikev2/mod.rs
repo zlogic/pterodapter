@@ -15,7 +15,7 @@ use tokio::{
     time,
 };
 
-use crate::fortivpn;
+use crate::{bufferpool, fortivpn};
 
 mod crypto;
 mod esp;
@@ -78,13 +78,15 @@ impl Server {
         listen_addr: SocketAddr,
         dest: mpsc::Sender<SessionMessage>,
     ) -> Result<(), IKEv2Error> {
+        let mut buffer_pool = bufferpool::BufferPool::new(1024, MAX_DATAGRAM_SIZE);
         loop {
             // Theoretically the allocator should be smart enough to recycle memory.
             // In the unlikely case this becomes a problem, switching to stack-allocated
             // arrays would reduce memory usage, but increase number of copy operations.
             // As mpsc uses a queue internally, memory will be allocated for the queue elements
             // in any case.
-            let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+            let mut buf = buffer_pool.borrow().await.unwrap();
+            (&mut buf).resize(MAX_DATAGRAM_SIZE, 0);
             let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
             buf.truncate(bytes_res);
             let msg = SessionMessage::UdpDatagram(UdpDatagram {
@@ -235,7 +237,7 @@ impl Sockets {
 struct UdpDatagram {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
-    request: Vec<u8>,
+    request: bufferpool::Buffer,
 }
 
 impl UdpDatagram {
@@ -264,7 +266,7 @@ impl UdpDatagram {
 enum SessionMessage {
     UdpDatagram(UdpDatagram),
     RetransmitRequest(session::SessionID, u32),
-    VpnPacket(Vec<u8>),
+    VpnPacket(bufferpool::Buffer),
     VpnDisconnected,
     CleanupTimer,
     Shutdown,
@@ -749,7 +751,8 @@ impl Sessions {
         }
     }
 
-    async fn process_vpn_packet(&mut self, mut data: Vec<u8>) -> Result<(), IKEv2Error> {
+    async fn process_vpn_packet(&mut self, mut buf: bufferpool::Buffer) -> Result<(), IKEv2Error> {
+        let data: &mut Vec<u8> = &mut buf;
         let hdr = match esp::IpHeader::from_packet(&data) {
             Ok(hdr) => hdr,
             Err(err) => {
@@ -840,16 +843,18 @@ impl FortiService {
 
     async fn read_vpn_packet(
         forti_client: &mut fortivpn::FortiVPNTunnel,
-    ) -> Result<Vec<u8>, fortivpn::FortiError> {
-        let mut buffer = [0u8; MAX_ESP_PACKET_SIZE];
+        buffer_pool: &mut bufferpool::BufferPool,
+    ) -> Result<bufferpool::Buffer, fortivpn::FortiError> {
+        let mut buffer = buffer_pool.borrow().await.unwrap();
+        buffer.resize(MAX_ESP_PACKET_SIZE, 0);
         match forti_client.try_read_packet(&mut buffer, None).await {
             Ok(msg_len) => {
                 if msg_len > 0 {
-                    let mut packet_buffer = Vec::with_capacity(MAX_ESP_PACKET_SIZE);
-                    packet_buffer.extend_from_slice(&buffer[..msg_len]);
-                    Ok(packet_buffer)
+                    buffer.truncate(msg_len);
+                    Ok(buffer)
                 } else {
-                    Ok(vec![])
+                    buffer.truncate(0);
+                    Ok(buffer)
                 }
             }
             Err(err) => Err(err),
@@ -862,6 +867,7 @@ impl FortiService {
         mut rx: mpsc::Receiver<FortiServiceCommand>,
         sessions_tx: mpsc::Sender<SessionMessage>,
     ) -> Result<(), IKEv2Error> {
+        let mut buffer_pool = bufferpool::BufferPool::new(1024, MAX_DATAGRAM_SIZE);
         loop {
             // Spawn a new connection task.
             let connect_handle = {
@@ -933,7 +939,9 @@ impl FortiService {
                         }
                     }
                     FortiServiceCommand::ReceivePacket => {
-                        let data = match Self::read_vpn_packet(&mut forti_client).await {
+                        let data = match Self::read_vpn_packet(&mut forti_client, &mut buffer_pool)
+                            .await
+                        {
                             Ok(data) => data,
                             Err(err) => {
                                 warn!("Failed to receive packet from VPN: {}", err);
