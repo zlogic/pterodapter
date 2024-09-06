@@ -1,10 +1,17 @@
-# Pterodapter
+# pterodapter
 
 ![Build status](https://github.com/zlogic/pterodapter/actions/workflows/cargo-build.yml/badge.svg)
 
 <img src="logo.png" alt="Logo" style="width:32px;height:32px;">
 
-Pterodapter is a userspace Proxy-to-FortiVPN adapter that acts as an open standard SOCKS5/HTTP/CONNECT proxy server, and forwards traffic to a FortiVPN network.
+pterodapter is a userspace Proxy-to-FortiVPN adapter that acts as
+
+* an L5 open standard SOCKS5/HTTP/CONNECT proxy server
+* or an L3 IKEv2 VPN server (a subset of [RFC 7296](https://datatracker.ietf.org/doc/html/rfc7296) is implemented)
+
+and forwards traffic to a FortiVPN network.
+
+## Proxy mode
 
 No drivers to install or root access to create tun/utun devices.
 
@@ -13,10 +20,24 @@ As it can be used with [PAC files](https://en.wikipedia.org/wiki/Proxy_auto-conf
 
 [smoltcp](https://github.com/smoltcp-rs/smoltcp) emulates L3 physical hardware and allows conversion of L5 (SOCKS5/HTTP/CONNECT proxy) traffic into L3 packets.
 
+## IKEv2 VPN mode
+
+Root permissions are not required, but unfortunately most IKEv2 clients can only use standard ports 500 and 4500.
+Listening on port 500 requires elevated permissions or port-forwarding; the IKEv2 server needs to run externally to prevent port conflicts.
+
+To avoid granting root permissions, the following command grants permissions to listen on ports < 1024 without granting full root access:
+
+```shell
+sudo setcap CAP_NET_BIND_SERVICE=+eip pterodapter
+```
 
 # How to use it
 
-Build/download a copy, and run it using the following options:
+Build/download a copy, and follow the Proxy or IKEv2 VPN instructions.
+
+## Proxy
+
+Run pterodapter with the following arguments:
 
 ```shell
 pterotapter [--log-level=<level>] [--listen-address=<hostport>] --destination=<hostport> [--pac-file=<path>] [--tunnel-domain=<suffix>] proxy
@@ -62,7 +83,7 @@ function FindProxyForURL(url, host) {
 }
 ```
 
-## How to set up a client
+### How to set up a client
 
 Configure your browser to use a PAC file, for example:
 
@@ -86,6 +107,49 @@ export NO_PROXY=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 ```
 
 For containers running in Podman Machine, use `host.containers.internal` instead of `localhost`.
+
+## IKEv2 VPN
+
+Run pterodapter with the following arguments:
+
+```shell
+pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] --destination=<hostport> [--tunnel-domain=<domain>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
+```
+
+`--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
+
+`--listen-ip=<ip-address>` is an optional argument to specify the proxy listen IP address, for example `--listen-ip=127.0.0.1`. If not specified, will use `::` as the listen address (all IPv4 and IPv6 addresses). Multiple addresses can be specified.
+
+`--destination=<hostport>` specifies the FortiVPN connection address, for example `--destination=fortivpn.example.com:443`.
+
+`--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. Multiple domains can be specified; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN. This is implemented using IKEv2 traffic selectors and works as expected on macOS; Windows seems to have [issues with split routing](https://docs.strongswan.org/docs/5.9/howtos/forwarding.html#_split_tunneling_with_ikev2). To ensure that dynamic IPs are handled correctly, pterodapter will send updated routes (IKEv2 Traffic Selectors) when the client rekeys the session.
+
+`--destination=<hostport>` specifies the hostname to send to the client when performing a client handshake. If not specified, will use `pterodapter` as the hostname. Windows refuses to connect if the hostname doesn't match connection settings; macOS prints a warning in the Console.
+
+`--cacert=<filename>` specifies the path to a root CA PEM file, required for two-way authentication.
+
+`--cert=<filename>` specifies the path to the server's public cert PEM file, required for two-way authentication.
+
+`--key=<filename>` specifies the path to the server's private key PEM file (matching the public cert specified in `--cert`), required for two-way authentication.
+
+For example:
+
+```shell
+./pterodapter --log-level=trace \
+    --listen-ip=127.0.0.1 \
+    --destination=fortivpn.example.com:443 \
+    --tunnel-domain=gitlab.example.com \
+    --tunnel-domain=registry.example.com \
+    --id-hostname=pterodapter.home \
+    --cacert=vpn-root.cert.pem \
+    --cert=vpn-server.cert.pem \
+    --key=vpn-server.key.pem \
+    proxy
+```
+
+For more information how to generate certs and configure clients, see the [certs.md](docs/certs.md) document.
+
+For information how to run pterodapter as a systemd unit, see the [systemd.md](docs/systemd.md) document.
 
 # Reference
 
