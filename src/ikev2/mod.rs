@@ -727,6 +727,7 @@ impl Sessions {
             let hdr = esp::IpHeader::from_packet(decrypted_slice)?;
             trace!("IP header {}", hdr);
             if !sa.accepts_esp_to_vpn(&hdr) {
+                info!("ESP packet {} dropped by traffic selector", hdr);
                 return Err("ESP packet dropped by traffic selector".into());
             }
             if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
@@ -792,7 +793,11 @@ impl Sessions {
                 .await?;
             Ok(())
         } else {
-            Err("No matching Security Associations found".into())
+            info!(
+                "No matching Security Associations found for VPN packet {}",
+                hdr
+            );
+            Err("No matching Security Associations found for VPN packet".into())
         }
     }
 }
