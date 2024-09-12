@@ -1,8 +1,8 @@
 use std::{error, fmt, sync::Arc};
 
+use aws_lc_rs::{digest, signature};
 use base64::engine::{general_purpose, Engine as _};
 use log::warn;
-use ring::{digest, signature};
 use tokio_rustls::rustls::{self, pki_types};
 use x509_cert::{der::Decode as _, ext::pkix};
 
@@ -295,17 +295,14 @@ impl ServerIdentity {
         let public_cert_der = pem_to_der(public_cert_pem, &PEM_SECTION_CERTIFICATE)?;
 
         let private_key_der = pem_to_der(private_key_pem, &PEM_SECTION_PRIVATE_KEY)?;
-        let rng = ring::rand::SystemRandom::new();
         let key_pair_fixed = signature::EcdsaKeyPair::from_pkcs8(
             &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
             &private_key_der,
-            &rng,
         )
         .map_err(|_| "Failed to parse ECDSA private key")?;
         let key_pair_asn1 = signature::EcdsaKeyPair::from_pkcs8(
             &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &private_key_der,
-            &rng,
         )
         .map_err(|_| "Failed to parse ECDSA private key")?;
         Ok(ServerIdentity {
@@ -325,7 +322,7 @@ impl ServerIdentity {
         msg: &[u8],
         dest: &mut [u8],
     ) -> Result<usize, CertError> {
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let key_pair = match format {
             SignatureFormat::Default => &self.key_pair_fixed,
             SignatureFormat::AdditionalParameters => &self.key_pair_asn1,

@@ -1,5 +1,5 @@
+use aws_lc_rs::{aead, agreement, digest, hkdf, hmac};
 use log::warn;
-use ring::{aead, agreement, digest, hkdf, hmac};
 use std::{error, fmt, ops::Range};
 
 use super::message;
@@ -293,7 +293,7 @@ impl DHTransformType {
     fn init(transform_type: message::TransformType) -> Result<DHTransformType, InitError> {
         match transform_type {
             message::TransformType::DH_256_ECP => {
-                let rng = ring::rand::SystemRandom::new();
+                let rng = aws_lc_rs::rand::SystemRandom::new();
                 let private_key =
                     match agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng) {
                         Ok(private_key) => private_key,
@@ -387,9 +387,15 @@ impl DHTransform for DHTransformECP256 {
             Some(private_key) => private_key,
             None => return Err("ECDH private key is already consumed".into()),
         };
-        match agreement::agree_ephemeral(private_key, &other_public_key, |secret_point| {
-            res.as_mut_slice().copy_from_slice(secret_point)
-        }) {
+        match agreement::agree_ephemeral(
+            private_key,
+            &other_public_key,
+            InitError::new("Failed to read ECDH key"),
+            |secret_point| {
+                res.as_mut_slice().copy_from_slice(secret_point);
+                Ok(())
+            },
+        ) {
             Ok(key) => key,
             Err(_) => {
                 return Err("Failed to compute ECDH shared secret".into());
@@ -550,7 +556,7 @@ impl hkdf::KeyType for DerivedKeysLength {
 
 enum Auth {
     None,
-    HmacSha256tr128(AuthHmacSha256tr128),
+    HmacSha256tr128(Box<AuthHmacSha256tr128>),
 }
 
 impl Auth {
@@ -558,7 +564,7 @@ impl Auth {
         match transform_type {
             Some(message::TransformType::AUTH_HMAC_SHA2_256_128) => {
                 let key = hmac::Key::new(hmac::HMAC_SHA256, key);
-                Ok(Self::HmacSha256tr128(AuthHmacSha256tr128 { key }))
+                Ok(Self::HmacSha256tr128(Box::new(AuthHmacSha256tr128 { key })))
             }
             None => Ok(Self::None),
             _ => Err("Unsupported PRF".into()),
