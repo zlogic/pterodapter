@@ -35,9 +35,6 @@ const MAX_ESP_PACKET_SIZE: usize = 1500;
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-const VPN_ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
-const VPN_ECHO_TIMEOUT: Duration = Duration::from_secs(60);
-
 pub struct Config {
     pub listen_ips: Vec<IpAddr>,
     pub hostname: Option<String>,
@@ -824,18 +821,6 @@ impl FortiService {
         fortivpn::FortiVPNTunnel::new(&config, sslvpn_cookie).await
     }
 
-    async fn process_echo(
-        forti_client: &mut fortivpn::FortiVPNTunnel,
-        last_echo_sent: time::Instant,
-    ) -> Result<(), IKEv2Error> {
-        forti_client.send_echo_request().await?;
-        if forti_client.last_echo_reply() + VPN_ECHO_TIMEOUT < last_echo_sent {
-            Err("No echo replies received".into())
-        } else {
-            Ok(())
-        }
-    }
-
     async fn peek_vpn(forti_client: &mut fortivpn::FortiVPNTunnel) -> Option<FortiServiceCommand> {
         if let Err(err) = forti_client.peek_recv().await {
             debug!("Failed to check if VPN has data available: {}", err);
@@ -912,7 +897,7 @@ impl FortiService {
                 let rt = runtime::Handle::current();
                 let tx = tx.clone();
                 rt.spawn(async move {
-                    let mut interval = tokio::time::interval(VPN_ECHO_SEND_INTERVAL);
+                    let mut interval = fortivpn::echo_send_interval();
                     loop {
                         interval.tick().await;
                         let _ = tx.send(FortiServiceCommand::SendEcho).await;
@@ -920,7 +905,6 @@ impl FortiService {
                 })
             };
             // Handle connection until it drops.
-            let mut last_echo_sent = time::Instant::now();
             let mut selector = crate::futures::RoundRobinSelector::new();
             while let Some(command) = selector
                 .select(rx.recv(), Self::peek_vpn(&mut forti_client))
@@ -948,14 +932,10 @@ impl FortiService {
                         }
                     }
                     FortiServiceCommand::SendEcho => {
-                        let next_echo_sent = time::Instant::now();
-                        if let Err(err) =
-                            Self::process_echo(&mut forti_client, last_echo_sent).await
-                        {
+                        if let Err(err) = forti_client.process_echo().await {
                             warn!("Echo request timed out: {}", err);
                             break;
                         }
-                        last_echo_sent = next_echo_sent;
                     }
                     FortiServiceCommand::RequestIpConfiguration(tx) => {
                         let _ =

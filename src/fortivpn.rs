@@ -10,7 +10,7 @@ use rand::Rng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    time::{Duration, Instant},
+    time::{Duration, Instant, Interval},
 };
 use tokio_rustls::rustls;
 
@@ -37,6 +37,9 @@ const MAX_MTU: usize = PPP_MTU as usize;
 
 // TODO: check how FortiVPN chooses the listen port - is it fixed or sent as a parameter?
 const REDIRECT_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8020);
+
+const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
+const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
 
 pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     println!(
@@ -143,6 +146,7 @@ pub struct FortiVPNTunnel {
     ppp_state: PPPState,
     ppp_magic: u32,
     ppp_identifier: u8,
+    last_echo_sent: Instant,
     last_echo_reply: Instant,
 }
 
@@ -170,6 +174,7 @@ impl FortiVPNTunnel {
             ppp_state,
             ppp_magic,
             ppp_identifier: 2,
+            last_echo_sent: Instant::now(),
             last_echo_reply: Instant::now(),
         })
     }
@@ -584,15 +589,25 @@ impl FortiVPNTunnel {
         Ok(self.socket.flush().await?)
     }
 
-    pub async fn send_echo_request(&mut self) -> Result<(), FortiError> {
+    async fn send_echo_request(&mut self) -> Result<(), FortiError> {
         self.send_echo(ppp::LcpCode::ECHO_REQUEST, self.ppp_identifier)
             .await?;
         self.ppp_identifier += 1;
+        self.last_echo_sent = Instant::now();
         Ok(())
     }
 
-    pub fn last_echo_reply(&self) -> Instant {
-        self.last_echo_reply
+    pub async fn process_echo(&mut self) -> Result<(), FortiError> {
+        let last_echo_sent = self.last_echo_sent;
+        if last_echo_sent + ECHO_SEND_INTERVAL < Instant::now() {
+            // Only send echo if it's time.
+            self.send_echo_request().await?;
+        }
+        if self.last_echo_reply + ECHO_TIMEOUT < last_echo_sent {
+            Err("No echo replies received".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
@@ -892,6 +907,10 @@ impl PPPState {
             Ok(())
         }
     }
+}
+
+pub fn echo_send_interval() -> Interval {
+    tokio::time::interval(ECHO_SEND_INTERVAL)
 }
 
 type BufTlsStream = BufReader<tokio_rustls::client::TlsStream<TcpStream>>;

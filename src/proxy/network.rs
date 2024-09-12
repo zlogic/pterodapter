@@ -20,8 +20,6 @@ const READ_BUFFER_SIZE: usize = 65536 * 2 * 2;
 const WRITE_BUFFER_SIZE: usize = 65536 * 2;
 const DEVICE_BUFFERS_COUNT: usize = 8 * 2;
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
-const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Network<'a> {
     device: VpnDevice<'a>,
@@ -411,8 +409,6 @@ pub enum Command {
 
 struct VpnDevice<'a> {
     vpn: fortivpn::FortiVPNTunnel,
-    last_echo_sent: tokio::time::Instant,
-    next_echo_receive_check: tokio::time::Instant,
     read_buffers: storage::RingBuffer<'a, Vec<u8>>,
     write_buffers: storage::RingBuffer<'a, Vec<u8>>,
 }
@@ -427,8 +423,6 @@ impl VpnDevice<'_> {
             .collect::<Vec<_>>();
         VpnDevice {
             vpn,
-            last_echo_sent: tokio::time::Instant::now(),
-            next_echo_receive_check: tokio::time::Instant::now() + ECHO_TIMEOUT,
             read_buffers: storage::RingBuffer::new(read_buffers),
             write_buffers: storage::RingBuffer::new(write_buffers),
         }
@@ -490,25 +484,8 @@ impl VpnDevice<'_> {
     }
 
     async fn process_keepalive(&mut self) -> Result<(), NetworkError> {
-        let current_time = tokio::time::Instant::now();
-        if self.last_echo_sent + ECHO_TIMEOUT < current_time {
-            // Reset timeout if no echos were sent for too long (e.g. because of sleep).
-            self.next_echo_receive_check = current_time + ECHO_TIMEOUT;
-        }
-        if self.last_echo_sent + ECHO_SEND_INTERVAL < current_time {
-            // No echo sent recently, should test if connection is still alive.
-            self.vpn.send_echo_request().await?;
-            self.last_echo_sent = current_time;
-        }
-        if current_time < self.next_echo_receive_check {
-            // Haven't reached the next timeout check yet.
-            Ok(())
-        } else if self.vpn.last_echo_reply() + ECHO_TIMEOUT < current_time {
-            Err("No echo replies received".into())
-        } else {
-            self.next_echo_receive_check = current_time + ECHO_TIMEOUT;
-            Ok(())
-        }
+        // process_echo rate-limits echo requests, can be called as frequently as needed.
+        Ok(self.vpn.process_echo().await?)
     }
 }
 
