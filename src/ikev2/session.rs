@@ -1,6 +1,7 @@
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use rand::Rng;
 use std::{
+    cmp::Ordering,
     collections::HashSet,
     error, fmt,
     hash::{Hash, Hasher},
@@ -19,6 +20,7 @@ const MAX_NONCE: usize = 384 / 8;
 // ECSDA DER-encoded signatures can vafy in length and reach up to 72 bytes, plus optional algorithm parameters.
 const MAX_SIGNATURE_LENGTH: usize = 1 + 12 + 72;
 
+const MAX_ENCRYPTED_FRAGMENT_SIZE: usize = 1500;
 const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;
 
 const IKE_SESSION_EXPIRATION: time::Duration = time::Duration::from_secs(60 * 60);
@@ -118,12 +120,14 @@ pub struct IKEv2Session {
     ts_local: Vec<message::TrafficSelector>,
     child_sas: HashSet<ChildSessionID>,
     pki_processing: Arc<pki::PkiProcessing>,
+    use_fragmentation: bool,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
     user_id: Option<String>,
     last_update: Instant,
     remote_message_id: u32,
     local_message_id: u32,
+    fragment_reassembly: Option<FragmentReassembly>,
     last_response: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
     last_request: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
     sent_request: Option<RequestContext>,
@@ -149,12 +153,14 @@ impl IKEv2Session {
             ts_local: ts_local.to_vec(),
             child_sas: HashSet::new(),
             pki_processing,
+            use_fragmentation: false,
             params: None,
             crypto_stack: None,
             user_id: None,
             last_update: Instant::now(),
             remote_message_id: 0,
             local_message_id: 0,
+            fragment_reassembly: None,
             last_response: None,
             last_request: None,
             sent_request: None,
@@ -175,6 +181,7 @@ impl IKEv2Session {
     pub fn handle_response_expiration(&mut self, now: time::Instant) {
         if self.last_update + IKE_RESPONSE_EXPIRATION < now {
             self.last_response = None;
+            self.fragment_reassembly = None;
         }
     }
 
@@ -206,16 +213,26 @@ impl IKEv2Session {
         // TODO: return error if payload type is critical but not recognized
         self.last_update = Instant::now();
         let message_id = request.read_message_id();
-        if message_id < self.remote_message_id {
-            // This is an outdated retransmission, nothing to do.
-            return Ok(0);
-        }
-        if message_id == self.remote_message_id {
-            // Retransmit last response if available.
-            if let Some(last_response) = self.last_response {
-                let len = last_response.1;
-                response.raw_data_mut()[..len].copy_from_slice(&last_response.0[..len]);
-                return Ok(len);
+        match message_id.cmp(&self.remote_message_id) {
+            Ordering::Less => {
+                // This is an outdated retransmission, nothing to do.
+                return Ok(0);
+            }
+            Ordering::Equal => {
+                // Retransmit last response if available.
+                if let Some(last_response) = self.last_response {
+                    if !Self::should_retransmit(request) {
+                        // RFC 7383 2.6.1 states that only message 1 should trigger a
+                        // retransmission.
+                        return Ok(0);
+                    }
+                    let len = last_response.1;
+                    response.raw_data_mut()[..len].copy_from_slice(&last_response.0[..len]);
+                    return Ok(len);
+                }
+            }
+            Ordering::Greater => {
+                // New message ID, can proceed.
             }
         }
 
@@ -228,6 +245,27 @@ impl IKEv2Session {
             false,
             request.read_message_id(),
         )?;
+
+        let decrypted_data = if exchange_type == message::ExchangeType::IKE_SA_INIT {
+            None
+        } else {
+            // TODO: return INVALID_SYNTAX notification?
+            let decrypted_data = self.decrypt_request(request)?;
+            if decrypted_data.is_none() {
+                // Not all fragments have been received.
+                return Ok(0);
+            }
+            self.fragment_reassembly = None;
+            decrypted_data
+        };
+        let request = if let Some(decrypted_data) = decrypted_data.as_ref() {
+            &message::InputMessage::from_datagram(decrypted_data, request.is_nat())?
+        } else {
+            request
+        };
+        if decrypted_data.is_some() {
+            debug!("Decrypted packet from {}\n{:?}", remote_addr, request);
+        }
 
         let response_length = match exchange_type {
             message::ExchangeType::IKE_SA_INIT => self.process_sa_init_request(request, response),
@@ -265,14 +303,21 @@ impl IKEv2Session {
         Ok(response_length)
     }
 
-    fn process_encrypted_payload<'a>(
-        &self,
+    fn decrypt_request(
+        &mut self,
         request: &message::InputMessage,
-        encrypted_payload: &message::EncryptedMessage,
-        decrypted_data: &'a mut [u8],
-    ) -> Result<&'a [u8], SessionError> {
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        let encrypted_payload = match request.iter_payloads().next() {
+            Some(Ok(payload)) => payload,
+            Some(Err(err)) => return Err(err.into()),
+            None => return Err("Request has no encrypted payloads".into()),
+        };
+
+        let mut decrypted_data = [0u8; MAX_ENCRYPTED_FRAGMENT_SIZE];
+        let encrypted_payload = encrypted_payload.encrypted_data()?;
         let encrypted_data = encrypted_payload.encrypted_data();
-        decrypted_data[..encrypted_data.len()].copy_from_slice(encrypted_data);
+        let decrypted_data = &mut decrypted_data[..encrypted_data.len()];
+        decrypted_data.copy_from_slice(encrypted_data);
         let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
             crypto_stack
         } else {
@@ -283,7 +328,7 @@ impl IKEv2Session {
         } else {
             return Err("Crypto parameters not initialized".into());
         };
-        let validate_slice = request.signature_data(encrypted_payload, signature_length.is_some());
+        let validate_slice = request.signature_data(&encrypted_payload, signature_length.is_some());
         let valid_signature = crypto_stack.validate_signature(validate_slice);
         if !valid_signature {
             return Err("Packet has invalid signature".into());
@@ -298,12 +343,78 @@ impl IKEv2Session {
         } else {
             encrypted_data.len()
         };
-        match crypto_stack.decrypt_data(decrypted_data, encrypted_data_len, associated_data) {
-            Ok(decrypted_slice) => Ok(decrypted_slice),
-            Err(err) => {
-                info!("Failed to decrypt data: {}", err);
-                Err("Failed to decrypt data".into())
+        let decrypted_slice =
+            match crypto_stack.decrypt_data(decrypted_data, encrypted_data_len, associated_data) {
+                Ok(decrypted_slice) => decrypted_slice,
+                Err(err) => {
+                    info!("Failed to decrypt data: {}", err);
+                    return Err("Failed to decrypt data".into());
+                }
+            };
+        if encrypted_payload.total_fragments() == 1 {
+            let mut header = request.header();
+            let full_length = decrypted_slice.len() + header.len();
+            message::MessageWriter::update_header(
+                &mut header,
+                encrypted_payload.next_payload(),
+                full_length as u32,
+            );
+            let mut decrypted_message = Vec::with_capacity(MAX_ENCRYPTED_FRAGMENT_SIZE);
+            if request.is_nat() {
+                decrypted_message.resize(4, 0);
             }
+            decrypted_message.extend_from_slice(&header);
+            decrypted_message.extend_from_slice(decrypted_slice);
+            Ok(Some(decrypted_message))
+        } else {
+            debug!(
+                "Decrypted fragment {}, total: {}",
+                encrypted_payload.fragment_number(),
+                encrypted_payload.total_fragments()
+            );
+            let message_id = request.read_message_id();
+            let fragment_reassembly = match self.fragment_reassembly.as_mut() {
+                Some(fragment_reassembly) => {
+                    if fragment_reassembly.message_id != message_id {
+                        let mut fragment_reassembly = FragmentReassembly::new(message_id);
+                        fragment_reassembly.add(&encrypted_payload, decrypted_slice)?;
+                        self.fragment_reassembly = Some(fragment_reassembly);
+                        return Ok(None);
+                    }
+                    fragment_reassembly
+                }
+                None => {
+                    let mut fragment_reassembly = FragmentReassembly::new(message_id);
+                    fragment_reassembly.add(&encrypted_payload, decrypted_slice)?;
+                    self.fragment_reassembly = Some(fragment_reassembly);
+                    return Ok(None);
+                }
+            };
+            fragment_reassembly.add(&encrypted_payload, decrypted_slice)?;
+            if !fragment_reassembly.is_complete() {
+                return Ok(None);
+            }
+            let decrypted_message = fragment_reassembly.to_vec(request);
+            self.fragment_reassembly = None;
+            Ok(Some(decrypted_message))
+        }
+    }
+
+    fn should_retransmit(request: &message::InputMessage) -> bool {
+        match request.iter_payloads().next() {
+            Some(Ok(payload)) => {
+                if payload.payload_type()
+                    == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT
+                {
+                    payload
+                        .encrypted_data()
+                        .map_or(true, |payload| payload.fragment_number() == 1)
+                } else {
+                    true
+                }
+            }
+            Some(Err(_)) => true,
+            None => true,
         }
     }
 
@@ -493,16 +604,20 @@ impl IKEv2Session {
                 }
                 message::PayloadType::NOTIFY => {
                     let notify = payload.to_notify()?;
-                    if notify.message_type()
-                        == message::NotifyMessageType::SIGNATURE_HASH_ALGORITHMS
-                    {
-                        let supports_sha256 = notify
-                            .to_signature_hash_algorithms()?
-                            .any(|alg| alg == message::SignatureHashAlgorithm::SHA2_256);
-                        if !supports_sha256 {
-                            // TODO: return NO_PROPOSAL_CHOSEN notification.
-                            return Err("No supported signature hash algorithms".into());
+                    match notify.message_type() {
+                        message::NotifyMessageType::SIGNATURE_HASH_ALGORITHMS => {
+                            let supports_sha256 = notify
+                                .to_signature_hash_algorithms()?
+                                .any(|alg| alg == message::SignatureHashAlgorithm::SHA2_256);
+                            if !supports_sha256 {
+                                // TODO: return NO_PROPOSAL_CHOSEN notification.
+                                return Err("No supported signature hash algorithms".into());
+                            }
                         }
+                        message::NotifyMessageType::IKEV2_FRAGMENTATION_SUPPORTED => {
+                            self.use_fragmentation = true;
+                        }
+                        _ => {}
                     }
                 }
                 _ => {
@@ -572,6 +687,15 @@ impl IKEv2Session {
             &nat_ip,
         )?;
 
+        if self.use_fragmentation {
+            response.write_notify_payload(
+                None,
+                &[],
+                message::NotifyMessageType::IKEV2_FRAGMENTATION_SUPPORTED,
+                &[],
+            )?;
+        }
+
         // Only one algorithm is supported, otherwise this would need to be an array.
         let supported_signature_algorithms =
             message::SignatureHashAlgorithm::SHA2_256.to_be_bytes();
@@ -633,37 +757,6 @@ impl IKEv2Session {
         } else {
             return Err("Crypto parameters not initialized".into());
         };
-        let mut decrypted_request = [0u8; MAX_ENCRYPTED_DATA_SIZE];
-        let mut decrypted_iter = None;
-
-        for payload in request.iter_payloads() {
-            let payload = match payload {
-                Ok(payload) => payload,
-                Err(err) => {
-                    // TODO: return INVALID_SYNTAX notification.
-                    warn!("Received invalid payload: {}", err);
-                    continue;
-                }
-            };
-            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
-                let encrypted_payload = payload.encrypted_data()?;
-                // TODO: return AUTHENTICATION_FAILED notification on error.
-                let decrypted_slice = self.process_encrypted_payload(
-                    request,
-                    &encrypted_payload,
-                    &mut decrypted_request,
-                )?;
-                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
-            }
-        }
-
-        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
-            decrypted_iter
-        } else {
-            // TODO: return AUTHENTICATION_FAILED notification.
-            // AUTH payload is supposed to have an encrypted payload.
-            return Ok(response.complete_message());
-        };
 
         let mut client_cert = None;
         let mut client_auth = None;
@@ -674,7 +767,7 @@ impl IKEv2Session {
         let mut ts_local = vec![];
         let mut ipv4_address_requested = false;
 
-        for payload in decrypted_iter {
+        for payload in request.iter_payloads() {
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(err) => {
@@ -683,7 +776,6 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            trace!("Decrypted payload\n {:?}", payload);
             match payload.payload_type() {
                 message::PayloadType::CERTIFICATE => {
                     let certificate = payload.to_certificate()?;
@@ -1020,38 +1112,10 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
     ) -> Result<usize, SessionError> {
-        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
-        let mut decrypted_iter = None;
-
-        for payload in request.iter_payloads() {
-            let payload = if let Ok(payload) = payload {
-                payload
-            } else {
-                // TODO: return INVALID_SYNTAX notification.
-                continue;
-            };
-            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
-                let encrypted_payload = payload.encrypted_data()?;
-                let decrypted_slice = self.process_encrypted_payload(
-                    request,
-                    &encrypted_payload,
-                    &mut decrypted_data,
-                )?;
-                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
-            }
-        }
-
         let mut delete_spi = vec![];
         let mut delete_ike = false;
 
-        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
-            decrypted_iter
-        } else {
-            // TODO: return INVALID_SYNTAX notification.
-            // INFORMATIONAL payload is supposed to have an encrypted payload.
-            return Ok(response.complete_message());
-        };
-        for payload in decrypted_iter {
+        for payload in request.iter_payloads() {
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(err) => {
@@ -1060,7 +1124,6 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            trace!("Decrypted payload\n {:?}", payload);
             match payload.payload_type() {
                 message::PayloadType::DELETE => {
                     let delete = payload.to_delete()?;
@@ -1142,35 +1205,6 @@ impl IKEv2Session {
             return Err("Crypto stack not initialized".into());
         };
 
-        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
-        let mut decrypted_iter = None;
-
-        for payload in request.iter_payloads() {
-            let payload = if let Ok(payload) = payload {
-                payload
-            } else {
-                // TODO: return INVALID_SYNTAX notification.
-                continue;
-            };
-            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
-                let encrypted_payload = payload.encrypted_data()?;
-                let decrypted_slice = self.process_encrypted_payload(
-                    request,
-                    &encrypted_payload,
-                    &mut decrypted_data,
-                )?;
-                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
-            }
-        }
-
-        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
-            decrypted_iter
-        } else {
-            // TODO: return INVALID_SYNTAX notification.
-            // CREATE_CHILD_SA payload is supposed to have an encrypted payload.
-            return Ok(response.complete_message());
-        };
-
         let mut rekey_child_sa = None;
         let mut dh_transform = None;
         let mut transform_params = None;
@@ -1180,7 +1214,7 @@ impl IKEv2Session {
         let mut nonce_responder = None;
         let mut ts_remote = vec![];
         let mut ts_local = vec![];
-        for payload in decrypted_iter {
+        for payload in request.iter_payloads() {
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(err) => {
@@ -1189,7 +1223,6 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            trace!("Decrypted payload\n {:?}", payload);
             match payload.payload_type() {
                 message::PayloadType::NOTIFY => {
                     let notify = payload.to_notify()?;
@@ -1466,12 +1499,14 @@ impl IKEv2Session {
                 ts_local: self.ts_local.clone(),
                 child_sas: self.child_sas.clone(),
                 pki_processing: self.pki_processing.clone(),
+                use_fragmentation: self.use_fragmentation,
                 params: Some(transform_params),
                 crypto_stack: Some(new_crypto_stack),
                 user_id: self.user_id.clone(),
                 last_update: self.last_update,
                 remote_message_id: 0,
                 local_message_id: 0,
+                fragment_reassembly: None,
                 last_response: None,
                 last_request: None,
                 sent_request: None,
@@ -1612,38 +1647,9 @@ impl IKEv2Session {
             return Ok(());
         }
 
-        let mut decrypted_data = [0u8; MAX_ENCRYPTED_DATA_SIZE];
-        let mut decrypted_iter = None;
-        for payload in response.iter_payloads() {
-            let payload = if let Ok(payload) = payload {
-                payload
-            } else {
-                // TODO: return INVALID_SYNTAX notification.
-                continue;
-            };
-            if payload.payload_type() == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED {
-                let encrypted_payload = payload.encrypted_data()?;
-                let decrypted_slice = self.process_encrypted_payload(
-                    response,
-                    &encrypted_payload,
-                    &mut decrypted_data,
-                )?;
-                decrypted_iter = Some(encrypted_payload.iter_decrypted_message(decrypted_slice));
-            }
-        }
-        let decrypted_iter = if let Some(decrypted_iter) = decrypted_iter {
-            decrypted_iter
-        } else {
-            // TODO: return INVALID_SYNTAX notification.
-            // Responses are always sent encrypted.
-            return Err("Response has no encrypted payload".into());
-        };
-
         let exchange_type = response.read_exchange_type()?;
         match exchange_type {
-            message::ExchangeType::INFORMATIONAL => {
-                self.process_informational_response(decrypted_iter)
-            }
+            message::ExchangeType::INFORMATIONAL => self.process_informational_response(response),
             _ => {
                 warn!(
                     "Unimplemented response handler for message {}",
@@ -1668,9 +1674,9 @@ impl IKEv2Session {
 
     fn process_informational_response(
         &mut self,
-        payloads: message::PayloadIter,
+        request: &message::InputMessage,
     ) -> Result<(), SessionError> {
-        for payload in payloads {
+        for payload in request.iter_payloads() {
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(err) => {
@@ -1679,7 +1685,6 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            trace!("Decrypted payload\n {:?}", payload);
             // No payloads are parsed here, so only critical ones are checked.
             if payload.is_critical() {
                 warn!(
@@ -1791,6 +1796,88 @@ impl Hash for ChildSessionID {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.remote_spi.hash(state);
         self.local_spi.hash(state);
+    }
+}
+
+struct FragmentReassembly {
+    message_id: u32,
+    next_payload: message::PayloadType,
+    fragments: Vec<Option<Vec<u8>>>,
+}
+
+impl FragmentReassembly {
+    fn new(message_id: u32) -> FragmentReassembly {
+        FragmentReassembly {
+            message_id,
+            next_payload: message::PayloadType::NONE,
+            fragments: vec![],
+        }
+    }
+
+    fn add(
+        &mut self,
+        fragment: &message::EncryptedMessage,
+        decrypted_data: &[u8],
+    ) -> Result<(), SessionError> {
+        if fragment.fragment_number() == 1 {
+            self.next_payload = fragment.next_payload();
+        }
+        let total_fragments = fragment.total_fragments() as usize;
+        if self.fragments.is_empty() {
+            self.fragments.resize(total_fragments, None);
+        } else if self.fragments.len() != total_fragments {
+            return Err("Total fragments count mismatch".into());
+        }
+        let fragment_number = fragment.fragment_number() as usize;
+        let fragment_number = if fragment_number >= 1 {
+            fragment_number - 1
+        } else {
+            return Err("Fragment number is less than 1".into());
+        };
+        if fragment_number < self.fragments.len() {
+            let dest = &mut self.fragments[fragment_number];
+            if dest.is_none() {
+                *dest = Some(decrypted_data.to_vec());
+            }
+            Ok(())
+        } else {
+            Err("Fragment number exceeds total fragments".into())
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.fragments.is_empty() && self.fragments.iter().all(|fragment| fragment.is_some())
+    }
+
+    fn data_length(&self) -> usize {
+        self.fragments
+            .iter()
+            .map(|fragment| {
+                if let Some(fragment) = fragment {
+                    fragment.len()
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    fn to_vec(&self, request: &message::InputMessage) -> Vec<u8> {
+        let decrypted_length = self.data_length();
+        let mut decrypted_message = Vec::with_capacity(MAX_ENCRYPTED_DATA_SIZE);
+        if request.is_nat() {
+            decrypted_message.resize(4, 0);
+        }
+        let mut header = request.header();
+        let full_length = header.len() + decrypted_length;
+        message::MessageWriter::update_header(&mut header, self.next_payload, full_length as u32);
+        decrypted_message.extend_from_slice(&header);
+        self.fragments.iter().for_each(|fragment| {
+            if let Some(fragment) = fragment {
+                decrypted_message.extend_from_slice(fragment)
+            }
+        });
+        decrypted_message
     }
 }
 

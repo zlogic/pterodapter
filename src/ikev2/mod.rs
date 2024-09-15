@@ -27,8 +27,7 @@ const IKEV2_PORT: u16 = 500;
 const IKEV2_NAT_PORT: u16 = 4500;
 const IKEV2_LISTEN_PORTS: [u16; 2] = [IKEV2_PORT, IKEV2_NAT_PORT];
 
-// TODO: for Windows, add IKEV2_FRAGMENTATION_SUPPORTED support. Otherwise, UDP fragmentation will be used to transmit larger packets.
-const MAX_DATAGRAM_SIZE: usize = 4096;
+const MAX_DATAGRAM_SIZE: usize = 1500;
 // Use 1500 as max MTU, real value is likely lower.
 const MAX_ESP_PACKET_SIZE: usize = 1500;
 
@@ -242,19 +241,6 @@ impl UdpDatagram {
 
     fn is_ikev2(&self) -> bool {
         self.local_addr.port() == IKEV2_PORT || self.is_non_esp()
-    }
-
-    fn ikev2_data(&self) -> &[u8] {
-        if self.local_addr.port() == IKEV2_PORT {
-            // Regular IKEv2 message sent to port 500.
-            self.request.as_slice()
-        } else if self.is_non_esp() {
-            // Shared IKEv2/ESP-in-UDP port, marked as an IKEv2 message.
-            &self.request[4..]
-        } else {
-            // Shared IKEv2/ESP-in-UDP port, an ESP-in-UDP message.
-            &[]
-        }
     }
 }
 
@@ -513,12 +499,9 @@ impl Sessions {
         }
     }
 
-    async fn process_ikev2_message(
-        &mut self,
-        datagram: &mut UdpDatagram,
-    ) -> Result<(), IKEv2Error> {
-        let request_bytes = datagram.ikev2_data();
-        let ikev2_request = message::InputMessage::from_datagram(request_bytes)?;
+    async fn process_ikev2_message(&mut self, datagram: &UdpDatagram) -> Result<(), IKEv2Error> {
+        let is_nat = datagram.is_non_esp();
+        let ikev2_request = message::InputMessage::from_datagram(&datagram.request, is_nat)?;
         if !ikev2_request.is_valid() {
             return Err("Invalid message received".into());
         }
@@ -572,7 +555,7 @@ impl Sessions {
         }
 
         let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
-        let start_offset = if datagram.is_non_esp() { 4 } else { 0 };
+        let start_offset = if ikev2_request.is_nat() { 4 } else { 0 };
 
         if ikev2_request.read_flags()?.has(message::Flags::RESPONSE) {
             session.process_response(datagram.remote_addr, datagram.local_addr, &ikev2_request)?;
@@ -589,10 +572,9 @@ impl Sessions {
             )?;
             self.reserved_spi = Some(reserved_spi);
 
-            let response_bytes = &response_bytes[..response_len + start_offset];
-
             // Response retransmissions are initiated by client.
-            if !response_bytes.is_empty() {
+            if response_len > 0 {
+                let response_bytes = &response_bytes[..response_len + start_offset];
                 self.sockets
                     .send_datagram(&datagram.local_addr, &datagram.remote_addr, response_bytes)
                     .await?;

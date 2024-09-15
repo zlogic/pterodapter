@@ -143,17 +143,23 @@ impl fmt::Debug for Spi {
 
 pub struct InputMessage<'a> {
     data: &'a [u8],
+    is_nat: bool,
 }
 
 // Parse and validate using spec from RFC 7296, Section 3.
 impl InputMessage<'_> {
-    pub fn from_datagram(p: &[u8]) -> Result<InputMessage, FormatError> {
+    pub fn from_datagram(p: &[u8], is_nat: bool) -> Result<InputMessage, FormatError> {
+        let data = if is_nat { &p[4..] } else { p };
         if p.len() < 28 {
             warn!("Not enough data in message");
             Err("Not enough data in message".into())
         } else {
-            Ok(InputMessage { data: p })
+            Ok(InputMessage { data, is_nat })
         }
+    }
+
+    pub fn is_nat(&self) -> bool {
+        self.is_nat
     }
 
     pub fn read_initiator_spi(&self) -> u64 {
@@ -168,8 +174,8 @@ impl InputMessage<'_> {
         u64::from_be_bytes(result)
     }
 
-    fn read_next_payload(&self) -> u8 {
-        self.data[16]
+    fn read_next_payload(&self) -> PayloadType {
+        PayloadType::from_u8(self.data[16])
     }
 
     fn read_version(&self) -> (u8, u8) {
@@ -197,6 +203,14 @@ impl InputMessage<'_> {
         let mut result = [0u8; 4];
         result.copy_from_slice(&self.data[24..28]);
         u32::from_be_bytes(result)
+    }
+
+    pub fn header(&self) -> [u8; 28] {
+        let mut header = [0u8; 28];
+        header[16] = PayloadType::NONE.0;
+        // Don't copy length to keep it empty.
+        header[..24].copy_from_slice(&self.data[..24]);
+        header
     }
 
     pub fn is_valid(&self) -> bool {
@@ -336,6 +350,11 @@ impl MessageWriter<'_> {
         self.next_payload_index = 16;
         self.cursor = 28;
         Ok(())
+    }
+
+    pub fn update_header(header: &mut [u8; 28], next_payload: PayloadType, length: u32) {
+        header[16] = next_payload.0;
+        header[24..28].copy_from_slice(&length.to_be_bytes());
     }
 
     fn sa_parameters_len(params: &crypto::TransformParameters) -> (usize, usize) {
@@ -721,7 +740,7 @@ impl MessageWriter<'_> {
 
 pub struct Payload<'a> {
     payload_type: PayloadType,
-    encrypted_next_payload: Option<u8>,
+    encrypted_next_payload: Option<PayloadType>,
     critical: bool,
     data: &'a [u8],
     start_offset: usize,
@@ -835,7 +854,17 @@ impl Payload<'_> {
             } else {
                 return Err("Unspecified next encrypted payload".into());
             };
-            Ok(EncryptedMessage::from_payload(encrypted_next_payload, self))
+            Ok(EncryptedMessage::from_encrypted_payload(
+                encrypted_next_payload,
+                self,
+            ))
+        } else if self.payload_type == PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT {
+            let encrypted_next_payload = if let Some(next_payload) = self.encrypted_next_payload {
+                next_payload
+            } else {
+                return Err("Unspecified next encrypted payload".into());
+            };
+            EncryptedMessage::from_encrypted_fragment_payload(encrypted_next_payload, self)
         } else {
             Err("Payload type is not ENCRYPTED_AND_AUTHENTICATED".into())
         }
@@ -844,7 +873,7 @@ impl Payload<'_> {
 
 pub struct PayloadIter<'a> {
     start_offset: usize,
-    next_payload: u8,
+    next_payload: PayloadType,
     payload_encrypted: bool,
     data: &'a [u8],
 }
@@ -854,7 +883,7 @@ impl<'a> Iterator for PayloadIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         const CRITICAL_BIT: u8 = 1 << 7;
-        if self.next_payload == 0 || self.payload_encrypted {
+        if self.next_payload == PayloadType::NONE || self.payload_encrypted {
             if !self.data.is_empty() {
                 debug!("Packet has unaccounted data");
             }
@@ -867,7 +896,7 @@ impl<'a> Iterator for PayloadIter<'a> {
         let current_payload = self.next_payload;
         let start_offset = self.start_offset;
         let data = self.data;
-        let next_payload = self.data[0];
+        let next_payload = PayloadType::from_u8(self.data[0]);
         self.next_payload = next_payload;
         let payload_flags = self.data[1];
         let mut payload_length = [0u8; 2];
@@ -890,20 +919,19 @@ impl<'a> Iterator for PayloadIter<'a> {
                 return Some(Err("Unsupported payload reserved flags".into()));
             }
         };
-        let payload_type = match PayloadType::from_u8(current_payload) {
-            Ok(payload_type) => payload_type,
-            Err(err) => {
-                return Some(Err(err));
-            }
-        };
-        self.payload_encrypted = current_payload == PayloadType::ENCRYPTED_AND_AUTHENTICATED.0;
-        let encrypted_next_payload = if payload_type == PayloadType::ENCRYPTED_AND_AUTHENTICATED {
-            Some(next_payload)
+        if !next_payload.is_supported() {
+            warn!("Unsupported IKEv2 Payload Type {}", self.next_payload);
+            return Some(Err("Unsupported IKEv2 Payload Type".into()));
+        }
+        self.payload_encrypted = current_payload == PayloadType::ENCRYPTED_AND_AUTHENTICATED
+            || current_payload == PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT;
+        let encrypted_next_payload = if self.payload_encrypted {
+            Some(self.next_payload)
         } else {
             None
         };
         let item = Payload {
-            payload_type,
+            payload_type: current_payload,
             encrypted_next_payload,
             critical,
             data: &data[4..payload_length],
@@ -935,15 +963,16 @@ impl PayloadType {
     pub const CONFIGURATION: PayloadType = PayloadType(47);
     pub const EXTENSIBLE_AUTHENTICATION: PayloadType = PayloadType(48);
 
-    fn from_u8(value: u8) -> Result<PayloadType, FormatError> {
-        if (Self::SECURITY_ASSOCIATION.0..=Self::EXTENSIBLE_AUTHENTICATION.0).contains(&value)
-            || value == Self::NONE.0
-        {
-            Ok(PayloadType(value))
-        } else {
-            warn!("Unsupported IKEv2 Payload Type {}", value);
-            Err("Unsupported IKEv2 Payload Type".into())
-        }
+    pub const ENCRYPTED_AND_AUTHENTICATED_FRAGMENT: PayloadType = PayloadType(53);
+
+    fn from_u8(value: u8) -> PayloadType {
+        PayloadType(value)
+    }
+
+    fn is_supported(&self) -> bool {
+        (Self::SECURITY_ASSOCIATION.0..=Self::EXTENSIBLE_AUTHENTICATION.0).contains(&self.0)
+            || self.0 == Self::NONE.0
+            || self.0 == Self::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT.0
     }
 }
 
@@ -967,6 +996,9 @@ impl fmt::Display for PayloadType {
             Self::ENCRYPTED_AND_AUTHENTICATED => write!(f, "Encrypted and Authenticated")?,
             Self::CONFIGURATION => write!(f, "Configuration")?,
             Self::EXTENSIBLE_AUTHENTICATION => write!(f, "Extensible Authentication")?,
+            Self::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT => {
+                write!(f, "Encrypted and Authenticated Fragment")?
+            }
             _ => write!(f, "Unknown exchange type {}", self.0)?,
         }
         Ok(())
@@ -2324,31 +2356,65 @@ impl<'a> Iterator for ConfigurationAttributesIter<'a> {
 }
 
 pub struct EncryptedMessage<'a> {
-    next_payload: u8,
+    next_payload: PayloadType,
     data: &'a [u8],
     start_offset: usize,
+    fragment_number: u16,
+    total_fragments: u16,
 }
 
 impl<'a> EncryptedMessage<'a> {
-    fn from_payload(next_payload: u8, payload: &'a Payload) -> EncryptedMessage<'a> {
+    fn from_encrypted_payload(
+        next_payload: PayloadType,
+        payload: &'a Payload,
+    ) -> EncryptedMessage<'a> {
         EncryptedMessage {
             next_payload,
             data: payload.data,
             start_offset: payload.start_offset,
+            fragment_number: 1,
+            total_fragments: 1,
         }
+    }
+
+    fn from_encrypted_fragment_payload(
+        next_payload: PayloadType,
+        payload: &'a Payload,
+    ) -> Result<EncryptedMessage<'a>, FormatError> {
+        let data = payload.data;
+        if payload.data.len() < 4 {
+            Err("Not enough data in Encrypted Fragment payload".into())
+        } else {
+            let mut fragment_number = [0u8; 2];
+            fragment_number.copy_from_slice(&data[0..2]);
+            let fragment_number = u16::from_be_bytes(fragment_number);
+            let mut total_fragments = [0u8; 2];
+            total_fragments.copy_from_slice(&data[2..4]);
+            let total_fragments = u16::from_be_bytes(total_fragments);
+            Ok(EncryptedMessage {
+                next_payload,
+                data: &data[4..],
+                start_offset: payload.start_offset + 4,
+                fragment_number,
+                total_fragments,
+            })
+        }
+    }
+
+    pub fn next_payload(&self) -> PayloadType {
+        self.next_payload
+    }
+
+    pub fn fragment_number(&self) -> u16 {
+        self.fragment_number
+    }
+
+    pub fn total_fragments(&self) -> u16 {
+        self.total_fragments
     }
 
     pub fn encrypted_data(&self) -> &[u8] {
         self.data
-    }
-
-    pub fn iter_decrypted_message<'b>(&self, decrypted_data: &'b [u8]) -> PayloadIter<'b> {
-        PayloadIter {
-            next_payload: self.next_payload,
-            payload_encrypted: false,
-            data: decrypted_data,
-            start_offset: 0,
-        }
     }
 }
 
