@@ -54,6 +54,9 @@ Options:\
 Options:\
 \n      --log-level=<LOG_LEVEL>   Log level [default: info]\
 \n      --listen-ip=<IP>          Listen IP address, multiple options can be provided [default: ::]\
+\n      --ike-port=<PORT>         IKEv2 port [default: 500]\
+\n      --nat-port=<PORT>         NAT port for IKEv2 and ESP [default: 4500]\
+\n      --listen-ip=<IP>          Listen IP address, multiple options can be provided [default: ::]\
 \n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --tunnel-domain=<DOMAIN>  (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
 \n      --id-hostname=<FQDN>      Hostname for identification [default: pterodapter]\
@@ -110,6 +113,8 @@ impl Args {
         let mut destination_hostport = None;
 
         let mut listen_ips = vec![];
+        let mut ike_port = 500u16;
+        let mut nat_port = 4500u16;
         let mut id_hostname: Option<String> = None;
         let mut root_ca = None;
         let mut private_key = None;
@@ -183,6 +188,24 @@ impl Args {
                         name,
                         value,
                         format_args!("Failed to parse IP address: {}", err),
+                    ),
+                };
+            } else if action_type == ActionType::IkeV2 && name == "--ike-port" {
+                match u16::from_str(value) {
+                    Ok(port) => ike_port = port,
+                    Err(err) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("Failed to parse IKEv2 port: {}", err),
+                    ),
+                };
+            } else if action_type == ActionType::IkeV2 && name == "--nat-port" {
+                match u16::from_str(value) {
+                    Ok(port) => nat_port = port,
+                    Err(err) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("Failed to parse NAT port for IKEv2: {}", err),
                     ),
                 };
             } else if action_type == ActionType::IkeV2 && name == "--id-hostname" {
@@ -284,6 +307,8 @@ impl Args {
                     let ikev2_config = ikev2::Config {
                         hostname: id_hostname.clone(),
                         listen_ips: listen_ips.clone(),
+                        port: ike_port,
+                        nat_port,
                         root_ca,
                         server_cert,
                         tunnel_domains,

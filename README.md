@@ -113,12 +113,16 @@ For containers running in Podman Machine, use `host.containers.internal` instead
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] --destination=<hostport> [--tunnel-domain=<domain>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
+pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --destination=<hostport> [--tunnel-domain=<domain>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
 
 `--listen-ip=<ip-address>` is an optional argument to specify the proxy listen IP address, for example `--listen-ip=127.0.0.1`. If not specified, will use `::` as the listen address (all IPv4 and IPv6 addresses). Multiple addresses can be specified.
+
+`--ike-port=<port>` is an optional argument to specify the IKEv2 listen port, for example `--ike-port=9500`. If not specified, will use port 500 (the default IKEv2 port).
+
+`--nat-port=<port>` is an optional argument to specify the NAT port for IKEv2 and ESP, for example `--nat-port=9501`. If not specified, will use port 4500 (the default IKEv2 and ESP NAT port).
 
 `--destination=<hostport>` specifies the FortiVPN connection address, for example `--destination=fortivpn.example.com:443`.
 

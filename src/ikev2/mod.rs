@@ -23,10 +23,6 @@ mod message;
 mod pki;
 mod session;
 
-const IKEV2_PORT: u16 = 500;
-const IKEV2_NAT_PORT: u16 = 4500;
-const IKEV2_LISTEN_PORTS: [u16; 2] = [IKEV2_PORT, IKEV2_NAT_PORT];
-
 const MAX_DATAGRAM_SIZE: usize = 1500;
 // Use 1500 as max MTU, real value is likely lower.
 const MAX_ESP_PACKET_SIZE: usize = 1500;
@@ -35,6 +31,8 @@ const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub struct Config {
+    pub port: u16,
+    pub nat_port: u16,
     pub listen_ips: Vec<IpAddr>,
     pub hostname: Option<String>,
     pub root_ca: Option<String>,
@@ -44,6 +42,8 @@ pub struct Config {
 
 pub struct Server {
     listen_ips: Vec<IpAddr>,
+    port: u16,
+    nat_port: u16,
     pki_processing: Arc<pki::PkiProcessing>,
     tunnel_domains: Vec<String>,
     command_sender: Option<mpsc::Sender<SessionMessage>>,
@@ -62,6 +62,8 @@ impl Server {
         )?;
         Ok(Server {
             listen_ips: config.listen_ips,
+            port: config.port,
+            nat_port: config.nat_port,
             pki_processing: Arc::new(pki_processing),
             tunnel_domains: config.tunnel_domains,
             command_sender: None,
@@ -72,6 +74,7 @@ impl Server {
     async fn listen_socket(
         socket: Arc<UdpSocket>,
         listen_addr: SocketAddr,
+        is_nat_port: bool,
         dest: mpsc::Sender<SessionMessage>,
     ) -> Result<(), IKEv2Error> {
         loop {
@@ -86,6 +89,7 @@ impl Server {
             let msg = SessionMessage::UdpDatagram(UdpDatagram {
                 remote_addr,
                 local_addr: listen_addr,
+                is_nat_port,
                 request: buf,
             });
             dest.send(msg).await.map_err(|_| "Channel closed")?;
@@ -127,7 +131,7 @@ impl Server {
         if self.command_sender.is_some() {
             return Err("Server already started".into());
         }
-        let sockets = Arc::new(Sockets::new(&self.listen_ips).await?);
+        let sockets = Arc::new(Sockets::new(&self.listen_ips, &[self.port, self.nat_port]).await?);
         let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
         let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
         let vpn_service = FortiService::new(fortivpn_config);
@@ -141,9 +145,11 @@ impl Server {
         let rt = runtime::Handle::current();
         // Non-critical futures sockets will be terminated by Tokio during the shutdown_timeout phase.
         sockets.iter_sockets().for_each(|(listen_addr, socket)| {
+            let is_nat_port = listen_addr.port() == self.nat_port;
             rt.spawn(Server::listen_socket(
                 socket.clone(),
                 *listen_addr,
+                is_nat_port,
                 sessions.create_sender(),
             ));
         });
@@ -183,11 +189,11 @@ struct Sockets {
 }
 
 impl Sockets {
-    async fn new(listen_ips: &[IpAddr]) -> Result<Sockets, IKEv2Error> {
+    async fn new(listen_ips: &[IpAddr], listen_ports: &[u16]) -> Result<Sockets, IKEv2Error> {
         let mut sockets = HashMap::new();
         for listen_ip in listen_ips {
-            for listen_port in IKEV2_LISTEN_PORTS {
-                let socket = match UdpSocket::bind((*listen_ip, listen_port)).await {
+            for listen_port in listen_ports {
+                let socket = match UdpSocket::bind((*listen_ip, *listen_port)).await {
                     Ok(socket) => socket,
                     Err(err) => {
                         log::error!("Failed to open listener on {}: {}", listen_ip, err);
@@ -231,6 +237,7 @@ impl Sockets {
 struct UdpDatagram {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
+    is_nat_port: bool,
     request: Vec<u8>,
 }
 
@@ -240,7 +247,7 @@ impl UdpDatagram {
     }
 
     fn is_ikev2(&self) -> bool {
-        self.local_addr.port() == IKEV2_PORT || self.is_non_esp()
+        !self.is_nat_port || self.is_non_esp()
     }
 }
 

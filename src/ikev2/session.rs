@@ -10,8 +10,8 @@ use std::{
     time::{self, Instant},
 };
 
+use super::MAX_DATAGRAM_SIZE;
 use super::{crypto, esp, message, pki, SendError, Sockets};
-use super::{IKEV2_NAT_PORT, IKEV2_PORT, MAX_DATAGRAM_SIZE};
 
 use crypto::DHTransform;
 
@@ -665,7 +665,7 @@ impl IKEv2Session {
         }
 
         // Simulate that the host is behind a NAT - same as StrongSwan's encap=yes does it.
-        let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), IKEV2_PORT);
+        let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 500);
         let nat_ip = nat_detection_ip(
             request.read_initiator_spi(),
             request.read_responder_spi(),
@@ -1568,13 +1568,7 @@ impl IKEv2Session {
             return Err("Already processing another command".into());
         }
         let mut request_bytes = [0u8; MAX_DATAGRAM_SIZE];
-        // Requests will always be sent to the ESP port.
-        let start_offset = if self.remote_addr.port() == IKEV2_NAT_PORT {
-            4
-        } else {
-            0
-        };
-        let mut ikev2_request = message::MessageWriter::new(&mut request_bytes[start_offset..])?;
+        let mut ikev2_request = message::MessageWriter::new(&mut request_bytes)?;
         ikev2_request.write_header(
             self.session_id.remote_spi,
             self.session_id.local_spi,
