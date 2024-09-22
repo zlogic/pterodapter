@@ -623,7 +623,7 @@ impl Sessions {
                 }
                 session::IKEv2PendingAction::DeleteChildSA(session_id) => {
                     if self.security_associations.remove(&session_id).is_some() {
-                        info!("Deleted Security Association {:x}", session_id)
+                        debug!("Deleted Security Association {:x}", session_id)
                     }
                 }
                 session::IKEv2PendingAction::CreateIKEv2Session(session_id, session) => {
@@ -631,7 +631,7 @@ impl Sessions {
                 }
             });
         if delete_session && self.sessions.remove(&session_id).is_some() {
-            info!("Deleted IKEv2 session {}", session_id);
+            debug!("Deleted IKEv2 session {}", session_id);
         }
     }
 
@@ -732,7 +732,7 @@ impl Sessions {
             let hdr = esp::IpHeader::from_packet(decrypted_slice)?;
             trace!("IP header {}", hdr);
             if !sa.accepts_esp_to_vpn(&hdr) {
-                info!("ESP packet {} dropped by traffic selector", hdr);
+                debug!("ESP packet {} dropped by traffic selector", hdr);
                 return Err("ESP packet dropped by traffic selector".into());
             }
             if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
@@ -798,7 +798,7 @@ impl Sessions {
                 .await?;
             Ok(())
         } else {
-            info!(
+            debug!(
                 "No matching Security Associations found for VPN packet {}",
                 hdr
             );
