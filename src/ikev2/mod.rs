@@ -246,6 +246,7 @@ impl UdpDatagram {
 
 enum SessionMessage {
     UdpDatagram(UdpDatagram),
+    TransmitResponse(session::SessionID, u32, bool),
     RetransmitRequest(session::SessionID, u32),
     VpnPacket(Vec<u8>),
     VpnDisconnected,
@@ -455,6 +456,9 @@ impl Sessions {
                         );
                     }
                 }
+                SessionMessage::TransmitResponse(session_id, message_id, is_nat) => {
+                    self.transmit_response(session_id, message_id, is_nat).await;
+                }
                 SessionMessage::VpnPacket(data) => {
                     if let Err(err) = self.process_vpn_packet(data).await {
                         warn!("Failed to process VPN packet: {}", err);
@@ -554,30 +558,26 @@ impl Sessions {
             session.update_ip(client_ip, dns_addrs);
         }
 
-        let mut response_bytes = [0u8; MAX_DATAGRAM_SIZE];
-        let start_offset = if ikev2_request.is_nat() { 4 } else { 0 };
-
         if ikev2_request.read_flags()?.has(message::Flags::RESPONSE) {
             session.process_response(datagram.remote_addr, datagram.local_addr, &ikev2_request)?;
         } else {
-            let mut ikev2_response =
-                message::MessageWriter::new(&mut response_bytes[start_offset..])?;
-
-            let response_len = session.process_request(
+            let transmit_response = session.process_request(
                 datagram.remote_addr,
                 datagram.local_addr,
                 &ikev2_request,
-                &mut ikev2_response,
                 &mut reserved_spi,
             )?;
             self.reserved_spi = Some(reserved_spi);
-
             // Response retransmissions are initiated by client.
-            if response_len > 0 {
-                let response_bytes = &response_bytes[..response_len + start_offset];
-                self.sockets
-                    .send_datagram(&datagram.local_addr, &datagram.remote_addr, response_bytes)
-                    .await?;
+            if transmit_response {
+                let _ = self
+                    .tx
+                    .send(SessionMessage::TransmitResponse(
+                        session_id,
+                        ikev2_request.read_message_id(),
+                        is_nat,
+                    ))
+                    .await;
             }
         }
 
@@ -632,6 +632,32 @@ impl Sessions {
             });
         if delete_session && self.sessions.remove(&session_id).is_some() {
             info!("Deleted IKEv2 session {}", session_id);
+        }
+    }
+
+    async fn transmit_response(
+        &mut self,
+        session_id: session::SessionID,
+        message_id: u32,
+        is_nat: bool,
+    ) {
+        let session = if let Some(session) = self.sessions.get_mut(&session_id) {
+            session
+        } else {
+            debug!(
+                "Failed to transmit response: missing session {}",
+                session_id
+            );
+            return;
+        };
+        if let Err(err) = session
+            .send_last_response(&self.sockets, message_id, is_nat)
+            .await
+        {
+            warn!(
+                "Failed to transmit response to session {}: {}",
+                session_id, err
+            );
         }
     }
 

@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use rand::Rng;
 use std::{
     cmp::Ordering,
@@ -17,11 +17,15 @@ use crypto::DHTransform;
 
 // All keys are less than 256 bits, but mathching the client nonce size is a good idea.
 const MAX_NONCE: usize = 384 / 8;
-// ECSDA DER-encoded signatures can vafy in length and reach up to 72 bytes, plus optional algorithm parameters.
+// ECSDA DER-encoded signatures can vary in length and reach up to 72 bytes, plus optional algorithm parameters.
 const MAX_SIGNATURE_LENGTH: usize = 1 + 12 + 72;
 
 const MAX_ENCRYPTED_FRAGMENT_SIZE: usize = 1500;
 const MAX_ENCRYPTED_DATA_SIZE: usize = 4096;
+
+// RFC 7383 recommends a limit of 576 bytes for the entire IPv4 datagram.
+// This includes IP/UDP headers, the IKEv2 header and encryption IV, rounding of encryption blocks, tag and validation signature.
+const MAX_TRANSMIT_FRAGMENT_SIZE: usize = 576;
 
 const IKE_SESSION_EXPIRATION: time::Duration = time::Duration::from_secs(60 * 60);
 const IKE_RESPONSE_EXPIRATION: time::Duration = time::Duration::from_secs(60);
@@ -128,8 +132,8 @@ pub struct IKEv2Session {
     remote_message_id: u32,
     local_message_id: u32,
     fragment_reassembly: Option<FragmentReassembly>,
-    last_response: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
-    last_request: Option<([u8; MAX_DATAGRAM_SIZE], usize)>,
+    last_response: Vec<Vec<u8>>,
+    last_request: Vec<Vec<u8>>,
     sent_request: Option<RequestContext>,
     request_retransmit: usize,
     pending_actions: Vec<IKEv2PendingAction>,
@@ -161,8 +165,8 @@ impl IKEv2Session {
             remote_message_id: 0,
             local_message_id: 0,
             fragment_reassembly: None,
-            last_response: None,
-            last_request: None,
+            last_response: vec![],
+            last_request: vec![],
             sent_request: None,
             request_retransmit: 0,
             pending_actions: vec![],
@@ -180,7 +184,7 @@ impl IKEv2Session {
 
     pub fn handle_response_expiration(&mut self, now: time::Instant) {
         if self.last_update + IKE_RESPONSE_EXPIRATION < now {
-            self.last_response = None;
+            self.last_response = vec![];
             self.fragment_reassembly = None;
         }
     }
@@ -207,28 +211,20 @@ impl IKEv2Session {
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
         request: &message::InputMessage,
-        response: &mut message::MessageWriter,
         new_ids: &mut ReservedSpi,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<bool, SessionError> {
         // TODO: return error if payload type is critical but not recognized
         self.last_update = Instant::now();
         let message_id = request.read_message_id();
         match message_id.cmp(&self.remote_message_id) {
             Ordering::Less => {
                 // This is an outdated retransmission, nothing to do.
-                return Ok(0);
+                return Ok(false);
             }
             Ordering::Equal => {
                 // Retransmit last response if available.
-                if let Some(last_response) = self.last_response {
-                    if !Self::should_retransmit(request) {
-                        // RFC 7383 2.6.1 states that only message 1 should trigger a
-                        // retransmission.
-                        return Ok(0);
-                    }
-                    let len = last_response.1;
-                    response.raw_data_mut()[..len].copy_from_slice(&last_response.0[..len]);
-                    return Ok(len);
+                if !self.last_response.is_empty() {
+                    return Ok(Self::should_retransmit(request));
                 }
             }
             Ordering::Greater => {
@@ -238,6 +234,8 @@ impl IKEv2Session {
 
         let exchange_type = request.read_exchange_type()?;
 
+        let mut response_bytes = [0u8; MAX_ENCRYPTED_DATA_SIZE];
+        let mut response = message::MessageWriter::new(&mut response_bytes[4..])?;
         response.write_header(
             self.session_id.remote_spi,
             self.session_id.local_spi,
@@ -253,7 +251,7 @@ impl IKEv2Session {
             let decrypted_data = self.decrypt_request(request)?;
             if decrypted_data.is_none() {
                 // Not all fragments have been received.
-                return Ok(0);
+                return Ok(false);
             }
             self.fragment_reassembly = None;
             decrypted_data
@@ -267,16 +265,18 @@ impl IKEv2Session {
             debug!("Decrypted packet from {}\n{:?}", remote_addr, request);
         }
 
-        let response_length = match exchange_type {
-            message::ExchangeType::IKE_SA_INIT => self.process_sa_init_request(request, response),
+        match exchange_type {
+            message::ExchangeType::IKE_SA_INIT => {
+                self.process_sa_init_request(request, &mut response)
+            }
             message::ExchangeType::IKE_AUTH => {
-                self.process_auth_request(remote_addr, local_addr, request, response, new_ids)
+                self.process_auth_request(remote_addr, local_addr, request, &mut response, new_ids)
             }
             message::ExchangeType::INFORMATIONAL => {
-                self.process_informational_request(request, response)
+                self.process_informational_request(request, &mut response)
             }
             message::ExchangeType::CREATE_CHILD_SA => {
-                self.process_create_child_sa_request(request, response, new_ids)
+                self.process_create_child_sa_request(request, &mut response, new_ids)
             }
             _ => {
                 warn!("Unimplemented handler for message {}", exchange_type);
@@ -284,15 +284,11 @@ impl IKEv2Session {
             }
         }?;
 
-        if let Some(mut last_response) = self.last_response {
-            last_response.0[..response_length]
-                .copy_from_slice(&response.raw_data()[..response_length]);
-            last_response.1 = response_length;
+        self.last_response = if exchange_type == message::ExchangeType::IKE_SA_INIT {
+            let response_length = response.complete_message();
+            vec![response_bytes[..4 + response_length].to_vec()]
         } else {
-            let mut last_response = ([0u8; MAX_DATAGRAM_SIZE], response_length);
-            last_response.0[..response_length]
-                .copy_from_slice(&response.raw_data()[..response_length]);
-            self.last_response = Some(last_response);
+            self.encrypt_message(&mut response)?
         };
         self.remote_message_id = message_id;
 
@@ -300,7 +296,7 @@ impl IKEv2Session {
         self.remote_addr = remote_addr;
         self.local_addr = local_addr;
 
-        Ok(response_length)
+        Ok(true)
     }
 
     fn decrypt_request(
@@ -401,6 +397,7 @@ impl IKEv2Session {
     }
 
     fn should_retransmit(request: &message::InputMessage) -> bool {
+        // RFC 7383 2.6.1 states that only message 1 should trigger a retransmission.
         match request.iter_payloads().next() {
             Some(Ok(payload)) => {
                 if payload.payload_type()
@@ -418,10 +415,21 @@ impl IKEv2Session {
         }
     }
 
-    fn complete_encrypted_payload(
+    fn encrypt_message(
         &mut self,
-        response: &mut message::MessageWriter,
-    ) -> Result<usize, SessionError> {
+        msg: &mut message::MessageWriter,
+    ) -> Result<Vec<Vec<u8>>, SessionError> {
+        if log::log_enabled!(log::Level::Debug) {
+            let msg_length = msg.complete_message();
+            match message::InputMessage::from_datagram(&msg.raw_data()[..msg_length], false) {
+                Ok(msg) => {
+                    trace!("Encrypting message\n{:?}", msg);
+                }
+                Err(err) => {
+                    warn!("Failed to decode message for encryption: {}", err);
+                }
+            }
+        }
         let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_mut() {
             crypto_stack
         } else {
@@ -433,48 +441,64 @@ impl IKEv2Session {
             return Err("Crypto parameters not initialized".into());
         };
 
-        let encrypted_data_len = if let Some(len) = response.encrypted_data_length() {
-            len
+        let first_payload_type = msg.first_payload_type();
+        let chunk_size = if self.use_fragmentation {
+            MAX_TRANSMIT_FRAGMENT_SIZE
         } else {
-            return Err("Encrypted payload is not started".into());
+            usize::MAX
         };
-        let full_encrypted_length = crypto_stack.encrypted_payload_length(encrypted_data_len);
-        response.set_encrypted_payload_length(full_encrypted_length);
-        let full_message_len = response.complete_message();
+        let chunks = msg.payloads_data().chunks(chunk_size);
+        let total_fragments = chunks.len() as u16;
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, fragment)| {
+                let encrypted_data_len = fragment.len();
+                let mut msg_bytes = vec![0u8; MAX_DATAGRAM_SIZE];
+                let mut msg = msg.clone_header(&mut msg_bytes[4..])?;
+                let full_encrypted_length =
+                    crypto_stack.encrypted_payload_length(encrypted_data_len);
+                let unencrypted_len = msg.write_encrypted_payload(
+                    fragment,
+                    full_encrypted_length,
+                    first_payload_type,
+                    i as u16,
+                    total_fragments,
+                )?;
+                let full_message_len = msg.complete_message();
+                msg_bytes.truncate(4 + full_message_len);
 
-        let raw_data = response.raw_data_mut();
-        {
-            let (associated_data, encrypt_data) =
-                raw_data.split_at_mut(full_message_len - full_encrypted_length);
-            let associated_data = if !add_signature {
-                associated_data
-            } else {
-                &mut [0u8; 0]
-            };
+                {
+                    let msg_bytes = &mut msg_bytes[4..];
+                    let (associated_data, encrypt_data) = msg_bytes.split_at_mut(unencrypted_len);
+                    let associated_data = if !add_signature {
+                        associated_data
+                    } else {
+                        &mut [0u8; 0]
+                    };
 
-            crypto_stack
-                .encrypt_data(encrypt_data, encrypted_data_len, associated_data)
-                .map_err(|err| {
-                    warn!("Failed to encrypt data {}", err);
-                    "Failed to encrypt data"
+                    crypto_stack
+                        .encrypt_data(encrypt_data, encrypted_data_len, associated_data)
+                        .map_err(|err| {
+                            warn!("Failed to encrypt data {}", err);
+                            "Failed to encrypt data"
+                        })?;
+                }
+
+                crypto_stack.sign(&mut msg_bytes[4..]).map_err(|err| {
+                    warn!("Failed to sign data {}", err);
+                    "Failed to sign data"
                 })?;
-        }
-
-        crypto_stack
-            .sign(&mut raw_data[..full_message_len])
-            .map_err(|err| {
-                warn!("Failed to sign data {}", err);
-                "Failed to sign data"
-            })?;
-
-        Ok(full_message_len)
+                Ok(msg_bytes)
+            })
+            .collect::<_>()
     }
 
     fn process_sa_init_request(
         &mut self,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<(), SessionError> {
         response.write_header(
             self.session_id.remote_spi,
             self.session_id.local_spi,
@@ -721,7 +745,7 @@ impl IKEv2Session {
             nonce_responder,
         });
 
-        Ok(response_length)
+        Ok(())
     }
 
     fn process_auth_request(
@@ -731,7 +755,7 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
         new_ids: &mut ReservedSpi,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<(), SessionError> {
         self.pending_actions
             .push(IKEv2PendingAction::DeleteHalfOpenSession(
                 self.remote_addr,
@@ -740,7 +764,7 @@ impl IKEv2Session {
         let ctx = match self.state {
             SessionState::InitSA(ref ctx) => ctx.clone(),
             _ => {
-                return self.process_failed_response(
+                return self.write_failed_response(
                     response,
                     message::NotifyMessageType::AUTHENTICATION_FAILED,
                     "Session is not in init state".into(),
@@ -784,7 +808,7 @@ impl IKEv2Session {
                             "Certificate encoding {} is unsupported",
                             certificate.encoding()
                         );
-                        return self.process_failed_response(
+                        return self.write_failed_response(
                             response,
                             message::NotifyMessageType::AUTHENTICATION_FAILED,
                             "Certificate encoding is unsupported".into(),
@@ -807,7 +831,7 @@ impl IKEv2Session {
                             "Certificate request encoding {} is unsupported",
                             certreq.read_encoding()
                         );
-                        return self.process_failed_response(
+                        return self.write_failed_response(
                             response,
                             message::NotifyMessageType::AUTHENTICATION_FAILED,
                             "Certificate request encoding is unsupported".into(),
@@ -839,7 +863,7 @@ impl IKEv2Session {
                                 "Authentication method {} is unsupported",
                                 auth.read_method()
                             );
-                            return self.process_failed_response(
+                            return self.write_failed_response(
                                 response,
                                 message::NotifyMessageType::AUTHENTICATION_FAILED,
                                 "Authentication method is unsupported".into(),
@@ -917,7 +941,7 @@ impl IKEv2Session {
         let client_cert = if let Some(cert) = client_cert {
             cert
         } else {
-            return self.process_failed_response(
+            return self.write_failed_response(
                 response,
                 message::NotifyMessageType::AUTHENTICATION_FAILED,
                 "Client provided no cert".into(),
@@ -926,7 +950,7 @@ impl IKEv2Session {
         let (client_auth, signature_format) = if let Some(auth) = client_auth {
             auth
         } else {
-            return self.process_failed_response(
+            return self.write_failed_response(
                 response,
                 message::NotifyMessageType::AUTHENTICATION_FAILED,
                 "Client provided no auth".into(),
@@ -935,7 +959,7 @@ impl IKEv2Session {
         let id_initiator = if let Some(id) = id_initiator {
             id
         } else {
-            return self.process_failed_response(
+            return self.write_failed_response(
                 response,
                 message::NotifyMessageType::AUTHENTICATION_FAILED,
                 "Client provided no ID".into(),
@@ -1001,7 +1025,6 @@ impl IKEv2Session {
         // At this point the client identity has been successfully verified, proceed with sending a successful response.
         self.user_id = Some(client_cert.subject().into());
         self.state = SessionState::Established;
-        response.start_encrypted_payload()?;
 
         if let Some(id_responder) = self.pki_processing.server_id() {
             let write_slice = response
@@ -1088,30 +1111,24 @@ impl IKEv2Session {
             local_spi,
             Box::new(child_sa),
         ));
-
-        self.complete_encrypted_payload(response)
+        Ok(())
     }
 
-    fn process_failed_response(
+    fn write_failed_response(
         &mut self,
         response: &mut message::MessageWriter,
         reason: message::NotifyMessageType,
         err: SessionError,
-    ) -> Result<usize, SessionError> {
-        response.start_encrypted_payload()?;
-
+    ) -> Result<(), SessionError> {
         debug!("Request failed, sending error response: {}", err);
-
-        response.write_notify_payload(None, &[], reason, &[])?;
-
-        self.complete_encrypted_payload(response)
+        Ok(response.write_notify_payload(None, &[], reason, &[])?)
     }
 
     fn process_informational_request(
         &mut self,
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<(), SessionError> {
         let mut delete_spi = vec![];
         let mut delete_ike = false;
 
@@ -1143,8 +1160,6 @@ impl IKEv2Session {
             }
         }
 
-        response.start_encrypted_payload()?;
-
         if delete_ike {
             self.pending_actions
                 .push(IKEv2PendingAction::DeleteIKESession);
@@ -1152,7 +1167,7 @@ impl IKEv2Session {
                 self.pending_actions
                     .push(IKEv2PendingAction::DeleteChildSA(sa_id.local_spi));
             });
-            response.write_delete_payload(message::IPSecProtocolID::IKE, &[])?;
+            Ok(response.write_delete_payload(message::IPSecProtocolID::IKE, &[])?)
         } else if !delete_spi.is_empty() {
             let local_spis = delete_spi
                 .into_iter()
@@ -1187,10 +1202,11 @@ impl IKEv2Session {
                     Some(message::Spi::U32(sa_id.local_spi))
                 })
                 .collect::<Vec<_>>();
-            response.write_delete_payload(message::IPSecProtocolID::ESP, &local_spis)?;
+            Ok(response.write_delete_payload(message::IPSecProtocolID::ESP, &local_spis)?)
+        } else {
+            // No action needed - most likely a keepalive request.
+            Ok(())
         }
-
-        self.complete_encrypted_payload(response)
     }
 
     fn process_create_child_sa_request(
@@ -1198,7 +1214,7 @@ impl IKEv2Session {
         request: &message::InputMessage,
         response: &mut message::MessageWriter,
         new_ids: &mut ReservedSpi,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<(), SessionError> {
         let crypto_stack = if let Some(crypto_stack) = self.crypto_stack.as_ref() {
             crypto_stack
         } else {
@@ -1326,7 +1342,7 @@ impl IKEv2Session {
         let nonce_initiator = if let Some(nonce_initiator) = nonce_initiator {
             nonce_initiator
         } else {
-            return self.process_failed_response(
+            return self.write_failed_response(
                 response,
                 message::NotifyMessageType::INVALID_SYNTAX,
                 "Client provided no nonce".into(),
@@ -1340,7 +1356,7 @@ impl IKEv2Session {
         let (mut transform_params, proposal_num) = if let Some(params) = transform_params {
             params
         } else {
-            return self.process_failed_response(
+            return self.write_failed_response(
                 response,
                 message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
                 "Unacceptable Security Association proposals".into(),
@@ -1352,7 +1368,7 @@ impl IKEv2Session {
             }
             (None, None) => None,
             _ => {
-                return self.process_failed_response(
+                return self.write_failed_response(
                     response,
                     message::NotifyMessageType::INVALID_KE_PAYLOAD,
                     "DH transform or key exchange is not initialized".into(),
@@ -1403,7 +1419,7 @@ impl IKEv2Session {
                 Ok(crypto_stack) => crypto_stack,
                 Err(err) => {
                     warn!("Failed to rekey crypto stack: {}", err);
-                    return self.process_failed_response(
+                    return self.write_failed_response(
                         response,
                         message::NotifyMessageType::INVALID_SYNTAX,
                         "Failed to rekey crypto stack".into(),
@@ -1426,7 +1442,7 @@ impl IKEv2Session {
                 .iter()
                 .any(|sa_id| sa_id.remote_spi == old_spi)
             {
-                return self.process_failed_response(
+                return self.write_failed_response(
                     response,
                     message::NotifyMessageType::CHILD_SA_NOT_FOUND,
                     "Cannot find child SA to rekey".into(),
@@ -1507,8 +1523,8 @@ impl IKEv2Session {
                 remote_message_id: 0,
                 local_message_id: 0,
                 fragment_reassembly: None,
-                last_response: None,
-                last_request: None,
+                last_response: vec![],
+                last_request: vec![],
                 sent_request: None,
                 request_retransmit: 0,
                 pending_actions: vec![],
@@ -1519,8 +1535,6 @@ impl IKEv2Session {
                     new_session,
                 ));
         }
-
-        response.start_encrypted_payload()?;
 
         response.write_security_association(&[(&transform_params, proposal_num)])?;
         let dest =
@@ -1534,8 +1548,7 @@ impl IKEv2Session {
             response.write_traffic_selector_payload(true, &ts_remote)?;
             response.write_traffic_selector_payload(false, &self.ts_local)?;
         }
-
-        self.complete_encrypted_payload(response)
+        Ok(())
     }
 
     pub fn take_pending_actions(&mut self) -> Vec<IKEv2PendingAction> {
@@ -1551,7 +1564,7 @@ impl IKEv2Session {
         exchange_type: message::ExchangeType,
         command_generator: impl FnOnce(&mut message::MessageWriter) -> Result<(), SessionError>,
     ) -> Result<u32, SessionError> {
-        if self.sent_request.is_some() || self.last_request.is_some() {
+        if self.sent_request.is_some() || !self.last_request.is_empty() {
             return Err("Already processing another command".into());
         }
         let mut request_bytes = [0u8; MAX_DATAGRAM_SIZE];
@@ -1569,11 +1582,11 @@ impl IKEv2Session {
             true,
             self.local_message_id,
         )?;
-        ikev2_request.start_encrypted_payload()?;
+        self.last_request = vec![];
         command_generator(&mut ikev2_request)?;
-        let request_len = self.complete_encrypted_payload(&mut ikev2_request)?;
 
-        self.last_request = Some((request_bytes, request_len + start_offset));
+        self.last_request = self.encrypt_message(&mut ikev2_request)?;
+
         self.request_retransmit = 0;
         Ok(self.local_message_id)
     }
@@ -1608,6 +1621,79 @@ impl IKEv2Session {
         Ok(())
     }
 
+    fn log_fragment_contents(
+        message_type: &str,
+        message_id: u32,
+        session_id: SessionID,
+        fragment: &[u8],
+        fragment_number: usize,
+        total_fragments: usize,
+    ) {
+        if log::log_enabled!(log::Level::Trace) {
+            // Fragments are always prepended with the NAT header just in case.
+            match message::InputMessage::from_datagram(fragment, true) {
+                Ok(msg) => {
+                    trace!(
+                        "Transmitting {} ID {} for session {} (fragment {} of {}):\n{:?}",
+                        message_type,
+                        message_id,
+                        session_id,
+                        fragment_number + 1,
+                        total_fragments,
+                        msg
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                            "Transmitting {} ID {} for session {} (fragment {} of {}), cannot decode: {:?}",
+                            message_type,
+                            message_id,
+                            session_id,
+                            fragment_number + 1,
+                            total_fragments,
+                            err
+                        );
+                }
+            }
+        } else {
+            debug!(
+                "Transmitting {} ID {} for session {} (fragment {} of {})",
+                message_type,
+                message_id,
+                session_id,
+                fragment_number + 1,
+                total_fragments,
+            );
+        }
+    }
+
+    pub async fn send_last_response(
+        &self,
+        sockets: &Sockets,
+        message_id: u32,
+        is_nat: bool,
+    ) -> Result<(), SendError> {
+        if message_id != self.remote_message_id {
+            return Ok(());
+        }
+        let total_fragments = self.last_response.len();
+        for (i, fragment) in self.last_response.iter().enumerate() {
+            Self::log_fragment_contents(
+                "response",
+                self.remote_message_id,
+                self.session_id,
+                fragment,
+                i,
+                total_fragments,
+            );
+            let fragment = if is_nat { fragment } else { &fragment[4..] };
+            sockets
+                .send_datagram(&self.local_addr, &self.remote_addr, fragment)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn send_last_request(
         &mut self,
         sockets: &Sockets,
@@ -1616,18 +1702,22 @@ impl IKEv2Session {
         if message_id != self.local_message_id {
             return Ok(());
         }
-        if let Some((request_bytes, request_len)) = self.last_request {
-            debug!(
-                "Transmitting request {} for session {}",
-                self.local_message_id, self.session_id
-            );
+        if !self.last_request.is_empty() {
             self.request_retransmit += 1;
+        }
+        let total_fragments = self.last_response.len();
+        for (i, fragment) in self.last_request.iter().enumerate() {
+            Self::log_fragment_contents(
+                "request",
+                self.remote_message_id,
+                self.session_id,
+                fragment,
+                i,
+                total_fragments,
+            );
+            // Requests are always sent to the NAT port.
             sockets
-                .send_datagram(
-                    &self.local_addr,
-                    &self.remote_addr,
-                    &request_bytes[..request_len],
-                )
+                .send_datagram(&self.local_addr, &self.remote_addr, fragment)
                 .await?;
         }
         Ok(())
@@ -1661,7 +1751,7 @@ impl IKEv2Session {
 
         // Remove last request to stop retransmissions.
         self.local_message_id += 1;
-        self.last_request = None;
+        self.last_request = vec![];
         self.sent_request = None;
         self.request_retransmit = 0;
 

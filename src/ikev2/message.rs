@@ -303,7 +303,6 @@ impl InputMessage<'_> {
 pub struct MessageWriter<'a> {
     dest: &'a mut [u8],
     next_payload_index: usize,
-    encrypted_payload_start: Option<usize>,
     cursor: usize,
 }
 
@@ -317,7 +316,6 @@ impl MessageWriter<'_> {
         Ok(MessageWriter {
             dest,
             next_payload_index,
-            encrypted_payload_start: None,
             cursor,
         })
     }
@@ -355,6 +353,19 @@ impl MessageWriter<'_> {
     pub fn update_header(header: &mut [u8; 28], next_payload: PayloadType, length: u32) {
         header[16] = next_payload.0;
         header[24..28].copy_from_slice(&length.to_be_bytes());
+    }
+
+    pub fn clone_header<'a>(
+        &self,
+        dest: &'a mut [u8],
+    ) -> Result<MessageWriter<'a>, NotEnoughSpaceError> {
+        let mut new_writer = Self::new(dest)?;
+        new_writer.next_payload_index = 16;
+        new_writer.cursor = 28;
+        new_writer.dest[16] = PayloadType::NONE.0;
+        new_writer.dest[..24].copy_from_slice(&self.dest[..24]);
+        new_writer.dest[24..28].fill(0);
+        Ok(new_writer)
     }
 
     fn sa_parameters_len(params: &crypto::TransformParameters) -> (usize, usize) {
@@ -677,10 +688,43 @@ impl MessageWriter<'_> {
         Ok(())
     }
 
-    pub fn start_encrypted_payload(&mut self) -> Result<(), NotEnoughSpaceError> {
-        self.encrypted_payload_start = Some(self.cursor);
-        self.next_payload_slice(PayloadType::ENCRYPTED_AND_AUTHENTICATED, 0)?;
-        Ok(())
+    pub fn write_encrypted_payload(
+        &mut self,
+        data: &[u8],
+        full_encrypted_len: usize,
+        next_payload: PayloadType,
+        fragment_number: u16,
+        total_fragments: u16,
+    ) -> Result<usize, NotEnoughSpaceError> {
+        if full_encrypted_len < data.len() {
+            return Err(NotEnoughSpaceError {});
+        }
+        let encrypted_payload_start = self.cursor;
+        let encrypted_data_start = if total_fragments == 1 {
+            let next_payload_slice = self
+                .next_payload_slice(PayloadType::ENCRYPTED_AND_AUTHENTICATED, full_encrypted_len)?;
+            next_payload_slice[..data.len()].copy_from_slice(data);
+            encrypted_payload_start + 4
+        } else {
+            let next_payload_slice = self.next_payload_slice(
+                PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT,
+                4 + full_encrypted_len,
+            )?;
+            next_payload_slice[0..2].copy_from_slice(&(fragment_number + 1).to_be_bytes());
+            next_payload_slice[2..4].copy_from_slice(&total_fragments.to_be_bytes());
+            next_payload_slice[4..4 + data.len()].copy_from_slice(data);
+            encrypted_payload_start + 4 + 4
+        };
+        let next_payload = if fragment_number == 0 {
+            next_payload.0
+        } else {
+            PayloadType::NONE.0
+        };
+        // First byte of encrypted payload will contain the next encrypted payload type.
+        // Encrypted payloads are an exception where the Next Payload specifies the embedded
+        // payload type.
+        self.dest[encrypted_payload_start] = next_payload;
+        Ok(encrypted_data_start)
     }
 
     pub fn next_payload_slice(
@@ -706,21 +750,8 @@ impl MessageWriter<'_> {
         Ok(&mut self.dest[next_data])
     }
 
-    pub fn encrypted_data_length(&self) -> Option<usize> {
-        Some(self.cursor - self.encrypted_payload_start? - 4)
-    }
-
-    pub fn set_encrypted_payload_length(&mut self, payload_len: usize) {
-        let encrypted_payload_start =
-            if let Some(encrypted_payload_start) = self.encrypted_payload_start {
-                encrypted_payload_start
-            } else {
-                return;
-            };
-        let payload_len = payload_len + 4;
-        self.dest[encrypted_payload_start + 2..encrypted_payload_start + 4]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-        self.cursor = encrypted_payload_start + payload_len;
+    pub fn first_payload_type(&self) -> PayloadType {
+        PayloadType::from_u8(self.dest[16])
     }
 
     pub fn complete_message(&mut self) -> usize {
@@ -729,12 +760,12 @@ impl MessageWriter<'_> {
         self.cursor
     }
 
-    pub fn raw_data_mut(&mut self) -> &mut [u8] {
+    pub fn raw_data(&mut self) -> &[u8] {
         self.dest
     }
 
-    pub fn raw_data(&mut self) -> &[u8] {
-        self.dest
+    pub fn payloads_data(&self) -> &[u8] {
+        &self.dest[28..self.cursor]
     }
 }
 
@@ -2566,6 +2597,15 @@ impl fmt::Debug for Payload<'_> {
                     attr.read_value(),
                 )?;
             }
+        } else if let Ok(pl_enc) = self.encrypted_data() {
+            writeln!(
+                f,
+                "    Fragment {} out of {} next type {}",
+                pl_enc.fragment_number(),
+                pl_enc.total_fragments(),
+                pl_enc.next_payload(),
+            )?;
+            writeln!(f, "    Data {:?}", pl_enc.encrypted_data())?;
         } else {
             writeln!(f, "    Data {:?}", self.data)?;
         }
