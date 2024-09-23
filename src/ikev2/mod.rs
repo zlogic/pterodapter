@@ -27,7 +27,11 @@ const MAX_DATAGRAM_SIZE: usize = 1500;
 // Use 1500 as max MTU, real value is likely lower.
 const MAX_ESP_PACKET_SIZE: usize = 1500;
 
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
+const IKE_DELETE_DELAY: Duration = Duration::from_secs(30);
+const ESP_DELETE_DELAY: Duration = Duration::from_secs(30);
+
 const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub struct Config {
@@ -154,7 +158,7 @@ impl Server {
             ));
         });
         rt.spawn(Server::send_timer_ticks(
-            Duration::from_secs(15),
+            CLEANUP_INTERVAL,
             sessions.create_sender(),
         ));
         let command_sender = sessions.create_sender();
@@ -254,6 +258,8 @@ impl UdpDatagram {
 enum SessionMessage {
     UdpDatagram(UdpDatagram),
     TransmitResponse(session::SessionID, u32, bool),
+    DeleteSession(session::SessionID),
+    DeleteSecurityAssociation(u32),
     RetransmitRequest(session::SessionID, u32),
     VpnPacket(Vec<u8>),
     VpnDisconnected,
@@ -415,6 +421,18 @@ impl Sessions {
         }
     }
 
+    fn delete_session(&mut self, session_id: session::SessionID) {
+        if self.sessions.remove(&session_id).is_some() {
+            debug!("Deleted IKEv2 session {}", session_id);
+        }
+    }
+
+    fn delete_security_association(&mut self, session_id: u32) {
+        if self.security_associations.remove(&session_id).is_some() {
+            debug!("Deleted Security Association {:x}", session_id)
+        }
+    }
+
     async fn update_all_split_routes(&mut self) {
         for (session_id, session) in self.sessions.iter_mut() {
             if let Err(err) = session.update_split_routes(&self.tunnel_ips) {
@@ -470,6 +488,10 @@ impl Sessions {
                     if let Err(err) = self.process_vpn_packet(data).await {
                         warn!("Failed to process VPN packet: {}", err);
                     }
+                }
+                SessionMessage::DeleteSession(session_id) => self.delete_session(session_id),
+                SessionMessage::DeleteSecurityAssociation(session_id) => {
+                    self.delete_security_association(session_id)
                 }
                 SessionMessage::VpnDisconnected => {
                     let rt = runtime::Handle::current();
@@ -588,12 +610,13 @@ impl Sessions {
             }
         }
 
-        self.process_pending_actions(session_id);
+        let rt = runtime::Handle::current();
+        self.process_pending_actions(session_id, rt);
 
         Ok(())
     }
 
-    fn process_pending_actions(&mut self, session_id: session::SessionID) {
+    fn process_pending_actions(&mut self, session_id: session::SessionID, rt: runtime::Handle) {
         let session = if let Some(session_id) = self.sessions.get_mut(&session_id) {
             session_id
         } else {
@@ -604,7 +627,6 @@ impl Sessions {
             return;
         };
 
-        let mut delete_session = false;
         session
             .take_pending_actions()
             .into_iter()
@@ -626,20 +648,30 @@ impl Sessions {
                         .insert(session_id, *security_association);
                 }
                 session::IKEv2PendingAction::DeleteIKESession => {
-                    delete_session = true;
+                    let tx = self.tx.clone();
+                    let cmd = SessionMessage::DeleteSession(session_id);
+                    rt.spawn(async move {
+                        debug!("Scheduling to delete IKEv2 session {}", session_id);
+                        time::sleep(IKE_DELETE_DELAY).await;
+                        let _ = tx.send(cmd).await;
+                    });
                 }
                 session::IKEv2PendingAction::DeleteChildSA(session_id) => {
-                    if self.security_associations.remove(&session_id).is_some() {
-                        debug!("Deleted Security Association {:x}", session_id)
-                    }
+                    let tx = self.tx.clone();
+                    let cmd = SessionMessage::DeleteSecurityAssociation(session_id);
+                    rt.spawn(async move {
+                        debug!(
+                            "Scheduling to delete Security Association session {:x}",
+                            session_id
+                        );
+                        time::sleep(ESP_DELETE_DELAY).await;
+                        let _ = tx.send(cmd).await;
+                    });
                 }
                 session::IKEv2PendingAction::CreateIKEv2Session(session_id, session) => {
                     self.sessions.insert(session_id, session);
                 }
             });
-        if delete_session && self.sessions.remove(&session_id).is_some() {
-            debug!("Deleted IKEv2 session {}", session_id);
-        }
     }
 
     async fn transmit_response(
