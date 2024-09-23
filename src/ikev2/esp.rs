@@ -20,6 +20,7 @@ pub struct SecurityAssociation {
     remote_addr: SocketAddr,
     replay_window: ReplayWindow,
     local_seq: u32,
+    deleting: bool,
 }
 
 impl SecurityAssociation {
@@ -47,7 +48,16 @@ impl SecurityAssociation {
             signature_length,
             replay_window: ReplayWindow::new(),
             local_seq: 0,
+            deleting: false,
         }
+    }
+
+    pub fn start_deleting(&mut self) {
+        self.deleting = true;
+    }
+
+    pub fn is_deleting(&self) -> bool {
+        self.deleting
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -60,12 +70,6 @@ impl SecurityAssociation {
 
     pub fn encoded_length(&self, msg_len: usize) -> usize {
         8 + self.crypto_stack.encrypted_payload_length(msg_len)
-    }
-
-    pub fn max_sequence_number(&self) -> u32 {
-        self.replay_window
-            .last_seq
-            .map_or(self.local_seq, |remote_seq| remote_seq.max(self.local_seq))
     }
 
     pub fn accepts_esp_to_vpn(&self, hdr: &IpHeader) -> bool {
