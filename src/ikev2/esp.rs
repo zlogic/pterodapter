@@ -20,7 +20,7 @@ pub struct SecurityAssociation {
     remote_addr: SocketAddr,
     replay_window: ReplayWindow,
     local_seq: u32,
-    deleting: bool,
+    index: usize,
 }
 
 impl SecurityAssociation {
@@ -29,6 +29,7 @@ impl SecurityAssociation {
         remote_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
         crypto_stack: crypto::CryptoStack,
         params: &crypto::TransformParameters,
+        index: usize,
     ) -> SecurityAssociation {
         let signature_length = if let Some(signature_length) = params.auth_signature_length() {
             signature_length / 8
@@ -48,16 +49,16 @@ impl SecurityAssociation {
             signature_length,
             replay_window: ReplayWindow::new(),
             local_seq: 0,
-            deleting: false,
+            index,
         }
     }
 
-    pub fn start_deleting(&mut self) {
-        self.deleting = true;
+    pub fn index(&self) -> usize {
+        self.index
     }
 
-    pub fn is_deleting(&self) -> bool {
-        self.deleting
+    pub fn is_active(&self) -> bool {
+        self.local_seq > 0 || self.replay_window.last_seq.is_some()
     }
 
     pub fn local_addr(&self) -> SocketAddr {

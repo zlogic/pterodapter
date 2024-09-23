@@ -657,9 +657,6 @@ impl Sessions {
                     });
                 }
                 session::IKEv2PendingAction::DeleteChildSA(session_id) => {
-                    if let Some(sa) = self.security_associations.get_mut(&session_id) {
-                        sa.start_deleting();
-                    };
                     let tx = self.tx.clone();
                     let cmd = SessionMessage::DeleteSecurityAssociation(session_id);
                     rt.spawn(async move {
@@ -809,12 +806,18 @@ impl Sessions {
             }
         };
         trace!("Received packet from VPN {}\n{:?}", hdr, data);
-        // Prefer SA that's not being deleted.
+        // Prefer an active, most recent SA.
         if let Some(sa) = self
             .security_associations
             .values_mut()
             .filter(|sa| sa.accepts_vpn_to_esp(&hdr))
-            .reduce(|a, b| if a.is_deleting() { b } else { a })
+            .reduce(|a, b| {
+                if a.is_active() && a.index() > b.index() {
+                    a
+                } else {
+                    b
+                }
+            })
         {
             let msg_len = data.len();
             if data.len() >= MAX_ESP_PACKET_SIZE {
