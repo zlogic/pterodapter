@@ -21,8 +21,8 @@ rdr pass proto udp from any to 192.168.100.1 port 500 -> 127.0.0.1 port 9500
 rdr pass proto udp from 127.0.0.1 port 9500 to any -> 127.0.0.1 port 500
 rdr pass proto udp from any to 192.168.100.1 port 4500 -> 127.0.0.1 port 9501
 rdr pass proto udp from 127.0.0.1 port 9501 to any -> 127.0.0.1 port 4500
-pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port 500
-pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port 4500
+pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port {500, 4500}
+pass out route-to (lo0 127.0.0.1) proto udp from 192.168.100.1 port {500, 4500} to any
 EOF
 ```
 
@@ -50,8 +50,8 @@ rdr pass proto udp from any to 192.168.100.1 port 500 -> 127.0.0.1 port 9500
 rdr pass proto udp from 127.0.0.1 port 9500 to any -> 127.0.0.1 port 500
 rdr pass proto udp from any to 192.168.100.1 port 4500 -> 127.0.0.1 port 9501
 rdr pass proto udp from 127.0.0.1 port 9501 to any -> 127.0.0.1 port 4500
-pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port 500
-pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port 4500
+pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port {500, 4500}
+pass out route-to (lo0 127.0.0.1) proto udp from 192.168.100.1 port {500, 4500} to any
 EOF
 ```
 
