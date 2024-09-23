@@ -442,12 +442,18 @@ impl IKEv2Session {
         };
 
         let first_payload_type = msg.first_payload_type();
-        let chunk_size = if self.use_fragmentation {
-            MAX_TRANSMIT_FRAGMENT_SIZE
+        let chunks = if self.use_fragmentation {
+            let chunks = msg.payloads_data().chunks(MAX_TRANSMIT_FRAGMENT_SIZE);
+            if chunks.len() > 0 {
+                chunks.collect::<Vec<_>>()
+            } else {
+                // If the chunk list is empty, most likely this is an empty reponse
+                // e.g. INFORMATIONAL keepalive.
+                vec![msg.payloads_data()]
+            }
         } else {
-            usize::MAX
+            vec![msg.payloads_data()]
         };
-        let chunks = msg.payloads_data().chunks(chunk_size);
         let total_fragments = chunks.len() as u16;
         chunks
             .into_iter()
