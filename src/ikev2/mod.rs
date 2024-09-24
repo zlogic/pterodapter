@@ -29,8 +29,6 @@ const MAX_ESP_PACKET_SIZE: usize = 1500;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
-const IKE_DELETE_DELAY: Duration = Duration::from_secs(30);
-const ESP_DELETE_DELAY: Duration = Duration::from_secs(30);
 
 const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -647,16 +645,18 @@ impl Sessions {
                     self.security_associations
                         .insert(session_id, *security_association);
                 }
-                session::IKEv2PendingAction::DeleteIKESession => {
+                session::IKEv2PendingAction::DeleteIKESession(delay) => {
                     let tx = self.tx.clone();
                     let cmd = SessionMessage::DeleteSession(session_id);
                     rt.spawn(async move {
                         debug!("Scheduling to delete IKEv2 session {}", session_id);
-                        time::sleep(IKE_DELETE_DELAY).await;
+                        if !delay.is_zero() {
+                            time::sleep(delay).await;
+                        }
                         let _ = tx.send(cmd).await;
                     });
                 }
-                session::IKEv2PendingAction::DeleteChildSA(session_id) => {
+                session::IKEv2PendingAction::DeleteChildSA(session_id, delay) => {
                     let tx = self.tx.clone();
                     let cmd = SessionMessage::DeleteSecurityAssociation(session_id);
                     rt.spawn(async move {
@@ -664,7 +664,9 @@ impl Sessions {
                             "Scheduling to delete Security Association session {:x}",
                             session_id
                         );
-                        time::sleep(ESP_DELETE_DELAY).await;
+                        if !delay.is_zero() {
+                            time::sleep(delay).await;
+                        }
                         let _ = tx.send(cmd).await;
                     });
                 }

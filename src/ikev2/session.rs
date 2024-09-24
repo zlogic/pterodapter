@@ -32,6 +32,9 @@ const IKE_RESPONSE_EXPIRATION: time::Duration = time::Duration::from_secs(60);
 // TODO: set a time limit instead of retransmission limit.
 const IKE_RETRANSMISSIONS_LIMIT: usize = 5;
 
+const IKE_DELETE_DELAY: time::Duration = time::Duration::from_secs(30);
+const ESP_DELETE_DELAY: time::Duration = time::Duration::from_secs(30);
+
 #[derive(Clone, Copy)]
 pub struct SessionID {
     remote_spi: u64,
@@ -104,9 +107,9 @@ enum SessionState {
 pub enum IKEv2PendingAction {
     DeleteHalfOpenSession(SocketAddr, u64),
     CreateChildSA(esp::SecurityAssociationID, Box<esp::SecurityAssociation>),
-    DeleteChildSA(esp::SecurityAssociationID),
+    DeleteChildSA(esp::SecurityAssociationID, time::Duration),
     CreateIKEv2Session(SessionID, IKEv2Session),
-    DeleteIKESession,
+    DeleteIKESession(time::Duration),
 }
 
 pub enum NextRetransmission {
@@ -1172,10 +1175,12 @@ impl IKEv2Session {
 
         if delete_ike {
             self.pending_actions
-                .push(IKEv2PendingAction::DeleteIKESession);
+                .push(IKEv2PendingAction::DeleteIKESession(IKE_DELETE_DELAY));
             self.child_sas.iter().for_each(|sa_id| {
-                self.pending_actions
-                    .push(IKEv2PendingAction::DeleteChildSA(sa_id.local_spi));
+                self.pending_actions.push(IKEv2PendingAction::DeleteChildSA(
+                    sa_id.local_spi,
+                    ESP_DELETE_DELAY,
+                ));
             });
             Ok(response.write_delete_payload(message::IPSecProtocolID::IKE, &[])?)
         } else if !delete_spi.is_empty() {
@@ -1207,8 +1212,10 @@ impl IKEv2Session {
                         }
                     };
                     self.child_sas.remove(&sa_id);
-                    self.pending_actions
-                        .push(IKEv2PendingAction::DeleteChildSA(sa_id.local_spi));
+                    self.pending_actions.push(IKEv2PendingAction::DeleteChildSA(
+                        sa_id.local_spi,
+                        ESP_DELETE_DELAY,
+                    ));
                     Some(message::Spi::U32(sa_id.local_spi))
                 })
                 .collect::<Vec<_>>();
@@ -1741,9 +1748,16 @@ impl IKEv2Session {
         // TODO: return error if payload type is critical but not recognized
         self.last_update = Instant::now();
         let message_id = response.read_message_id();
-        if message_id < self.local_message_id {
-            // This is an outdated retransmission, nothing to do.
-            return Ok(());
+        match message_id.cmp(&self.local_message_id) {
+            Ordering::Less => {
+                // This is an outdated retransmission, nothing to do.
+                return Ok(());
+            }
+            Ordering::Equal => {}
+            Ordering::Greater => {
+                // This is an unexpected response.
+                return Err("Received unexpected response message ID".into());
+            }
         }
 
         let exchange_type = response.read_exchange_type()?;
@@ -1798,7 +1812,7 @@ impl IKEv2Session {
         match sent_request {
             Some(RequestContext::DeleteIKEv2) => {
                 self.pending_actions
-                    .push(IKEv2PendingAction::DeleteIKESession);
+                    .push(IKEv2PendingAction::DeleteIKESession(time::Duration::ZERO));
             }
             None => {
                 return Err("Received response for a non-existing request".into());
