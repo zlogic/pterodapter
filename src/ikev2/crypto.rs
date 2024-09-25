@@ -1046,9 +1046,16 @@ impl Encryption for EncryptionAesGcm256 {
     }
 }
 
-pub fn hash_sha1(data: &[u8]) -> [u8; 20] {
-    let mut result = [0u8; 20];
+pub fn hash_sha1(data: &[u8]) -> [u8; digest::SHA1_OUTPUT_LEN] {
+    let mut result = [0u8; digest::SHA1_OUTPUT_LEN];
     let hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data);
+    result.copy_from_slice(hash.as_ref());
+    result
+}
+
+pub fn hash_sha256(data: &[u8]) -> [u8; digest::SHA256_OUTPUT_LEN] {
+    let mut result = [0u8; digest::SHA256_OUTPUT_LEN];
+    let hash = digest::digest(&digest::SHA256, data);
     result.copy_from_slice(hash.as_ref());
     result
 }

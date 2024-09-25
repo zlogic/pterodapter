@@ -136,8 +136,9 @@ pub struct IKEv2Session {
     remote_message_id: u32,
     local_message_id: u32,
     fragment_reassembly: Option<FragmentReassembly>,
+    last_request_hash: Option<[u8; 32]>,
     last_response: Vec<Vec<u8>>,
-    last_request: Vec<Vec<u8>>,
+    last_sent_request: Vec<Vec<u8>>,
     sent_request: Option<RequestContext>,
     request_retransmit: usize,
     pending_actions: Vec<IKEv2PendingAction>,
@@ -170,8 +171,9 @@ impl IKEv2Session {
             remote_message_id: 0,
             local_message_id: 0,
             fragment_reassembly: None,
+            last_request_hash: None,
             last_response: vec![],
-            last_request: vec![],
+            last_sent_request: vec![],
             sent_request: None,
             request_retransmit: 0,
             pending_actions: vec![],
@@ -228,8 +230,26 @@ impl IKEv2Session {
             }
             Ordering::Equal => {
                 // Retransmit last response if available.
-                if !self.last_response.is_empty() {
-                    return Ok(Self::should_retransmit(request));
+                if let Some(last_request_hash) = self.last_request_hash.as_ref() {
+                    if !Self::should_retransmit(request) {
+                        return Ok(false);
+                    }
+                    let request_hash = crypto::hash_sha256(request.raw_data());
+                    if &request_hash == last_request_hash {
+                        // Update remote address if client changed IP or switched to another NAT port.
+                        self.remote_addr = remote_addr;
+                        self.local_addr = local_addr;
+                        return Ok(true);
+                    } else {
+                        // Retransmitted request is modified - could be an attacker
+                        // attempting to request a copy of the response.
+                        return Err(
+                            "Retransmitted request hash mismatch, not sending response".into()
+                        );
+                    }
+                } else if self.remote_message_id > 0 {
+                    // Last response expired, and this is not a "start from 0" session.
+                    return Ok(false);
                 }
             }
             Ordering::Greater => {
@@ -250,10 +270,13 @@ impl IKEv2Session {
         )?;
 
         let decrypted_data = if exchange_type == message::ExchangeType::IKE_SA_INIT {
+            self.last_request_hash = Some(crypto::hash_sha256(request.raw_data()));
             None
         } else {
-            // TODO: return INVALID_SYNTAX notification?
             let decrypted_data = self.decrypt_request(request)?;
+            if Self::should_retransmit(request) {
+                self.last_request_hash = Some(crypto::hash_sha256(request.raw_data()));
+            }
             if decrypted_data.is_none() {
                 // Not all fragments have been received.
                 return Ok(false);
@@ -402,21 +425,26 @@ impl IKEv2Session {
     }
 
     fn should_retransmit(request: &message::InputMessage) -> bool {
-        // RFC 7383 2.6.1 states that only message 1 should trigger a retransmission.
-        match request.iter_payloads().next() {
-            Some(Ok(payload)) => {
-                if payload.payload_type()
-                    == message::PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT
-                {
-                    payload
-                        .encrypted_data()
-                        .map_or(true, |payload| payload.fragment_number() == 1)
-                } else {
-                    true
-                }
+        if let Ok(exchange_type) = request.read_exchange_type() {
+            if exchange_type == message::ExchangeType::IKE_SA_INIT {
+                return request.read_message_id() == 0;
             }
-            Some(Err(_)) => true,
-            None => true,
+        } else {
+            return false;
+        };
+        // RFC 7383 2.6.1 states that only message 1 should trigger a retransmission.
+        // Otherwise, the first payload should be an encrypted message
+        // (avoid any retransmissions if request is not encrypted).
+        match request.iter_payloads().next() {
+            Some(Ok(payload)) => match payload.payload_type() {
+                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT => payload
+                    .encrypted_data()
+                    .map_or(true, |payload| payload.fragment_number() == 1),
+                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => true,
+                _ => false,
+            },
+            Some(Err(_)) => false,
+            None => false,
         }
     }
 
@@ -1545,8 +1573,9 @@ impl IKEv2Session {
                 remote_message_id: 0,
                 local_message_id: 0,
                 fragment_reassembly: None,
+                last_request_hash: None,
                 last_response: vec![],
-                last_request: vec![],
+                last_sent_request: vec![],
                 sent_request: None,
                 request_retransmit: 0,
                 pending_actions: vec![],
@@ -1586,7 +1615,7 @@ impl IKEv2Session {
         exchange_type: message::ExchangeType,
         command_generator: impl FnOnce(&mut message::MessageWriter) -> Result<(), SessionError>,
     ) -> Result<u32, SessionError> {
-        if self.sent_request.is_some() || !self.last_request.is_empty() {
+        if self.sent_request.is_some() || !self.last_sent_request.is_empty() {
             return Err("Already processing another command".into());
         }
         let mut request_bytes = [0u8; MAX_DATAGRAM_SIZE];
@@ -1598,10 +1627,10 @@ impl IKEv2Session {
             true,
             self.local_message_id,
         )?;
-        self.last_request = vec![];
+        self.last_sent_request = vec![];
         command_generator(&mut ikev2_request)?;
 
-        self.last_request = self.encrypt_message(&mut ikev2_request)?;
+        self.last_sent_request = self.encrypt_message(&mut ikev2_request)?;
 
         self.request_retransmit = 0;
         Ok(self.local_message_id)
@@ -1718,11 +1747,11 @@ impl IKEv2Session {
         if message_id != self.local_message_id {
             return Ok(());
         }
-        if !self.last_request.is_empty() {
+        if !self.last_sent_request.is_empty() {
             self.request_retransmit += 1;
         }
-        let total_fragments = self.last_response.len();
-        for (i, fragment) in self.last_request.iter().enumerate() {
+        let total_fragments = self.last_sent_request.len();
+        for (i, fragment) in self.last_sent_request.iter().enumerate() {
             Self::log_fragment_contents(
                 "request",
                 self.remote_message_id,
@@ -1774,7 +1803,7 @@ impl IKEv2Session {
 
         // Remove last request to stop retransmissions.
         self.local_message_id += 1;
-        self.last_request = vec![];
+        self.last_sent_request = vec![];
         self.sent_request = None;
         self.request_retransmit = 0;
 
