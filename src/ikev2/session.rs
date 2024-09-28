@@ -110,6 +110,7 @@ pub enum IKEv2PendingAction {
     DeleteChildSA(esp::SecurityAssociationID, time::Duration),
     CreateIKEv2Session(SessionID, IKEv2Session),
     DeleteIKESession(time::Duration),
+    DeleteOtherIKESessions(Vec<u8>),
 }
 
 pub enum NextRetransmission {
@@ -131,7 +132,7 @@ pub struct IKEv2Session {
     use_fragmentation: bool,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
-    user_id: Option<String>,
+    client_id: Option<(String, Vec<u8>)>,
     last_update: Instant,
     remote_message_id: u32,
     local_message_id: u32,
@@ -166,7 +167,7 @@ impl IKEv2Session {
             use_fragmentation: false,
             params: None,
             crypto_stack: None,
-            user_id: None,
+            client_id: None,
             last_update: Instant::now(),
             remote_message_id: 0,
             local_message_id: 0,
@@ -186,7 +187,19 @@ impl IKEv2Session {
     }
 
     pub fn user_id(&self) -> Option<&str> {
-        self.user_id.as_deref()
+        if let Some((user_id, _)) = self.client_id.as_ref() {
+            Some(user_id.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub fn certificate_serial(&self) -> Option<&[u8]> {
+        if let Some((_, certificate_serial)) = self.client_id.as_ref() {
+            Some(certificate_serial.as_slice())
+        } else {
+            None
+        }
     }
 
     pub fn handle_response_expiration(&mut self, now: time::Instant) {
@@ -829,6 +842,7 @@ impl IKEv2Session {
         let mut ts_remote = vec![];
         let mut ts_local = vec![];
         let mut ipv4_address_requested = false;
+        let mut initial_contact = false;
 
         for payload in request.iter_payloads() {
             let payload = match payload {
@@ -862,6 +876,14 @@ impl IKEv2Session {
                             warn!("Certificate is not valid: {}", err);
                         }
                     };
+                }
+                message::PayloadType::NOTIFY => {
+                    let notify = payload.to_notify()?;
+                    if notify.message_type() == message::NotifyMessageType::INITIAL_CONTACT
+                        && notify.spi() == message::Spi::None
+                    {
+                        initial_contact = true;
+                    }
                 }
                 message::PayloadType::CERTIFICATE_REQUEST => {
                     let certreq = payload.to_certificate_request()?;
@@ -1062,7 +1084,7 @@ impl IKEv2Session {
         }
 
         // At this point the client identity has been successfully verified, proceed with sending a successful response.
-        self.user_id = Some(client_cert.subject().into());
+        self.client_id = Some((client_cert.subject().into(), client_cert.serial().into()));
         self.state = SessionState::Established;
 
         if let Some(id_responder) = self.pki_processing.server_id() {
@@ -1133,6 +1155,13 @@ impl IKEv2Session {
                 return Err("Failed to set up child SA cryptography stack".into());
             }
         };
+
+        if initial_contact {
+            self.pending_actions
+                .push(IKEv2PendingAction::DeleteOtherIKESessions(
+                    client_cert.serial().to_vec(),
+                ));
+        }
 
         response.write_security_association(&[(&transform_params, proposal_num)])?;
 
@@ -1568,7 +1597,7 @@ impl IKEv2Session {
                 use_fragmentation: self.use_fragmentation,
                 params: Some(transform_params),
                 crypto_stack: Some(new_crypto_stack),
-                user_id: self.user_id.clone(),
+                client_id: self.client_id.clone(),
                 last_update: self.last_update,
                 remote_message_id: 0,
                 local_message_id: 0,

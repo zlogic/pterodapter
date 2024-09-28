@@ -145,6 +145,11 @@ impl PkiProcessing {
         } else {
             client_cert.tbs_certificate.subject.to_string()
         };
+        let serial = client_cert
+            .tbs_certificate
+            .serial_number
+            .as_bytes()
+            .to_vec();
         let public_key = client_cert
             .tbs_certificate
             .subject_public_key_info
@@ -155,6 +160,7 @@ impl PkiProcessing {
         Ok(ClientCertificate {
             public_key,
             subject,
+            serial,
         })
     }
 
@@ -175,6 +181,7 @@ impl PkiProcessing {
 pub struct ClientCertificate {
     public_key: Vec<u8>,
     subject: String,
+    serial: Vec<u8>,
 }
 
 const ASN1_IDENTIFIDER_ECDSA_WITH_SHA256: [u8; 12] = [
@@ -184,6 +191,10 @@ const ASN1_IDENTIFIDER_ECDSA_WITH_SHA256: [u8; 12] = [
 impl ClientCertificate {
     pub fn subject(&self) -> &str {
         self.subject.as_str()
+    }
+
+    pub fn serial(&self) -> &[u8] {
+        self.serial.as_slice()
     }
 
     pub fn verify_signature(

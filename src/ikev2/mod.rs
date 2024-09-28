@@ -656,6 +656,28 @@ impl Sessions {
                         let _ = tx.send(cmd).await;
                     });
                 }
+                session::IKEv2PendingAction::DeleteOtherIKESessions(cert_serial) => {
+                    // RFC 7296 Section 2.4 states that sessions may be terminated without a
+                    // timeout.
+                    self.sessions
+                        .iter()
+                        .for_each(|(other_session_id, session)| {
+                            if other_session_id == &session_id
+                                || session.certificate_serial() != Some(&cert_serial)
+                            {
+                                return;
+                            }
+                            let tx = self.tx.clone();
+                            let cmd = SessionMessage::DeleteSession(session_id);
+                            rt.spawn(async move {
+                                debug!(
+                                    "Scheduling to delete IKEv2 session {} on INITIAL_CONTACT",
+                                    session_id
+                                );
+                                let _ = tx.send(cmd).await;
+                            });
+                        });
+                }
                 session::IKEv2PendingAction::DeleteChildSA(session_id, delay) => {
                     let tx = self.tx.clone();
                     let cmd = SessionMessage::DeleteSecurityAssociation(session_id);
