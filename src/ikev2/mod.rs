@@ -1,7 +1,7 @@
 use log::{debug, info, trace, warn};
 use rand::Rng;
 use std::{
-    collections::{self, HashMap},
+    collections::{self, HashMap, HashSet},
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -625,6 +625,7 @@ impl Sessions {
             return;
         };
 
+        let mut delete_session_ids = HashSet::new();
         session
             .take_pending_actions()
             .into_iter()
@@ -657,26 +658,19 @@ impl Sessions {
                     });
                 }
                 session::IKEv2PendingAction::DeleteOtherIKESessions(cert_serial) => {
-                    // RFC 7296 Section 2.4 states that sessions may be terminated without a
-                    // timeout.
-                    self.sessions
+                    delete_session_ids = self
+                        .sessions
                         .iter()
-                        .for_each(|(other_session_id, session)| {
-                            if other_session_id == &session_id
-                                || session.certificate_serial() != Some(&cert_serial)
+                        .filter_map(|(other_session_id, session)| {
+                            if other_session_id != &session_id
+                                && session.certificate_serial() == Some(&cert_serial)
                             {
-                                return;
+                                Some(other_session_id.to_owned())
+                            } else {
+                                None
                             }
-                            let tx = self.tx.clone();
-                            let cmd = SessionMessage::DeleteSession(session_id);
-                            rt.spawn(async move {
-                                debug!(
-                                    "Scheduling to delete IKEv2 session {} on INITIAL_CONTACT",
-                                    session_id
-                                );
-                                let _ = tx.send(cmd).await;
-                            });
-                        });
+                        })
+                        .collect::<HashSet<_>>();
                 }
                 session::IKEv2PendingAction::DeleteChildSA(session_id, delay) => {
                     let tx = self.tx.clone();
@@ -696,6 +690,31 @@ impl Sessions {
                     self.sessions.insert(session_id, session);
                 }
             });
+
+        self.sessions.retain(|session_id, session| {
+            // RFC 7296 Section 2.4 states that sessions may be terminated without a timeout.
+            if delete_session_ids.contains(session_id) {
+                session
+                    .get_local_sa_spis()
+                    .into_iter()
+                    .for_each(|local_spi| {
+                        if self.security_associations.remove(&local_spi).is_some() {
+                            info!(
+                                "Deleted Security Association {:x} from session {} deleted on INITIAL_CONTACT",
+                                local_spi, session_id
+                            );
+                        }
+                    });
+                info!(
+                    "Deleting session with SPI {} {} on INITIAL_CONTACT",
+                    session_id,
+                    session.user_id().unwrap_or("Unknown")
+                );
+                false
+            } else {
+                true
+            }
+        });
     }
 
     async fn transmit_response(
