@@ -127,7 +127,6 @@ pub struct IKEv2Session {
     dns_addrs: Vec<IpAddr>,
     ts_local: Vec<message::TrafficSelector>,
     child_sas: HashSet<ChildSessionID>,
-    child_sa_index: usize,
     pki_processing: Arc<pki::PkiProcessing>,
     use_fragmentation: bool,
     params: Option<crypto::TransformParameters>,
@@ -162,7 +161,6 @@ impl IKEv2Session {
             dns_addrs: vec![],
             ts_local: ts_local.to_vec(),
             child_sas: HashSet::new(),
-            child_sa_index: 0,
             pki_processing,
             use_fragmentation: false,
             params: None,
@@ -1174,9 +1172,8 @@ impl IKEv2Session {
             (ts_remote, remote_addr, remote_spi),
             child_crypto_stack,
             &transform_params,
-            self.child_sa_index,
+            new_ids.next_esp_index(),
         );
-        self.child_sa_index += 1;
         self.pending_actions.push(IKEv2PendingAction::CreateChildSA(
             local_spi,
             Box::new(child_sa),
@@ -1538,9 +1535,8 @@ impl IKEv2Session {
                 (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
-                self.child_sa_index,
+                new_ids.next_esp_index(),
             );
-            self.child_sa_index += 1;
             self.pending_actions.push(IKEv2PendingAction::CreateChildSA(
                 local_spi,
                 Box::new(child_sa),
@@ -1566,9 +1562,8 @@ impl IKEv2Session {
                 (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
-                self.child_sa_index,
+                new_ids.next_esp_index(),
             );
-            self.child_sa_index += 1;
             self.pending_actions.push(IKEv2PendingAction::CreateChildSA(
                 local_spi,
                 Box::new(child_sa),
@@ -1593,7 +1588,6 @@ impl IKEv2Session {
                 internal_addr: self.internal_addr,
                 ts_local: self.ts_local.clone(),
                 child_sas,
-                child_sa_index: self.child_sa_index,
                 pki_processing: self.pki_processing.clone(),
                 use_fragmentation: self.use_fragmentation,
                 params: Some(transform_params),
@@ -1915,13 +1909,15 @@ fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: 
 pub struct ReservedSpi {
     ike: Option<u64>,
     esp: Option<u32>,
+    esp_index: usize,
 }
 
 impl ReservedSpi {
-    pub fn new() -> ReservedSpi {
+    pub fn new(esp_index: usize) -> ReservedSpi {
         ReservedSpi {
             ike: None,
             esp: None,
+            esp_index,
         }
     }
 
@@ -1947,6 +1943,12 @@ impl ReservedSpi {
 
     fn take_esp(&mut self) -> Option<u32> {
         self.esp.take()
+    }
+
+    fn next_esp_index(&mut self) -> usize {
+        let index = self.esp_index;
+        self.esp_index += 1;
+        index
     }
 }
 

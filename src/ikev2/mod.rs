@@ -274,6 +274,7 @@ struct Sessions {
     traffic_selectors: Vec<message::TrafficSelector>,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
+    next_sa_index: usize,
     half_sessions: HashMap<(SocketAddr, u64), (u64, Instant)>,
     reserved_spi: Option<session::ReservedSpi>,
     tx: mpsc::Sender<SessionMessage>,
@@ -297,6 +298,7 @@ impl Sessions {
             tunnel_ips,
             traffic_selectors,
             sessions: HashMap::new(),
+            next_sa_index: 0,
             security_associations: HashMap::new(),
             half_sessions: HashMap::new(),
             reserved_spi: None,
@@ -457,7 +459,7 @@ impl Sessions {
         let mut reserved_spi = if let Some(reserved_spi) = self.reserved_spi.take() {
             reserved_spi
         } else {
-            session::ReservedSpi::new()
+            session::ReservedSpi::new(self.next_sa_index)
         };
         while reserved_spi.needs_ike() {
             let next_id = rand::thread_rng().gen::<u64>();
@@ -654,6 +656,7 @@ impl Sessions {
                     }
                 }
                 session::IKEv2PendingAction::CreateChildSA(session_id, security_association) => {
+                    self.next_sa_index = self.next_sa_index.max(security_association.index() + 1);
                     self.security_associations
                         .insert(session_id, *security_association);
                 }
