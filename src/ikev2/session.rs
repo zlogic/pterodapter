@@ -1583,6 +1583,7 @@ impl IKEv2Session {
                     _ => return Err("Security Association has unsupported remote SPI type".into()),
                 };
             let session_id = SessionID::new(remote_spi, local_spi);
+            let child_sas = self.child_sas.drain().collect::<HashSet<_>>();
             let new_session = IKEv2Session {
                 session_id,
                 remote_addr: self.remote_addr,
@@ -1591,7 +1592,7 @@ impl IKEv2Session {
                 state: SessionState::Established,
                 internal_addr: self.internal_addr,
                 ts_local: self.ts_local.clone(),
-                child_sas: self.child_sas.clone(),
+                child_sas,
                 child_sa_index: self.child_sa_index,
                 pki_processing: self.pki_processing.clone(),
                 use_fragmentation: self.use_fragmentation,

@@ -420,8 +420,19 @@ impl Sessions {
     }
 
     fn delete_session(&mut self, session_id: session::SessionID) {
-        if self.sessions.remove(&session_id).is_some() {
+        if let Some(session) = self.sessions.remove(&session_id) {
             debug!("Deleted IKEv2 session {}", session_id);
+            session
+                .get_local_sa_spis()
+                .into_iter()
+                .for_each(|local_spi| {
+                    if self.security_associations.remove(&local_spi).is_some() {
+                        debug!(
+                            "Deleted Security Association {:x} from session {}",
+                            local_spi, session_id
+                        );
+                    }
+                });
         }
     }
 
