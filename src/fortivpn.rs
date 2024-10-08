@@ -910,7 +910,9 @@ impl PPPState {
 }
 
 pub fn echo_send_interval() -> Interval {
-    tokio::time::interval(ECHO_SEND_INTERVAL)
+    let mut interval = tokio::time::interval(ECHO_SEND_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
 }
 
 type BufTlsStream = BufReader<tokio_rustls::client::TlsStream<TcpStream>>;

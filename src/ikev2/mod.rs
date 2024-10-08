@@ -103,6 +103,7 @@ impl Server {
         dest: mpsc::Sender<SessionMessage>,
     ) -> Result<(), IKEv2Error> {
         let mut interval = tokio::time::interval(duration);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             dest.send(SessionMessage::CleanupTimer)
@@ -162,6 +163,7 @@ impl Server {
         let command_sender = sessions.create_sender();
         rt.spawn(async move {
             let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
+            delay.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
                 delay.tick().await;
                 let (tunnel_ips, traffic_selectors) = match split_routes.refresh_addresses().await {
@@ -965,12 +967,12 @@ impl FortiService {
                     let _ = tx.send(FortiServiceCommand::HandleConnection(result)).await;
                 })
             };
-            let mut res = None;
+            let mut forti_client = None;
             // Wait for async events or the connection to open.
             while let Some(command) = rx.recv().await {
                 match command {
-                    FortiServiceCommand::HandleConnection(forti_client) => {
-                        res = Some(forti_client);
+                    FortiServiceCommand::HandleConnection(res) => {
+                        forti_client = Some(res);
                         break;
                     }
                     FortiServiceCommand::Shutdown => return Ok(()),
@@ -988,7 +990,7 @@ impl FortiService {
                 }
             }
             connect_handle.abort();
-            let mut forti_client = match res.unwrap() {
+            let mut forti_client = match forti_client.unwrap() {
                 Ok(forti_client) => forti_client,
                 Err(err) => {
                     debug!("Error occurred when connecting to FortiClient: {}", err);
@@ -1044,7 +1046,9 @@ impl FortiService {
                             tx.send(Some((forti_client.ip_addr(), forti_client.dns().to_vec())));
                     }
                     FortiServiceCommand::Shutdown => {
-                        forti_client.terminate().await?;
+                        if let Err(err) = forti_client.terminate().await {
+                            warn!("Failed to terminate VPN client connection: {}", err);
+                        }
                         return Ok(());
                     }
                     FortiServiceCommand::HandleConnection(forti_client) => {
