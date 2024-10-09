@@ -592,7 +592,7 @@ impl FortiVPNTunnel {
     async fn send_echo_request(&mut self) -> Result<(), FortiError> {
         self.send_echo(ppp::LcpCode::ECHO_REQUEST, self.ppp_identifier)
             .await?;
-        self.ppp_identifier += 1;
+        self.ppp_identifier = self.ppp_identifier.overflowing_add(1).0;
         self.last_echo_sent = Instant::now();
         Ok(())
     }
