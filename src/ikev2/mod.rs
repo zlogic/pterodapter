@@ -1070,7 +1070,11 @@ impl FortiService {
             if let Err(err) = forti_client.terminate().await {
                 warn!("Failed to terminate VPN client connection: {}", err);
             }
-            let _ = sessions_tx.send(SessionMessage::VpnDisconnected).await;
+            {
+                let rt = runtime::Handle::current();
+                let sessions_tx = sessions_tx.clone();
+                rt.spawn(async move { sessions_tx.send(SessionMessage::VpnDisconnected).await });
+            }
         }
     }
 
