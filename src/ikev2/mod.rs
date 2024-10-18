@@ -703,7 +703,7 @@ impl Sessions {
                     });
                 }
                 session::IKEv2PendingAction::CreateIKEv2Session(session_id, session) => {
-                    self.sessions.insert(session_id, session);
+                    self.sessions.insert(session_id, *session);
                 }
             });
 

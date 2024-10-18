@@ -108,7 +108,7 @@ pub enum IKEv2PendingAction {
     DeleteHalfOpenSession(SocketAddr, u64),
     CreateChildSA(esp::SecurityAssociationID, Box<esp::SecurityAssociation>),
     DeleteChildSA(esp::SecurityAssociationID, time::Duration),
-    CreateIKEv2Session(SessionID, IKEv2Session),
+    CreateIKEv2Session(SessionID, Box<IKEv2Session>),
     DeleteIKESession(time::Duration),
     DeleteOtherIKESessions(Vec<u8>),
 }
@@ -1607,7 +1607,7 @@ impl IKEv2Session {
             self.pending_actions
                 .push(IKEv2PendingAction::CreateIKEv2Session(
                     session_id,
-                    new_session,
+                    Box::new(new_session),
                 ));
         }
 
