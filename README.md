@@ -11,6 +11,8 @@ pterodapter is a userspace Proxy-to-FortiVPN adapter that acts as
 
 and forwards traffic to a FortiVPN network.
 
+![Connection diagram](diagram.svg)
+
 ## Proxy mode
 
 No drivers to install or root access to create tun/utun devices.
