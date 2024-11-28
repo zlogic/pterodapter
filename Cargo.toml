@@ -14,7 +14,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 rustls-platform-verifier = { version = "0.4", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
-smoltcp = { version = "0.11", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
+smoltcp = { version = "0.12", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
 
 aws-lc-rs = { version = "*", optional = true, default-features = false }
 rustls-webpki = { version = "*", optional = true, default-features = false, features = ["alloc", "aws_lc_rs"] }

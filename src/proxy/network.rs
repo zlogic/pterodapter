@@ -551,7 +551,7 @@ struct RxToken<'a> {
 impl<'a> phy::RxToken for RxToken<'a> {
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         f(self.src)
     }
