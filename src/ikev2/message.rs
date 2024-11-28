@@ -1040,7 +1040,7 @@ pub struct PayloadSecurityAssociation<'a> {
     data: &'a [u8],
 }
 
-impl<'a> PayloadSecurityAssociation<'a> {
+impl PayloadSecurityAssociation<'_> {
     pub fn iter_proposals(&self) -> SecurityAssociationIter {
         SecurityAssociationIter {
             data: self.data,
@@ -1161,7 +1161,7 @@ pub struct SecurityAssociationProposal<'a> {
     data: &'a [u8],
 }
 
-impl<'a> SecurityAssociationProposal<'a> {
+impl SecurityAssociationProposal<'_> {
     pub fn iter_transforms(&self) -> SecurityAssociationTransformIter {
         SecurityAssociationTransformIter {
             num_transforms: self.num_transforms,
@@ -1390,7 +1390,7 @@ pub struct SecurityAssociationTransform<'a> {
     data: &'a [u8],
 }
 
-impl<'a> SecurityAssociationTransform<'a> {
+impl SecurityAssociationTransform<'_> {
     pub fn transform_type(&self) -> TransformType {
         self.transform_type
     }
@@ -1483,7 +1483,7 @@ pub struct SecurityAssociationTransformAttribute<'a> {
     data: &'a [u8],
 }
 
-impl<'a> SecurityAssociationTransformAttribute<'a> {
+impl SecurityAssociationTransformAttribute<'_> {
     pub fn attribute_type(&self) -> TransformAttributeType {
         self.attribute_type
     }
@@ -1735,7 +1735,7 @@ pub struct PayloadNonce<'a> {
     data: &'a [u8],
 }
 
-impl<'a> PayloadNonce<'a> {
+impl PayloadNonce<'_> {
     pub fn read_value(&self) -> &[u8] {
         self.data
     }
@@ -1924,7 +1924,7 @@ pub struct SignatureHashAlgorithmIter<'a> {
     data: &'a [u8],
 }
 
-impl<'a> Iterator for SignatureHashAlgorithmIter<'a> {
+impl Iterator for SignatureHashAlgorithmIter<'_> {
     type Item = SignatureHashAlgorithm;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1990,7 +1990,7 @@ pub struct DeleteSpiIter<'a> {
     data: &'a [u8],
 }
 
-impl<'a> Iterator for DeleteSpiIter<'a> {
+impl Iterator for DeleteSpiIter<'_> {
     type Item = Spi;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2144,7 +2144,7 @@ pub struct TrafficSelectorIter<'a> {
     data: &'a [u8],
 }
 
-impl<'a> Iterator for TrafficSelectorIter<'a> {
+impl Iterator for TrafficSelectorIter<'_> {
     type Item = Result<TrafficSelector, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2330,7 +2330,7 @@ pub struct ConfigurationAttribute<'a> {
     data: &'a [u8],
 }
 
-impl<'a> ConfigurationAttribute<'a> {
+impl ConfigurationAttribute<'_> {
     pub fn attribute_type(&self) -> ConfigurationAttributeType {
         self.attribute_type
     }

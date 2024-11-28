@@ -548,7 +548,7 @@ struct RxToken<'a> {
     src: &'a mut Vec<u8>,
 }
 
-impl<'a> phy::RxToken for RxToken<'a> {
+impl phy::RxToken for RxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -561,7 +561,7 @@ struct TxToken<'a> {
     dest: &'a mut Vec<u8>,
 }
 
-impl<'a> phy::TxToken for TxToken<'a> {
+impl phy::TxToken for TxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,

@@ -250,7 +250,7 @@ pub enum LcpOptionData<'a> {
 }
 
 impl<'a> LcpOptionData<'a> {
-    fn from_data(option_type: u8, data: &'a [u8]) -> Result<LcpOptionData, FormatError> {
+    fn from_data(option_type: u8, data: &'a [u8]) -> Result<LcpOptionData<'a>, FormatError> {
         let data = match option_type {
             0 => Self::Reserved(),
             1 => {
@@ -461,7 +461,7 @@ pub enum IpcpOptionData<'a> {
 }
 
 impl<'a> IpcpOptionData<'a> {
-    fn from_data(option_type: u8, data: &'a [u8]) -> Result<IpcpOptionData, FormatError> {
+    fn from_data(option_type: u8, data: &'a [u8]) -> Result<IpcpOptionData<'a>, FormatError> {
         let data = match option_type {
             1 => Self::IpAddresses(),
             2 => {
