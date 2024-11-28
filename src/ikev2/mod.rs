@@ -1020,6 +1020,10 @@ impl FortiService {
                             warn!("Failed to send packet to VPN: {}", err);
                             break;
                         };
+                        if let Err(err) = forti_client.flush().await {
+                            warn!("Failed to flush packet to VPN: {}", err);
+                            break;
+                        };
                     }
                     FortiServiceCommand::ReceivePacket => {
                         let data = match Self::read_vpn_packet(&mut forti_client).await {
