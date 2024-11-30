@@ -1055,6 +1055,7 @@ impl FortiService {
                             tx.send(Some((forti_client.ip_addr(), forti_client.dns().to_vec())));
                     }
                     FortiServiceCommand::Shutdown => {
+                        keepalive_timer.abort();
                         if let Err(err) = forti_client.terminate().await {
                             warn!("Failed to terminate VPN client connection: {}", err);
                         }
