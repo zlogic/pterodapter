@@ -879,10 +879,17 @@ impl Sessions {
             })
         {
             let msg_len = data.len();
-            if data.len() >= MAX_ESP_PACKET_SIZE {
+            let encoded_length = sa.encoded_length(data.len());
+            if encoded_length > data.capacity() {
+                // This sometimes happens when FortiVPN returns a zero-padded packet.
+                warn!(
+                    "Vector doesn't have capacity for ESP headers, data length is {}, capacity is {}",
+                    encoded_length,
+                    data.capacity()
+                );
                 return Err("Vector doesn't have capacity for ESP headers".into());
             }
-            data.resize(sa.encoded_length(data.len()), 0);
+            data.resize(encoded_length, 0);
             let encrypted_data = sa.handle_vpn(data.as_mut_slice(), msg_len)?;
             trace!(
                 "Encrypted VPN packet to {}\n{:?}",
