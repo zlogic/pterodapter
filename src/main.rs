@@ -406,14 +406,14 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
             eprintln!("Failed to start runtime: {}", err);
             1
         })?;
-    let mut server = match ikev2::Server::new(config.ikev2) {
+    let server = match ikev2::Server::new(config.ikev2) {
         Ok(server) => server,
         Err(err) => {
             eprintln!("Failed to create server: {}", err);
             std::process::exit(1)
         }
     };
-    rt.block_on(server.start(config.fortivpn)).map_err(|err| {
+    let mut server = rt.block_on(server.start(config.fortivpn)).map_err(|err| {
         eprintln!("Failed to run server: {}", err);
         1
     })?;

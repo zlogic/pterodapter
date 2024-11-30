@@ -2,16 +2,20 @@ use log::{debug, info, trace, warn};
 use rand::Rng;
 use std::{
     collections::{self, HashMap, HashSet},
-    error, fmt, io,
+    error, fmt,
+    future::{self, Future},
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::pin,
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 use tokio::{
     net::UdpSocket,
     runtime,
     sync::{mpsc, oneshot},
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
     time,
 };
 
@@ -48,8 +52,30 @@ pub struct Server {
     nat_port: u16,
     pki_processing: Arc<pki::PkiProcessing>,
     tunnel_domains: Vec<String>,
-    command_sender: Option<mpsc::Sender<SessionMessage>>,
+}
+
+pub struct ServerHandle {
+    command_sender: mpsc::Sender<SessionMessage>,
     join_set: JoinSet<Result<(), IKEv2Error>>,
+}
+
+impl ServerHandle {
+    pub async fn terminate(&mut self) -> Result<(), IKEv2Error> {
+        if self
+            .command_sender
+            .send(SessionMessage::Shutdown)
+            .await
+            .is_err()
+        {
+            return Err("Command channel closed".into());
+        }
+        while let Some(res) = self.join_set.join_next().await {
+            if let Err(err) = res {
+                warn!("Error returned when shutting down: {}", err);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Server {
@@ -68,34 +94,7 @@ impl Server {
             nat_port: config.nat_port,
             pki_processing: Arc::new(pki_processing),
             tunnel_domains: config.tunnel_domains,
-            command_sender: None,
-            join_set: JoinSet::new(),
         })
-    }
-
-    async fn listen_socket(
-        socket: Arc<UdpSocket>,
-        listen_addr: SocketAddr,
-        is_nat_port: bool,
-        dest: mpsc::Sender<SessionMessage>,
-    ) -> Result<(), IKEv2Error> {
-        loop {
-            // Theoretically the allocator should be smart enough to recycle memory.
-            // In the unlikely case this becomes a problem, switching to stack-allocated
-            // arrays would reduce memory usage, but increase number of copy operations.
-            // As mpsc uses a queue internally, memory will be allocated for the queue elements
-            // in any case.
-            let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
-            let (bytes_res, remote_addr) = socket.recv_from(&mut buf).await?;
-            buf.truncate(bytes_res);
-            let msg = SessionMessage::UdpDatagram(UdpDatagram {
-                remote_addr,
-                local_addr: listen_addr,
-                is_nat_port,
-                request: buf,
-            });
-            dest.send(msg).await.map_err(|_| "Channel closed")?;
-        }
     }
 
     async fn send_timer_ticks(
@@ -112,29 +111,11 @@ impl Server {
         }
     }
 
-    pub async fn terminate(&mut self) -> Result<(), IKEv2Error> {
-        match self.command_sender {
-            Some(ref command_sender) => {
-                if command_sender.send(SessionMessage::Shutdown).await.is_err() {
-                    return Err("Command channel closed".into());
-                }
-            }
-            None => return Err("Shutdown already in progress".into()),
-        }
-        self.command_sender = None;
-        while let Some(res) = self.join_set.join_next().await {
-            if let Err(err) = res {
-                warn!("Error returned when shutting down: {}", err);
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn start(&mut self, fortivpn_config: fortivpn::Config) -> Result<(), IKEv2Error> {
-        if self.command_sender.is_some() {
-            return Err("Server already started".into());
-        }
-        let sockets = Arc::new(Sockets::new(&self.listen_ips, &[self.port, self.nat_port]).await?);
+    pub async fn start(
+        self,
+        fortivpn_config: fortivpn::Config,
+    ) -> Result<ServerHandle, IKEv2Error> {
+        let sockets = Arc::new(Sockets::new(&self.listen_ips, self.port, self.nat_port).await?);
         let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
         let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
         let vpn_service = FortiService::new(fortivpn_config);
@@ -147,6 +128,7 @@ impl Server {
         );
         let rt = runtime::Handle::current();
         // Non-critical futures sockets will be terminated by Tokio during the shutdown_timeout phase.
+        /*
         sockets.iter_sockets().for_each(|(listen_addr, socket)| {
             let is_nat_port = listen_addr.port() == self.nat_port;
             rt.spawn(Server::listen_socket(
@@ -156,6 +138,7 @@ impl Server {
                 sessions.create_sender(),
             ));
         });
+        */
         rt.spawn(Server::send_timer_ticks(
             CLEANUP_INTERVAL,
             sessions.create_sender(),
@@ -181,23 +164,36 @@ impl Server {
                     .await;
             }
         });
-        self.command_sender = Some(sessions.create_sender());
-        self.join_set
-            .spawn_on(async move { sessions.process_messages().await }, &rt);
-        Ok(())
+        let command_sender = sessions.create_sender();
+        let mut join_set = JoinSet::new();
+        join_set.spawn_on(
+            async move {
+                loop {
+                    let datagram = sockets.read_datagram().await?;
+                    warn!("Received datagram {:?}", datagram.bytes);
+                }
+            },
+            &rt,
+        );
+        //join_set.spawn_on(async move { sessions.process_messages().await }, &rt);
+        Ok(ServerHandle {
+            command_sender,
+            join_set,
+        })
     }
 }
 
 struct Sockets {
     sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
+    nat_port: u16,
 }
 
 impl Sockets {
-    async fn new(listen_ips: &[IpAddr], listen_ports: &[u16]) -> Result<Sockets, IKEv2Error> {
+    async fn new(listen_ips: &[IpAddr], port: u16, nat_port: u16) -> Result<Sockets, IKEv2Error> {
         let mut sockets = HashMap::new();
         for listen_ip in listen_ips {
-            for listen_port in listen_ports {
-                let socket = match UdpSocket::bind((*listen_ip, *listen_port)).await {
+            for listen_port in [port, nat_port] {
+                let socket = match UdpSocket::bind((*listen_ip, listen_port)).await {
                     Ok(socket) => socket,
                     Err(err) => {
                         log::error!("Failed to open listener on {}: {}", listen_ip, err);
@@ -209,7 +205,66 @@ impl Sockets {
                 sockets.insert(listen_addr, Arc::new(socket));
             }
         }
-        Ok(Sockets { sockets })
+        Ok(Sockets { sockets, nat_port })
+    }
+
+    fn read_datagram(&self) -> impl Future<Output = Result<UdpDatagram, IKEv2Error>> + use<'_> {
+        /*
+            let mut poll_futures = self
+                .sockets
+                .iter()
+                .map(|(listen_addr, socket)| {
+                    let socket = socket.clone();
+                    // TODO: reuse buffers, read into stack before creating a vec, or create a buffer
+                    // pool?
+                    let mut dest = vec![0u8; MAX_DATAGRAM_SIZE];
+                    let recv_future = async move {
+                        let (bytes_res, remote_addr) = socket.recv_from(dest.as_mut_slice()).await?;
+                        dest.truncate(bytes_res);
+                        Ok(UdpDatagram {
+                            remote_addr,
+                            local_addr: *listen_addr,
+                            is_nat_port: listen_addr.port() == self.nat_port,
+                            bytes: dest,
+                        })
+                    };
+                    pin!(recv_future)
+                })
+                .collect::<Vec<_>>();
+        */
+        // TODO: use a round robin order to read from all sockets simultaneously.
+        let sockets = self
+            .sockets
+            .iter()
+            .map(|(listen_addr, socket)| (*listen_addr, socket.clone()))
+            .collect::<Vec<_>>();
+        future::poll_fn(move |cx| {
+            sockets
+                .iter()
+                .flat_map(|(listen_addr, socket)| {
+                    let recv_future = pin!(async {
+                        let mut dest = vec![0u8; MAX_DATAGRAM_SIZE];
+                        let (bytes_res, remote_addr) =
+                            socket.recv_from(dest.as_mut_slice()).await?;
+                        dest.truncate(bytes_res);
+                        Ok(UdpDatagram {
+                            remote_addr,
+                            local_addr: *listen_addr,
+                            is_nat_port: listen_addr.port() == self.nat_port,
+                            bytes: dest,
+                        })
+                    });
+                    if let Poll::Ready(buf) = recv_future.poll(cx) {
+                        Some(Poll::Ready(buf))
+                    } else {
+                        None
+                    }
+                })
+                .next()
+                .unwrap_or(Poll::Pending)
+        })
+        //dest.resize(MAX_DATAGRAM_SIZE, 0);
+        //dest.truncate(bytes_res);
     }
 
     fn iter_sockets(&self) -> collections::hash_map::Iter<SocketAddr, Arc<UdpSocket>> {
@@ -242,12 +297,12 @@ struct UdpDatagram {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
     is_nat_port: bool,
-    request: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl UdpDatagram {
     fn is_non_esp(&self) -> bool {
-        self.request.len() >= 4 && self.request[0..4] == [0x00, 0x00, 0x00, 0x00]
+        self.bytes.len() >= 4 && self.bytes[0..4] == [0x00, 0x00, 0x00, 0x00]
     }
 
     fn is_ikev2(&self) -> bool {
@@ -256,7 +311,6 @@ impl UdpDatagram {
 }
 
 enum SessionMessage {
-    UdpDatagram(UdpDatagram),
     TransmitResponse(session::SessionID, u32, bool),
     DeleteSession(session::SessionID),
     DeleteSecurityAssociation(u32),
@@ -483,9 +537,10 @@ impl Sessions {
     }
 
     async fn process_messages(&mut self) -> Result<(), IKEv2Error> {
-        self.vpn_service.start(self.create_sender()).await?;
+        //self.vpn_service.start(self.create_sender()).await?;
         while let Some(message) = self.rx.recv().await {
             match message {
+                /*
                 SessionMessage::UdpDatagram(mut datagram) => {
                     if let Err(err) = self.process_datagram(&mut datagram).await {
                         warn!(
@@ -494,6 +549,7 @@ impl Sessions {
                         );
                     }
                 }
+                */
                 SessionMessage::TransmitResponse(session_id, message_id, is_nat) => {
                     self.transmit_response(session_id, message_id, is_nat).await;
                 }
@@ -547,7 +603,7 @@ impl Sessions {
 
     async fn process_ikev2_message(&mut self, datagram: &UdpDatagram) -> Result<(), IKEv2Error> {
         let is_nat = datagram.is_non_esp();
-        let ikev2_request = message::InputMessage::from_datagram(&datagram.request, is_nat)?;
+        let ikev2_request = message::InputMessage::from_datagram(&datagram.bytes, is_nat)?;
         if !ikev2_request.is_valid() {
             return Err("Invalid message received".into());
         }
@@ -800,8 +856,7 @@ impl Sessions {
     }
 
     async fn process_esp_packet(&mut self, datagram: &mut UdpDatagram) -> Result<(), IKEv2Error> {
-        let packet_bytes = datagram.request.as_slice();
-        if packet_bytes == [0xff] {
+        if datagram.bytes == [0xff] {
             debug!("Received ESP NAT keepalive from {}", datagram.remote_addr);
             return Ok(self
                 .sockets
@@ -811,17 +866,16 @@ impl Sessions {
         trace!(
             "Received ESP packet from {}\n{:?}",
             datagram.remote_addr,
-            packet_bytes,
+            datagram.bytes,
         );
-        if packet_bytes.len() < 8 {
+        if datagram.bytes.len() < 8 {
             return Err("Not enough data in ESP packet".into());
         }
         let mut local_spi = [0u8; 4];
-        local_spi.copy_from_slice(&packet_bytes[0..4]);
+        local_spi.copy_from_slice(&datagram.bytes[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
         if let Some(sa) = self.security_associations.get_mut(&local_spi) {
-            let packet_bytes = datagram.request.as_mut_slice();
-            let decrypted_slice = sa.handle_esp(packet_bytes)?;
+            let decrypted_slice = sa.handle_esp(&mut datagram.bytes)?;
             trace!(
                 "Decrypted ESP packet from {}\n{:?}",
                 datagram.remote_addr,
@@ -911,16 +965,18 @@ impl Sessions {
 }
 
 struct FortiService {
-    config: Option<fortivpn::Config>,
-    command_sender: Option<mpsc::Sender<FortiServiceCommand>>,
+    config: fortivpn::Config,
+    tunnel: Option<fortivpn::FortiVPNTunnel>,
+    connect_handle: Option<JoinHandle<Result<(), fortivpn::FortiError>>>,
     join_set: JoinSet<Result<(), IKEv2Error>>,
 }
 
 impl FortiService {
     fn new(config: fortivpn::Config) -> FortiService {
         FortiService {
-            config: Some(config),
-            command_sender: None,
+            config,
+            tunnel: None,
+            connect_handle: None,
             join_set: JoinSet::new(),
         }
     }
@@ -957,6 +1013,23 @@ impl FortiService {
         }
     }
 
+    async fn process_next(&self) {
+        match self.tunnel.as_ref() {
+            Some(tunnel) => self.process_next_connected(tunnel).await,
+            None => self.process_next_connection().await,
+        }
+    }
+
+    async fn process_next_connection(&self) {
+        if let Some(connect_handle) = self.connect_handle.as_ref() {
+            //connect_handle
+        }
+        let result = Self::connect(self.config.clone()).await;
+    }
+
+    async fn process_next_connected(&self, tunnel: &fortivpn::FortiVPNTunnel) {}
+
+    /*
     async fn run(
         config: fortivpn::Config,
         tx: mpsc::Sender<FortiServiceCommand>,
@@ -964,38 +1037,6 @@ impl FortiService {
         sessions_tx: mpsc::Sender<SessionMessage>,
     ) -> Result<(), IKEv2Error> {
         loop {
-            // Spawn a new connection task.
-            let connect_handle = {
-                let rt = runtime::Handle::current();
-                let tx = tx.clone();
-                let config = config.clone();
-                rt.spawn(async move {
-                    let result = Self::connect(config).await;
-                    let _ = tx.send(FortiServiceCommand::HandleConnection(result)).await;
-                })
-            };
-            let mut forti_client = None;
-            // Wait for async events or the connection to open.
-            while let Some(command) = rx.recv().await {
-                match command {
-                    FortiServiceCommand::HandleConnection(res) => {
-                        forti_client = Some(res);
-                        break;
-                    }
-                    FortiServiceCommand::Shutdown => return Ok(()),
-                    FortiServiceCommand::SendPacket(_) => {
-                        debug!("Received packet for closed FortiClient channel");
-                    }
-                    FortiServiceCommand::ReceivePacket => {
-                        debug!("Received packet from closed FortiClient channel");
-                    }
-                    FortiServiceCommand::SendEcho => {}
-                    FortiServiceCommand::RequestIpConfiguration(tx) => {
-                        debug!("Received IP request for closed FortiClient channel");
-                        let _ = tx.send(None);
-                    }
-                }
-            }
             connect_handle.abort();
             let mut forti_client = match forti_client.unwrap() {
                 Ok(forti_client) => forti_client,
@@ -1061,19 +1102,6 @@ impl FortiService {
                         }
                         return Ok(());
                     }
-                    FortiServiceCommand::HandleConnection(forti_client) => {
-                        warn!("Received unexpected new connection, closing");
-                        let mut forti_client = match forti_client {
-                            Ok(forti_client) => forti_client,
-                            Err(err) => {
-                                debug!("Error occurred when connecting to FortiClient: {}", err);
-                                continue;
-                            }
-                        };
-                        if let Err(err) = forti_client.terminate().await {
-                            warn!("Failed to terminate VPN client connection: {}", err);
-                        }
-                    }
                 }
             }
             keepalive_timer.abort();
@@ -1087,35 +1115,23 @@ impl FortiService {
             }
         }
     }
-
-    async fn start(&mut self, sessions_tx: mpsc::Sender<SessionMessage>) -> Result<(), IKEv2Error> {
-        if self.command_sender.is_some() {
-            return Err("VPN client service is already started".into());
-        }
-        let config = if let Some(config) = self.config.take() {
-            config
-        } else {
-            return Err("VPN client config is already consumed".into());
-        };
-        let (tx, rx) = mpsc::channel(32);
-        self.command_sender = Some(tx.clone());
-        let rt = runtime::Handle::current();
-        self.join_set
-            .spawn_on(Self::run(config, tx, rx, sessions_tx), &rt);
-
-        Ok(())
-    }
+    */
 
     async fn send_packet(&self, data: Vec<u8>) -> Result<(), IKEv2Error> {
+        Ok(())
+        /*
         if let Some(tx) = self.command_sender.as_ref() {
             let _ = tx.send(FortiServiceCommand::SendPacket(data)).await;
             Ok(())
         } else {
             Err("VPN client service is not running".into())
         }
+        */
     }
 
     async fn ip_configuration(&self) -> Result<Option<(IpAddr, Vec<IpAddr>)>, IKEv2Error> {
+        Ok(None)
+        /*
         if let Some(command_sender) = self.command_sender.as_ref() {
             let (tx, rx) = oneshot::channel();
             command_sender
@@ -1126,9 +1142,12 @@ impl FortiService {
         } else {
             Err("VPN client service is not running".into())
         }
+        */
     }
 
     async fn terminate(&mut self) -> Result<(), IKEv2Error> {
+        Ok(())
+        /*
         match self.command_sender {
             Some(ref command_sender) => {
                 if command_sender
@@ -1148,11 +1167,11 @@ impl FortiService {
             }
         }
         Ok(())
+        */
     }
 }
 
 enum FortiServiceCommand {
-    HandleConnection(Result<fortivpn::FortiVPNTunnel, fortivpn::FortiError>),
     RequestIpConfiguration(oneshot::Sender<Option<(IpAddr, Vec<IpAddr>)>>),
     SendPacket(Vec<u8>),
     ReceivePacket,
