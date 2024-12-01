@@ -341,6 +341,17 @@ impl MultiPoller {
     {
         let sockets = self.sockets.clone();
         future::poll_fn(move |cx| {
+            let command_message = match command_recv.as_mut().poll(cx) {
+                Poll::Ready(command) => command,
+                Poll::Pending => None,
+            };
+            if command_message.is_some() {
+                return Poll::Ready(MultiPollResult {
+                    command_message,
+                    ready_sockets: vec![],
+                    vpn_status: None,
+                });
+            }
             let mut ready_sockets = Vec::with_capacity(sockets.len());
             ready_sockets.extend(sockets.iter().filter_map(|(listen_addr, socket)| {
                 match socket.poll_recv_ready(cx) {
@@ -348,6 +359,13 @@ impl MultiPoller {
                     Poll::Pending => None,
                 }
             }));
+            if !ready_sockets.is_empty() {
+                return Poll::Ready(MultiPollResult {
+                    command_message: None,
+                    ready_sockets,
+                    vpn_status: None,
+                });
+            }
             let vpn_status = if !ignore_vpn {
                 match peek_vpn.as_mut().poll(cx) {
                     Poll::Ready(res) => Some(res),
@@ -357,14 +375,10 @@ impl MultiPoller {
                 // Avoid waking if VPN is already shut down.
                 None
             };
-            let command_message = match command_recv.as_mut().poll(cx) {
-                Poll::Ready(command) => command,
-                Poll::Pending => None,
-            };
-            if command_message.is_some() || vpn_status.is_some() || !ready_sockets.is_empty() {
+            if vpn_status.is_some() {
                 Poll::Ready(MultiPollResult {
-                    command_message,
-                    ready_sockets,
+                    command_message: None,
+                    ready_sockets: vec![],
                     vpn_status,
                 })
             } else {
