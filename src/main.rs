@@ -12,7 +12,6 @@ use tokio::{signal, sync::mpsc};
 use tokio_rustls::rustls;
 
 mod fortivpn;
-mod futures;
 mod http;
 mod logger;
 mod ppp;
@@ -406,24 +405,22 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
             eprintln!("Failed to start runtime: {}", err);
             1
         })?;
-    let server = match ikev2::Server::new(config.ikev2) {
+    let mut server = match ikev2::Server::new(config.ikev2) {
         Ok(server) => server,
         Err(err) => {
             eprintln!("Failed to create server: {}", err);
             std::process::exit(1)
         }
     };
-    let mut server = rt.block_on(server.start(config.fortivpn)).map_err(|err| {
+    rt.block_on(server.start(config.fortivpn)).map_err(|err| {
         eprintln!("Failed to run server: {}", err);
         1
     })?;
-    let cancel_flag = Arc::new(atomic::AtomicBool::new(false));
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let cancel_handle = rt.spawn(async move {
         if let Err(err) = signal::ctrl_c().await {
             eprintln!("Failed to wait for CTRL+C signal: {}", err);
         }
-        cancel_flag.store(true, atomic::Ordering::Relaxed);
         let _ = shutdown_sender.send(());
     });
 
