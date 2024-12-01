@@ -1634,6 +1634,13 @@ impl IKEv2Session {
         matches!(self.sent_request, Some(RequestContext::DeleteIKEv2))
     }
 
+    pub fn is_established(&mut self) -> bool {
+        match self.state {
+            SessionState::Established | SessionState::Deleting => true,
+            SessionState::Empty | SessionState::InitSA(_) => false,
+        }
+    }
+
     fn start_request(
         &mut self,
         exchange_type: message::ExchangeType,

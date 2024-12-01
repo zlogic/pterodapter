@@ -596,6 +596,29 @@ impl Sessions {
                     .await;
             });
         }
+        self.sessions.retain(|session_id, session| {
+            if !session.is_established() {
+                info!(
+                    "Deleting non-established session with SPI {} {}",
+                    session_id,
+                    session.user_id().unwrap_or("Unknown")
+                );
+                session
+                    .get_local_sa_spis()
+                    .into_iter()
+                    .for_each(|local_spi| {
+                        if self.security_associations.remove(&local_spi).is_some() {
+                            info!(
+                                "Deleted Security Association {:x} from non-established session {}",
+                                local_spi, session_id
+                            );
+                        }
+                    });
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn delete_session(&mut self, session_id: session::SessionID) {
@@ -1149,8 +1172,10 @@ impl FortiService {
                 tx.send(result)
             });
             Ok(())
-        } else {
+        } else if !self.shutdown {
             Err("Received VPN disconnection request for a closed tunnel".into())
+        } else {
+            Ok(())
         }
     }
 
