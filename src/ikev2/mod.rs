@@ -189,7 +189,6 @@ impl Server {
         let mut udp_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut vpn_buffer = [0u8; MAX_ESP_PACKET_SIZE];
         let nat_port = sockets.nat_port;
-        let mut vpn_connected = false;
         let mut shutdown = false;
         loop {
             if shutdown && sessions.is_empty() && !vpn_service.is_connected() {
@@ -271,10 +270,6 @@ impl Server {
                         listen_addr
                     );
                 }
-            }
-            if vpn_connected && vpn_service.is_connected() {
-                vpn_connected = false;
-                sessions.delete_all_sessions(&rt);
             }
             if let Some(vpn_status) = poll_result.vpn_status {
                 let can_recv = match vpn_status {
