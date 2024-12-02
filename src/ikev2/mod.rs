@@ -6,7 +6,7 @@ use std::{
     future::{self, Future},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    pin::{pin, Pin},
+    pin::pin,
     sync::Arc,
     task::Poll,
     time::{Duration, Instant},
@@ -196,16 +196,14 @@ impl Server {
                 return Ok(());
             }
             // Wait until something is ready.
-            let poll_result = {
-                let ignore_vpn = shutdown && !vpn_service.is_connected();
-                let next_vpn_packet = vpn_service.next_packet();
-                let next_vpn_packet_pin = pin!(next_vpn_packet);
-                let next_command = command_receiver.recv();
-                let next_command_pin = pin!(next_command);
-                poller
-                    .ready_list(next_command_pin, next_vpn_packet_pin, ignore_vpn)
-                    .await
-            };
+            let ignore_vpn = shutdown && !vpn_service.is_connected();
+            let poll_result = poller
+                .ready_list(
+                    command_receiver.recv(),
+                    vpn_service.next_packet(),
+                    ignore_vpn,
+                )
+                .await;
             // Process all ready events.
             if let Some(message) = poll_result.command_message {
                 match message {
@@ -324,16 +322,18 @@ impl MultiPoller {
         MultiPoller { sockets }
     }
 
-    fn ready_list<'a, C, V>(
+    async fn ready_list<'a, C, V>(
         &self,
-        mut command_recv: Pin<&'a mut C>,
-        mut peek_vpn: Pin<&'a mut V>,
+        command_recv: C,
+        peek_vpn: V,
         ignore_vpn: bool,
-    ) -> impl Future<Output = MultiPollResult> + use<'a, '_, C, V>
+    ) -> MultiPollResult
     where
         C: Future<Output = Option<SessionMessage>>,
         V: Future<Output = Result<bool, IKEv2Error>>,
     {
+        let mut command_recv = pin!(command_recv);
+        let mut peek_vpn = pin!(peek_vpn);
         let sockets = self.sockets.clone();
         future::poll_fn(move |cx| {
             let mut ready_sockets = Vec::with_capacity(sockets.len());
@@ -366,6 +366,7 @@ impl MultiPoller {
                 Poll::Pending
             }
         })
+        .await
     }
 }
 
