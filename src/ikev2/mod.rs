@@ -269,28 +269,27 @@ impl Server {
                     );
                 }
             }
-            if let Some(vpn_status) = poll_result.vpn_status {
-                let can_recv = match vpn_status {
-                    Ok(ready) => ready,
+            let vpn_can_recv = match poll_result.vpn_status {
+                Some(Ok(ready)) => ready,
+                Some(Err(err)) => {
+                    warn!("VPN reported an error status: {}", err);
+                    if let Err(err) = vpn_service.start_disconnection(&rt) {
+                        warn!("Failed to start VPN disconnection: {}", err);
+                    }
+                    false
+                }
+                None => false,
+            };
+            if vpn_can_recv {
+                let read_bytes = match vpn_service.read_vpn_packet(&mut vpn_buffer).await {
+                    Ok(bytes) => bytes,
                     Err(err) => {
-                        warn!("VPN reported an error status: {}", err);
-                        false
-                    }
-                };
-
-                let read_bytes = if can_recv {
-                    match vpn_service.read_vpn_packet(&mut vpn_buffer).await {
-                        Ok(bytes) => bytes,
-                        Err(err) => {
-                            warn!("Failed to receive packet from VPN: {}", err);
-                            if let Err(err) = vpn_service.start_disconnection(&rt) {
-                                warn!("Failed to start VPN disconnection: {}", err);
-                            }
-                            0
+                        warn!("Failed to receive packet from VPN: {}", err);
+                        if let Err(err) = vpn_service.start_disconnection(&rt) {
+                            warn!("Failed to start VPN disconnection: {}", err);
                         }
+                        0
                     }
-                } else {
-                    0
                 };
                 if let Err(err) = sessions
                     .process_vpn_packet(&mut vpn_buffer, read_bytes)
