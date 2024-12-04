@@ -1279,7 +1279,8 @@ impl FortiService {
                 }
                 if let Err(err) = result.as_ref() {
                     warn!("VPN channel closed with error: {}", err)
-                } else if tunnel_rx.is_closed() {
+                }
+                if tunnel_rx.is_closed() {
                     debug!("VPN listener is terminated");
                     return Ok(());
                 }
