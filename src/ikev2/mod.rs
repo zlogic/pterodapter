@@ -19,7 +19,7 @@ use tokio::{
     time,
 };
 
-use crate::fortivpn;
+use crate::{bufferpool, fortivpn};
 
 mod crypto;
 mod esp;
@@ -322,13 +322,10 @@ impl Sockets {
         socket: Arc<UdpSocket>,
         is_nat_port: bool,
     ) {
+        let mut buffer_pool = bufferpool::BufferPool::new(tx.max_capacity(), MAX_DATAGRAM_SIZE);
         loop {
-            // Theoretically the allocator should be smart enough to recycle memory.
-            // In the unlikely case this becomes a problem, switching to stack-allocated
-            // arrays would reduce memory usage, but increase number of copy operations.
-            // As mpsc uses a queue internally, memory will be allocated for the queue elements
-            // in any case.
-            let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+            let mut buf = buffer_pool.borrow().await.unwrap();
+            buf.resize(MAX_DATAGRAM_SIZE, 0);
             let (bytes_res, remote_addr) = match socket.recv_from(&mut buf).await {
                 Ok(res) => res,
                 Err(err) => {
@@ -378,9 +375,7 @@ impl Sockets {
     }
 
     fn create_sender(&self) -> UdpSender {
-        UdpSender {
-            tx: self.send_tx.clone(),
-        }
+        UdpSender::new(self.send_tx.clone())
     }
 }
 
@@ -388,7 +383,7 @@ struct UdpDatagram {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
     is_nat_port: bool,
-    bytes: Vec<u8>,
+    bytes: bufferpool::Buffer,
 }
 
 impl UdpDatagram {
@@ -401,19 +396,37 @@ impl UdpDatagram {
     }
 }
 
-#[derive(Clone)]
 struct UdpSender {
     tx: mpsc::Sender<SendUdpDatagram>,
+    buffer_pool: bufferpool::BufferPool,
+}
+
+impl UdpSender {
+    fn new(tx: mpsc::Sender<SendUdpDatagram>) -> UdpSender {
+        UdpSender {
+            tx,
+            buffer_pool: bufferpool::BufferPool::new(128, MAX_DATAGRAM_SIZE),
+        }
+    }
+}
+
+impl Clone for UdpSender {
+    fn clone(&self) -> Self {
+        UdpSender {
+            tx: self.tx.clone(),
+            buffer_pool: bufferpool::BufferPool::new(128, MAX_DATAGRAM_SIZE),
+        }
+    }
 }
 
 impl UdpSender {
     async fn send_datagram(
-        &self,
+        &mut self,
         local_addr: &SocketAddr,
         remote_addr: &SocketAddr,
         data: &[u8],
     ) -> Result<(), SendError> {
-        let mut buffer = Vec::with_capacity(MAX_DATAGRAM_SIZE);
+        let mut buffer = self.buffer_pool.borrow().await.unwrap();
         buffer.extend_from_slice(data);
         self.tx
             .send(SendUdpDatagram {
@@ -429,7 +442,7 @@ impl UdpSender {
 struct SendUdpDatagram {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
-    bytes: Vec<u8>,
+    bytes: bufferpool::Buffer,
 }
 
 enum SessionMessage {
@@ -942,7 +955,7 @@ impl Sessions {
                 .await?);
         }
         trace!(
-            "Received ESP packet from {}\n{:?}",
+            "Received ESP packet from {}\n{}",
             datagram.remote_addr,
             datagram.bytes,
         );
@@ -1048,14 +1061,14 @@ impl Sessions {
 
 enum FortiTunnelEvent {
     Connected(IpAddr, Vec<IpAddr>),
-    ReceivedPacket(Vec<u8>, usize),
+    ReceivedPacket(bufferpool::Buffer, usize),
     Error(fortivpn::FortiError),
     Disconnected,
     EchoFailed(fortivpn::FortiError),
 }
 
 enum FortiTunnelCommand {
-    SendPacket(Vec<u8>),
+    SendPacket(bufferpool::Buffer),
     Disconnect,
 }
 
@@ -1065,16 +1078,19 @@ struct FortiService {
     tunnel_tx: Option<mpsc::Sender<FortiTunnelCommand>>,
     tunnel_rx: Option<mpsc::Receiver<FortiTunnelEvent>>,
     tunnel_task: Option<JoinHandle<Result<(), IKEv2Error>>>,
+    buffer_pool: bufferpool::BufferPool,
 }
 
 impl FortiService {
     fn new(config: fortivpn::Config) -> FortiService {
+        let buffer_pool = bufferpool::BufferPool::new(128, fortivpn::PPP_MTU.into());
         FortiService {
             config,
             ip_configuration: None,
             tunnel_tx: None,
             tunnel_rx: None,
             tunnel_task: None,
+            buffer_pool,
         }
     }
 
@@ -1179,6 +1195,7 @@ impl FortiService {
         }
         let mut need_flush = false;
         let mut is_connected = true;
+        let mut buffer_pool = bufferpool::BufferPool::new(tx.max_capacity(), MAX_DATAGRAM_SIZE);
         while is_connected {
             let (can_recv, command, send_echo, flush) = {
                 let mut received_packet = pin!(tunnel.peek_recv());
@@ -1206,7 +1223,8 @@ impl FortiService {
                 .await
             };
             if can_recv {
-                let mut buffer = vec![0; MAX_ESP_PACKET_SIZE];
+                let mut buffer = buffer_pool.borrow().await.unwrap();
+                buffer.resize(MAX_DATAGRAM_SIZE, 0);
                 let event = match tunnel.try_read_packet(&mut buffer, None).await {
                     Ok(packet_bytes) => FortiTunnelEvent::ReceivedPacket(buffer, packet_bytes),
                     Err(err) => {
@@ -1269,14 +1287,10 @@ impl FortiService {
         self.tunnel_task = Some(rt.spawn(async move {
             loop {
                 let result = Self::run_tunnel(config.clone(), &service_tx, &mut tunnel_rx).await;
-                if service_tx
+                service_tx
                     .send(FortiTunnelEvent::Disconnected)
                     .await
-                    .is_err()
-                {
-                    debug!("VPN sink channel closed");
-                    tunnel_rx.close();
-                }
+                    .map_err(|_| "VPN sink channel closed")?;
                 if let Err(err) = result.as_ref() {
                     warn!("VPN channel closed with error: {}", err)
                 } else if tunnel_rx.is_closed() {
@@ -1335,7 +1349,7 @@ impl FortiService {
 
     async fn send_packet(&mut self, data: &[u8]) -> Result<(), IKEv2Error> {
         if let Some(tx) = self.tunnel_tx.as_mut() {
-            let mut buffer = Vec::with_capacity(fortivpn::PPP_MTU as usize);
+            let mut buffer = self.buffer_pool.borrow().await.unwrap();
             if data.len() > buffer.capacity() {
                 warn!(
                     "ESP packet ({}) exceeds PPP MTU {}",

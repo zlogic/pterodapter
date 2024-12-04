@@ -1747,7 +1747,11 @@ impl IKEv2Session {
         }
     }
 
-    pub async fn send_last_response(&self, message_id: u32, is_nat: bool) -> Result<(), SendError> {
+    pub async fn send_last_response(
+        &mut self,
+        message_id: u32,
+        is_nat: bool,
+    ) -> Result<(), SendError> {
         if message_id != self.remote_message_id {
             return Ok(());
         }

@@ -11,6 +11,7 @@ use log::{debug, info};
 use tokio::{signal, sync::mpsc};
 use tokio_rustls::rustls;
 
+mod bufferpool;
 mod fortivpn;
 mod http;
 mod logger;
