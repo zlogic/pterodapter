@@ -134,17 +134,20 @@ impl Network<'_> {
                 }
             };
             let vpn_data_received = match vpn_event_received {
-                Some(Ok(())) => vpn_events
-                    .iter()
-                    .map(|vpn_event| match self.process_vpn_event(vpn_event) {
-                        Ok(data_received) => data_received,
-                        Err(err) => {
-                            warn!("Failed to process VPN event, terminating: {}", err);
-                            self.shutdown = true;
-                            false
-                        }
-                    })
-                    .any(|b| b),
+                Some(Ok(())) => {
+                    vpn_events
+                        .iter()
+                        .filter(|vpn_event| match self.process_vpn_event(vpn_event) {
+                            Ok(data_received) => data_received,
+                            Err(err) => {
+                                warn!("Failed to process VPN event, terminating: {}", err);
+                                self.shutdown = true;
+                                false
+                            }
+                        })
+                        .count()
+                        > 0
+                }
                 Some(Err(err)) => {
                     self.shutdown = true;
                     warn!("Failed to receive events from VPN, terminating: {}", err);
