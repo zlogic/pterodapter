@@ -3,11 +3,11 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     process,
     str::FromStr,
-    sync::{atomic, Arc},
+    sync::Arc,
     time::Duration,
 };
 
-use log::{debug, info};
+use log::info;
 use tokio::{signal, sync::mpsc};
 use tokio_rustls::rustls;
 
@@ -345,48 +345,31 @@ fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
         }
     });
 
-    let sslvpn_cookie = rt
-        .block_on(fortivpn::get_oauth_cookie(&config.fortivpn))
-        .map_err(|err| {
-            eprintln!("Failed to get SSLVPN cookie: {}", err);
-            1
-        })?;
+    let client = proxy::network::Network::new(config.fortivpn).map_err(|err| {
+        eprintln!("Failed to start virtual network interface: {}", err);
+        1
+    })?;
 
-    let forti_client = rt
-        .block_on(fortivpn::FortiVPNTunnel::new(
-            &config.fortivpn,
-            sslvpn_cookie,
-        ))
-        .map_err(|err| {
-            eprintln!("Failed to connect to VPN service: {}", err);
-            1
-        })?;
-    let cancel_flag = Arc::new(atomic::AtomicBool::new(false));
-    let mut client =
-        proxy::network::Network::new(forti_client, command_receiver, cancel_flag.clone()).map_err(
-            |err| {
-                eprintln!("Failed to start virtual network interface: {}", err);
-                1
-            },
-        )?;
+    let client_handle = rt.spawn(client.run(command_receiver));
 
-    let cancel_handle = rt.spawn(async move {
+    rt.block_on(async move {
         if let Err(err) = signal::ctrl_c().await {
             eprintln!("Failed to wait for CTRL+C signal: {}", err);
         }
-        cancel_flag.store(true, atomic::Ordering::Relaxed);
-    });
-    rt.block_on(async move {
-        if let Err(err) = client.run().await {
-            eprintln!("Network failed to run: {}", err);
+        info!("Started shutdown");
+        if command_sender
+            .send(proxy::network::Command::Shutdown)
+            .await
+            .is_err()
+        {
+            eprintln!("Shutdown listener is closed");
         }
-        if let Err(err) = client.terminate().await {
-            debug!("Failed to terminate client: {}", err);
+        if let Err(err) = client_handle.await {
+            eprintln!("Network failed to run: {}", err);
         }
     });
 
     server_handle.abort();
-    cancel_handle.abort();
     rt.shutdown_timeout(Duration::from_secs(60));
 
     info!("Stopped server");
@@ -395,8 +378,6 @@ fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
 
 #[cfg(feature = "ikev2")]
 fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
-    use tokio::sync::oneshot;
-
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -416,17 +397,11 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         eprintln!("Failed to run server: {}", err);
         1
     })?;
-    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let cancel_handle = rt.spawn(async move {
+
+    rt.block_on(async move {
         if let Err(err) = signal::ctrl_c().await {
             eprintln!("Failed to wait for CTRL+C signal: {}", err);
         }
-        let _ = shutdown_sender.send(());
-    });
-
-    rt.block_on(async move {
-        let _ = shutdown_receiver.await;
-        cancel_handle.abort();
         info!("Started shutdown");
         if let Err(err) = server.terminate().await {
             eprintln!("Failed to terminate server: {}", err);
