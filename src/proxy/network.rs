@@ -144,7 +144,7 @@ impl Network<'_> {
                             false
                         }
                     })
-                    .fold(false, |a, b| a || b),
+                    .any(|b| b),
                 Some(Err(err)) => {
                     self.shutdown = true;
                     warn!("Failed to receive events from VPN, terminating: {}", err);

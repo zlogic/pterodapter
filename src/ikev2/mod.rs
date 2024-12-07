@@ -936,7 +936,7 @@ impl Sessions {
         datagram: &mut UdpDatagram,
         vpn_service: &mut FortiService,
     ) -> Result<(), IKEv2Error> {
-        if datagram.bytes.as_slice() == &[0xff] {
+        if datagram.bytes.as_slice() == [0xff] {
             debug!("Received ESP NAT keepalive from {}", datagram.remote_addr);
             return Ok(self
                 .udp_sender
