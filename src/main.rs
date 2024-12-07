@@ -363,6 +363,7 @@ fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
             .is_err()
         {
             eprintln!("Shutdown listener is closed");
+            return;
         }
         if let Err(err) = client_handle.await {
             eprintln!("Network failed to run: {}", err);
@@ -378,6 +379,8 @@ fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
 
 #[cfg(feature = "ikev2")]
 fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
+    use tokio::sync::oneshot;
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -386,25 +389,29 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
             eprintln!("Failed to start runtime: {}", err);
             1
         })?;
-    let mut server = match ikev2::Server::new(config.ikev2) {
+    let server = match ikev2::Server::new(config.ikev2) {
         Ok(server) => server,
         Err(err) => {
             eprintln!("Failed to create server: {}", err);
             std::process::exit(1)
         }
     };
-    rt.block_on(server.start(config.fortivpn)).map_err(|err| {
-        eprintln!("Failed to run server: {}", err);
-        1
-    })?;
+
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+
+    let service_handle = rt.spawn(server.run(config.fortivpn, shutdown_receiver));
 
     rt.block_on(async move {
         if let Err(err) = signal::ctrl_c().await {
             eprintln!("Failed to wait for CTRL+C signal: {}", err);
         }
         info!("Started shutdown");
-        if let Err(err) = server.terminate().await {
-            eprintln!("Failed to terminate server: {}", err);
+        if shutdown_sender.send(()).is_err() {
+            eprintln!("Shutdown listener is closed");
+            return;
+        }
+        if let Err(err) = service_handle.await {
+            eprintln!("Failed to run server: {}", err);
         };
     });
     rt.shutdown_timeout(Duration::from_secs(60));

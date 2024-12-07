@@ -15,7 +15,6 @@ use tokio::{
     net::UdpSocket,
     runtime,
     sync::{mpsc, oneshot},
-    task::JoinSet,
     time,
 };
 
@@ -52,8 +51,6 @@ pub struct Server {
     nat_port: u16,
     pki_processing: Arc<pki::PkiProcessing>,
     tunnel_domains: Vec<String>,
-    cancel_sender: Option<oneshot::Sender<()>>,
-    join_set: JoinSet<Result<(), IKEv2Error>>,
 }
 
 type FortiService = fortivpn::service::FortiService<MAX_ESP_PACKET_SIZE, MAX_DATAGRAM_SIZE>;
@@ -74,8 +71,6 @@ impl Server {
             nat_port: config.nat_port,
             pki_processing: Arc::new(pki_processing),
             tunnel_domains: config.tunnel_domains,
-            cancel_sender: None,
-            join_set: JoinSet::new(),
         })
     }
 
@@ -93,24 +88,11 @@ impl Server {
         }
     }
 
-    pub async fn terminate(&mut self) -> Result<(), IKEv2Error> {
-        match self.cancel_sender.take() {
-            Some(cancel_sender) => {
-                if cancel_sender.send(()).is_err() {
-                    return Err("Cancel channel closed".into());
-                }
-            }
-            None => return Err("Shutdown already in progress".into()),
-        }
-        while let Some(res) = self.join_set.join_next().await {
-            if let Err(err) = res {
-                warn!("Error returned when shutting down: {}", err);
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn start(&mut self, fortivpn_config: fortivpn::Config) -> Result<(), IKEv2Error> {
+    pub async fn run(
+        self,
+        fortivpn_config: fortivpn::Config,
+        shutdown_receiver: oneshot::Receiver<()>,
+    ) -> Result<(), IKEv2Error> {
         let sockets = Sockets::new(&self.listen_ips, self.port, self.nat_port).await?;
         let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
         let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
@@ -152,24 +134,18 @@ impl Server {
             tunnel_ips,
             traffic_selectors,
         );
-        let (cancel_sender, cancel_receiver) = oneshot::channel();
-        self.cancel_sender = Some(cancel_sender);
         rt.spawn(async move {
-            if cancel_receiver.await.is_ok()
+            if shutdown_receiver.await.is_ok()
                 && command_sender.send(SessionMessage::Shutdown).await.is_err()
             {
                 warn!("Command channel closed");
             }
         });
 
-        self.join_set.spawn_on(
-            Self::run(command_receiver, sockets, sessions, vpn_service),
-            &rt,
-        );
-        Ok(())
+        Self::run_process(command_receiver, sockets, sessions, vpn_service).await
     }
 
-    async fn run(
+    async fn run_process(
         mut command_receiver: mpsc::Receiver<SessionMessage>,
         mut sockets: Sockets,
         mut sessions: Sessions,
