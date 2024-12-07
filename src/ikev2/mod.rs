@@ -19,7 +19,7 @@ use tokio::{
     time,
 };
 
-use crate::fortivpn;
+use crate::fortivpn::{self, service::FortiTunnelEvent};
 
 mod crypto;
 mod esp;
@@ -56,7 +56,7 @@ pub struct Server {
     join_set: JoinSet<Result<(), IKEv2Error>>,
 }
 
-type FortiService = fortivpn::FortiService<MAX_ESP_PACKET_SIZE, MAX_DATAGRAM_SIZE>;
+type FortiService = fortivpn::service::FortiService<MAX_ESP_PACKET_SIZE, MAX_DATAGRAM_SIZE>;
 
 impl Server {
     pub fn new(config: Config) -> Result<Server, IKEv2Error> {
@@ -114,7 +114,7 @@ impl Server {
         let sockets = Sockets::new(&self.listen_ips, self.port, self.nat_port).await?;
         let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
         let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
-        let vpn_service = fortivpn::FortiService::new(fortivpn_config, 64, 16);
+        let vpn_service = fortivpn::service::FortiService::new(fortivpn_config, 64, 16);
 
         let rt = runtime::Handle::current();
         let (command_sender, command_receiver) = mpsc::channel(32);
@@ -258,24 +258,24 @@ impl Server {
                 }
             }
             match vpn_event {
-                Some(Ok(fortivpn::FortiTunnelEvent::Error(err))) => {
+                Some(Ok(FortiTunnelEvent::Error(err))) => {
                     warn!("VPN reported an error status: {}", err);
                 }
-                Some(Ok(fortivpn::FortiTunnelEvent::ReceivedPacket(mut data, read_bytes))) => {
+                Some(Ok(FortiTunnelEvent::ReceivedPacket(mut data, read_bytes))) => {
                     if let Err(err) = sessions.process_vpn_packet(&mut data, read_bytes).await {
                         warn!("Failed to process VPN packet: {}", err);
                     }
                 }
-                Some(Ok(fortivpn::FortiTunnelEvent::EchoFailed(err))) => {
+                Some(Ok(FortiTunnelEvent::EchoFailed(err))) => {
                     warn!("Echo request timed out: {}", err);
                 }
-                Some(Ok(fortivpn::FortiTunnelEvent::Disconnected)) => {
+                Some(Ok(FortiTunnelEvent::Disconnected)) => {
                     sessions.delete_all_sessions(&rt);
                 }
                 Some(Err(err)) => {
                     warn!("VPN reported an error status: {}", err);
                 }
-                Some(Ok(fortivpn::FortiTunnelEvent::Connected(_, _))) | None => {}
+                Some(Ok(FortiTunnelEvent::Connected(_, _))) | None => {}
             }
         }
     }
@@ -1135,7 +1135,7 @@ pub enum IKEv2Error {
     CertError(pki::CertError),
     Session(session::SessionError),
     Esp(esp::EspError),
-    Forti(fortivpn::FortiError),
+    Forti(fortivpn::service::VpnServiceError),
     SendError(SendError),
     Join(tokio::task::JoinError),
     Io(io::Error),
@@ -1215,8 +1215,8 @@ impl From<esp::EspError> for IKEv2Error {
     }
 }
 
-impl From<fortivpn::FortiError> for IKEv2Error {
-    fn from(err: fortivpn::FortiError) -> IKEv2Error {
+impl From<fortivpn::service::VpnServiceError> for IKEv2Error {
+    fn from(err: fortivpn::service::VpnServiceError) -> IKEv2Error {
         Self::Forti(err)
     }
 }

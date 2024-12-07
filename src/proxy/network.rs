@@ -13,7 +13,7 @@ use tokio::{
     time::Duration,
 };
 
-use crate::fortivpn;
+use crate::fortivpn::{self, service::FortiTunnelEvent};
 
 const MAX_MTU_SIZE: usize = 1500;
 const READ_BUFFER_SIZE: usize = 65536 * 2 * 2;
@@ -21,7 +21,7 @@ const WRITE_BUFFER_SIZE: usize = 65536 * 2;
 const DEVICE_BUFFERS_COUNT: usize = 32 * 2;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-type FortiService = fortivpn::FortiService<MAX_MTU_SIZE, MAX_MTU_SIZE>;
+type FortiService = fortivpn::service::FortiService<MAX_MTU_SIZE, MAX_MTU_SIZE>;
 
 pub struct Network<'a> {
     device: VpnDevice<'a>,
@@ -35,7 +35,11 @@ pub struct Network<'a> {
 
 impl Network<'_> {
     pub fn new<'a>(config: fortivpn::Config) -> Result<Network<'a>, NetworkError> {
-        let vpn = fortivpn::FortiService::new(config, DEVICE_BUFFERS_COUNT, DEVICE_BUFFERS_COUNT);
+        let vpn = fortivpn::service::FortiService::new(
+            config,
+            DEVICE_BUFFERS_COUNT,
+            DEVICE_BUFFERS_COUNT,
+        );
         let mut device = VpnDevice::new(vpn);
         let mut config = iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
@@ -335,20 +339,17 @@ impl Network<'_> {
         }
     }
 
-    fn process_vpn_event(
-        &mut self,
-        vpn_event: &fortivpn::FortiTunnelEvent,
-    ) -> Result<bool, NetworkError> {
+    fn process_vpn_event(&mut self, vpn_event: &FortiTunnelEvent) -> Result<bool, NetworkError> {
         match vpn_event {
-            fortivpn::FortiTunnelEvent::Connected(ip_addr, _) => {
+            FortiTunnelEvent::Connected(ip_addr, _) => {
                 self.update_ip_configuration(Some(*ip_addr))?;
                 Ok(false)
             }
-            fortivpn::FortiTunnelEvent::Error(err) => {
+            FortiTunnelEvent::Error(err) => {
                 warn!("VPN reported an error status: {}", err);
                 Ok(false)
             }
-            fortivpn::FortiTunnelEvent::ReceivedPacket(buffer, read_bytes) => {
+            FortiTunnelEvent::ReceivedPacket(buffer, read_bytes) => {
                 let processed = match self.device.process_received_packet(&buffer[..*read_bytes]) {
                     Ok(processed) => processed,
                     Err(err) => {
@@ -358,11 +359,11 @@ impl Network<'_> {
                 };
                 Ok(processed)
             }
-            fortivpn::FortiTunnelEvent::Disconnected => {
+            FortiTunnelEvent::Disconnected => {
                 self.update_ip_configuration(None)?;
                 Ok(false)
             }
-            fortivpn::FortiTunnelEvent::EchoFailed(err) => {
+            FortiTunnelEvent::EchoFailed(err) => {
                 warn!("Echo request timed out: {}", err);
                 Ok(false)
             }
@@ -571,7 +572,7 @@ impl VpnDevice<'_> {
 impl VpnDevice<'_> {
     async fn next_vpn_events(
         &mut self,
-        dest: &mut Vec<fortivpn::FortiTunnelEvent>,
+        dest: &mut Vec<fortivpn::service::FortiTunnelEvent>,
     ) -> Result<(), NetworkError> {
         Ok(self.vpn.next_events(dest).await?)
     }
@@ -695,7 +696,7 @@ pub enum NetworkError {
     Internal(&'static str),
     Connect(socket::tcp::ConnectError),
     Io(io::Error),
-    Forti(fortivpn::FortiError),
+    Forti(fortivpn::service::VpnServiceError),
 }
 
 impl fmt::Display for NetworkError {
@@ -744,8 +745,8 @@ impl From<io::Error> for NetworkError {
     }
 }
 
-impl From<crate::fortivpn::FortiError> for NetworkError {
-    fn from(err: crate::fortivpn::FortiError) -> NetworkError {
+impl From<crate::fortivpn::service::VpnServiceError> for NetworkError {
+    fn from(err: crate::fortivpn::service::VpnServiceError) -> NetworkError {
         Self::Forti(err)
     }
 }
