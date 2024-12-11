@@ -31,11 +31,13 @@ pub struct Config {
 // When running locally, using this MTU adjusts to the FortiVPN stream MTU.
 pub const PPP_MTU: u16 = 1500 - 20 - 20 - 5 - 6 - 4;
 
-// ESP_MTU specifies the typical MTU used by most IKEv2 clients.
-// By aligning to this value, fragmentation can be significantly reduced.
-pub const ESP_MTU: u16 = 1280;
+// ESP_MTU specifies the MTU matching the ESP slice size.
+// It's set the the UDP buffer size, with reserved space for ESP headers [8] and
+// cryptography nonce [8] + padding [8] + tag [16] (for AES GCM),
+// or IV [16] + padding [32] + authentication hash [12] (for AES CBC).
+pub const ESP_MTU: u16 = 1500 - 8 - 8 - 8 - 16;
 
-const MAX_MTU: usize = PPP_MTU as usize;
+const MAX_MTU: usize = ESP_MTU as usize;
 
 // TODO: check how FortiVPN chooses the listen port - is it fixed or sent as a parameter?
 const REDIRECT_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8020);
@@ -532,18 +534,16 @@ impl FortiVPNTunnel {
         ppp_data: &[u8],
     ) -> Result<(), FortiError> {
         // FortiVPN encapsulation.
-        let mut packet = [0u8; 8 + MAX_MTU];
+        let mut ppp_header = [0u8; 8];
         let ppp_packet_length = ppp_data.len() + 2;
-        packet[0..2].copy_from_slice(&(6 + ppp_packet_length as u16).to_be_bytes());
-        packet[2..4].copy_from_slice(&[0x50, 0x50]);
-        packet[4..6].copy_from_slice(&(ppp_packet_length as u16).to_be_bytes());
+        ppp_header[0..2].copy_from_slice(&(6 + ppp_packet_length as u16).to_be_bytes());
+        ppp_header[2..4].copy_from_slice(&[0x50, 0x50]);
+        ppp_header[4..6].copy_from_slice(&(ppp_packet_length as u16).to_be_bytes());
         // PPP encapsulation.
-        packet[6..8].copy_from_slice(&protocol.value().to_be_bytes());
+        ppp_header[6..8].copy_from_slice(&protocol.value().to_be_bytes());
 
-        // Data.
-        packet[8..8 + ppp_data.len()].copy_from_slice(ppp_data);
-        let packet = &packet[..8 + ppp_data.len()];
-        Ok(socket.write_all(packet).await?)
+        socket.write_all(&ppp_header).await?;
+        Ok(socket.write_all(ppp_data).await?)
     }
 
     async fn read_ppp_packet(
@@ -779,7 +779,9 @@ impl PPPState {
         if self.bytes_remaining > 0 {
             return Ok(());
         }
-        // If no data is available, this will return immediately.
+        // This will wait until the PPP header is available, and should be used in a non-blocking
+        // way (e.g. from a poll_fn).
+        // TODO: check this is safe to cancel (will not read again).
         while self.ppp_header_length < self.ppp_header.len() {
             match socket
                 .read(&mut self.ppp_header[self.ppp_header_length..])
