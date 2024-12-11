@@ -132,8 +132,8 @@ impl SecurityAssociation {
         data: &'a mut [u8],
         msg_len: usize,
     ) -> Result<&'a [u8], EspError> {
-        if data.len() < msg_len + 8 + self.signature_length {
-            return Err("Not enough data in ESP packet".into());
+        if data.len() < self.encoded_length(msg_len) {
+            return Err("Not enough capacity in ESP packet buffer".into());
         }
         if self.local_seq == u32::MAX {
             return Err("Sequence number overflow".into());
