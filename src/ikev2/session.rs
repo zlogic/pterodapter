@@ -10,8 +10,8 @@ use std::{
     time::{self, Instant},
 };
 
-use super::MAX_DATAGRAM_SIZE;
-use super::{crypto, esp, message, pki, SendError, UdpSender};
+use super::{crypto, esp, message, pki, SendError};
+use super::{Sockets, MAX_DATAGRAM_SIZE};
 
 use crypto::DHTransform;
 
@@ -128,7 +128,6 @@ pub struct IKEv2Session {
     ts_local: Vec<message::TrafficSelector>,
     child_sas: HashSet<ChildSessionID>,
     pki_processing: Arc<pki::PkiProcessing>,
-    udp_sender: UdpSender,
     use_fragmentation: bool,
     params: Option<crypto::TransformParameters>,
     crypto_stack: Option<crypto::CryptoStack>,
@@ -151,7 +150,6 @@ impl IKEv2Session {
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
         pki_processing: Arc<pki::PkiProcessing>,
-        udp_sender: UdpSender,
         ts_local: &[message::TrafficSelector],
     ) -> IKEv2Session {
         IKEv2Session {
@@ -164,7 +162,6 @@ impl IKEv2Session {
             ts_local: ts_local.to_vec(),
             child_sas: HashSet::new(),
             pki_processing,
-            udp_sender,
             use_fragmentation: false,
             params: None,
             crypto_stack: None,
@@ -1592,7 +1589,6 @@ impl IKEv2Session {
                 ts_local: self.ts_local.clone(),
                 child_sas,
                 pki_processing: self.pki_processing.clone(),
-                udp_sender: self.udp_sender.clone(),
                 use_fragmentation: self.use_fragmentation,
                 params: Some(transform_params),
                 crypto_stack: Some(new_crypto_stack),
@@ -1747,7 +1743,12 @@ impl IKEv2Session {
         }
     }
 
-    pub async fn send_last_response(&self, message_id: u32, is_nat: bool) -> Result<(), SendError> {
+    pub async fn send_last_response(
+        &self,
+        sockets: &Sockets,
+        message_id: u32,
+        is_nat: bool,
+    ) -> Result<(), SendError> {
         if message_id != self.remote_message_id {
             return Ok(());
         }
@@ -1762,14 +1763,18 @@ impl IKEv2Session {
                 total_fragments,
             );
             let fragment = if is_nat { fragment } else { &fragment[4..] };
-            self.udp_sender
+            sockets
                 .send_datagram(&self.local_addr, &self.remote_addr, fragment)
                 .await?;
         }
         Ok(())
     }
 
-    pub async fn send_last_request(&mut self, message_id: u32) -> Result<(), SendError> {
+    pub async fn send_last_request(
+        &mut self,
+        sockets: &Sockets,
+        message_id: u32,
+    ) -> Result<(), SendError> {
         if message_id != self.local_message_id {
             return Ok(());
         }
@@ -1787,7 +1792,7 @@ impl IKEv2Session {
                 total_fragments,
             );
             // Requests are always sent to the NAT port.
-            self.udp_sender
+            sockets
                 .send_datagram(&self.local_addr, &self.remote_addr, fragment)
                 .await?;
         }
