@@ -941,7 +941,10 @@ impl Sessions {
             trace!("IP header {}", hdr);
             if !sa.accepts_esp_to_vpn(&hdr) {
                 debug!("ESP packet {} dropped by traffic selector", hdr);
-                return Err("ESP packet dropped by traffic selector".into());
+                // Microsoft Teams can spam the network with a lot of stray packets.
+                // Don't log an error if the packet is dropped to keep the logs clean on the info
+                // level.
+                return Ok(());
             }
             if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
                 warn!(
