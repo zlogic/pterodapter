@@ -3,26 +3,24 @@
 IKEv2 relies on fixed port numbers (500 and 4500) and most implementations (macOS and Windows built-in VPN clients) don't allow to specify a custom port number.
 Additionally, IKEv2 uses fixed ports on the client side as well.
 
-This means that running on localhost (127.0.0.1) will connect from `127.0.0.1:500` to `127.0.0.1:500`, and fail if pterodapter is already using port 500.
-Using another localhost destination IP address (e.g. 127.0.0.2 or 127.0.1.1) will also change the source IP address - it's not possible to connect from 127.0.0.1 to 127.0.0.2.
+This means that running on localhost (127.0.0.1 or ::1) will connect from `127.0.0.1:500` to `127.0.0.1:500`, and fail if pterodapter is already using port 500.
+Using another localhost destination IP address (e.g. 127.0.0.2, 127.0.1.1 or ::1) will also change the source IP address - it's not possible to connect from 127.0.0.1 to 127.0.0.2.
+The macOS IKEv2 client also seems to prefer real network cards (en0), even with `route add` or `networksetup -setadditionalroutes` route traffic through lo0.
 
-The solution is using the built-in [pf](https://www.openbsd.org/faq/pf/index.html) filter to set up a fake IP address (e.g. 192.168.100.1) and redirect all packets to a custom port used by pterodapter.
+The solution is using the built-in [pf](https://www.openbsd.org/faq/pf/index.html) filter to set up a fake IP address (e.g. fd00::40, an IPv6 unique local address) and redirect all packets to a custom port used by pterodapter.
 
-This document explains how to set up a rule so that 192.168.100.1:500 is redirected to 127.0.0.1:9500, and 192.168.100.1:4500 is redirected to 127.0.0.1:9501; this way, a local copy of pterodapter will look like it's running at 192.168.100.1.
+This document explains how to set up a rule so that `[fd00::40]:500` is redirected to `[::1]:9500`, and `[fd00::40]:4500` is redirected to `[::1]:9501`; this way, a local copy of pterodapter will look like it's running at `fd00::40`.
 
 
 ## Simple PF rule
 
-Run pterodapter on ports 9500 + 9501 - and specify 192.168.100.1 as the destination host.
+Run pterodapter on ports 9500 + 9501 - and specify fd00::40 as the destination host.
 
 ```shell
 cat << EOF | sudo pfctl -e -f -
-rdr pass proto udp from any to 192.168.100.1 port 500 -> 127.0.0.1 port 9500
-rdr pass proto udp from 127.0.0.1 port 9500 to any -> 127.0.0.1 port 500
-rdr pass proto udp from any to 192.168.100.1 port 4500 -> 127.0.0.1 port 9501
-rdr pass proto udp from 127.0.0.1 port 9501 to any -> 127.0.0.1 port 4500
-pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port {500, 4500}
-pass out route-to (lo0 127.0.0.1) proto udp from 192.168.100.1 port {500, 4500} to any
+rdr pass proto udp from any to fd00::40 port 500 tag MAC_TO_VPN -> ::1 port 9500
+rdr pass proto udp from any to fd00::40 port 4500 tag MAC_TO_VPN -> ::1 port 9501
+pass out quick on en0 route-to lo0 inet6 proto udp from any to fd00::40 port {500, 4500} tag MAC_TO_VPN
 EOF
 ```
 
@@ -46,12 +44,9 @@ and add an achor:
 
 ```shell
 cat << EOF | sudo pfctl -a com.apple/pterodapter -f -
-rdr pass proto udp from any to 192.168.100.1 port 500 -> 127.0.0.1 port 9500
-rdr pass proto udp from 127.0.0.1 port 9500 to any -> 127.0.0.1 port 500
-rdr pass proto udp from any to 192.168.100.1 port 4500 -> 127.0.0.1 port 9501
-rdr pass proto udp from 127.0.0.1 port 9501 to any -> 127.0.0.1 port 4500
-pass out route-to (lo0 127.0.0.1) proto udp from any to 192.168.100.1 port {500, 4500}
-pass out route-to (lo0 127.0.0.1) proto udp from 192.168.100.1 port {500, 4500} to any
+rdr pass proto udp from any to fd00::40 port 500 tag MAC_TO_VPN -> ::1 port 9500
+rdr pass proto udp from any to fd00::40 port 4500 tag MAC_TO_VPN -> ::1 port 9501
+pass out quick on en0 route-to lo0 inet6 proto udp from any to fd00::40 port {500, 4500} tag MAC_TO_VPN
 EOF
 ```
 
