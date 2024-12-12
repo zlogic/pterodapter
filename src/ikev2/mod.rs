@@ -272,13 +272,15 @@ impl Server {
 }
 
 struct Sockets {
-    sockets: HashMap<SocketAddr, UdpSocket>,
+    sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
+    socket_list: Vec<(SocketAddr, Arc<UdpSocket>)>,
     nat_port: u16,
 }
 
 impl Sockets {
     async fn new(listen_ips: &[IpAddr], port: u16, nat_port: u16) -> Result<Sockets, IKEv2Error> {
         let mut sockets = HashMap::new();
+        let mut socket_list = vec![];
         for listen_ip in listen_ips {
             for listen_port in [port, nat_port] {
                 let socket = match UdpSocket::bind((*listen_ip, listen_port)).await {
@@ -288,12 +290,18 @@ impl Sockets {
                         return Err(err.into());
                     }
                 };
+                let socket = Arc::new(socket);
                 let listen_addr = socket.local_addr()?;
                 info!("Started server on {}", listen_addr);
-                sockets.insert(listen_addr, socket);
+                sockets.insert(listen_addr, socket.clone());
+                socket_list.push((listen_addr, socket));
             }
         }
-        Ok(Sockets { sockets, nat_port })
+        Ok(Sockets {
+            sockets,
+            socket_list,
+            nat_port,
+        })
     }
 
     fn poll_recv(
@@ -302,14 +310,11 @@ impl Sockets {
         seed: usize,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<UdpDatagramOrigin, IKEv2Error>> {
-        let sockets_len = self.sockets.len();
-        for (listen_addr, socket) in self
-            .sockets
-            .iter()
-            .skip(seed % sockets_len)
-            .cycle()
-            .take(sockets_len)
-        {
+        // Split socket list into two parts, then combine the second half with the first one.
+        let seed = seed % self.socket_list.len();
+        let (left, right) = self.socket_list.split_at(seed % self.socket_list.len());
+        let it = right.into_iter().chain(left.into_iter());
+        for (listen_addr, socket) in it {
             let is_nat_port = listen_addr.port() == self.nat_port;
             buf.clear();
             match socket.poll_recv_from(cx, buf) {
