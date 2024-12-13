@@ -13,15 +13,13 @@ use tokio::{
     time::Duration,
 };
 
-use crate::fortivpn::{self, service::FortiTunnelEvent};
+use crate::fortivpn::{self, service::FortiService};
 
 const MAX_MTU_SIZE: usize = 1500;
 const READ_BUFFER_SIZE: usize = 65536 * 2 * 2;
 const WRITE_BUFFER_SIZE: usize = 65536 * 2;
 const DEVICE_BUFFERS_COUNT: usize = 32 * 2;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-type FortiService = fortivpn::service::FortiService<MAX_MTU_SIZE, MAX_MTU_SIZE>;
 
 pub struct Network<'a> {
     device: VpnDevice<'a>,
@@ -35,11 +33,7 @@ pub struct Network<'a> {
 
 impl Network<'_> {
     pub fn new<'a>(config: fortivpn::Config) -> Result<Network<'a>, NetworkError> {
-        let vpn = fortivpn::service::FortiService::new(
-            config,
-            DEVICE_BUFFERS_COUNT,
-            DEVICE_BUFFERS_COUNT,
-        );
+        let vpn = FortiService::new(config);
         let mut device = VpnDevice::new(vpn);
         let mut config = iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
@@ -65,25 +59,15 @@ impl Network<'_> {
 
         let rt = runtime::Handle::current();
         let mut next_wake = tokio::time::Instant::now();
-        let mut vpn_events = Vec::with_capacity(DEVICE_BUFFERS_COUNT);
         while !self.shutdown {
-            if !self.device.vpn.is_connected() {
-                self.device.vpn.start_connection(&rt);
-            }
-            let (vpn_event_received, command) = {
-                vpn_events.clear();
-                let vpn_connected = self.device.vpn.is_connected();
-                let mut vpn_event_received = pin!(self.device.next_vpn_events(&mut vpn_events));
+            let (vpn_event, command) = {
+                let mut vpn_event = pin!(self.device.wait_event(&rt));
                 let mut device_ready = pin!(tokio::time::sleep_until(next_wake));
                 let mut receive_command = pin!(command_receiver.recv());
                 future::poll_fn(|cx| {
-                    let vpn_event_received = if vpn_connected {
-                        match vpn_event_received.as_mut().poll(cx) {
-                            Poll::Ready(res) => Some(res),
-                            Poll::Pending => None,
-                        }
-                    } else {
-                        None
+                    let vpn_event_received = match vpn_event.as_mut().poll(cx) {
+                        Poll::Ready(res) => Some(res),
+                        Poll::Pending => None,
                     };
                     let device_ready = device_ready.as_mut().poll(cx).is_ready();
                     let command = receive_command.as_mut().poll(cx);
@@ -133,28 +117,27 @@ impl Network<'_> {
                     false
                 }
             };
-            let vpn_data_received = match vpn_event_received {
-                Some(Ok(())) => {
-                    vpn_events
-                        .iter()
-                        .filter(|vpn_event| match self.process_vpn_event(vpn_event) {
-                            Ok(data_received) => data_received,
-                            Err(err) => {
-                                warn!("Failed to process VPN event, terminating: {}", err);
-                                self.shutdown = true;
-                                false
-                            }
-                        })
-                        .count()
-                        > 0
+            if vpn_event.is_some() {
+                let ip_addr = self.device.ip_addr();
+                if let Err(err) = self.update_ip_configuration(ip_addr) {
+                    warn!("Failed to update device IP address: {}", err);
                 }
-                Some(Err(err)) => {
-                    self.shutdown = true;
-                    warn!("Failed to receive events from VPN, terminating: {}", err);
-                    false
+            }
+            let vpn_data_received = if let Some(Err(err)) = vpn_event {
+                warn!("VPN reported an error status: {}", err);
+                false
+            } else {
+                match self.device.read_next_packet().await {
+                    Ok(data_received) => data_received,
+                    Err(err) => {
+                        warn!("Failed to read packet from VPN: {}", err);
+                        false
+                    }
                 }
-                None => false,
             };
+            if let Err(err) = self.device.vpn.process_events().await {
+                warn!("Failed to process VPN lifecycle events: {}", err);
+            }
             if tokio::time::Instant::now() > next_wake
                 || data_copied
                 || vpn_data_received
@@ -266,11 +249,11 @@ impl Network<'_> {
         data_copied
     }
 
-    fn update_ip_configuration(
-        &mut self,
-        ip_configuration: Option<IpAddr>,
-    ) -> Result<(), NetworkError> {
-        self.ip_addr = ip_configuration;
+    fn update_ip_configuration(&mut self, ip_addr: Option<IpAddr>) -> Result<(), NetworkError> {
+        if self.ip_addr == ip_addr {
+            return Ok(());
+        }
+        self.ip_addr = ip_addr;
         if let Some(ip_addr) = self.ip_addr {
             // TODO: how to choose the CIDR?
             let ip_cidr = wire::IpCidr::new(ip_addr.into(), 8);
@@ -339,37 +322,6 @@ impl Network<'_> {
                     .insert(socket_handle, ProxyClientConnection::new(socket));
             }
             Command::Shutdown => self.shutdown = true,
-        }
-    }
-
-    fn process_vpn_event(&mut self, vpn_event: &FortiTunnelEvent) -> Result<bool, NetworkError> {
-        match vpn_event {
-            FortiTunnelEvent::Connected(ip_addr, _) => {
-                self.update_ip_configuration(Some(*ip_addr))?;
-                Ok(false)
-            }
-            FortiTunnelEvent::Error(err) => {
-                warn!("VPN reported an error status: {}", err);
-                Ok(false)
-            }
-            FortiTunnelEvent::ReceivedPacket(buffer, read_bytes) => {
-                let processed = match self.device.process_received_packet(&buffer[..*read_bytes]) {
-                    Ok(processed) => processed,
-                    Err(err) => {
-                        warn!("Failed to forward packet from VPN to device: {}", err);
-                        false
-                    }
-                };
-                Ok(processed)
-            }
-            FortiTunnelEvent::Disconnected => {
-                self.update_ip_configuration(None)?;
-                Ok(false)
-            }
-            FortiTunnelEvent::EchoFailed(err) => {
-                warn!("Echo request timed out: {}", err);
-                Ok(false)
-            }
         }
     }
 
@@ -573,23 +525,21 @@ impl VpnDevice<'_> {
 }
 
 impl VpnDevice<'_> {
-    async fn next_vpn_events(
-        &mut self,
-        dest: &mut Vec<fortivpn::service::FortiTunnelEvent>,
-    ) -> Result<(), NetworkError> {
-        Ok(self.vpn.next_events(dest).await?)
+    async fn wait_event(&mut self, rt: &runtime::Handle) -> Result<(), NetworkError> {
+        Ok(self.vpn.wait_event(rt).await?)
     }
 
     async fn terminate(&mut self) -> Result<(), NetworkError> {
-        self.vpn.start_disconnection().await?;
-        while self.vpn.is_connected() && self.vpn.next_event().await.is_ok() {}
-        Ok(())
+        Ok(self.vpn.terminate().await?)
     }
 
-    fn process_received_packet(&mut self, data: &[u8]) -> Result<bool, NetworkError> {
-        if let Ok(dest) = self.read_buffers.enqueue_one() {
-            dest.clear();
-            dest.extend_from_slice(data);
+    async fn read_next_packet(&mut self) -> Result<bool, NetworkError> {
+        if !self.vpn.can_read() {
+            Ok(false)
+        } else if let Ok(dest) = self.read_buffers.enqueue_one() {
+            dest.resize(dest.capacity(), 0);
+            let bytes_read = self.vpn.read_packet(dest).await?.len();
+            dest.truncate(bytes_read);
             Ok(true)
         } else {
             // Read buffers are full.
@@ -608,6 +558,14 @@ impl VpnDevice<'_> {
             }
         }
         Ok(data_sent)
+    }
+
+    fn ip_addr(&self) -> Option<IpAddr> {
+        if let Some((ip_addr, _)) = self.vpn.ip_configuration() {
+            Some(ip_addr)
+        } else {
+            None
+        }
     }
 }
 

@@ -1,373 +1,198 @@
 use std::{error, fmt, net::IpAddr};
 
-use log::{debug, warn};
-use tokio::{runtime, sync::mpsc, task::JoinHandle};
+use log::{debug, info, warn};
+use tokio::{runtime, task::JoinHandle, time::Interval};
 
 use super::{Config, FortiVPNTunnel};
 
-pub enum FortiTunnelEvent {
-    Connected(IpAddr, Vec<IpAddr>),
-    ReceivedPacket(Vec<u8>, usize),
-    Error(VpnServiceError),
+struct ConnectedData {
+    tunnel: FortiVPNTunnel,
+    echo_timer: Interval,
+    need_echo: bool,
+    can_read: bool,
+    sent_data: bool,
+    need_flush: bool,
+}
+
+enum ConnectionState {
     Disconnected,
-    EchoFailed(VpnServiceError),
+    Connecting(JoinHandle<Result<FortiVPNTunnel, VpnServiceError>>),
+    Connected(ConnectedData),
 }
 
-enum FortiTunnelCommand {
-    SendPacket(Vec<u8>),
-    Disconnect,
-}
-
-pub struct FortiService<const S: usize, const R: usize> {
+pub struct FortiService {
     config: Config,
-    recv_queue: usize,
-    send_queue: usize,
-    ip_configuration: Option<(IpAddr, Vec<IpAddr>)>,
-    tunnel_tx: Option<mpsc::Sender<FortiTunnelCommand>>,
-    tunnel_rx: Option<mpsc::Receiver<FortiTunnelEvent>>,
-    tunnel_task: Option<JoinHandle<Result<(), VpnServiceError>>>,
+    state: ConnectionState,
 }
 
-impl<const S: usize, const R: usize> FortiService<S, R> {
-    pub fn new(config: Config, recv_queue: usize, send_queue: usize) -> FortiService<S, R> {
+impl FortiService {
+    pub fn new(config: Config) -> FortiService {
         FortiService {
             config,
-            recv_queue,
-            send_queue,
-            ip_configuration: None,
-            tunnel_tx: None,
-            tunnel_rx: None,
-            tunnel_task: None,
+            state: ConnectionState::Disconnected,
         }
     }
 
     pub fn is_connected(&self) -> bool {
-        self.tunnel_tx.is_some() || self.tunnel_rx.is_some() || self.tunnel_task.is_some()
+        matches!(self.state, ConnectionState::Connected(_))
     }
 
-    async fn get_oauth_cookie(
-        config: &Config,
-        rx: &mut mpsc::Receiver<FortiTunnelCommand>,
-    ) -> Result<String, VpnServiceError> {
-        use std::future::{self, Future};
-        use std::pin::pin;
-        use std::task::Poll;
-        loop {
-            let (sslvpn_cookie, received_cancel) = {
-                let mut sslvpn_cookie = pin!(super::get_oauth_cookie(config));
-                let mut receive_command = pin!(rx.recv());
-                future::poll_fn(move |cx| {
-                    let received_cookie = match sslvpn_cookie.as_mut().poll(cx) {
-                        Poll::Ready(res) => Some(res),
-                        Poll::Pending => None,
-                    };
-                    let received_cancel = match receive_command.as_mut().poll(cx) {
-                        Poll::Ready(Some(FortiTunnelCommand::Disconnect)) => Some(true),
-                        Poll::Ready(Some(_)) => Some(false),
-                        Poll::Ready(None) => Some(true),
-                        Poll::Pending => None,
-                    };
-                    if received_cookie.is_some() || received_cancel.is_some() {
-                        Poll::Ready((received_cookie, received_cancel))
-                    } else {
-                        Poll::Pending
-                    }
-                })
-                .await
-            };
-            if matches![received_cancel, Some(true)] {
-                rx.close();
-                return Err("VPN connection canceled while waiting for cookie".into());
-            } else if let Some(sslvpn_cookie) = sslvpn_cookie {
-                debug!("VPN cookie received");
-                return Ok(sslvpn_cookie?);
-            }
-        }
-    }
-
-    async fn connect(
-        config: &Config,
-        sslvpn_cookie: String,
-        rx: &mut mpsc::Receiver<FortiTunnelCommand>,
-    ) -> Result<FortiVPNTunnel, VpnServiceError> {
-        use std::future::{self, Future};
-        use std::pin::pin;
-        use std::task::Poll;
-        loop {
-            let (tunnel, received_cancel) = {
-                let mut tunnel_connected = pin!(FortiVPNTunnel::new(config, sslvpn_cookie.clone()));
-                let mut receive_command = pin!(rx.recv());
-                future::poll_fn(move |cx| {
-                    let tunnel_connected = match tunnel_connected.as_mut().poll(cx) {
-                        Poll::Ready(res) => Some(res),
-                        Poll::Pending => None,
-                    };
-                    let received_cancel = match receive_command.as_mut().poll(cx) {
-                        Poll::Ready(Some(FortiTunnelCommand::Disconnect)) => Some(true),
-                        Poll::Ready(Some(_)) => Some(false),
-                        Poll::Ready(None) => Some(true),
-                        Poll::Pending => None,
-                    };
-                    if tunnel_connected.is_some() || received_cancel.is_some() {
-                        Poll::Ready((tunnel_connected, received_cancel))
-                    } else {
-                        Poll::Pending
-                    }
-                })
-                .await
-            };
-            if matches![received_cancel, Some(true)] {
-                rx.close();
-                return Err("VPN connection canceled while opening tunnel".into());
-            } else if let Some(tunnel) = tunnel {
-                debug!("VPN connection opened");
-                return Ok(tunnel?);
-            }
-        }
-    }
-
-    async fn run_tunnel(
-        config: Config,
-        tx: &mpsc::Sender<FortiTunnelEvent>,
-        rx: &mut mpsc::Receiver<FortiTunnelCommand>,
-    ) -> Result<(), VpnServiceError> {
-        use std::future::{self, Future};
-        use std::pin::pin;
-        use std::task::Poll;
-
-        let sslvpn_cookie = Self::get_oauth_cookie(&config.clone(), rx).await?;
-        let mut tunnel = Self::connect(&config.clone(), sslvpn_cookie, rx).await?;
-        if tx
-            .send(FortiTunnelEvent::Connected(
-                tunnel.ip_addr(),
-                tunnel.dns().to_vec(),
-            ))
-            .await
-            .is_err()
-        {
-            debug!("VPN sink channel closed");
-            rx.close();
-        }
-        let mut echo_timer = tokio::time::interval(super::ECHO_SEND_INTERVAL);
-        echo_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut need_flush = false;
-        let mut is_connected = true;
-        while is_connected {
-            let (can_recv, command, send_echo, flush) = {
-                let mut received_packet = pin!(tunnel.peek_recv());
-                let mut receive_command = pin!(rx.recv());
-                let mut send_echo = pin!(echo_timer.tick());
-                future::poll_fn(move |cx| {
-                    let can_recv = received_packet.as_mut().poll(cx).is_ready();
-                    let command = match receive_command.as_mut().poll(cx) {
-                        Poll::Ready(Some(command)) => Some(command),
-                        Poll::Ready(None) => Some(FortiTunnelCommand::Disconnect),
-                        Poll::Pending => None,
-                    };
-                    // Flush if there's no more data to send.
-                    let should_send = matches!(command, Some(FortiTunnelCommand::SendPacket(_)));
-                    let send_echo = send_echo.as_mut().poll(cx).is_ready();
-                    if can_recv || command.is_some() || send_echo {
-                        Poll::Ready((can_recv, command, send_echo, !should_send))
-                    } else if need_flush {
-                        // Always flush when there are no reads or writes.
-                        Poll::Ready((false, None, false, true))
-                    } else {
-                        Poll::Pending
-                    }
-                })
-                .await
-            };
-            if can_recv {
-                let mut buffer = vec![0; R];
-                let event = match tunnel.try_read_packet(&mut buffer).await {
-                    Ok(packet_bytes) => FortiTunnelEvent::ReceivedPacket(buffer, packet_bytes),
-                    Err(err) => {
-                        is_connected = false;
-                        FortiTunnelEvent::Error(err.into())
-                    }
-                };
-                if tx.send(event).await.is_err() {
-                    debug!("VPN sink channel closed");
-                    rx.close();
-                }
-            }
-            match command {
-                Some(FortiTunnelCommand::SendPacket(buffer)) => {
-                    need_flush = true;
-                    if let Err(err) = tunnel.send_packet(&buffer).await {
-                        is_connected = false;
-                        if tx.send(FortiTunnelEvent::Error(err.into())).await.is_err() {
-                            debug!("VPN sink channel closed");
-                            rx.close();
-                        }
-                    }
-                }
-                Some(FortiTunnelCommand::Disconnect) => {
-                    rx.close();
-                    is_connected = false;
-                }
-                None => {}
-            }
-            if send_echo {
-                need_flush = true;
-                if let Err(err) = tunnel.process_echo().await {
-                    if tx
-                        .send(FortiTunnelEvent::EchoFailed(err.into()))
-                        .await
-                        .is_err()
-                    {
-                        debug!("VPN sink channel closed");
-                        rx.close();
-                    }
-                }
-            }
-            if flush {
-                if let Err(err) = tunnel.flush().await {
-                    is_connected = false;
-                    if tx.send(FortiTunnelEvent::Error(err.into())).await.is_err() {
-                        debug!("VPN sink channel closed");
-                        rx.close();
-                    }
-                }
-                need_flush = false;
-            }
-        }
-
-        Ok(tunnel.terminate().await?)
-    }
-
-    pub fn start_connection(&mut self, rt: &runtime::Handle) {
-        let (service_tx, service_rx) = mpsc::channel(self.recv_queue);
-        let (tunnel_tx, mut tunnel_rx) = mpsc::channel(self.send_queue);
-        let config = self.config.clone();
-        self.tunnel_rx = Some(service_rx);
-        self.tunnel_tx = Some(tunnel_tx);
-        self.tunnel_task = Some(rt.spawn(async move {
-            loop {
-                let result = Self::run_tunnel(config.clone(), &service_tx, &mut tunnel_rx).await;
-                if service_tx
-                    .send(FortiTunnelEvent::Disconnected)
-                    .await
-                    .is_err()
-                {
-                    debug!("VPN sink channel closed");
-                    tunnel_rx.close();
-                }
-                if let Err(err) = result.as_ref() {
-                    warn!("VPN channel closed with error: {}", err)
-                }
-                if tunnel_rx.is_closed() {
-                    debug!("VPN listener is terminated");
-                    return Ok(());
-                }
-            }
-        }));
-    }
-
-    fn process_connection_event(&mut self, event: &FortiTunnelEvent) {
-        match event {
-            FortiTunnelEvent::Disconnected => {
-                self.ip_configuration = None;
-            }
-            FortiTunnelEvent::Connected(ip_addr, ref dns) => {
-                self.ip_configuration = Some((*ip_addr, dns.to_vec()));
-            }
-            _ => {}
-        }
-    }
-
-    pub async fn next_event(&mut self) -> Result<FortiTunnelEvent, VpnServiceError> {
-        if let Some(tunnel_rx) = self.tunnel_rx.as_mut() {
-            let event = if let Some(event) = tunnel_rx.recv().await {
-                event
-            } else {
-                return Err("VPN receiver closed".into());
-            };
-            self.process_connection_event(&event);
-            Ok(event)
-        } else if let Some(tunnel_task) = self.tunnel_task.as_mut() {
-            let result = tunnel_task.await;
-            self.tunnel_task = None;
-            match result {
-                Ok(Ok(())) => Ok(FortiTunnelEvent::Disconnected),
-                Ok(Err(err)) => Err(err),
-                Err(err) => Err(err.into()),
-            }
+    pub fn can_read(&self) -> bool {
+        if let ConnectionState::Connected(ref state) = self.state {
+            state.can_read
         } else {
-            Err("VPN client is stopped".into())
+            false
         }
     }
 
-    pub async fn next_events(
-        &mut self,
-        buffer: &mut Vec<FortiTunnelEvent>,
-    ) -> Result<(), VpnServiceError> {
-        buffer.clear();
-        if let Some(tunnel_rx) = self.tunnel_rx.as_mut() {
-            let count = tunnel_rx.recv_many(buffer, buffer.capacity()).await;
-            if count == 0 {
-                return Err("VPN receiver closed".into());
-            };
-            buffer
-                .iter()
-                .for_each(|event| self.process_connection_event(event));
-            Ok(())
-        } else if let Some(tunnel_task) = self.tunnel_task.as_mut() {
-            let result = tunnel_task.await;
-            self.tunnel_task = None;
-            match result {
-                Ok(Ok(())) => {
-                    buffer.push(FortiTunnelEvent::Disconnected);
-                    Ok(())
-                }
-                Ok(Err(err)) => Err(err),
-                Err(err) => Err(err.into()),
-            }
-        } else {
-            Err("VPN client is stopped".into())
-        }
+    async fn connect(config: Config) -> Result<FortiVPNTunnel, VpnServiceError> {
+        let sslvpn_cookie = super::get_oauth_cookie(&config).await?;
+        debug!("VPN cookie received");
+        Ok(FortiVPNTunnel::new(&config, sslvpn_cookie).await?)
     }
-    pub async fn start_disconnection(&mut self) -> Result<(), VpnServiceError> {
-        if let Some(tx) = self.tunnel_tx.take() {
-            self.tunnel_rx = None;
-            if tx.send(FortiTunnelCommand::Disconnect).await.is_err() {
-                if let Some(tunnel_task) = self.tunnel_task.take() {
-                    tunnel_task.abort();
-                }
-                Err("Receiver for VPN disconnection command closed".into())
-            } else {
+
+    pub async fn wait_event(&mut self, rt: &runtime::Handle) -> Result<(), VpnServiceError> {
+        use std::future::{self, Future};
+        use std::pin::pin;
+        use std::task::Poll;
+
+        match &mut self.state {
+            ConnectionState::Disconnected => {
+                let connect_handle = rt.spawn(Self::connect(self.config.clone()));
+                self.state = ConnectionState::Connecting(connect_handle);
                 Ok(())
             }
+            ConnectionState::Connecting(join_handle) => match join_handle.await? {
+                Ok(tunnel) => {
+                    info!("VPN service is connected");
+                    let mut echo_timer = tokio::time::interval(super::ECHO_SEND_INTERVAL);
+                    echo_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    self.state = ConnectionState::Connected(ConnectedData {
+                        tunnel,
+                        echo_timer,
+                        need_echo: false,
+                        can_read: false,
+                        sent_data: false,
+                        need_flush: false,
+                    });
+                    Ok(())
+                }
+                Err(err) => {
+                    self.state = ConnectionState::Disconnected;
+                    Err(err)
+                }
+            },
+            ConnectionState::Connected(connected_data) => {
+                let (send_echo, packet_available) = {
+                    let mut send_echo = pin!(connected_data.echo_timer.tick());
+                    let mut received_packet = pin!(connected_data.tunnel.peek_recv());
+                    future::poll_fn(move |cx| {
+                        let send_echo = send_echo.as_mut().poll(cx);
+                        let packet_available = received_packet.as_mut().poll(cx);
+                        if send_echo.is_ready() || packet_available.is_ready() {
+                            let packet_available = match packet_available {
+                                Poll::Ready(packet_available) => Some(packet_available),
+                                Poll::Pending => None,
+                            };
+                            Poll::Ready((send_echo.is_ready(), packet_available))
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await
+                };
+                connected_data.need_echo = send_echo;
+                match packet_available {
+                    Some(Ok(())) => {
+                        connected_data.can_read = true;
+                    }
+                    Some(Err(err)) => {
+                        warn!(
+                            "Failed to check if next packet from VPN is available: {}",
+                            err
+                        );
+                        self.state = ConnectionState::Disconnected;
+                        return Err(err.into());
+                    }
+                    None => {}
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn read_packet<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+    ) -> Result<&'a [u8], VpnServiceError> {
+        if let ConnectionState::Connected(state) = &mut self.state {
+            if state.can_read {
+                match state.tunnel.try_read_packet(buffer).await {
+                    Ok(packet_bytes) => Ok(&buffer[..packet_bytes]),
+                    Err(err) => {
+                        self.state = ConnectionState::Disconnected;
+                        Err(err.into())
+                    }
+                }
+            } else {
+                Ok(&[])
+            }
         } else {
-            Ok(())
+            Ok(&[])
         }
     }
 
     pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), VpnServiceError> {
-        if let Some(tx) = self.tunnel_tx.as_mut() {
-            let mut buffer = Vec::with_capacity(S);
-            if data.len() > buffer.capacity() {
-                warn!(
-                    "ESP packet ({}) exceeds PPP MTU {}",
-                    data.len(),
-                    buffer.capacity()
-                );
-                // Just drop the packet.
-                return Ok(());
-            }
-            buffer.extend_from_slice(data);
-            if tx
-                .send(FortiTunnelCommand::SendPacket(buffer))
-                .await
-                .is_err()
-            {
-                Err("VPN channel closed".into())
+        if let ConnectionState::Connected(state) = &mut self.state {
+            state.need_flush = true;
+            state.sent_data = true;
+            if let Err(err) = state.tunnel.send_packet(data).await {
+                self.state = ConnectionState::Disconnected;
+                Err(err.into())
             } else {
                 Ok(())
             }
         } else {
-            Err("VPN client service is not running".into())
+            Err("VPN client service is not connected".into())
+        }
+    }
+
+    pub async fn process_events(&mut self) -> Result<(), VpnServiceError> {
+        if let ConnectionState::Connected(state) = &mut self.state {
+            if state.need_echo {
+                state.need_echo = false;
+                if let Err(err) = state.tunnel.process_echo().await {
+                    warn!("Echo request timed out: {}", err);
+                    self.state = ConnectionState::Disconnected;
+                    return Err(err.into());
+                }
+            }
+            if !state.sent_data && state.need_flush {
+                state.need_flush = false;
+                if let Err(err) = state.tunnel.flush().await {
+                    warn!("Failed to flush data to VPN: {}", err);
+                    self.state = ConnectionState::Disconnected;
+                    return Err(err.into());
+                }
+            }
+            state.sent_data = false;
+            state.can_read = false;
+        }
+        Ok(())
+    }
+
+    pub async fn terminate(&mut self) -> Result<(), VpnServiceError> {
+        match &mut self.state {
+            ConnectionState::Connected(state) => {
+                state.need_flush = true;
+                if let Err(err) = state.tunnel.terminate().await {
+                    self.state = ConnectionState::Disconnected;
+                    Err(err.into())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
         }
     }
 
@@ -376,10 +201,11 @@ impl<const S: usize, const R: usize> FortiService<S, R> {
     }
 
     pub fn ip_configuration(&self) -> Option<(IpAddr, &[IpAddr])> {
-        if let Some((ip_addr, dns)) = &self.ip_configuration {
-            Some((*ip_addr, dns))
-        } else {
-            None
+        match self.state {
+            ConnectionState::Connected(ref state) => {
+                Some((state.tunnel.ip_addr(), state.tunnel.dns()))
+            }
+            _ => None,
         }
     }
 }

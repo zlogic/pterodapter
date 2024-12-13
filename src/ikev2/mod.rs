@@ -19,7 +19,7 @@ use tokio::{
     time,
 };
 
-use crate::fortivpn::{self, service::FortiTunnelEvent};
+use crate::fortivpn::{self, service::FortiService};
 
 mod crypto;
 mod esp;
@@ -53,8 +53,6 @@ pub struct Server {
     pki_processing: Arc<pki::PkiProcessing>,
     tunnel_domains: Vec<String>,
 }
-
-type FortiService = fortivpn::service::FortiService<MAX_ESP_PACKET_SIZE, MAX_DATAGRAM_SIZE>;
 
 impl Server {
     pub fn new(config: Config) -> Result<Server, IKEv2Error> {
@@ -97,7 +95,7 @@ impl Server {
         let sockets = Sockets::new(&self.listen_ips, self.port, self.nat_port).await?;
         let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
         let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
-        let vpn_service = fortivpn::service::FortiService::new(fortivpn_config, 64, 16);
+        let vpn_service = FortiService::new(fortivpn_config);
 
         let rt = runtime::Handle::current();
         let (command_sender, command_receiver) = mpsc::channel(32);
@@ -157,20 +155,18 @@ impl Server {
         let mut vpn_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut poll_seed = 0usize;
         loop {
-            if shutdown && sessions.is_empty() && !vpn_service.is_connected() {
+            let vpn_is_connected = vpn_service.is_connected();
+            if shutdown && sessions.is_empty() && !vpn_is_connected {
                 debug!("Shutdown completed");
                 return Ok(());
-            }
-            if !shutdown && !vpn_service.is_connected() {
-                vpn_service.start_connection(&rt);
             }
             // Wait until something is ready.
             let mut udp_read_buf = ReadBuf::new(&mut udp_buffer);
             poll_seed = poll_seed.wrapping_add(1);
             let (command_message, udp_source, vpn_event) = {
-                let ignore_vpn = shutdown && !vpn_service.is_connected();
+                let ignore_vpn = shutdown && !vpn_is_connected;
                 let mut receive_command = pin!(command_receiver.recv());
-                let mut vpn_event = pin!(vpn_service.next_event());
+                let mut vpn_event = pin!(vpn_service.wait_event(&rt));
                 let sockets = &sessions.sockets;
                 future::poll_fn(|cx| {
                     let mut ready = false;
@@ -211,7 +207,7 @@ impl Server {
                     SessionMessage::Shutdown => {
                         shutdown = true;
                         sessions.cleanup(&rt);
-                        if let Err(err) = vpn_service.start_disconnection().await {
+                        if let Err(err) = vpn_service.terminate().await {
                             warn!("Failed to terminate VPN client connection: {}", err);
                         }
                     }
@@ -220,6 +216,23 @@ impl Server {
                     }
                 }
                 sessions.process_message(message).await;
+            }
+            if let Some(Err(err)) = vpn_event {
+                warn!("VPN reported an error status: {}", err);
+            } else if vpn_service.can_read() {
+                match vpn_service.read_packet(&mut vpn_buffer).await {
+                    Ok(read_buf) => {
+                        let read_bytes = read_buf.len();
+                        let mut read_buf = ReadBuf::new(&mut vpn_buffer);
+                        read_buf.set_filled(read_bytes);
+                        if let Err(err) = sessions.process_vpn_packet(read_buf).await {
+                            warn!("Failed to forward VPN packet to IKEv2: {}", err);
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to read packet from VPN: {}", err);
+                    }
+                }
             }
             match udp_source {
                 Some(Ok(datagram)) => {
@@ -245,27 +258,11 @@ impl Server {
                 }
                 None => {}
             }
-            match vpn_event {
-                Some(Ok(FortiTunnelEvent::Error(err))) => {
-                    warn!("VPN reported an error status: {}", err);
-                }
-                Some(Ok(FortiTunnelEvent::ReceivedPacket(data, read_bytes))) => {
-                    let mut read_buf = ReadBuf::new(&mut vpn_buffer);
-                    read_buf.put_slice(&data[..read_bytes]);
-                    if let Err(err) = sessions.process_vpn_packet(read_buf).await {
-                        warn!("Failed to process VPN packet: {}", err);
-                    }
-                }
-                Some(Ok(FortiTunnelEvent::EchoFailed(err))) => {
-                    warn!("Echo request timed out: {}", err);
-                }
-                Some(Ok(FortiTunnelEvent::Disconnected)) => {
-                    sessions.delete_all_sessions(&rt);
-                }
-                Some(Err(err)) => {
-                    warn!("VPN reported an error status: {}", err);
-                }
-                Some(Ok(FortiTunnelEvent::Connected(_, _))) | None => {}
+            if let Err(err) = vpn_service.process_events().await {
+                warn!("Failed to process VPN lifecycle events: {}", err);
+            }
+            if vpn_is_connected && !vpn_service.is_connected() {
+                sessions.delete_all_sessions(&rt);
             }
         }
     }
@@ -313,7 +310,7 @@ impl Sockets {
         // Split socket list into two parts, then combine the second half with the first one.
         let seed = seed % self.socket_list.len();
         let (left, right) = self.socket_list.split_at(seed % self.socket_list.len());
-        let it = right.into_iter().chain(left.into_iter());
+        let it = right.iter().chain(left.iter());
         for (listen_addr, socket) in it {
             let is_nat_port = listen_addr.port() == self.nat_port;
             buf.clear();
