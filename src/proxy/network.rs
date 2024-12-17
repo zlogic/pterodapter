@@ -109,7 +109,7 @@ impl Network<'_> {
             if let Some(command) = command {
                 self.process_command(command);
             }
-            let vpn_data_sent = match self.device.send_all_data().await {
+            let vpn_data_sent = match self.device.send_next_packet().await {
                 Ok(data_sent) => data_sent,
                 Err(err) => {
                     warn!("Failed to transfer data to sockets: {}", err);
@@ -547,11 +547,11 @@ impl VpnDevice<'_> {
         }
     }
 
-    async fn send_all_data(&mut self) -> Result<bool, NetworkError> {
+    async fn send_next_packet(&mut self) -> Result<bool, NetworkError> {
         let mut data_sent = false;
         if self.vpn.is_connected() {
-            while let Ok(src) = self.write_buffers.dequeue_one() {
-                self.vpn.send_packet(src).await?;
+            if let Ok(src) = self.write_buffers.dequeue_one() {
+                self.vpn.enqueue_send_packet(src)?;
                 src.clear();
                 data_sent = true;
             }

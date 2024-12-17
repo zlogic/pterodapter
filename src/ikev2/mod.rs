@@ -151,8 +151,8 @@ impl Server {
     ) -> Result<(), IKEv2Error> {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
-        let mut udp_buffer = [0u8; MAX_DATAGRAM_SIZE];
-        let mut vpn_buffer = [0u8; MAX_DATAGRAM_SIZE];
+        let mut udp_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
+        let mut vpn_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut poll_seed = 0usize;
         loop {
             let vpn_is_connected = vpn_service.is_connected();
@@ -161,45 +161,62 @@ impl Server {
                 return Ok(());
             }
             // Wait until something is ready.
-            let mut udp_read_buf = ReadBuf::new(&mut udp_buffer);
+            let mut udp_read_buf = ReadBuf::new(&mut udp_read_buffer);
             poll_seed = poll_seed.wrapping_add(1);
-            let (command_message, udp_source, vpn_event) = {
+            let mut vpn_event = None;
+            let mut sent_udp = None;
+            let mut udp_source = None;
+            let mut command_message = None;
+            {
                 let ignore_vpn = shutdown && !vpn_is_connected;
                 let mut receive_command = pin!(command_receiver.recv());
-                let mut vpn_event = pin!(vpn_service.wait_event(&mut vpn_buffer));
-                let sockets = &sessions.sockets;
+                let mut receive_vpn_event = pin!(vpn_service.wait_event(&mut vpn_read_buffer));
+                let sockets = &mut sessions.sockets;
+                let must_send_esp = sockets.is_pending_send();
                 future::poll_fn(|cx| {
-                    let mut ready = false;
-                    let received_command = receive_command.as_mut().poll(cx);
-                    ready = ready || received_command.is_ready();
-                    let received_command = match received_command {
-                        Poll::Ready(cmd) => cmd,
-                        Poll::Pending => None,
-                    };
-                    let received_udp = sockets.poll_recv(cx, poll_seed, &mut udp_read_buf);
-                    ready = ready || received_udp.is_ready();
-                    let received_udp = match received_udp {
-                        Poll::Ready(cmd) => Some(cmd),
-                        Poll::Pending => None,
-                    };
-                    let vpn_event = if !ignore_vpn {
-                        let vpn_event = vpn_event.as_mut().poll(cx);
-                        ready = ready || vpn_event.is_ready();
-                        match vpn_event {
-                            Poll::Ready(cmd) => Some(cmd),
+                    if vpn_event.is_none() {
+                        vpn_event = if !ignore_vpn {
+                            let vpn_event = receive_vpn_event.as_mut().poll(cx);
+                            match vpn_event {
+                                Poll::Ready(cmd) => Some(cmd),
+                                Poll::Pending => None,
+                            }
+                        } else {
+                            // Avoid waking if VPN is already shut down.
+                            None
+                        };
+                    }
+                    if sent_udp.is_none() && must_send_esp {
+                        sent_udp = match sockets.poll_pending_send(cx) {
+                            Poll::Ready(result) => Some(result),
+                            Poll::Pending => None,
+                        };
+                    }
+                    if command_message.is_none() {
+                        command_message = match receive_command.as_mut().poll(cx) {
+                            Poll::Ready(cmd) => cmd,
                             Poll::Pending => None,
                         }
-                    } else {
-                        // Avoid waking if VPN is already shut down.
-                        None
-                    };
-                    if ready {
-                        Poll::Ready((received_command, received_udp, vpn_event))
+                    }
+                    if udp_source.is_none() {
+                        udp_source = match sockets.poll_recv(cx, poll_seed, &mut udp_read_buf) {
+                            Poll::Ready(result) => Some(result),
+                            Poll::Pending => None,
+                        };
+                    }
+                    if must_send_esp && sent_udp.is_none() {
+                        Poll::Pending
+                    } else if vpn_event.is_some()
+                        || sent_udp.is_some()
+                        || command_message.is_some()
+                        || udp_source.is_some()
+                    {
+                        Poll::Ready(())
                     } else {
                         Poll::Pending
                     }
                 })
-                .await
+                .await;
             };
             // Process all ready events.
             if let Some(message) = command_message {
@@ -218,24 +235,21 @@ impl Server {
                 sessions.process_message(message).await;
             }
             match vpn_event {
-                Some(Ok(())) => {
-                    match vpn_service.read_packet(&mut vpn_buffer).await {
-                        Ok(data) => {
-                            let read_bytes = data.len();
-                            // Ensure that the entire buffer is available when adding ESP and
-                            // encryption headers.
-                            let mut read_buf =
-                                ReadBuf::new(&mut vpn_buffer[fortivpn::PPP_HEADER_SIZE..]);
-                            read_buf.set_filled(read_bytes);
-                            if let Err(err) = sessions.process_vpn_packet(read_buf).await {
-                                warn!("Failed to forward VPN packet to IKEv2: {}", err);
-                            }
-                        }
-                        Err(err) => {
-                            warn!("Failed to read packet from VPN: {}", err);
+                Some(Ok(())) => match vpn_service.read_packet(&mut vpn_read_buffer).await {
+                    Ok(data) => {
+                        let read_bytes = data.len();
+
+                        let mut read_buf =
+                            ReadBuf::new(&mut vpn_read_buffer[fortivpn::PPP_HEADER_SIZE..]);
+                        read_buf.set_filled(read_bytes);
+                        if let Err(err) = sessions.process_vpn_packet(read_buf).await {
+                            warn!("Failed to forward VPN packet to IKEv2: {}", err);
                         }
                     }
-                }
+                    Err(err) => {
+                        warn!("Failed to read packet from VPN: {}", err);
+                    }
+                },
                 Some(Err(err)) => warn!("VPN reported an error status: {}", err),
                 None => {}
             }
@@ -263,6 +277,9 @@ impl Server {
                 }
                 None => {}
             }
+            if let Some(Err(err)) = sent_udp {
+                warn!("Failed to send UDP ESP message: {}", err);
+            }
             if let Err(err) = vpn_service.process_events().await {
                 warn!("Failed to process VPN lifecycle events: {}", err);
             }
@@ -277,6 +294,8 @@ struct Sockets {
     sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
     socket_list: Vec<(SocketAddr, Arc<UdpSocket>)>,
     nat_port: u16,
+    send_buffer: [u8; MAX_DATAGRAM_SIZE],
+    pending_send: Option<UdpPendingSend>,
 }
 
 impl Sockets {
@@ -303,7 +322,42 @@ impl Sockets {
             sockets,
             socket_list,
             nat_port,
+            send_buffer: [0u8; MAX_DATAGRAM_SIZE],
+            pending_send: None,
         })
+    }
+
+    fn poll_pending_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), IKEv2Error>> {
+        if let Some(ref pending_send) = self.pending_send {
+            if let Some(socket) = self.sockets.get(&pending_send.local_addr) {
+                match socket.poll_send_to(
+                    cx,
+                    &self.send_buffer[..pending_send.size],
+                    pending_send.remote_addr,
+                ) {
+                    Poll::Ready(Ok(_)) => {
+                        self.pending_send = None;
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Err(err)) => {
+                        self.pending_send = None;
+                        Poll::Ready(Err(err.into()))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            } else {
+                warn!(
+                    "No open sockets for source address {} (destination {})",
+                    pending_send.local_addr, pending_send.remote_addr
+                );
+                Poll::Ready(Err("No open sockets for source address".into()))
+            }
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
     fn poll_recv(
@@ -360,6 +414,29 @@ impl Sockets {
             Err("No open sockets for source address".into())
         }
     }
+
+    fn enqueue_send_datagram(
+        &mut self,
+        local_addr: &SocketAddr,
+        remote_addr: &SocketAddr,
+        data: &[u8],
+    ) -> Result<(), SendError> {
+        if self.pending_send.is_some() {
+            warn!("UDP cannot enqeue more packets, dropping send request");
+        } else if !data.is_empty() {
+            self.pending_send = Some(UdpPendingSend {
+                remote_addr: *remote_addr,
+                local_addr: *local_addr,
+                size: data.len(),
+            });
+            self.send_buffer[..data.len()].copy_from_slice(data);
+        }
+        Ok(())
+    }
+
+    fn is_pending_send(&self) -> bool {
+        self.pending_send.is_some()
+    }
 }
 
 struct UdpDatagramOrigin {
@@ -384,6 +461,12 @@ struct UdpDatagram<'a> {
     local_addr: SocketAddr,
     is_nat_port: bool,
     bytes: ReadBuf<'a>,
+}
+
+struct UdpPendingSend {
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+    size: usize,
 }
 
 impl UdpDatagram<'_> {
@@ -946,7 +1029,7 @@ impl Sessions {
                 );
                 return Err("Decrypted ESP packet size exceeds MTU".into());
             }
-            Ok(vpn_service.send_packet(decrypted_slice).await?)
+            Ok(vpn_service.enqueue_send_packet(decrypted_slice)?)
         } else {
             warn!(
                 "Security Association {:x} from {} not found",
@@ -1003,9 +1086,12 @@ impl Sessions {
                 sa.remote_addr(),
                 encrypted_data
             );
-            self.sockets
-                .send_datagram(&sa.local_addr(), &sa.remote_addr(), encrypted_data)
-                .await?;
+
+            self.sockets.enqueue_send_datagram(
+                &sa.local_addr(),
+                &sa.remote_addr(),
+                encrypted_data,
+            )?;
             Ok(())
         } else {
             debug!(

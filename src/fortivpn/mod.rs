@@ -538,19 +538,31 @@ impl FortiVPNTunnel {
         Ok(())
     }
 
-    async fn send_ppp_packet(
-        socket: &mut BufTlsStream,
-        protocol: ppp::Protocol,
-        ppp_data: &[u8],
-    ) -> Result<(), FortiError> {
+    fn write_ppp_header(protocol: ppp::Protocol, length: usize) -> [u8; PPP_HEADER_SIZE] {
         // FortiVPN encapsulation.
         let mut ppp_header = [0u8; PPP_HEADER_SIZE];
-        let ppp_packet_length = ppp_data.len() + 2;
+        let ppp_packet_length = length + 2;
         ppp_header[0..2].copy_from_slice(&(6 + ppp_packet_length as u16).to_be_bytes());
         ppp_header[2..4].copy_from_slice(&[0x50, 0x50]);
         ppp_header[4..6].copy_from_slice(&(ppp_packet_length as u16).to_be_bytes());
         // PPP encapsulation.
         ppp_header[6..8].copy_from_slice(&protocol.value().to_be_bytes());
+        ppp_header
+    }
+
+    pub fn write_ipv4_packet(src: &[u8], dest: &mut [u8]) -> usize {
+        let ppp_header = Self::write_ppp_header(ppp::Protocol::IPV4, src.len());
+        dest[..ppp_header.len()].copy_from_slice(&ppp_header);
+        dest[ppp_header.len()..ppp_header.len() + src.len()].copy_from_slice(src);
+        ppp_header.len() + src.len()
+    }
+
+    async fn send_ppp_packet(
+        socket: &mut BufTlsStream,
+        protocol: ppp::Protocol,
+        ppp_data: &[u8],
+    ) -> Result<(), FortiError> {
+        let ppp_header = Self::write_ppp_header(protocol, ppp_data.len());
 
         socket.write_all(&ppp_header).await?;
         Ok(socket.write_all(ppp_data).await?)
@@ -604,8 +616,9 @@ impl FortiVPNTunnel {
         }
     }
 
-    pub async fn send_packet(&mut self, data: &[u8]) -> Result<(), FortiError> {
-        Self::send_ppp_packet(&mut self.socket, ppp::Protocol::IPV4, data).await
+    pub async fn write_data(&mut self, data: &mut [u8]) -> Result<usize, FortiError> {
+        self.socket.write_all(data).await?;
+        Ok(data.len())
     }
 
     pub async fn flush(&mut self) -> Result<(), FortiError> {
