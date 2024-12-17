@@ -159,7 +159,7 @@ impl FortiService {
     pub async fn process_events(&mut self) -> Result<(), VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
             if !state.send_range.is_empty() {
-                let remaining_data = &mut state.send_buffer[state.send_range.clone()];
+                let remaining_data = &state.send_buffer[state.send_range.clone()];
                 match state.tunnel.write_data(remaining_data).await {
                     Ok(sent_bytes) => {
                         state.send_range.start += sent_bytes;
