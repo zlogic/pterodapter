@@ -166,7 +166,7 @@ impl Server {
             let (command_message, udp_source, vpn_event) = {
                 let ignore_vpn = shutdown && !vpn_is_connected;
                 let mut receive_command = pin!(command_receiver.recv());
-                let mut vpn_event = pin!(vpn_service.wait_event(&rt));
+                let mut vpn_event = pin!(vpn_service.wait_event(&mut vpn_buffer));
                 let sockets = &sessions.sockets;
                 future::poll_fn(|cx| {
                     let mut ready = false;
@@ -217,22 +217,27 @@ impl Server {
                 }
                 sessions.process_message(message).await;
             }
-            if let Some(Err(err)) = vpn_event {
-                warn!("VPN reported an error status: {}", err);
-            } else if vpn_service.can_read() {
-                match vpn_service.read_packet(&mut vpn_buffer).await {
-                    Ok(read_buf) => {
-                        let read_bytes = read_buf.len();
-                        let mut read_buf = ReadBuf::new(&mut vpn_buffer);
-                        read_buf.set_filled(read_bytes);
-                        if let Err(err) = sessions.process_vpn_packet(read_buf).await {
-                            warn!("Failed to forward VPN packet to IKEv2: {}", err);
+            match vpn_event {
+                Some(Ok(())) => {
+                    match vpn_service.read_packet(&mut vpn_buffer).await {
+                        Ok(data) => {
+                            let read_bytes = data.len();
+                            // Ensure that the entire buffer is available when adding ESP and
+                            // encryption headers.
+                            let mut read_buf =
+                                ReadBuf::new(&mut vpn_buffer[fortivpn::PPP_HEADER_SIZE..]);
+                            read_buf.set_filled(read_bytes);
+                            if let Err(err) = sessions.process_vpn_packet(read_buf).await {
+                                warn!("Failed to forward VPN packet to IKEv2: {}", err);
+                            }
+                        }
+                        Err(err) => {
+                            warn!("Failed to read packet from VPN: {}", err);
                         }
                     }
-                    Err(err) => {
-                        warn!("Failed to read packet from VPN: {}", err);
-                    }
                 }
+                Some(Err(err)) => warn!("VPN reported an error status: {}", err),
+                None => {}
             }
             match udp_source {
                 Some(Ok(datagram)) => {

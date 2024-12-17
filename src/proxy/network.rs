@@ -8,7 +8,6 @@ use log::{debug, trace, warn};
 use rand::Rng;
 use smoltcp::{iface, phy, socket, storage, wire};
 use tokio::{
-    runtime,
     sync::{mpsc, oneshot},
     time::Duration,
 };
@@ -57,11 +56,11 @@ impl Network<'_> {
         use std::pin::pin;
         use std::task::Poll;
 
-        let rt = runtime::Handle::current();
         let mut next_wake = tokio::time::Instant::now();
+        let mut vpn_buffer = [0u8; fortivpn::PPP_MTU as usize];
         while !self.shutdown {
             let (vpn_event, command) = {
-                let mut vpn_event = pin!(self.device.wait_event(&rt));
+                let mut vpn_event = pin!(self.device.wait_event(&mut vpn_buffer));
                 let mut device_ready = pin!(tokio::time::sleep_until(next_wake));
                 let mut receive_command = pin!(command_receiver.recv());
                 future::poll_fn(|cx| {
@@ -127,7 +126,7 @@ impl Network<'_> {
                 warn!("VPN reported an error status: {}", err);
                 false
             } else {
-                match self.device.read_next_packet().await {
+                match self.device.read_next_packet(&mut vpn_buffer).await {
                     Ok(data_received) => data_received,
                     Err(err) => {
                         warn!("Failed to read packet from VPN: {}", err);
@@ -525,21 +524,21 @@ impl VpnDevice<'_> {
 }
 
 impl VpnDevice<'_> {
-    async fn wait_event(&mut self, rt: &runtime::Handle) -> Result<(), NetworkError> {
-        Ok(self.vpn.wait_event(rt).await?)
+    async fn wait_event(&mut self, buf: &mut [u8]) -> Result<(), NetworkError> {
+        Ok(self.vpn.wait_event(buf).await?)
     }
 
     async fn terminate(&mut self) -> Result<(), NetworkError> {
         Ok(self.vpn.terminate().await?)
     }
 
-    async fn read_next_packet(&mut self) -> Result<bool, NetworkError> {
-        if !self.vpn.can_read() {
+    async fn read_next_packet(&mut self, buf: &mut [u8]) -> Result<bool, NetworkError> {
+        let data = self.vpn.read_packet(buf).await?;
+        if data.is_empty() {
             Ok(false)
         } else if let Ok(dest) = self.read_buffers.enqueue_one() {
-            dest.resize(dest.capacity(), 0);
-            let bytes_read = self.vpn.read_packet(dest).await?.len();
-            dest.truncate(bytes_read);
+            dest.clear();
+            dest.extend_from_slice(data);
             Ok(true)
         } else {
             // Read buffers are full.

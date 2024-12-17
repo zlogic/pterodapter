@@ -9,7 +9,6 @@ struct ConnectedData {
     tunnel: FortiVPNTunnel,
     echo_timer: Interval,
     need_echo: bool,
-    can_read: bool,
     sent_data: bool,
     need_flush: bool,
 }
@@ -37,27 +36,20 @@ impl FortiService {
         matches!(self.state, ConnectionState::Connected(_))
     }
 
-    pub fn can_read(&self) -> bool {
-        if let ConnectionState::Connected(ref state) = self.state {
-            state.can_read
-        } else {
-            false
-        }
-    }
-
     async fn connect(config: Config) -> Result<FortiVPNTunnel, VpnServiceError> {
         let sslvpn_cookie = super::get_oauth_cookie(&config).await?;
         debug!("VPN cookie received");
         Ok(FortiVPNTunnel::new(&config, sslvpn_cookie).await?)
     }
 
-    pub async fn wait_event(&mut self, rt: &runtime::Handle) -> Result<(), VpnServiceError> {
+    pub async fn wait_event<'a>(&mut self, buf: &'a mut [u8]) -> Result<(), VpnServiceError> {
         use std::future::{self, Future};
         use std::pin::pin;
         use std::task::Poll;
 
         match &mut self.state {
             ConnectionState::Disconnected => {
+                let rt = runtime::Handle::current();
                 let connect_handle = rt.spawn(Self::connect(self.config.clone()));
                 self.state = ConnectionState::Connecting(connect_handle);
                 Ok(())
@@ -71,7 +63,6 @@ impl FortiService {
                         tunnel,
                         echo_timer,
                         need_echo: false,
-                        can_read: false,
                         sent_data: false,
                         need_flush: false,
                     });
@@ -85,7 +76,7 @@ impl FortiService {
             ConnectionState::Connected(connected_data) => {
                 let (send_echo, packet_available) = {
                     let mut send_echo = pin!(connected_data.echo_timer.tick());
-                    let mut received_packet = pin!(connected_data.tunnel.peek_recv());
+                    let mut received_packet = pin!(connected_data.tunnel.read_data(buf));
                     future::poll_fn(move |cx| {
                         let send_echo = send_echo.as_mut().poll(cx);
                         let packet_available = received_packet.as_mut().poll(cx);
@@ -102,21 +93,16 @@ impl FortiService {
                     .await
                 };
                 connected_data.need_echo = send_echo;
-                match packet_available {
-                    Some(Ok(())) => {
-                        connected_data.can_read = true;
-                    }
-                    Some(Err(err)) => {
-                        warn!(
-                            "Failed to check if next packet from VPN is available: {}",
-                            err
-                        );
-                        self.state = ConnectionState::Disconnected;
-                        return Err(err.into());
-                    }
-                    None => {}
+                if let Some(Err(err)) = packet_available {
+                    warn!(
+                        "Failed to check if next packet from VPN is available: {}",
+                        err
+                    );
+                    self.state = ConnectionState::Disconnected;
+                    Err(err.into())
+                } else {
+                    Ok(())
                 }
-                Ok(())
             }
         }
     }
@@ -126,16 +112,12 @@ impl FortiService {
         buffer: &'a mut [u8],
     ) -> Result<&'a [u8], VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
-            if state.can_read {
-                match state.tunnel.try_read_packet(buffer).await {
-                    Ok(packet_bytes) => Ok(&buffer[..packet_bytes]),
-                    Err(err) => {
-                        self.state = ConnectionState::Disconnected;
-                        Err(err.into())
-                    }
+            match state.tunnel.try_read_packet(buffer).await {
+                Ok(data) => Ok(data),
+                Err(err) => {
+                    self.state = ConnectionState::Disconnected;
+                    Err(err.into())
                 }
-            } else {
-                Ok(&[])
             }
         } else {
             Ok(&[])
@@ -176,7 +158,6 @@ impl FortiService {
                 }
             }
             state.sent_data = false;
-            state.can_read = false;
         }
         Ok(())
     }
@@ -184,13 +165,9 @@ impl FortiService {
     pub async fn terminate(&mut self) -> Result<(), VpnServiceError> {
         match &mut self.state {
             ConnectionState::Connected(state) => {
-                state.need_flush = true;
-                if let Err(err) = state.tunnel.terminate().await {
-                    self.state = ConnectionState::Disconnected;
-                    Err(err.into())
-                } else {
-                    Ok(())
-                }
+                let result = state.tunnel.terminate().await;
+                self.state = ConnectionState::Disconnected;
+                Ok(result?)
             }
             _ => Ok(()),
         }
