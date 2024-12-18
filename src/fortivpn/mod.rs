@@ -616,8 +616,8 @@ impl FortiVPNTunnel {
         }
     }
 
-    pub async fn write_data(&mut self, data: &[u8]) -> Result<usize, FortiError> {
-        Ok(self.socket.write(data).await?)
+    pub async fn write_data(&mut self, data: &[u8]) -> Result<(), FortiError> {
+        Ok(self.socket.write_all(data).await?)
     }
 
     pub async fn flush(&mut self) -> Result<(), FortiError> {

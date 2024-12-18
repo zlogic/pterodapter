@@ -1,18 +1,18 @@
-use std::{error, fmt, net::IpAddr, ops::Range};
+use std::{error, fmt, net::IpAddr};
 
 use log::{debug, info, warn};
 use tokio::{runtime, task::JoinHandle, time::Interval};
 
 use super::{Config, FortiVPNTunnel};
 
-const SEND_BUFFER_SIZE: usize = super::PPP_MTU as usize * 4;
+const SEND_BUFFER_SIZE: usize = super::PPP_MTU as usize + super::PPP_HEADER_SIZE;
 
 struct ConnectedData {
     tunnel: FortiVPNTunnel,
     echo_timer: Interval,
     need_echo: bool,
     send_buffer: [u8; SEND_BUFFER_SIZE],
-    send_range: Range<usize>,
+    send_len: usize,
     sent_data: bool,
     need_flush: bool,
 }
@@ -68,7 +68,7 @@ impl FortiService {
                         echo_timer,
                         need_echo: false,
                         send_buffer: [0u8; SEND_BUFFER_SIZE],
-                        send_range: 0..0,
+                        send_len: 0,
                         sent_data: false,
                         need_flush: false,
                     });
@@ -133,22 +133,16 @@ impl FortiService {
 
     pub fn enqueue_send_packet(&mut self, data: &[u8]) -> Result<(), VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
-            let available_bytes = state.send_buffer.len() - state.send_range.end;
-            if available_bytes < data.len() + super::PPP_HEADER_SIZE {
+            if state.send_buffer.len() < data.len() + super::PPP_HEADER_SIZE {
                 debug!(
-                    "VPN send buffer {}, with remaining capacity {} cannot fit data {}",
+                    "VPN send buffer {} cannot fit data {}",
                     state.send_buffer.len(),
-                    available_bytes,
                     data.len()
                 );
                 Err("VPN send buffer cannot fit all data".into())
             } else {
                 // Pre-pad packets, so that writes can be done in batches.
-                let packet_len = FortiVPNTunnel::write_ipv4_packet(
-                    data,
-                    &mut state.send_buffer[state.send_range.end..],
-                );
-                state.send_range.end += packet_len;
+                state.send_len = FortiVPNTunnel::write_ipv4_packet(data, &mut state.send_buffer);
                 Ok(())
             }
         } else {
@@ -158,16 +152,13 @@ impl FortiService {
 
     pub async fn process_events(&mut self) -> Result<(), VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
-            if !state.send_range.is_empty() {
-                let remaining_data = &state.send_buffer[state.send_range.clone()];
+            if state.send_len > 0 {
+                let remaining_data = &state.send_buffer[..state.send_len];
                 match state.tunnel.write_data(remaining_data).await {
-                    Ok(sent_bytes) => {
-                        state.send_range.start += sent_bytes;
+                    Ok(()) => {
+                        state.send_len = 0;
                         state.sent_data = true;
                         state.need_flush = true;
-                        if state.send_range.is_empty() {
-                            state.send_range = 0..0;
-                        }
                     }
                     Err(err) => {
                         warn!("Failed to send packet to VPN: {}", err);

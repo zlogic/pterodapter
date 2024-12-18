@@ -27,9 +27,9 @@ mod message;
 mod pki;
 mod session;
 
-const MAX_DATAGRAM_SIZE: usize = 1500;
+const MAX_DATAGRAM_SIZE: usize = 1500 + fortivpn::PPP_HEADER_SIZE;
 // Use 1500 as max MTU, real value is likely lower.
-const MAX_ESP_PACKET_SIZE: usize = 1500;
+const MAX_ESP_PACKET_SIZE: usize = 1500 + fortivpn::PPP_HEADER_SIZE;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
