@@ -153,6 +153,7 @@ impl Server {
         let mut shutdown = false;
         let mut udp_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut vpn_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
+        let mut vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut poll_seed = 0usize;
         loop {
             let vpn_is_connected = vpn_service.is_connected();
@@ -240,32 +241,38 @@ impl Server {
                 Some(Err(err)) => warn!("VPN reported an error status: {}", err),
                 None => {}
             }
-            match udp_source {
+            let send_slice_to_vpn = match udp_source {
                 Some(Ok(datagram)) => {
                     let mut datagram = datagram.into_datagram(udp_read_buf);
+                    let remote_addr = datagram.remote_addr;
                     let result = if datagram.is_ikev2() {
                         sessions
                             .process_ikev2_message(&datagram, vpn_service.ip_configuration())
                             .await
+                            .map(|()| None)
                     } else {
-                        sessions
-                            .process_esp_packet(&mut vpn_service, &mut datagram)
-                            .await
+                        sessions.process_esp_packet(&mut datagram).await
                     };
-                    if let Err(err) = result {
-                        warn!(
-                            "Failed to process message from {}: {}",
-                            datagram.remote_addr, err
-                        );
+                    match result {
+                        Ok(Some(send_slice)) => {
+                            vpn_write_buffer[..send_slice.len()].copy_from_slice(send_slice);
+                            Some(&vpn_write_buffer[..send_slice.len()])
+                        }
+                        Ok(None) => None,
+                        Err(err) => {
+                            warn!("Failed to process message from {}: {}", remote_addr, err);
+                            None
+                        }
                     }
                 }
                 Some(Err(err)) => {
                     warn!("Failed to read data from UDP socket: {}", err);
+                    None
                 }
-                None => {}
-            }
+                None => None,
+            };
             let (vpn_event, sent_udp) = {
-                let mut process_vpn_events = pin!(vpn_service.process_events());
+                let mut process_vpn_events = pin!(vpn_service.process_events(send_slice_to_vpn));
                 let mut sent_udp = None;
                 let mut vpn_event = None;
                 let sockets = &mut sessions.sockets;
@@ -994,29 +1001,31 @@ impl Sessions {
         });
     }
 
-    async fn process_esp_packet(
+    async fn process_esp_packet<'a>(
         &mut self,
-        vpn_service: &mut FortiService,
-        datagram: &mut UdpDatagram<'_>,
-    ) -> Result<(), IKEv2Error> {
+        datagram: &'a mut UdpDatagram<'a>,
+    ) -> Result<Option<&'a [u8]>, IKEv2Error> {
         let remote_addr = datagram.remote_addr;
-        let bytes = datagram.filled_bytes_mut();
-        if bytes == [0xff] {
+        if datagram.filled_bytes() == [0xff] {
             debug!("Received ESP NAT keepalive from {}", datagram.remote_addr);
-            return Ok(self
-                .sockets
+            self.sockets
                 .send_datagram(&datagram.local_addr, &datagram.remote_addr, &[0xff])
-                .await?);
+                .await?;
+            return Ok(None);
         }
-        trace!("Received ESP packet from {}\n{:?}", remote_addr, bytes,);
-        if bytes.len() < 8 {
+        trace!(
+            "Received ESP packet from {}\n{:?}",
+            remote_addr,
+            datagram.filled_bytes()
+        );
+        if datagram.filled_bytes().len() < 8 {
             return Err("Not enough data in ESP packet".into());
         }
         let mut local_spi = [0u8; 4];
-        local_spi.copy_from_slice(&bytes[0..4]);
+        local_spi.copy_from_slice(&datagram.filled_bytes()[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
         if let Some(sa) = self.security_associations.get_mut(&local_spi) {
-            let decrypted_slice = sa.handle_esp(bytes)?;
+            let decrypted_slice = sa.handle_esp(datagram.filled_bytes_mut())?;
             trace!(
                 "Decrypted ESP packet from {}\n{:?}",
                 remote_addr,
@@ -1029,7 +1038,7 @@ impl Sessions {
                 // Microsoft Teams can spam the network with a lot of stray packets.
                 // Don't log an error if the packet is dropped to keep the logs clean on the info
                 // level.
-                return Ok(());
+                return Ok(None);
             }
             if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
                 warn!(
@@ -1039,7 +1048,7 @@ impl Sessions {
                 );
                 return Err("Decrypted ESP packet size exceeds MTU".into());
             }
-            Ok(vpn_service.enqueue_send_packet(decrypted_slice)?)
+            Ok(Some(decrypted_slice))
         } else {
             warn!(
                 "Security Association {:x} from {} not found",

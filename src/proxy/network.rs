@@ -109,13 +109,6 @@ impl Network<'_> {
             if let Some(command) = command {
                 self.process_command(command);
             }
-            let vpn_data_sent = match self.device.send_next_packet().await {
-                Ok(data_sent) => data_sent,
-                Err(err) => {
-                    warn!("Failed to transfer data to sockets: {}", err);
-                    false
-                }
-            };
             if vpn_event.is_some() {
                 let ip_addr = self.device.ip_addr();
                 if let Err(err) = self.update_ip_configuration(ip_addr) {
@@ -134,9 +127,13 @@ impl Network<'_> {
                     }
                 }
             };
-            if let Err(err) = self.device.vpn.process_events().await {
-                warn!("Failed to process VPN lifecycle events: {}", err);
-            }
+            let vpn_data_sent = match self.device.process_lifecyle_events().await {
+                Ok(data_sent) => data_sent,
+                Err(err) => {
+                    warn!("Failed to process VPN lifecycle events: {}", err);
+                    false
+                }
+            };
             if tokio::time::Instant::now() > next_wake
                 || data_copied
                 || vpn_data_received
@@ -547,16 +544,20 @@ impl VpnDevice<'_> {
         }
     }
 
-    async fn send_next_packet(&mut self) -> Result<bool, NetworkError> {
-        let mut data_sent = false;
+    async fn process_lifecyle_events(&mut self) -> Result<bool, NetworkError> {
         if self.vpn.is_connected() {
-            if let Ok(src) = self.write_buffers.dequeue_one() {
-                self.vpn.enqueue_send_packet(src)?;
+            let send_packet = if let Ok(src) = self.write_buffers.dequeue_one() {
+                self.vpn.process_events(Some(src.as_slice())).await?;
                 src.clear();
-                data_sent = true;
-            }
+                true
+            } else {
+                self.vpn.process_events(None).await?;
+                false
+            };
+            Ok(send_packet)
+        } else {
+            Ok(false)
         }
-        Ok(data_sent)
     }
 
     fn ip_addr(&self) -> Option<IpAddr> {

@@ -5,16 +5,13 @@ use tokio::{runtime, task::JoinHandle, time::Interval};
 
 use super::{Config, FortiVPNTunnel};
 
-const SEND_BUFFER_SIZE: usize = super::PPP_MTU as usize + super::PPP_HEADER_SIZE;
+const FLUSH_INTERVAL: usize = 5;
 
 struct ConnectedData {
     tunnel: FortiVPNTunnel,
     echo_timer: Interval,
     need_echo: bool,
-    send_buffer: [u8; SEND_BUFFER_SIZE],
-    send_len: usize,
-    sent_data: bool,
-    need_flush: bool,
+    unflushed_writes: usize,
 }
 
 enum ConnectionState {
@@ -67,10 +64,7 @@ impl FortiService {
                         tunnel,
                         echo_timer,
                         need_echo: false,
-                        send_buffer: [0u8; SEND_BUFFER_SIZE],
-                        send_len: 0,
-                        sent_data: false,
-                        need_flush: false,
+                        unflushed_writes: 0,
                     });
                     Ok(())
                 }
@@ -131,34 +125,15 @@ impl FortiService {
         }
     }
 
-    pub fn enqueue_send_packet(&mut self, data: &[u8]) -> Result<(), VpnServiceError> {
+    pub async fn process_events(
+        &mut self,
+        send_data: Option<&[u8]>,
+    ) -> Result<(), VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
-            if state.send_buffer.len() < data.len() + super::PPP_HEADER_SIZE {
-                debug!(
-                    "VPN send buffer {} cannot fit data {}",
-                    state.send_buffer.len(),
-                    data.len()
-                );
-                Err("VPN send buffer cannot fit all data".into())
-            } else {
-                // Pre-pad packets, so that writes can be done in batches.
-                state.send_len = FortiVPNTunnel::write_ipv4_packet(data, &mut state.send_buffer);
-                Ok(())
-            }
-        } else {
-            Err("VPN client service is not connected".into())
-        }
-    }
-
-    pub async fn process_events(&mut self) -> Result<(), VpnServiceError> {
-        if let ConnectionState::Connected(state) = &mut self.state {
-            if state.send_len > 0 {
-                let remaining_data = &state.send_buffer[..state.send_len];
-                match state.tunnel.write_data(remaining_data).await {
+            if let Some(send_data) = send_data {
+                match state.tunnel.write_data(send_data).await {
                     Ok(()) => {
-                        state.send_len = 0;
-                        state.sent_data = true;
-                        state.need_flush = true;
+                        state.unflushed_writes += 1;
                     }
                     Err(err) => {
                         warn!("Failed to send packet to VPN: {}", err);
@@ -166,24 +141,23 @@ impl FortiService {
                         return Err(err.into());
                     }
                 }
-            } else {
-                if state.need_echo {
-                    state.need_echo = false;
-                    if let Err(err) = state.tunnel.process_echo().await {
-                        warn!("Echo request timed out: {}", err);
-                        self.state = ConnectionState::Disconnected;
-                        return Err(err.into());
-                    }
+            }
+            if state.need_echo {
+                state.need_echo = false;
+                if let Err(err) = state.tunnel.process_echo().await {
+                    warn!("Echo request timed out: {}", err);
+                    self.state = ConnectionState::Disconnected;
+                    return Err(err.into());
                 }
-                if !state.sent_data && state.need_flush {
-                    state.need_flush = false;
-                    if let Err(err) = state.tunnel.flush().await {
-                        warn!("Failed to flush data to VPN: {}", err);
-                        self.state = ConnectionState::Disconnected;
-                        return Err(err.into());
-                    }
+            }
+            if state.unflushed_writes > FLUSH_INTERVAL
+                || (state.unflushed_writes > 0 && send_data.is_none())
+            {
+                if let Err(err) = state.tunnel.flush().await {
+                    warn!("Failed to flush data to VPN: {}", err);
+                    self.state = ConnectionState::Disconnected;
+                    return Err(err.into());
                 }
-                state.sent_data = false;
             }
         }
         Ok(())
