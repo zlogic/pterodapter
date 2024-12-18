@@ -8,7 +8,7 @@ use std::{
 use log::{debug, info, warn};
 use rand::Rng;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufStream},
     net::{TcpListener, TcpStream},
     time::{Duration, Instant},
 };
@@ -203,7 +203,7 @@ impl FortiVPNTunnel {
 
         let socket = TcpStream::connect(&hostport).await?;
         let socket = connector.connect(dnsname, socket).await?;
-        Ok(BufReader::new(socket))
+        Ok(BufStream::new(socket))
     }
 
     async fn request_vpn_allocation(
@@ -550,13 +550,6 @@ impl FortiVPNTunnel {
         ppp_header
     }
 
-    pub fn write_ipv4_packet(src: &[u8], dest: &mut [u8]) -> usize {
-        let ppp_header = Self::write_ppp_header(ppp::Protocol::IPV4, src.len());
-        dest[..ppp_header.len()].copy_from_slice(&ppp_header);
-        dest[ppp_header.len()..ppp_header.len() + src.len()].copy_from_slice(src);
-        ppp_header.len() + src.len()
-    }
-
     async fn send_ppp_packet(
         socket: &mut BufTlsStream,
         protocol: ppp::Protocol,
@@ -617,6 +610,9 @@ impl FortiVPNTunnel {
     }
 
     pub async fn write_data(&mut self, data: &[u8]) -> Result<(), FortiError> {
+        let ppp_header = Self::write_ppp_header(ppp::Protocol::IPV4, data.len());
+
+        self.socket.write_all(&ppp_header).await?;
         Ok(self.socket.write_all(data).await?)
     }
 
@@ -879,7 +875,7 @@ impl PPPState {
     }
 }
 
-type BufTlsStream = BufReader<tokio_rustls::client::TlsStream<TcpStream>>;
+type BufTlsStream = BufStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 #[derive(Debug)]
 pub enum FortiError {
