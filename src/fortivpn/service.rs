@@ -43,7 +43,7 @@ impl FortiService {
         Ok(FortiVPNTunnel::new(&config, sslvpn_cookie).await?)
     }
 
-    pub async fn wait_event<'a>(&mut self, buf: &'a mut [u8]) -> Result<(), VpnServiceError> {
+    pub async fn wait_event(&mut self, buf: &mut [u8]) -> Result<(), VpnServiceError> {
         use std::future::{self, Future};
         use std::pin::pin;
         use std::task::Poll;
