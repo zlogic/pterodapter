@@ -293,9 +293,9 @@ impl Network<'_> {
                 let tx_buffer = tcp::SocketBuffer::new(vec![0; WRITE_BUFFER_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
-                let mut local_port = rand::thread_rng().gen_range(49152..=65535);
+                let mut local_port = rand::rng().random_range(49152..=65535);
                 while !self.port_acceptable(&addr, local_port) {
-                    local_port = rand::thread_rng().gen_range(49152..=65535);
+                    local_port = rand::rng().random_range(49152..=65535);
                 }
                 let remote_addr = wire::IpAddress::from(addr.ip());
                 if let Err(err) = socket.connect(

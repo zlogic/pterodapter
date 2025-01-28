@@ -724,13 +724,13 @@ impl Sessions {
             session::ReservedSpi::new(self.next_sa_index)
         };
         while reserved_spi.needs_ike() {
-            let next_id = rand::thread_rng().gen::<u64>();
+            let next_id = rand::rng().random::<u64>();
             if !self.sessions.keys().any(|key| key.local_spi() == next_id) {
                 reserved_spi.add_ike(next_id);
             }
         }
         while reserved_spi.needs_esp() {
-            let next_id = rand::thread_rng().gen::<u32>();
+            let next_id = rand::rng().random::<u32>();
             if (0..255).contains(&next_id) {
                 // RFC 9333, section 3 states these SPI values are reserved and should not be used.
                 continue;

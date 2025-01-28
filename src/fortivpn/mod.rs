@@ -280,7 +280,7 @@ impl FortiVPNTunnel {
         let mut req = [0u8; 20];
         let mut resp = [0u8; 200];
         let identifier = 1;
-        let magic = rand::thread_rng().gen::<u32>();
+        let magic = rand::rng().random::<u32>();
         let opts = [
             ppp::LcpOptionData::MaximumReceiveUnit(mtu),
             ppp::LcpOptionData::MagicNumber(magic),

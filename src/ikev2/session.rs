@@ -213,7 +213,7 @@ impl IKEv2Session {
         }
         let next_retransmission = 3000 * self.request_retransmit as u64;
         let jitter = next_retransmission * 15 / 100;
-        let next_delay = rand::thread_rng().gen_range(
+        let next_delay = rand::rng().random_range(
             next_retransmission.saturating_sub(jitter)..=next_retransmission.saturating_add(jitter),
         );
         NextRetransmission::Delay(time::Duration::from_millis(next_delay))
@@ -618,7 +618,7 @@ impl IKEv2Session {
                     };
                     let mut nonce_local = [0u8; MAX_NONCE];
                     let nonce_local = &mut nonce_local[..nonce_remote.len()];
-                    rand::thread_rng().fill(nonce_local);
+                    rand::rng().fill(nonce_local);
                     nonce_responder = {
                         let mut nonce_responder = vec![0; nonce_local.len()];
                         nonce_responder.copy_from_slice(nonce_local);
@@ -1344,7 +1344,7 @@ impl IKEv2Session {
                     };
                     let mut nonce_local = [0u8; MAX_NONCE];
                     let nonce_local = &mut nonce_local[..nonce_remote.len()];
-                    rand::thread_rng().fill(nonce_local);
+                    rand::rng().fill(nonce_local);
                     nonce_responder = {
                         let mut nonce_responder = vec![0; nonce_local.len()];
                         nonce_responder.copy_from_slice(nonce_local);
