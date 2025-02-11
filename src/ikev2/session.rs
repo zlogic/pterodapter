@@ -656,7 +656,7 @@ impl IKEv2Session {
                         continue;
                     };
                     let skeyseed = prf_transform.prf(shared_secret.as_slice());
-                    let prf_transform = match params.create_prf(skeyseed.as_slice()) {
+                    let prf_transform = match params.create_prf_plus(skeyseed.as_slice()) {
                         Ok(prf) => prf,
                         Err(err) => {
                             warn!("Failed to init PRF transform for keying material: {}", err);
