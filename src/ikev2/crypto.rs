@@ -56,6 +56,16 @@ impl TransformParameters {
         )
     }
 
+    pub fn create_prf_plus(&self, key: &[u8]) -> Result<PseudorandomTransformPlus, InitError> {
+        PseudorandomTransformPlus::init(
+            self.prf
+                .as_ref()
+                .ok_or("PRF not configured")?
+                .transform_type,
+            key,
+        )
+    }
+
     pub fn protocol_id(&self) -> message::IPSecProtocolID {
         self.protocol_id
     }
@@ -405,9 +415,14 @@ impl DHTransform for DHTransformECP256 {
     }
 }
 
+pub enum PseudorandomTransformPlus {
+    None,
+    HmacSha256(hkdf::Prk),
+}
+
 pub enum PseudorandomTransform {
     None,
-    HmacSha256(hkdf::Prk, Box<hmac::Key>),
+    HmacSha256(Box<hmac::Key>),
 }
 
 impl PseudorandomTransform {
@@ -417,9 +432,8 @@ impl PseudorandomTransform {
     ) -> Result<PseudorandomTransform, InitError> {
         match transform_type {
             message::TransformType::PRF_HMAC_SHA2_256 => {
-                let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, key);
                 let key = hmac::Key::new(hmac::HMAC_SHA256, key);
-                Ok(Self::HmacSha256(prk, Box::new(key)))
+                Ok(Self::HmacSha256(Box::new(key)))
             }
             _ => Err("Unsupported PRF".into()),
         }
@@ -427,7 +441,7 @@ impl PseudorandomTransform {
 
     pub fn prf(&self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
         match self {
-            Self::HmacSha256(_, ref key) => {
+            Self::HmacSha256(ref key) => {
                 let tag = hmac::sign(key, data);
                 let mut result = Array::new(self.key_length());
                 result.as_mut_slice().copy_from_slice(tag.as_ref());
@@ -437,9 +451,31 @@ impl PseudorandomTransform {
         }
     }
 
+    fn key_length(&self) -> usize {
+        match self {
+            Self::HmacSha256(_) => 256 / 8,
+            Self::None => 0,
+        }
+    }
+}
+
+impl PseudorandomTransformPlus {
+    fn init(
+        transform_type: message::TransformType,
+        key: &[u8],
+    ) -> Result<PseudorandomTransformPlus, InitError> {
+        match transform_type {
+            message::TransformType::PRF_HMAC_SHA2_256 => {
+                let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, key);
+                Ok(Self::HmacSha256(prk))
+            }
+            _ => Err("Unsupported PRF".into()),
+        }
+    }
+
     fn derive_keys(&self, keys: &mut DerivedKeys, data: &[u8]) -> Result<(), InitError> {
         match self {
-            Self::HmacSha256(ref prk, _) => {
+            Self::HmacSha256(ref prk) => {
                 let info = [data];
                 let length = keys.full_length();
                 let destination_length = length.0;
@@ -466,13 +502,6 @@ impl PseudorandomTransform {
         let mut keys = DerivedKeys::new_ikev2(params);
         self.derive_keys(&mut keys, data)?;
         CryptoStack::new(params, &keys)
-    }
-
-    fn key_length(&self) -> usize {
-        match self {
-            Self::HmacSha256(_, _) => 256 / 8,
-            Self::None => 0,
-        }
     }
 }
 
@@ -628,6 +657,7 @@ impl AuthHmacSha256tr128 {
 
 pub struct CryptoStack {
     prf_child_sa: PseudorandomTransform,
+    prf_plus_child_sa: PseudorandomTransformPlus,
     auth_initiator: Auth,
     auth_responder: Auth,
     enc_initiator: EncryptionType,
@@ -654,6 +684,10 @@ impl CryptoStack {
         let padding = PaddingType::from_transform(params)?;
         Ok(CryptoStack {
             prf_child_sa: PseudorandomTransform::init(prf, &keys.keys[keys.derive.clone()])?,
+            prf_plus_child_sa: PseudorandomTransformPlus::init(
+                prf,
+                &keys.keys[keys.derive.clone()],
+            )?,
             auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
             auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
             enc_initiator: EncryptionType::init(
@@ -683,7 +717,7 @@ impl CryptoStack {
         data: &[u8],
     ) -> Result<CryptoStack, InitError> {
         let mut keys = DerivedKeys::new_esp(params);
-        self.prf_child_sa.derive_keys(&mut keys, data)?;
+        self.prf_plus_child_sa.derive_keys(&mut keys, data)?;
         let enc = params
             .enc
             .as_ref()
@@ -695,6 +729,7 @@ impl CryptoStack {
         let padding = PaddingType::from_transform(params)?;
         Ok(CryptoStack {
             prf_child_sa: PseudorandomTransform::None,
+            prf_plus_child_sa: PseudorandomTransformPlus::None,
             auth_initiator: Auth::init(auth, &keys.keys[keys.auth_initiator.clone()])?,
             auth_responder: Auth::init(auth, &keys.keys[keys.auth_responder.clone()])?,
             enc_initiator: EncryptionType::init(
@@ -718,7 +753,7 @@ impl CryptoStack {
         skeyseed: &[u8],
         prf_key: &[u8],
     ) -> Result<CryptoStack, InitError> {
-        let prf_transform = params.create_prf(skeyseed)?;
+        let prf_transform = params.create_prf_plus(skeyseed)?;
         prf_transform.create_crypto_stack(params, prf_key)
     }
 
