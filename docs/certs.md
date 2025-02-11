@@ -15,7 +15,7 @@ openssl req -new -x509 -key vpn-root.key.pem -out vpn-root.cert.pem -days 730 -s
   -addext "basicConstraints = critical, CA:TRUE" -addext "nameConstraints = critical, permitted;DNS:${SERVER_HOST}, permitted;email:${SERVER_HOST}"
 ```
 
-rustls cannot verify email constraints; appending `;email:${SERVER_HOST}` to `nameConstraints` will fail validation.
+rustls cannot verify email constraints; appending `, permitted;email:${SERVER_HOST}` to `nameConstraints` will fail validation.
 
 To import root CA in Windows, rename `vpn-root.cert.pem` to `vpn-root.cert.crt` and import it into the machine's _Trusted Root Certification Authorities_.
 Although importing a PFX bundle would import both the root and client certs into the right keystore.
