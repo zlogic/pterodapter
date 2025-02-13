@@ -23,6 +23,7 @@ use crate::fortivpn::{self, service::FortiService};
 
 mod crypto;
 mod esp;
+mod ip;
 mod message;
 mod pki;
 mod session;
@@ -36,6 +37,8 @@ const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 
 const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+pub type IpCidr = ip::Cidr;
+
 pub struct Config {
     pub port: u16,
     pub nat_port: u16,
@@ -44,6 +47,7 @@ pub struct Config {
     pub root_ca: Option<String>,
     pub server_cert: Option<(String, String)>,
     pub tunnel_domains: Vec<String>,
+    pub rnat_cidr: Option<ip::Cidr>,
 }
 
 pub struct Server {
@@ -1031,7 +1035,7 @@ impl Sessions {
                 remote_addr,
                 decrypted_slice
             );
-            let hdr = esp::IpHeader::from_packet(decrypted_slice)?;
+            let hdr = ip::IpHeader::from_packet(decrypted_slice)?;
             trace!("IP header {}", hdr);
             if !sa.accepts_esp_to_vpn(&hdr) {
                 debug!("ESP packet {} dropped by traffic selector", hdr);
@@ -1062,7 +1066,7 @@ impl Sessions {
         if buf.filled().is_empty() {
             return Ok(());
         }
-        let hdr = match esp::IpHeader::from_packet(buf.filled()) {
+        let hdr = match ip::IpHeader::from_packet(buf.filled()) {
             Ok(hdr) => hdr,
             Err(err) => {
                 warn!(
@@ -1209,6 +1213,7 @@ pub enum IKEv2Error {
     CertError(pki::CertError),
     Session(session::SessionError),
     Esp(esp::EspError),
+    Ip(ip::IpError),
     Forti(fortivpn::service::VpnServiceError),
     SendError(SendError),
     Join(tokio::task::JoinError),
@@ -1224,14 +1229,11 @@ impl fmt::Display for IKEv2Error {
             Self::CertError(ref e) => write!(f, "PKI cert error: {}", e),
             Self::Session(ref e) => write!(f, "IKEv2 session error: {}", e),
             Self::Esp(ref e) => write!(f, "ESP error: {}", e),
-            Self::Forti(ref e) => {
-                write!(f, "VPN error: {}", e)
-            }
+            Self::Ip(ref e) => write!(f, "IP error: {}", e),
+            Self::Forti(ref e) => write!(f, "VPN error: {}", e),
             Self::SendError(ref e) => write!(f, "Send error: {}", e),
             Self::Join(ref e) => write!(f, "Tokio join error: {}", e),
-            Self::Io(ref e) => {
-                write!(f, "IO error: {}", e)
-            }
+            Self::Io(ref e) => write!(f, "IO error: {}", e),
         }
     }
 }
@@ -1245,6 +1247,7 @@ impl error::Error for IKEv2Error {
             Self::CertError(ref err) => Some(err),
             Self::Session(ref err) => Some(err),
             Self::Esp(ref err) => Some(err),
+            Self::Ip(ref err) => Some(err),
             Self::Forti(ref err) => Some(err),
             Self::SendError(ref err) => Some(err),
             Self::Join(ref err) => Some(err),
@@ -1286,6 +1289,12 @@ impl From<session::SessionError> for IKEv2Error {
 impl From<esp::EspError> for IKEv2Error {
     fn from(err: esp::EspError) -> IKEv2Error {
         Self::Esp(err)
+    }
+}
+
+impl From<ip::IpError> for IKEv2Error {
+    fn from(err: ip::IpError) -> IKEv2Error {
+        Self::Ip(err)
     }
 }
 

@@ -58,6 +58,7 @@ Options:\
 \n      --listen-ip=<IP>          Listen IP address, multiple options can be provided [default: ::]\
 \n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --tunnel-domain=<DOMAIN>  (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
+\n      --rnat-cidr=<IP4CIDR>     (Optional) Enable RNAT mode and use the specified IP/CIDR as the internal network, e.g. 192.168.40.0/24\
 \n      --id-hostname=<FQDN>      Hostname for identification [default: pterodapter]\
 \n      --cacert=<FILENAME>       Path to root CA certificate (in PKCS 8 PEM format)\
 \n      --cert=<FILENAME>         Path to public certificate (in PKCS 8 PEM format)\
@@ -93,7 +94,7 @@ impl Args {
             }
         };
 
-        let fail_with_error = |name: &str, value: &str, err: fmt::Arguments| {
+        let fail_with_error = |name: &str, value: &str, err: fmt::Arguments| -> ! {
             eprintln!(
                 "Argument {} has an unsupported value {}: {}",
                 name, value, err
@@ -118,6 +119,7 @@ impl Args {
         let mut root_ca = None;
         let mut private_key = None;
         let mut public_cert = None;
+        let mut rnat_cidr = None;
 
         let tls_config =
             rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -148,10 +150,7 @@ impl Args {
                     "WARN" => log::LevelFilter::Warn,
                     "ERROR" => log::LevelFilter::Error,
                     "OFF" => log::LevelFilter::Off,
-                    _ => {
-                        fail_with_error(name, value, format_args!("Unsupported log level"));
-                        process::exit(2);
-                    }
+                    _ => fail_with_error(name, value, format_args!("Unsupported log level")),
                 };
             } else if action_type == ActionType::Proxy && name == "--listen-address" {
                 match SocketAddr::from_str(value) {
@@ -207,6 +206,41 @@ impl Args {
                         format_args!("Failed to parse NAT port for IKEv2: {}", err),
                     ),
                 };
+            } else if action_type == ActionType::IkeV2 && name == "--rnat-cidr" {
+                let (ip, prefix_len) = if let Some(value) = value.split_once("/") {
+                    value
+                } else {
+                    eprintln!("Failed to parse RNAT CIDR {}", value);
+                    println!("{}", USAGE_INSTRUCTIONS);
+                    process::exit(2);
+                };
+                let ip = match IpAddr::from_str(ip) {
+                    Ok(IpAddr::V4(ip)) => IpAddr::V4(ip),
+                    Ok(IpAddr::V6(_)) => {
+                        fail_with_error(name, value, format_args!("IPv4 CIDRs are not supported"))
+                    }
+                    Err(err) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("Failed to parse RNAT CIDR IP address: {}", err),
+                    ),
+                };
+                let prefix_len = match u8::from_str(prefix_len) {
+                    Ok(prefix) => prefix,
+                    Err(err) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("Failed to parse RNAT CIDR prefix length: {}", err),
+                    ),
+                };
+                if prefix_len > 32 {
+                    fail_with_error(
+                        name,
+                        value,
+                        format_args!("RNAT CIDR prefix length {} is invalid", prefix_len),
+                    );
+                }
+                rnat_cidr = Some(ikev2::IpCidr::new(ip, prefix_len));
             } else if action_type == ActionType::IkeV2 && name == "--id-hostname" {
                 id_hostname = Some(value.into());
             } else if action_type == ActionType::IkeV2 && name == "--cacert" {
@@ -311,6 +345,7 @@ impl Args {
                         root_ca,
                         server_cert,
                         tunnel_domains,
+                        rnat_cidr,
                     };
                     let action = Action::IkeV2(Ikev2Config {
                         ikev2: ikev2_config,
