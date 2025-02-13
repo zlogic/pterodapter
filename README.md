@@ -115,7 +115,7 @@ For containers running in Podman Machine, use `host.containers.internal` instead
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --destination=<hostport> [--tunnel-domain=<domain>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
+pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --destination=<hostport> [--tunnel-domain=<domain>] [--rnat-cidr=<ip4cidr>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
@@ -128,7 +128,17 @@ pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>]
 
 `--destination=<hostport>` specifies the FortiVPN connection address, for example `--destination=fortivpn.example.com:443`.
 
-`--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. Multiple domains can be specified; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN. This is implemented using IKEv2 traffic selectors and works as expected on macOS; Windows seems to have [issues with split routing](https://docs.strongswan.org/docs/5.9/howtos/forwarding.html#_split_tunneling_with_ikev2). To ensure that dynamic IPs are handled correctly, pterodapter will send updated routes (IKEv2 Traffic Selectors) when the client rekeys the session.
+`--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. Multiple domains can be specified; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN.
+This is implemented using IKEv2 traffic selectors and works as expected on macOS; Windows seems to have [issues with split routing](https://docs.strongswan.org/docs/5.9/howtos/forwarding.html#_split_tunneling_with_ikev2).
+To ensure that dynamic IPs are handled correctly, pterodapter will send updated routes (IKEv2 Traffic Selectors) when the client rekeys the session.
+If `--rnat-cidr` is specified, domains are handle as suffixes (e.g. `--tunnel-domain=example.com` will also route traffic to `subdomain.example.com`); otherwise, only full madomain matches will be routed to the VPN.
+
+`--rnat-cidr=<IP4CIDR>` specifies an optional argument indicating that RNAT mode should be enabled, for example `--rnat-cidr=192.168.40.0/24` will create a virtual subnet matching `192.168.40.0`-`192.168.40.255`.
+In RNAT mode, pterodapter will intercept DNS responses and remap external IP addresses to unused addresses on the RNAT subnet.
+This is done only for domains matching a suffix listed in `--tunnel-domain`.
+All IP traffic sent to a remapped address will be sent to the original external address.
+This approach simplifies the routing table (IKEv2 Traffic Selector) to use only one network or traffic selector; it also allows to use domain suffixes and handle DNS updates without reconnecting the client.
+RNAT (Revese NAT) is similar to [NAT hairpinning](https://en.wikipedia.org/wiki/Network_address_translation#NAT_hairpinning) but serves a different purpose.
 
 `--destination=<hostport>` specifies the hostname to send to the client when performing a client handshake. If not specified, will use `pterodapter` as the hostname. Windows refuses to connect if the hostname doesn't match connection settings; macOS prints a warning in the Console.
 
