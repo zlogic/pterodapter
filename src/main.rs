@@ -233,11 +233,14 @@ impl Args {
                         format_args!("Failed to parse RNAT CIDR prefix length: {}", err),
                     ),
                 };
-                if prefix_len > 32 {
+                if prefix_len >= 30 {
                     fail_with_error(
                         name,
                         value,
-                        format_args!("RNAT CIDR prefix length {} is invalid", prefix_len),
+                        format_args!(
+                            "RNAT CIDR prefix length {} should be less than 30",
+                            prefix_len
+                        ),
                     );
                 }
                 rnat_cidr = Some(ikev2::IpCidr::new(ip, prefix_len));
