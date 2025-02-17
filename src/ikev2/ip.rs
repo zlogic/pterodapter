@@ -1,6 +1,7 @@
 use std::{
     error, fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ops::RangeInclusive,
 };
 
 use log::warn;
@@ -184,6 +185,36 @@ pub struct Cidr {
 impl Cidr {
     pub fn new(addr: IpAddr, prefix_len: u8) -> Cidr {
         Cidr { addr, prefix_len }
+    }
+
+    fn addr_mask<D>(&self) -> D
+    where
+        D: std::ops::Shr<D, Output = D>
+            + std::ops::Sub<D, Output = D>
+            + std::ops::Not<Output = D>
+            + From<u8>,
+    {
+        let full_mask = !D::from(0);
+        full_mask >> self.prefix_len.into()
+    }
+
+    pub fn ip_range(&self) -> RangeInclusive<IpAddr> {
+        match self.addr {
+            IpAddr::V4(addr) => {
+                let mask: u32 = self.addr_mask();
+                let start_addr = addr.to_bits() & (!mask);
+                let end_addr = start_addr | mask;
+                IpAddr::V4(Ipv4Addr::from_bits(start_addr))
+                    ..=IpAddr::V4(Ipv4Addr::from_bits(end_addr))
+            }
+            IpAddr::V6(addr) => {
+                let mask: u128 = self.addr_mask();
+                let start_addr = addr.to_bits() & (!mask);
+                let end_addr = start_addr | mask;
+                IpAddr::V6(Ipv6Addr::from_bits(start_addr))
+                    ..=IpAddr::V6(Ipv6Addr::from_bits(end_addr))
+            }
+        }
     }
 }
 

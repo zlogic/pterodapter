@@ -56,6 +56,7 @@ pub struct Server {
     nat_port: u16,
     pki_processing: Arc<pki::PkiProcessing>,
     tunnel_domains: Vec<String>,
+    rnat_cidr: Option<ip::Cidr>,
 }
 
 impl Server {
@@ -74,6 +75,7 @@ impl Server {
             nat_port: config.nat_port,
             pki_processing: Arc::new(pki_processing),
             tunnel_domains: config.tunnel_domains,
+            rnat_cidr: config.rnat_cidr,
         })
     }
 
@@ -97,8 +99,6 @@ impl Server {
         shutdown_receiver: oneshot::Receiver<()>,
     ) -> Result<(), IKEv2Error> {
         let sockets = Sockets::new(&self.listen_ips, self.port, self.nat_port).await?;
-        let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
-        let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
         let vpn_service = FortiService::new(fortivpn_config);
 
         let rt = runtime::Handle::current();
@@ -108,27 +108,40 @@ impl Server {
             CLEANUP_INTERVAL,
             command_sender.clone(),
         ));
-        let routes_sender = command_sender.clone();
-        rt.spawn(async move {
-            let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
-            delay.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-            loop {
-                delay.tick().await;
-                let (tunnel_ips, traffic_selectors) = match split_routes.refresh_addresses().await {
-                    Ok(split_routes) => split_routes,
-                    Err(err) => {
-                        warn!("Failed to refresh IP addresses for split routes: {}", err);
-                        continue;
-                    }
-                };
-                let _ = routes_sender
-                    .send(SessionMessage::UpdateSplitRoutes(
-                        tunnel_ips,
-                        traffic_selectors,
-                    ))
-                    .await;
-            }
-        });
+        let (tunnel_ips, traffic_selectors) = if let Some(cidr) = self.rnat_cidr {
+            let ip_range = cidr.ip_range();
+            println!("Got network {}-{}", ip_range.start(), ip_range.end());
+            // TODO 0.5.0: Generate traffic selectors from CIDR.
+            // + init
+            // TODO 0.5.0: Check real number of IP addresses here (excluding .0);
+            (vec![], vec![])
+        } else {
+            let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
+            let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
+            let routes_sender = command_sender.clone();
+            rt.spawn(async move {
+                let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
+                delay.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                loop {
+                    delay.tick().await;
+                    let (tunnel_ips, traffic_selectors) =
+                        match split_routes.refresh_addresses().await {
+                            Ok(split_routes) => split_routes,
+                            Err(err) => {
+                                warn!("Failed to refresh IP addresses for split routes: {}", err);
+                                continue;
+                            }
+                        };
+                    let _ = routes_sender
+                        .send(SessionMessage::UpdateSplitRoutes(
+                            tunnel_ips,
+                            traffic_selectors,
+                        ))
+                        .await;
+                }
+            });
+            (tunnel_ips, traffic_selectors)
+        };
 
         let sessions = Sessions::new(
             self.pki_processing.clone(),
@@ -245,6 +258,8 @@ impl Server {
                 Some(Err(err)) => warn!("VPN reported an error status: {}", err),
                 None => {}
             }
+            // TODO 0.5.0: get IP configuration from CIDR.
+            // TODO 0.5.0: move all IP configuration (IP + mask + traffic selectors + DNS servers + internal domain) into a single struct.
             let send_slice_to_vpn = match udp_source {
                 Some(Ok(datagram)) => {
                     let mut datagram = datagram.into_datagram(udp_read_buf);
@@ -540,6 +555,7 @@ impl Sessions {
         tunnel_ips: Vec<IpAddr>,
         traffic_selectors: Vec<message::TrafficSelector>,
     ) -> Sessions {
+        // TODO 0.5.0: Add tunnel domains or DNS handler here.
         Sessions {
             pki_processing,
             sockets,
