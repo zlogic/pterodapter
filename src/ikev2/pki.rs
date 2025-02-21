@@ -1,7 +1,7 @@
 use std::{error, fmt, sync::Arc};
 
 use aws_lc_rs::{digest, signature};
-use base64::engine::{general_purpose, Engine as _};
+use base64::engine::{Engine as _, general_purpose};
 use log::warn;
 use tokio_rustls::rustls::{self, pki_types};
 use x509_cert::{der::Decode as _, ext::pkix};
@@ -110,13 +110,11 @@ impl PkiProcessing {
                 Ok((_, pkix::SubjectAltName(subject_alternative_name))) => subject_alternative_name
                     .iter()
                     .filter_map(|general_name| match general_name {
-                        pkix::name::GeneralName::Rfc822Name(ref name) => {
+                        pkix::name::GeneralName::Rfc822Name(name) => {
                             Some(name.as_str().to_string())
                         }
-                        pkix::name::GeneralName::DnsName(ref name) => {
-                            Some(name.as_str().to_string())
-                        }
-                        pkix::name::GeneralName::UniformResourceIdentifier(ref name) => {
+                        pkix::name::GeneralName::DnsName(name) => Some(name.as_str().to_string()),
+                        pkix::name::GeneralName::UniformResourceIdentifier(name) => {
                             Some(name.as_str().to_string())
                         }
                         _ => None,

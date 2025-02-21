@@ -1048,8 +1048,7 @@ impl Sessions {
             let decrypted_slice = sa.handle_esp(datagram.filled_bytes_mut())?;
             trace!(
                 "Decrypted ESP packet from {}\n{:?}",
-                remote_addr,
-                decrypted_slice
+                remote_addr, decrypted_slice
             );
             let hdr = ip::IpHeader::from_packet(decrypted_slice)?;
             trace!("IP header {}", hdr);

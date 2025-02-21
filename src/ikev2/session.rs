@@ -10,8 +10,8 @@ use std::{
     time::{self, Instant},
 };
 
-use super::{crypto, esp, message, pki, SendError};
-use super::{Sockets, MAX_DATAGRAM_SIZE};
+use super::{MAX_DATAGRAM_SIZE, Sockets};
+use super::{SendError, crypto, esp, message, pki};
 
 use crypto::DHTransform;
 
@@ -1721,14 +1721,14 @@ impl IKEv2Session {
                 }
                 Err(err) => {
                     warn!(
-                            "Transmitting {} ID {} for session {} (fragment {} of {}), cannot decode: {:?}",
-                            message_type,
-                            message_id,
-                            session_id,
-                            fragment_number + 1,
-                            total_fragments,
-                            err
-                        );
+                        "Transmitting {} ID {} for session {} (fragment {} of {}), cannot decode: {:?}",
+                        message_type,
+                        message_id,
+                        session_id,
+                        fragment_number + 1,
+                        total_fragments,
+                        err
+                    );
                 }
             }
         } else {
