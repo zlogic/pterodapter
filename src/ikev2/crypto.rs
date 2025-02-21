@@ -326,25 +326,25 @@ impl DHTransformType {
 impl DHTransform for DHTransformType {
     fn read_public_key(&self) -> Array<MAX_DH_KEY_LENGTH> {
         match self {
-            Self::ECP256(ref dh) => dh.read_public_key(),
+            Self::ECP256(dh) => dh.read_public_key(),
         }
     }
 
     fn key_length_bytes(&self) -> usize {
         match self {
-            Self::ECP256(ref dh) => dh.key_length_bytes(),
+            Self::ECP256(dh) => dh.key_length_bytes(),
         }
     }
 
     fn shared_key_length_bytes(&self) -> usize {
         match self {
-            Self::ECP256(ref dh) => dh.shared_key_length_bytes(),
+            Self::ECP256(dh) => dh.shared_key_length_bytes(),
         }
     }
 
     fn group_number(&self) -> u16 {
         match self {
-            Self::ECP256(ref dh) => dh.group_number(),
+            Self::ECP256(dh) => dh.group_number(),
         }
     }
 
@@ -353,7 +353,7 @@ impl DHTransform for DHTransformType {
         other_public_key: &[u8],
     ) -> Result<Array<MAX_DH_KEY_LENGTH>, InitError> {
         match self {
-            Self::ECP256(ref mut dh) => dh.compute_shared_secret(other_public_key),
+            Self::ECP256(dh) => dh.compute_shared_secret(other_public_key),
         }
     }
 }
@@ -441,7 +441,7 @@ impl PseudorandomTransform {
 
     pub fn prf(&self, data: &[u8]) -> Array<MAX_PRF_KEY_LENGTH> {
         match self {
-            Self::HmacSha256(ref key) => {
+            Self::HmacSha256(key) => {
                 let tag = hmac::sign(key, data);
                 let mut result = Array::new(self.key_length());
                 result.as_mut_slice().copy_from_slice(tag.as_ref());
@@ -475,7 +475,7 @@ impl PseudorandomTransformPlus {
 
     fn derive_keys(&self, keys: &mut DerivedKeys, data: &[u8]) -> Result<(), InitError> {
         match self {
-            Self::HmacSha256(ref prk) => {
+            Self::HmacSha256(prk) => {
                 let info = [data];
                 let length = keys.full_length();
                 let destination_length = length.0;
@@ -602,21 +602,21 @@ impl Auth {
 
     pub fn sign(&self, data: &mut [u8]) -> Result<(), CryptoError> {
         match self {
-            Self::HmacSha256tr128(ref auth) => auth.sign(data),
+            Self::HmacSha256tr128(auth) => auth.sign(data),
             Self::None => Ok(()),
         }
     }
 
     pub fn validate(&self, data: &[u8]) -> bool {
         match self {
-            Self::HmacSha256tr128(ref auth) => auth.validate(data),
+            Self::HmacSha256tr128(auth) => auth.validate(data),
             Self::None => true,
         }
     }
 
     pub fn signature_length(&self) -> usize {
         match self {
-            Self::HmacSha256tr128(ref auth) => auth.signature_length(),
+            Self::HmacSha256tr128(auth) => auth.signature_length(),
             Self::None => 0,
         }
     }
@@ -881,7 +881,7 @@ impl EncryptionType {
 
     fn encrypted_payload_length(&self, msg_len: usize) -> usize {
         match self {
-            Self::AesGcm256(ref enc) => enc.encrypted_payload_length(msg_len),
+            Self::AesGcm256(enc) => enc.encrypted_payload_length(msg_len),
         }
     }
 
@@ -892,7 +892,7 @@ impl EncryptionType {
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
         match self {
-            Self::AesGcm256(ref mut enc) => enc.encrypt(data, msg_len, associated_data),
+            Self::AesGcm256(enc) => enc.encrypt(data, msg_len, associated_data),
         }
     }
 
@@ -903,7 +903,7 @@ impl EncryptionType {
         associated_data: &[u8],
     ) -> Result<&'a [u8], CryptoError> {
         match self {
-            Self::AesGcm256(ref dec) => dec.decrypt(data, msg_len, associated_data),
+            Self::AesGcm256(dec) => dec.decrypt(data, msg_len, associated_data),
         }
     }
 }

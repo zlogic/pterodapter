@@ -180,7 +180,7 @@ impl InputMessage<'_> {
 
     fn read_version(&self) -> (u8, u8) {
         let version = self.data[17];
-        let major_version = version >> 4 & 0x0f;
+        let major_version = (version >> 4) & 0x0f;
         let minor_version = version & 0x0f;
         (major_version, minor_version)
     }
