@@ -2,12 +2,16 @@ use std::{error, fmt, net::SocketAddr};
 
 use log::warn;
 
-use super::{crypto, ip, message};
+use super::{
+    crypto,
+    ip::{self, Network},
+    message,
+};
 
 pub type SecurityAssociationID = u32;
 
 pub struct SecurityAssociation {
-    ts_local: Vec<message::TrafficSelector>,
+    network: Network,
     ts_remote: Vec<message::TrafficSelector>,
     local_spi: u32,
     remote_spi: u32,
@@ -22,7 +26,7 @@ pub struct SecurityAssociation {
 
 impl SecurityAssociation {
     pub fn new(
-        local_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
+        local_config: (Network, SocketAddr, u32),
         remote_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
         crypto_stack: crypto::CryptoStack,
         params: &crypto::TransformParameters,
@@ -33,10 +37,10 @@ impl SecurityAssociation {
         } else {
             0
         };
-        let (ts_local, local_addr, local_spi) = local_config;
+        let (network, local_addr, local_spi) = local_config;
         let (ts_remote, remote_addr, remote_spi) = remote_config;
         SecurityAssociation {
-            ts_local,
+            network,
             ts_remote,
             local_spi,
             remote_spi,
@@ -71,13 +75,13 @@ impl SecurityAssociation {
     }
 
     pub fn accepts_esp_to_vpn(&self, hdr: &ip::IpHeader) -> bool {
-        ts_accepts_header(&self.ts_local, hdr, TsCheck::Destination)
+        ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Destination)
             && ts_accepts_header(&self.ts_remote, hdr, TsCheck::Source)
     }
 
     pub fn accepts_vpn_to_esp(&self, hdr: &ip::IpHeader) -> bool {
         ts_accepts_header(&self.ts_remote, hdr, TsCheck::Destination)
-            && ts_accepts_header(&self.ts_local, hdr, TsCheck::Source)
+            && ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Source)
     }
 
     pub fn handle_esp<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
@@ -161,11 +165,6 @@ impl SecurityAssociation {
             }
         }
     }
-}
-
-pub fn ts_accepts(ts: &[message::TrafficSelector], addr: &SocketAddr) -> bool {
-    ts.iter()
-        .any(|ts| ts.addr_range().contains(&addr.ip()) && ts.port_range().contains(&addr.port()))
 }
 
 enum TsCheck {

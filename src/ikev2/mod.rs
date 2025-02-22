@@ -1,3 +1,4 @@
+use ip::Network;
 use log::{debug, info, trace, warn};
 use rand::Rng;
 use std::{
@@ -5,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -111,47 +112,36 @@ impl Server {
             CLEANUP_INTERVAL,
             command_sender.clone(),
         ));
-        let (tunnel_ips, traffic_selectors) = if let Some(cidr) = self.rnat_cidr {
-            let ip_range = cidr.ip_range();
-            println!("Got network {}-{}", ip_range.start(), ip_range.end());
-            // TODO 0.5.0: Generate traffic selectors from CIDR.
-            // + init
+        let network = if let Some(cidr) = self.rnat_cidr {
             // TODO 0.5.0: Check real number of IP addresses here (excluding .0);
-            (vec![], vec![])
+            ip::Network::new(ip::NetworkMode::Rnat(cidr), self.tunnel_domains.clone())?
         } else {
-            let mut split_routes = SplitRouteRegistry::new(self.tunnel_domains.clone());
-            let (tunnel_ips, traffic_selectors) = split_routes.refresh_addresses().await?;
+            let mut network = ip::Network::new(ip::NetworkMode::None, self.tunnel_domains.clone())?;
+            network.refresh_addresses().await?;
             let routes_sender = command_sender.clone();
+            let mut refresh_network = network.clone();
             rt.spawn(async move {
                 let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
                 delay.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
                 loop {
                     delay.tick().await;
-                    let (tunnel_ips, traffic_selectors) =
-                        match split_routes.refresh_addresses().await {
-                            Ok(split_routes) => split_routes,
-                            Err(err) => {
-                                warn!("Failed to refresh IP addresses for split routes: {}", err);
-                                continue;
-                            }
-                        };
+                    if let Err(err) = refresh_network.refresh_addresses().await {
+                        warn!("Failed to refresh IP addresses for split routes: {}", err);
+                        continue;
+                    };
                     let _ = routes_sender
-                        .send(SessionMessage::UpdateSplitRoutes(
-                            tunnel_ips,
-                            traffic_selectors,
-                        ))
+                        .send(SessionMessage::UpdateSplitRoutes(refresh_network.clone()))
                         .await;
                 }
             });
-            (tunnel_ips, traffic_selectors)
+            network
         };
 
         let sessions = Sessions::new(
             self.pki_processing.clone(),
             sockets,
             command_sender.clone(),
-            tunnel_ips,
-            traffic_selectors,
+            network,
         );
         rt.spawn(async move {
             if shutdown_receiver.await.is_ok()
@@ -261,15 +251,14 @@ impl Server {
                 Some(Err(err)) => warn!("VPN reported an error status: {}", err),
                 None => {}
             }
-            // TODO 0.5.0: get IP configuration from CIDR.
-            // TODO 0.5.0: move all IP configuration (IP + mask + traffic selectors + DNS servers + internal domain) into a single struct.
             let send_slice_to_vpn = match udp_source {
                 Some(Ok(datagram)) => {
                     let mut datagram = datagram.into_datagram(udp_read_buf);
                     let remote_addr = datagram.remote_addr;
                     let result = if datagram.is_ikev2() {
+                        sessions.update_ip(vpn_service.ip_configuration());
                         sessions
-                            .process_ikev2_message(&datagram, vpn_service.ip_configuration())
+                            .process_ikev2_message(&datagram)
                             .await
                             .map(|()| None)
                     } else {
@@ -532,15 +521,14 @@ enum SessionMessage {
     DeleteSecurityAssociation(u32),
     RetransmitRequest(session::SessionID, u32),
     CleanupTimer,
-    UpdateSplitRoutes(Vec<IpAddr>, Vec<message::TrafficSelector>),
+    UpdateSplitRoutes(Network),
     Shutdown,
 }
 
 struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Sockets,
-    tunnel_ips: Vec<IpAddr>,
-    traffic_selectors: Vec<message::TrafficSelector>,
+    network: Network,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
     next_sa_index: usize,
@@ -555,15 +543,12 @@ impl Sessions {
         pki_processing: Arc<pki::PkiProcessing>,
         sockets: Sockets,
         command_sender: mpsc::Sender<SessionMessage>,
-        tunnel_ips: Vec<IpAddr>,
-        traffic_selectors: Vec<message::TrafficSelector>,
+        network: Network,
     ) -> Sessions {
-        // TODO 0.5.0: Add tunnel domains or DNS handler here.
         Sessions {
             pki_processing,
             sockets,
-            tunnel_ips,
-            traffic_selectors,
+            network,
             sessions: HashMap::new(),
             next_sa_index: 0,
             security_associations: HashMap::new(),
@@ -601,7 +586,7 @@ impl Sessions {
                 remote_addr,
                 local_addr,
                 self.pki_processing.clone(),
-                &self.traffic_selectors,
+                &self.network,
             )
         });
         session_id
@@ -729,15 +714,26 @@ impl Sessions {
         }
     }
 
-    async fn update_all_split_routes(&mut self) {
+    fn update_all_split_routes(&mut self) {
         for (session_id, session) in self.sessions.iter_mut() {
-            if let Err(err) = session.update_split_routes(&self.tunnel_ips) {
+            if let Err(err) = session.update_split_routes(&self.network) {
                 warn!(
                     "Failed to update split routes for session {}: {}",
                     session_id, err
                 );
             }
         }
+    }
+
+    fn update_ip(&mut self, configuration: Option<(IpAddr, &[IpAddr])>) {
+        let (internal_addr, dns_addrs): (Option<IpAddr>, &[IpAddr]) =
+            if let Some((internal_addr, dns_addrs)) = configuration {
+                (Some(internal_addr), dns_addrs)
+            } else {
+                (None, &[])
+            };
+        self.network
+            .update_ip_configuration(internal_addr, dns_addrs);
     }
 
     fn reserve_session_ids(&mut self) -> session::ReservedSpi {
@@ -775,10 +771,9 @@ impl Sessions {
                 let rt = runtime::Handle::current();
                 self.cleanup(&rt);
             }
-            SessionMessage::UpdateSplitRoutes(tunnel_ips, traffic_selectors) => {
-                self.tunnel_ips = tunnel_ips;
-                self.traffic_selectors = traffic_selectors;
-                self.update_all_split_routes().await;
+            SessionMessage::UpdateSplitRoutes(network) => {
+                self.network = network;
+                self.update_all_split_routes();
             }
             SessionMessage::RetransmitRequest(session_id, message_id) => {
                 self.retransmit_request(session_id, message_id).await;
@@ -792,7 +787,6 @@ impl Sessions {
     async fn process_ikev2_message(
         &mut self,
         datagram: &UdpDatagram<'_>,
-        ip_configuration: Option<(IpAddr, &[IpAddr])>,
     ) -> Result<(), IKEv2Error> {
         let is_nat = datagram.is_non_esp();
         let ikev2_request = message::InputMessage::from_datagram(datagram.filled_bytes(), is_nat)?;
@@ -839,9 +833,7 @@ impl Sessions {
         if ikev2_request.read_exchange_type()? == message::ExchangeType::IKE_AUTH
             && !ikev2_request.read_flags()?.has(message::Flags::RESPONSE)
         {
-            if let Some((client_ip, dns_addrs)) = ip_configuration {
-                session.update_ip(client_ip, dns_addrs.to_vec());
-            }
+            session.update_network(&self.network);
         };
 
         if ikev2_request.read_flags()?.has(message::Flags::RESPONSE) {
@@ -1145,47 +1137,6 @@ impl Sessions {
                 hdr
             );
             Err("No matching Security Associations found for VPN packet".into())
-        }
-    }
-}
-
-struct SplitRouteRegistry {
-    tunnel_domains: Vec<String>,
-}
-
-impl SplitRouteRegistry {
-    fn new(tunnel_domains: Vec<String>) -> SplitRouteRegistry {
-        SplitRouteRegistry { tunnel_domains }
-    }
-
-    async fn refresh_addresses(
-        &mut self,
-    ) -> Result<(Vec<IpAddr>, Vec<message::TrafficSelector>), IKEv2Error> {
-        // Use a predefined port just in case.
-        let addresses = self
-            .tunnel_domains
-            .iter()
-            .map(|domain| tokio::net::lookup_host((domain.clone(), 80)))
-            .collect::<Vec<_>>();
-
-        let mut ip_addresses = vec![];
-        for addrs in addresses.into_iter() {
-            addrs.await?.for_each(|addr| ip_addresses.push(addr.ip()));
-        }
-        if ip_addresses.is_empty() {
-            let full_ts = message::TrafficSelector::from_ip_range(
-                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
-                    ..=IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
-            )?;
-            Ok((ip_addresses, vec![full_ts]))
-        } else {
-            let traffic_selectors = ip_addresses
-                .iter()
-                .map(|ip_address| {
-                    message::TrafficSelector::from_ip_range(*ip_address..=*ip_address)
-                })
-                .collect::<Result<Vec<message::TrafficSelector>, message::FormatError>>()?;
-            Ok((ip_addresses, traffic_selectors))
         }
     }
 }
