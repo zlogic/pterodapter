@@ -1,5 +1,5 @@
 use std::{
-    error, fmt,
+    error, fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::RangeInclusive,
 };
@@ -177,9 +177,16 @@ impl IpHeader {
     }
 }
 
+#[derive(Clone)]
 pub struct Cidr {
     addr: IpAddr,
     prefix_len: u8,
+}
+
+pub enum Netmask {
+    Ipv4Mask(Ipv4Addr),
+    Ipv6Prefix(u8),
+    None,
 }
 
 impl Cidr {
@@ -198,6 +205,13 @@ impl Cidr {
         full_mask >> self.prefix_len.into()
     }
 
+    fn addr_offset(addr: &IpAddr, offset: usize) -> IpAddr {
+        match addr {
+            IpAddr::V4(addr) => IpAddr::V4(Ipv4Addr::from_bits(addr.to_bits() + offset as u32)),
+            IpAddr::V6(addr) => IpAddr::V6(Ipv6Addr::from_bits(addr.to_bits() + offset as u128)),
+        }
+    }
+
     pub fn ip_range(&self) -> RangeInclusive<IpAddr> {
         match self.addr {
             IpAddr::V4(addr) => {
@@ -213,6 +227,150 @@ impl Cidr {
                 let end_addr = start_addr | mask;
                 IpAddr::V6(Ipv6Addr::from_bits(start_addr))
                     ..=IpAddr::V6(Ipv6Addr::from_bits(end_addr))
+            }
+        }
+    }
+
+    fn internal_addr(&self) -> IpAddr {
+        *self.ip_range().start()
+    }
+
+    pub fn netmask(&self) -> Netmask {
+        match &self.addr {
+            IpAddr::V4(_) => {
+                let inv_mask: u32 = self.addr_mask();
+                Netmask::Ipv4Mask(Ipv4Addr::from_bits(!inv_mask))
+            }
+            IpAddr::V6(_) => Netmask::Ipv6Prefix(self.prefix_len),
+        }
+    }
+
+    fn dns_addr(&self) -> IpAddr {
+        Self::addr_offset(self.ip_range().start(), 1)
+    }
+
+    fn traffic_selector(&self) -> Result<message::TrafficSelector, message::FormatError> {
+        message::TrafficSelector::from_ip_range(self.ip_range())
+    }
+}
+
+#[derive(Clone)]
+pub enum NetworkMode {
+    Rnat(Cidr),
+    Direct(IpAddr, Vec<IpAddr>),
+    None,
+}
+
+#[derive(Clone)]
+pub struct Network {
+    mode: NetworkMode,
+    tunnel_domains: Vec<String>,
+    local_ts: Vec<message::TrafficSelector>,
+}
+
+impl Network {
+    pub fn new(mode: NetworkMode, tunnel_domains: Vec<String>) -> Result<Network, IpError> {
+        match mode {
+            NetworkMode::Rnat(ref cidr) => {
+                let traffic_selector = cidr.traffic_selector()?;
+                Ok(Network {
+                    mode,
+                    tunnel_domains,
+                    local_ts: vec![traffic_selector],
+                })
+            }
+            NetworkMode::Direct(_, _) => Ok(Network {
+                mode,
+                tunnel_domains,
+                local_ts: vec![],
+            }),
+            NetworkMode::None => Ok(Network {
+                mode,
+                tunnel_domains,
+                local_ts: vec![Self::full_ts()?],
+            }),
+        }
+    }
+
+    fn full_ts() -> Result<message::TrafficSelector, message::FormatError> {
+        message::TrafficSelector::from_ip_range(
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))..=IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+        )
+    }
+
+    pub async fn refresh_addresses(&mut self) -> Result<(), IpError> {
+        // Use a predefined port just in case.
+        let addresses = self
+            .tunnel_domains
+            .iter()
+            .map(|domain| tokio::net::lookup_host((domain.clone(), 80)))
+            .collect::<Vec<_>>();
+
+        let mut ip_addresses = vec![];
+        for addrs in addresses.into_iter() {
+            addrs.await?.for_each(|addr| ip_addresses.push(addr.ip()));
+        }
+        if ip_addresses.is_empty() {
+            self.local_ts = vec![Self::full_ts()?];
+        } else {
+            self.local_ts = ip_addresses
+                .iter()
+                .map(|ip_address| {
+                    message::TrafficSelector::from_ip_range(*ip_address..=*ip_address)
+                })
+                .collect::<Result<Vec<message::TrafficSelector>, message::FormatError>>()?;
+        }
+        Ok(())
+    }
+
+    pub fn update_ip_configuration(&mut self, internal_addr: Option<IpAddr>, dns_addrs: &[IpAddr]) {
+        match self.mode {
+            NetworkMode::Direct(_, _) | NetworkMode::None => {
+                if let Some(internal_addr) = internal_addr {
+                    self.mode = NetworkMode::Direct(internal_addr, dns_addrs.to_vec());
+                } else {
+                    self.mode = NetworkMode::None;
+                }
+            }
+            NetworkMode::Rnat(_) => {}
+        }
+    }
+
+    pub fn internal_addr(&self) -> Option<IpAddr> {
+        match self.mode {
+            NetworkMode::Rnat(ref cidr) => Some(cidr.internal_addr()),
+            NetworkMode::Direct(ip_addr, _) => Some(ip_addr),
+            NetworkMode::None => None,
+        }
+    }
+
+    pub fn netmask(&self) -> Netmask {
+        match &self.mode {
+            NetworkMode::Rnat(cidr) => cidr.netmask(),
+            NetworkMode::Direct(_, _) | NetworkMode::None => Netmask::None,
+        }
+    }
+
+    pub fn dns_addrs(&self) -> Vec<IpAddr> {
+        match &self.mode {
+            NetworkMode::Rnat(cidr) => vec![cidr.dns_addr()],
+            NetworkMode::Direct(_, dns_addrs) => dns_addrs.clone(),
+            NetworkMode::None => vec![],
+        }
+    }
+
+    pub fn ts_local(&self) -> &[message::TrafficSelector] {
+        &self.local_ts
+    }
+
+    pub fn expand_local_ts(&mut self, new_local_ts: &[message::TrafficSelector]) {
+        for check_ts in new_local_ts {
+            if !self
+                .local_ts
+                .iter()
+                .any(|existing_ts| existing_ts.contains(check_ts))
+            {
+                self.local_ts.push(check_ts.clone());
             }
         }
     }
@@ -241,12 +399,16 @@ impl fmt::Display for IpHeader {
 #[derive(Debug)]
 pub enum IpError {
     Internal(&'static str),
+    Format(message::FormatError),
+    Io(io::Error),
 }
 
 impl fmt::Display for IpError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
+            Self::Format(ref e) => write!(f, "Format error: {}", e),
+            Self::Io(ref e) => write!(f, "IO error: {}", e),
         }
     }
 }
@@ -255,7 +417,21 @@ impl error::Error for IpError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             Self::Internal(_msg) => None,
+            Self::Format(ref err) => Some(err),
+            Self::Io(ref err) => Some(err),
         }
+    }
+}
+
+impl From<message::FormatError> for IpError {
+    fn from(err: message::FormatError) -> IpError {
+        Self::Format(err)
+    }
+}
+
+impl From<io::Error> for IpError {
+    fn from(err: io::Error) -> IpError {
+        Self::Io(err)
     }
 }
 

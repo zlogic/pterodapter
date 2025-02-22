@@ -10,7 +10,7 @@ use std::{
     time::{self, Instant},
 };
 
-use super::{MAX_DATAGRAM_SIZE, Sockets};
+use super::{MAX_DATAGRAM_SIZE, Sockets, ip::Network};
 use super::{SendError, crypto, esp, message, pki};
 
 use crypto::DHTransform;
@@ -123,9 +123,7 @@ pub struct IKEv2Session {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
     state: SessionState,
-    internal_addr: Option<IpAddr>,
-    dns_addrs: Vec<IpAddr>,
-    ts_local: Vec<message::TrafficSelector>,
+    network: Network,
     child_sas: HashSet<ChildSessionID>,
     pki_processing: Arc<pki::PkiProcessing>,
     use_fragmentation: bool,
@@ -150,16 +148,14 @@ impl IKEv2Session {
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
         pki_processing: Arc<pki::PkiProcessing>,
-        ts_local: &[message::TrafficSelector],
+        network: &Network,
     ) -> IKEv2Session {
         IKEv2Session {
             session_id,
             remote_addr,
             local_addr,
             state: SessionState::Empty,
-            internal_addr: None,
-            dns_addrs: vec![],
-            ts_local: ts_local.to_vec(),
+            network: network.clone(),
             child_sas: HashSet::new(),
             pki_processing,
             use_fragmentation: false,
@@ -219,9 +215,8 @@ impl IKEv2Session {
         NextRetransmission::Delay(time::Duration::from_millis(next_delay))
     }
 
-    pub fn update_ip(&mut self, internal_addr: IpAddr, dns_addrs: Vec<IpAddr>) {
-        self.internal_addr = Some(internal_addr);
-        self.dns_addrs = dns_addrs;
+    pub fn update_network(&mut self, network: &Network) {
+        self.network = network.clone();
     }
 
     pub fn process_request(
@@ -1034,7 +1029,7 @@ impl IKEv2Session {
             // TODO: return TS_UNACCEPTABLE notification.
             return Err("No traffic selectors offered by client".into());
         }
-        if !self.ts_local.iter().all(|local_ts| {
+        if !self.network.ts_local().iter().all(|local_ts| {
             ts_local
                 .iter()
                 .any(|client_ts| client_ts.contains(local_ts))
@@ -1042,7 +1037,6 @@ impl IKEv2Session {
             // TODO: return TS_UNACCEPTABLE notification.
             return Err("Failed to narrow traffic selector".into());
         }
-        let ts_local = &self.ts_local;
 
         let local_spi = if let Some(local_spi) = new_ids.take_esp() {
             local_spi
@@ -1127,8 +1121,8 @@ impl IKEv2Session {
         };
 
         if ipv4_address_requested {
-            if let Some(internal_addr) = self.internal_addr {
-                response.write_configuration_payload(internal_addr, &self.dns_addrs)?;
+            if let Some(internal_addr) = self.network.internal_addr() {
+                response.write_configuration_payload(internal_addr, &self.network.dns_addrs())?;
             } else {
                 warn!("No IP address is available, notifying client");
                 response.write_notify_payload(
@@ -1165,10 +1159,10 @@ impl IKEv2Session {
 
         // TODO: will macOS or Windows accept more traffic selectors?
         response.write_traffic_selector_payload(true, &ts_remote)?;
-        response.write_traffic_selector_payload(false, ts_local)?;
+        response.write_traffic_selector_payload(false, self.network.ts_local())?;
 
         let child_sa = esp::SecurityAssociation::new(
-            (ts_local.clone(), local_addr, local_spi),
+            (self.network.clone(), local_addr, local_spi),
             (ts_remote, remote_addr, remote_spi),
             child_crypto_stack,
             &transform_params,
@@ -1394,6 +1388,7 @@ impl IKEv2Session {
                         ts.retain(|ts| {
                             ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
                         });
+                        self.network.expand_local_ts(&ts);
                         ts_local = ts
                     }
                 }
@@ -1531,7 +1526,7 @@ impl IKEv2Session {
                 local_spi,
             });
             let child_sa = esp::SecurityAssociation::new(
-                (ts_local.clone(), self.local_addr, local_spi),
+                (self.network.clone(), self.local_addr, local_spi),
                 (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
@@ -1558,7 +1553,7 @@ impl IKEv2Session {
                 local_spi,
             });
             let child_sa = esp::SecurityAssociation::new(
-                (ts_local.clone(), self.local_addr, local_spi),
+                (self.network.clone(), self.local_addr, local_spi),
                 (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
@@ -1583,10 +1578,8 @@ impl IKEv2Session {
                 session_id,
                 remote_addr: self.remote_addr,
                 local_addr: self.local_addr,
-                dns_addrs: self.dns_addrs.clone(),
                 state: SessionState::Established,
-                internal_addr: self.internal_addr,
-                ts_local: self.ts_local.clone(),
+                network: self.network.clone(),
                 child_sas,
                 pki_processing: self.pki_processing.clone(),
                 use_fragmentation: self.use_fragmentation,
@@ -1621,7 +1614,7 @@ impl IKEv2Session {
 
         if rekey_child_sa.is_some() {
             response.write_traffic_selector_payload(true, &ts_remote)?;
-            response.write_traffic_selector_payload(false, &self.ts_local)?;
+            response.write_traffic_selector_payload(false, self.network.ts_local())?;
         }
         Ok(())
     }
@@ -1684,16 +1677,9 @@ impl IKEv2Session {
         Ok(message_id)
     }
 
-    pub fn update_split_routes(&mut self, tunnel_ips: &[IpAddr]) -> Result<(), SessionError> {
-        for tunnel_ip in tunnel_ips {
-            let addr = SocketAddr::from((*tunnel_ip, 0));
-            if !esp::ts_accepts(&self.ts_local, &addr) {
-                info!("Adding traffic selector for IP {}", tunnel_ip);
-                self.ts_local.push(message::TrafficSelector::from_ip_range(
-                    *tunnel_ip..=*tunnel_ip,
-                )?)
-            }
-        }
+    pub fn update_split_routes(&mut self, updated_network: &Network) -> Result<(), SessionError> {
+        // Only expand TS to keep IP/DNS unchanged, and keep existing routes for cached DNS entries
+        self.network.expand_local_ts(updated_network.ts_local());
         Ok(())
     }
 
