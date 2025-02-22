@@ -1155,8 +1155,7 @@ pub struct CryptoError {
 
 impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.msg)?;
-        Ok(())
+        f.write_str(self.msg)
     }
 }
 
