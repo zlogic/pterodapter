@@ -30,3 +30,19 @@ impl Log for Logger {
 
     fn flush(&self) {}
 }
+
+pub fn fmt_slice_hex(data: &[u8]) -> impl std::fmt::Display {
+    struct HexSlice<'a>(&'a [u8]);
+    impl std::fmt::Display for HexSlice<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for (i, b) in self.0.iter().enumerate() {
+                write!(f, "{:02x}", b)?;
+                if i + 1 < self.0.len() {
+                    write!(f, " ")?;
+                }
+            }
+            Ok(())
+        }
+    }
+    HexSlice(data)
+}

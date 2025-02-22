@@ -19,7 +19,10 @@ use tokio::{
     time,
 };
 
-use crate::fortivpn::{self, service::FortiService};
+use crate::{
+    fortivpn::{self, service::FortiService},
+    logger::fmt_slice_hex,
+};
 
 mod crypto;
 mod esp;
@@ -1034,9 +1037,9 @@ impl Sessions {
             return Ok(None);
         }
         trace!(
-            "Received ESP packet from {}\n{:?}",
+            "Received ESP packet from {}\n{}",
             remote_addr,
-            datagram.filled_bytes()
+            fmt_slice_hex(datagram.filled_bytes())
         );
         if datagram.filled_bytes().len() < 8 {
             return Err("Not enough data in ESP packet".into());
@@ -1047,8 +1050,9 @@ impl Sessions {
         if let Some(sa) = self.security_associations.get_mut(&local_spi) {
             let decrypted_slice = sa.handle_esp(datagram.filled_bytes_mut())?;
             trace!(
-                "Decrypted ESP packet from {}\n{:?}",
-                remote_addr, decrypted_slice
+                "Decrypted ESP packet from {}\n{}",
+                remote_addr,
+                fmt_slice_hex(decrypted_slice)
             );
             let hdr = ip::IpHeader::from_packet(decrypted_slice)?;
             trace!("IP header {}", hdr);
@@ -1085,14 +1089,18 @@ impl Sessions {
             Ok(hdr) => hdr,
             Err(err) => {
                 warn!(
-                    "Failed to read header in IP packet from VPN: {}\n{:?}",
+                    "Failed to read header in IP packet from VPN: {}\n{}",
                     err,
-                    buf.filled(),
+                    fmt_slice_hex(buf.filled()),
                 );
                 return Err("Failed to read header in IP packet from VPN".into());
             }
         };
-        trace!("Received packet from VPN {}\n{:?}", hdr, buf.filled());
+        trace!(
+            "Received packet from VPN {}\n{}",
+            hdr,
+            fmt_slice_hex(buf.filled())
+        );
         // Prefer an active, most recent SA.
         if let Some(sa) = self
             .security_associations
@@ -1120,9 +1128,9 @@ impl Sessions {
             let data_len = buf.filled().len();
             let encrypted_data = sa.handle_vpn(buf.initialized_mut(), data_len)?;
             trace!(
-                "Encrypted VPN packet to {}\n{:?}",
+                "Encrypted VPN packet to {}\n{}",
                 sa.remote_addr(),
-                encrypted_data
+                fmt_slice_hex(encrypted_data)
             );
 
             self.sockets.enqueue_send_datagram(

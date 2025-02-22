@@ -6,6 +6,8 @@ use std::{
 
 use log::{debug, warn};
 
+use crate::logger::fmt_slice_hex;
+
 use super::crypto;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2490,8 +2492,9 @@ impl fmt::Debug for Payload<'_> {
                         };
                         writeln!(
                             f,
-                            "        Attribute {} value {:?}",
-                            attr.attribute_type, attr.data
+                            "        Attribute {} value {}",
+                            attr.attribute_type,
+                            fmt_slice_hex(attr.data)
                         )?;
                     }
                 }
@@ -2499,41 +2502,41 @@ impl fmt::Debug for Payload<'_> {
         } else if let Ok(pl_kex) = self.to_key_exchange() {
             writeln!(
                 f,
-                "    DH Group num {} value {:?}",
+                "    DH Group num {} value {}",
                 pl_kex.read_group_num(),
-                pl_kex.read_value()
+                fmt_slice_hex(pl_kex.read_value())
             )?;
         } else if let Ok(pl_id) = self.to_identification() {
             let identification_type = pl_id.read_identification_type();
             writeln!(
                 f,
-                "    Identification type {} value {:?}",
+                "    Identification type {} value {}",
                 identification_type,
-                pl_id.read_value()
+                fmt_slice_hex(pl_id.read_value())
             )?;
         } else if let Ok(pl_cert) = self.to_certificate() {
             writeln!(
                 f,
-                "    Certificate format {} data {:?}",
+                "    Certificate format {} data {}",
                 pl_cert.encoding(),
-                pl_cert.read_value()
+                fmt_slice_hex(pl_cert.read_value())
             )?;
         } else if let Ok(pl_certreq) = self.to_certificate_request() {
             writeln!(
                 f,
-                "    Certificate request format {} data {:?}",
+                "    Certificate request format {} data {}",
                 pl_certreq.read_encoding(),
-                pl_certreq.read_value()
+                fmt_slice_hex(pl_certreq.read_value())
             )?;
         } else if let Ok(pl_auth) = self.to_authentication() {
             writeln!(
                 f,
-                "    Authentication method {} data {:?}",
+                "    Authentication method {} data {}",
                 pl_auth.read_method(),
-                pl_auth.read_value()
+                fmt_slice_hex(pl_auth.read_value())
             )?;
         } else if let Ok(pl_nonce) = self.to_nonce() {
-            writeln!(f, "    Value {:?}", pl_nonce.read_value(),)?;
+            writeln!(f, "    Value {}", fmt_slice_hex(pl_nonce.read_value()))?;
         } else if let Ok(pl_notify) = self.to_notify() {
             write!(f, "    Notify protocol ID ")?;
             match pl_notify.protocol_id {
@@ -2552,7 +2555,7 @@ impl fmt::Debug for Payload<'_> {
                 }
                 writeln!(f)?;
             } else {
-                writeln!(f, " value {:?}", pl_notify.read_value(),)?;
+                writeln!(f, " value {}", fmt_slice_hex(pl_notify.read_value()))?;
             }
         } else if let Ok(pl_delete) = self.to_delete() {
             write!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
@@ -2592,9 +2595,9 @@ impl fmt::Debug for Payload<'_> {
                 };
                 writeln!(
                     f,
-                    "      Attribute Type {} value {:?}",
+                    "      Attribute Type {} value {}",
                     attr.attribute_type(),
-                    attr.read_value(),
+                    fmt_slice_hex(attr.read_value()),
                 )?;
             }
         } else if let Ok(pl_enc) = self.encrypted_data() {
@@ -2605,9 +2608,9 @@ impl fmt::Debug for Payload<'_> {
                 pl_enc.total_fragments(),
                 pl_enc.next_payload(),
             )?;
-            writeln!(f, "    Data {:?}", pl_enc.encrypted_data())?;
+            writeln!(f, "    Data {}", fmt_slice_hex(pl_enc.encrypted_data()))?;
         } else {
-            writeln!(f, "    Data {:?}", self.data)?;
+            writeln!(f, "    Data {}", fmt_slice_hex(self.data))?;
         }
         Ok(())
     }

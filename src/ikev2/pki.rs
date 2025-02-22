@@ -6,6 +6,8 @@ use log::warn;
 use tokio_rustls::rustls::{self, pki_types};
 use x509_cert::{der::Decode as _, ext::pkix};
 
+use crate::logger::fmt_slice_hex;
+
 use super::message;
 
 pub struct PkiProcessing {
@@ -213,7 +215,10 @@ impl ClientCertificate {
                 }
                 let signature_oid = &signature[1..1 + asn1_length];
                 if signature_oid != ASN1_IDENTIFIDER_ECDSA_WITH_SHA256 {
-                    warn!("Unsupported ASN.1 AlgorithmIdentifier {:?}", signature_oid,);
+                    warn!(
+                        "Unsupported ASN.1 AlgorithmIdentifier {}",
+                        fmt_slice_hex(signature_oid)
+                    );
                     return Err("Unsupported ASN.1 AlgorithmIdentifier".into());
                 }
                 (

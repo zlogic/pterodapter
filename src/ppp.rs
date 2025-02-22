@@ -2,6 +2,8 @@ use std::{error, fmt, net::Ipv4Addr};
 
 use log::debug;
 
+use crate::logger::fmt_slice_hex;
+
 /*
  * PPP constants are defined in https://www.iana.org/assignments/ppp-numbers/ppp-numbers.xhtml
  */
@@ -345,12 +347,10 @@ impl fmt::Display for LcpOptionData<'_> {
             Self::Reserved() => write!(f, "Reserved"),
             Self::MaximumReceiveUnit(mru) => write!(f, "Maximum-Receive-Unit {}", mru),
             Self::AuthenticationProtocol(data) => {
-                write!(f, "Authentication-Protocol ")?;
-                fmt_slice_hex(data, f)
+                write!(f, "Authentication-Protocol {}", fmt_slice_hex(data))
             }
             Self::QualityProtocol(data) => {
-                write!(f, "Quality-Protocol ")?;
-                fmt_slice_hex(data, f)
+                write!(f, "Quality-Protocol {}", fmt_slice_hex(data))
             }
             Self::MagicNumber(magic) => write!(f, "Magic-Number {:08x}", magic),
             Self::ProtocolFieldCompression() => write!(f, "Protocol-Field-Compression"),
@@ -358,8 +358,12 @@ impl fmt::Display for LcpOptionData<'_> {
                 write!(f, "Address-and-Control-Field-Compression")
             }
             Self::Unknown(option_type, data) => {
-                write!(f, "Unknown option type {} data: ", option_type)?;
-                fmt_slice_hex(data, f)
+                write!(
+                    f,
+                    "Unknown option type {} data: {}",
+                    option_type,
+                    fmt_slice_hex(data)
+                )
             }
         }
     }
@@ -565,8 +569,7 @@ impl fmt::Display for IpcpOptionData<'_> {
         match *self {
             Self::IpAddresses() => write!(f, "IP-Addresses"),
             Self::IpCompressionProtocol(data) => {
-                write!(f, "IP-Compression-Protocol ")?;
-                fmt_slice_hex(data, f)
+                write!(f, "IP-Compression-Protocol {}", fmt_slice_hex(data))
             }
             Self::IpAddress(ip) => write!(f, "IP-Address {}", ip),
             Self::PrimaryDns(ip) => write!(f, "Primary DNS Server Address {}", ip),
@@ -638,16 +641,6 @@ pub fn encode_ipcp_config(
     Ok(length)
 }
 
-fn fmt_slice_hex(data: &[u8], f: &mut dyn std::fmt::Write) -> std::fmt::Result {
-    for (i, b) in data.iter().enumerate() {
-        write!(f, "{:02x}", b)?;
-        if i + 1 < data.len() {
-            write!(f, " ")?;
-        }
-    }
-    Ok(())
-}
-
 impl fmt::Display for Packet<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Protocol: {}", self.protocol)?;
@@ -673,8 +666,7 @@ impl fmt::Display for Packet<'_> {
             }
             Ok(())
         } else {
-            write!(f, ", data: ")?;
-            fmt_slice_hex(self.data, f)
+            write!(f, ", data: {}", fmt_slice_hex(self.data))
         }
     }
 }
