@@ -349,6 +349,7 @@ struct NatTable {
     // TODO 0.5.0: create a translate_packet function to rewrite headers & checksum, and modify DNS requests/responses.
     // TODO 0.5.0: use same number of DNS as FortiVPN (e.g. empty), round robin, fallback, reserve fixed DNS range or only use first server?
     // TODO 0.5.0: create a next_addr function to search through address space.
+    // TODO 0.5.0: this should probably be an mpsc service - to keep the same mapping across SAs and sessions.
 }
 
 pub enum IpNetmask {
@@ -413,7 +414,7 @@ impl Cidr {
     }
 
     fn dns_addr(&self) -> Vec<IpAddr> {
-        // TODO 0.5.0: reserve address from NAT block.
+        // TODO 0.5.0: reserve address from NAT block and use same number of addresses as the VPN.
         if let (Some(first), Some(second)) = (self.addresses.addr(0), self.addresses.addr(1)) {
             vec![first, second]
         } else {
@@ -440,13 +441,14 @@ impl Cidr {
 #[derive(Clone)]
 pub enum NetworkMode {
     Rnat(Cidr),
-    Direct(IpAddr, Vec<IpAddr>),
-    None,
+    Direct,
 }
 
 #[derive(Clone)]
 pub struct Network {
     mode: NetworkMode,
+    real_ip: Option<IpAddr>,
+    dns_addrs: Vec<IpAddr>,
     tunnel_domains: Vec<String>,
     tunnel_domains_idna: Vec<Vec<u8>>,
     local_ts: Vec<message::TrafficSelector>,
@@ -459,29 +461,18 @@ impl Network {
             .iter()
             .map(|domain| domain.as_bytes().to_vec())
             .collect::<Vec<_>>();
-        match mode {
-            NetworkMode::Rnat(ref cidr) => {
-                let traffic_selector = cidr.traffic_selector()?;
-                Ok(Network {
-                    mode,
-                    tunnel_domains,
-                    tunnel_domains_idna,
-                    local_ts: vec![traffic_selector],
-                })
-            }
-            NetworkMode::Direct(_, _) => Ok(Network {
-                mode,
-                tunnel_domains,
-                tunnel_domains_idna,
-                local_ts: vec![],
-            }),
-            NetworkMode::None => Ok(Network {
-                mode,
-                tunnel_domains,
-                tunnel_domains_idna,
-                local_ts: vec![Self::full_ts()?],
-            }),
-        }
+        let traffic_selectors = match mode {
+            NetworkMode::Rnat(ref cidr) => vec![cidr.traffic_selector()?],
+            NetworkMode::Direct => vec![],
+        };
+        Ok(Network {
+            mode,
+            real_ip: None,
+            dns_addrs: vec![],
+            tunnel_domains,
+            tunnel_domains_idna,
+            local_ts: traffic_selectors,
+        })
     }
 
     fn full_ts() -> Result<message::TrafficSelector, message::FormatError> {
@@ -516,34 +507,31 @@ impl Network {
     }
 
     pub fn update_ip_configuration(&mut self, internal_addr: Option<IpAddr>, dns_addrs: &[IpAddr]) {
-        match self.mode {
-            NetworkMode::Direct(_, _) | NetworkMode::None => {
-                if let Some(internal_addr) = internal_addr {
-                    self.mode = NetworkMode::Direct(internal_addr, dns_addrs.to_vec());
-                } else {
-                    self.mode = NetworkMode::None;
-                }
-            }
-            NetworkMode::Rnat(_) => {}
-        }
+        self.real_ip = internal_addr;
+        self.dns_addrs = dns_addrs.to_vec();
     }
 
     pub fn ip_netmask(&self) -> IpNetmask {
         match &self.mode {
-            NetworkMode::Rnat(cidr) => cidr.ip_netmask(),
-            NetworkMode::Direct(IpAddr::V4(addr), _) => {
-                IpNetmask::Ipv4Mask(*addr, Ipv4Addr::from_bits(!0u32))
+            NetworkMode::Rnat(cidr) => {
+                if self.real_ip.is_some() {
+                    cidr.ip_netmask()
+                } else {
+                    IpNetmask::None
+                }
             }
-            NetworkMode::Direct(IpAddr::V6(addr), _) => IpNetmask::Ipv6Prefix(*addr, 128),
-            NetworkMode::None => IpNetmask::None,
+            NetworkMode::Direct => match self.real_ip {
+                Some(IpAddr::V4(addr)) => IpNetmask::Ipv4Mask(addr, Ipv4Addr::from_bits(!0u32)),
+                Some(IpAddr::V6(addr)) => IpNetmask::Ipv6Prefix(addr, 128),
+                None => IpNetmask::None,
+            },
         }
     }
 
     pub fn dns_addrs(&self) -> Vec<IpAddr> {
         match &self.mode {
             NetworkMode::Rnat(cidr) => cidr.dns_addr(),
-            NetworkMode::Direct(_, dns_addrs) => dns_addrs.clone(),
-            NetworkMode::None => vec![],
+            NetworkMode::Direct => self.dns_addrs.clone(),
         }
     }
 

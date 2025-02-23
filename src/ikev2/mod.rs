@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -115,7 +115,7 @@ impl Server {
         let network = if let Some(cidr) = self.rnat_cidr {
             ip::Network::new(NetworkMode::Rnat(cidr), self.tunnel_domains.clone())?
         } else {
-            let mut network = Network::new(ip::NetworkMode::None, self.tunnel_domains.clone())?;
+            let mut network = Network::new(NetworkMode::Direct, self.tunnel_domains.clone())?;
             network.refresh_addresses().await?;
             let routes_sender = command_sender.clone();
             let mut refresh_network = network.clone();
@@ -714,13 +714,8 @@ impl Sessions {
     }
 
     fn update_all_split_routes(&mut self) {
-        for (session_id, session) in self.sessions.iter_mut() {
-            if let Err(err) = session.update_split_routes(&self.network) {
-                warn!(
-                    "Failed to update split routes for session {}: {}",
-                    session_id, err
-                );
-            }
+        for (_, session) in self.sessions.iter_mut() {
+            session.update_split_routes(self.network.ts_local())
         }
     }
 
@@ -731,6 +726,12 @@ impl Sessions {
             } else {
                 (None, &[])
             };
+        // TODO 0.5.0: Remove this debug code.
+        let internal_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10)));
+        let dns_addrs = &[
+            IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 10, 10, 2)),
+        ];
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
     }
