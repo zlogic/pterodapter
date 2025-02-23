@@ -528,14 +528,6 @@ impl Network {
         }
     }
 
-    pub fn internal_addr(&self) -> Option<IpAddr> {
-        match self.mode {
-            NetworkMode::Rnat(ref cidr) => cidr.internal_addr(),
-            NetworkMode::Direct(ip_addr, _) => Some(ip_addr),
-            NetworkMode::None => None,
-        }
-    }
-
     pub fn ip_netmask(&self) -> IpNetmask {
         match &self.mode {
             NetworkMode::Rnat(cidr) => cidr.ip_netmask(),

@@ -639,16 +639,6 @@ impl MessageWriter<'_> {
         )?;
         next_payload_slice[0] = ConfigurationType::CFG_REPLY.0;
 
-        // TODO 0.5.0: write the following configuration data if CIDR is in use:
-        // INTERNAL_IP4_SUBNET (IP + netmask, 8 bytes)
-        // INTERNAL_IP4_NETMASK (netmask, 4 bytes)
-        // INTERNAL_IP6_SUBNET (identical to INTERNAL_IP6_ADDRESS)
-        // https://www.rfc-editor.org/rfc/rfc4718.html
-        // https://datatracker.ietf.org/doc/html/rfc7296
-
-        // TODO 0.5.0: if request has INTERNAL_DNS_DOMAIN request, send back all tunnel domains
-        // https://datatracker.ietf.org/doc/html/rfc8598
-
         // Write IP address.
         let mut data = &mut next_payload_slice[4..];
         match ip_netmask {
