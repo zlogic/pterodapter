@@ -128,10 +128,10 @@ pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>]
 
 `--destination=<hostport>` specifies the FortiVPN connection address, for example `--destination=fortivpn.example.com:443`.
 
-`--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. Multiple domains can be specified; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN.
+`--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. To specify multiple domains, add a `--tunnel-domain` argument for each one; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN.
 This is implemented using IKEv2 traffic selectors and works as expected on macOS; Windows seems to have [issues with split routing](https://docs.strongswan.org/docs/5.9/howtos/forwarding.html#_split_tunneling_with_ikev2).
 To ensure that dynamic IPs are handled correctly, pterodapter will send updated routes (IKEv2 Traffic Selectors) when the client rekeys the session.
-If `--rnat-cidr` is specified, domains are handle as suffixes (e.g. `--tunnel-domain=example.com` will also route traffic to `subdomain.example.com`); otherwise, only full madomain matches will be routed to the VPN.
+If `--rnat-cidr` is specified, subdomains will also be tunneled (e.g. `--tunnel-domain=example.com` will also route traffic to `subdomain.example.com`); otherwise (no `--rnat-cidr` is specified), only complete domain matches will be routed to the VPN.
 
 `--rnat-cidr=<IP4CIDR>` specifies an optional argument indicating that RNAT mode should be enabled, for example `--rnat-cidr=192.168.40.0/24` will create a virtual subnet matching `192.168.40.0`-`192.168.40.255`.
 In RNAT mode, pterodapter will intercept DNS responses and remap external IP addresses to unused addresses on the RNAT subnet.
