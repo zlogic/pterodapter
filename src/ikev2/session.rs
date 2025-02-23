@@ -1548,6 +1548,7 @@ impl IKEv2Session {
                 remote_spi,
                 local_spi,
             });
+            // TODO 0.5.0: ensure that the cloned network inherits all NAT tables.
             let child_sa = esp::SecurityAssociation::new(
                 (self.network.clone(), self.local_addr, local_spi),
                 (ts_remote.clone(), self.remote_addr, remote_spi),
@@ -1575,6 +1576,7 @@ impl IKEv2Session {
                 remote_spi,
                 local_spi,
             });
+            // TODO 0.5.0: ensure that the cloned network inherits all NAT tables.
             let child_sa = esp::SecurityAssociation::new(
                 (self.network.clone(), self.local_addr, local_spi),
                 (ts_remote.clone(), self.remote_addr, remote_spi),
@@ -1700,10 +1702,8 @@ impl IKEv2Session {
         Ok(message_id)
     }
 
-    pub fn update_split_routes(&mut self, updated_network: &Network) -> Result<(), SessionError> {
-        // Only expand TS to keep IP/DNS unchanged, and keep existing routes for cached DNS entries
-        self.network.expand_local_ts(updated_network.ts_local());
-        Ok(())
+    pub fn update_split_routes(&mut self, updated_ts_local: &[message::TrafficSelector]) {
+        self.network.expand_local_ts(updated_ts_local)
     }
 
     fn log_fragment_contents(
