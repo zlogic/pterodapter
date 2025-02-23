@@ -215,10 +215,10 @@ impl Args {
                     process::exit(2);
                 };
                 let ip = match IpAddr::from_str(ip) {
-                    Ok(IpAddr::V4(ip)) => IpAddr::V4(ip),
-                    Ok(IpAddr::V6(_)) => {
+                    Ok(IpAddr::V4(_)) => {
                         fail_with_error(name, value, format_args!("IPv4 CIDRs are not supported"))
                     }
+                    Ok(IpAddr::V6(ip)) => IpAddr::V6(ip),
                     Err(err) => fail_with_error(
                         name,
                         value,
