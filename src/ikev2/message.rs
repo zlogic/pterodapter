@@ -617,7 +617,7 @@ impl MessageWriter<'_> {
         tunnel_domains: &[Vec<u8>],
     ) -> Result<(), NotEnoughSpaceError> {
         let addr_length = match ip_netmask {
-            IpNetmask::Ipv4Mask(_, _) => (4 + 4) * 2 + 4 + 8,
+            IpNetmask::Ipv4Mask(_, _) => (4 + 4) * 2,
             IpNetmask::Ipv6Prefix(_, _) => 4 + 17,
             IpNetmask::None => 0,
         };
@@ -657,15 +657,7 @@ impl MessageWriter<'_> {
                 );
                 data[10..12].copy_from_slice(&4u16.to_be_bytes());
                 data[12..16].copy_from_slice(&netmask.octets());
-                data[16..18].copy_from_slice(
-                    &ConfigurationAttributeType::INTERNAL_IP4_SUBNET
-                        .0
-                        .to_be_bytes(),
-                );
-                data[18..20].copy_from_slice(&8u16.to_be_bytes());
-                data[20..24].copy_from_slice(&addr.octets());
-                data[24..28].copy_from_slice(&netmask.octets());
-                data = &mut data[28..];
+                data = &mut data[16..];
             }
             IpNetmask::Ipv6Prefix(addr, prefix) => {
                 data[0..2].copy_from_slice(
