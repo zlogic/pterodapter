@@ -1,4 +1,4 @@
-use ip::Network;
+use ip::{Network, NetworkMode};
 use log::{debug, info, trace, warn};
 use rand::Rng;
 use std::{
@@ -113,10 +113,9 @@ impl Server {
             command_sender.clone(),
         ));
         let network = if let Some(cidr) = self.rnat_cidr {
-            // TODO 0.5.0: Check real number of IP addresses here (excluding .0);
-            ip::Network::new(ip::NetworkMode::Rnat(cidr), self.tunnel_domains.clone())?
+            ip::Network::new(NetworkMode::Rnat(cidr), self.tunnel_domains.clone())?
         } else {
-            let mut network = ip::Network::new(ip::NetworkMode::None, self.tunnel_domains.clone())?;
+            let mut network = Network::new(ip::NetworkMode::None, self.tunnel_domains.clone())?;
             network.refresh_addresses().await?;
             let routes_sender = command_sender.clone();
             let mut refresh_network = network.clone();
