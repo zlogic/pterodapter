@@ -8,7 +8,7 @@ use log::{debug, warn};
 
 use crate::logger::fmt_slice_hex;
 
-use super::crypto;
+use super::{crypto, ip::IpNetmask};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ExchangeType(u8);
@@ -612,12 +612,14 @@ impl MessageWriter<'_> {
 
     pub fn write_configuration_payload(
         &mut self,
-        addr: IpAddr,
+        ip_netmask: IpNetmask,
         dns: &[IpAddr],
+        tunnel_domains: &[Vec<u8>],
     ) -> Result<(), NotEnoughSpaceError> {
-        let addr_length = match addr {
-            IpAddr::V4(_) => (4 + 4) * 2,
-            IpAddr::V6(_) => 4 + 17,
+        let addr_length = match ip_netmask {
+            IpNetmask::Ipv4Mask(_, _) => (4 + 4) * 2,
+            IpNetmask::Ipv6Prefix(_, _) => 4 + 17,
+            IpNetmask::None => 0,
         };
         let dns_length = dns
             .iter()
@@ -626,20 +628,31 @@ impl MessageWriter<'_> {
                 IpAddr::V6(_) => 4 + 16,
             })
             .sum::<usize>();
+        let internal_dns_domain_length = tunnel_domains
+            .iter()
+            .map(|domain| 4 + domain.len())
+            .sum::<usize>();
 
-        let next_payload_slice =
-            self.next_payload_slice(PayloadType::CONFIGURATION, 4 + addr_length + dns_length)?;
+        let next_payload_slice = self.next_payload_slice(
+            PayloadType::CONFIGURATION,
+            4 + addr_length + dns_length + internal_dns_domain_length,
+        )?;
         next_payload_slice[0] = ConfigurationType::CFG_REPLY.0;
 
         // TODO 0.5.0: write the following configuration data if CIDR is in use:
         // INTERNAL_IP4_SUBNET (IP + netmask, 8 bytes)
         // INTERNAL_IP4_NETMASK (netmask, 4 bytes)
         // INTERNAL_IP6_SUBNET (identical to INTERNAL_IP6_ADDRESS)
+        // https://www.rfc-editor.org/rfc/rfc4718.html
+        // https://datatracker.ietf.org/doc/html/rfc7296
+
+        // TODO 0.5.0: if request has INTERNAL_DNS_DOMAIN request, send back all tunnel domains
+        // https://datatracker.ietf.org/doc/html/rfc8598
 
         // Write IP address.
         let mut data = &mut next_payload_slice[4..];
-        match addr {
-            IpAddr::V4(addr) => {
+        match ip_netmask {
+            IpNetmask::Ipv4Mask(addr, netmask) => {
                 data[0..2].copy_from_slice(
                     &ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
                         .0
@@ -647,17 +660,16 @@ impl MessageWriter<'_> {
                 );
                 data[2..4].copy_from_slice(&4u16.to_be_bytes());
                 data[4..8].copy_from_slice(&addr.octets());
-                // Assume only current address can be reached.
                 data[8..10].copy_from_slice(
                     &ConfigurationAttributeType::INTERNAL_IP4_NETMASK
                         .0
                         .to_be_bytes(),
                 );
                 data[10..12].copy_from_slice(&4u16.to_be_bytes());
-                data[12..16].fill_with(|| 255);
+                data[12..16].copy_from_slice(&netmask.octets());
                 data = &mut data[16..];
             }
-            IpAddr::V6(addr) => {
+            IpNetmask::Ipv6Prefix(addr, prefix) => {
                 data[0..2].copy_from_slice(
                     &ConfigurationAttributeType::INTERNAL_IP6_ADDRESS
                         .0
@@ -665,10 +677,10 @@ impl MessageWriter<'_> {
                 );
                 data[2..4].copy_from_slice(&17u16.to_be_bytes());
                 data[4..20].copy_from_slice(&addr.octets());
-                // Assume only current address can be reached.
-                data[20] = 128;
+                data[20] = prefix;
                 data = &mut data[21..];
             }
+            IpNetmask::None => {}
         };
         // Write all DNS servers.
         for addr in dns {
@@ -690,6 +702,18 @@ impl MessageWriter<'_> {
                     data = &mut data[20..];
                 }
             }
+        }
+
+        // Write all internal domains to have split DNS in macOS (RFC 8598).
+        for domain in tunnel_domains {
+            data[0..2].copy_from_slice(
+                &ConfigurationAttributeType::INTERNAL_DNS_DOMAIN
+                    .0
+                    .to_be_bytes(),
+            );
+            data[2..4].copy_from_slice(&(domain.len() as u16).to_be_bytes());
+            data[4..4 + domain.len()].copy_from_slice(domain);
+            data = &mut data[4 + domain.len()..];
         }
 
         Ok(())

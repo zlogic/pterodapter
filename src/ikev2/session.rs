@@ -10,7 +10,10 @@ use std::{
     time::{self, Instant},
 };
 
-use super::{MAX_DATAGRAM_SIZE, Sockets, ip::Network};
+use super::{
+    MAX_DATAGRAM_SIZE, Sockets,
+    ip::{IpNetmask, Network},
+};
 use super::{SendError, crypto, esp, message, pki};
 
 use crypto::DHTransform;
@@ -835,6 +838,7 @@ impl IKEv2Session {
         let mut ts_remote = vec![];
         let mut ts_local = vec![];
         let mut ipv4_address_requested = false;
+        let mut internal_domain_requested = false;
         let mut initial_contact = false;
 
         for payload in request.iter_payloads() {
@@ -966,18 +970,25 @@ impl IKEv2Session {
                     }
                 }
                 message::PayloadType::CONFIGURATION => {
-                    ipv4_address_requested =
-                        payload.to_configuration()?.iter_attributes().any(|attr| {
-                            let attr = match attr {
-                                Ok(attr) => attr,
-                                Err(err) => {
-                                    warn!("Failed to decode configuration attribute: {}", err);
-                                    return false;
+                    payload
+                        .to_configuration()?
+                        .iter_attributes()
+                        .try_for_each(|attr| {
+                            let attr = attr.map_err(|err| {
+                                warn!("Failed to decode configuration attribute: {}", err);
+                                err
+                            })?;
+                            match attr.attribute_type() {
+                                message::ConfigurationAttributeType::INTERNAL_IP4_ADDRESS => {
+                                    ipv4_address_requested = true
                                 }
-                            };
-                            attr.attribute_type()
-                                == message::ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
-                        })
+                                message::ConfigurationAttributeType::INTERNAL_DNS_DOMAIN => {
+                                    internal_domain_requested = true
+                                }
+                                _ => {}
+                            }
+                            Ok::<_, SessionError>(())
+                        })?;
                 }
                 _ => {
                     if payload.is_critical() {
@@ -1121,16 +1132,28 @@ impl IKEv2Session {
         };
 
         if ipv4_address_requested {
-            if let Some(internal_addr) = self.network.internal_addr() {
-                response.write_configuration_payload(internal_addr, &self.network.dns_addrs())?;
+            let ip_netmask = self.network.ip_netmask();
+            let tunnel_domains = if internal_domain_requested {
+                self.network.tunnel_domains()
             } else {
-                warn!("No IP address is available, notifying client");
-                response.write_notify_payload(
-                    None,
-                    &[],
-                    message::NotifyMessageType::INTERNAL_ADDRESS_FAILURE,
-                    &[],
-                )?;
+                &[]
+            };
+            match ip_netmask {
+                IpNetmask::Ipv4Mask(_, _) | IpNetmask::Ipv6Prefix(_, _) => response
+                    .write_configuration_payload(
+                        ip_netmask,
+                        &self.network.dns_addrs(),
+                        tunnel_domains,
+                    )?,
+                IpNetmask::None => {
+                    warn!("No IP address is available, notifying client");
+                    response.write_notify_payload(
+                        None,
+                        &[],
+                        message::NotifyMessageType::INTERNAL_ADDRESS_FAILURE,
+                        &[],
+                    )?;
+                }
             }
         }
 

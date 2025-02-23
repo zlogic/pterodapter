@@ -233,17 +233,26 @@ impl Args {
                         format_args!("Failed to parse RNAT CIDR prefix length: {}", err),
                     ),
                 };
-                if prefix_len >= 30 {
+                let cidr = match ikev2::IpCidr::new(ip, prefix_len) {
+                    Ok(cidr) => cidr,
+                    Err(err) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("Failed to create RNAT CIDR: {}", err),
+                    ),
+                };
+                let valid_address_count = cidr.valid_address_count();
+                if valid_address_count < 4 {
                     fail_with_error(
                         name,
                         value,
                         format_args!(
-                            "RNAT CIDR prefix length {} should be less than 30",
-                            prefix_len
+                            "RNAT CIDR doesn't have enough available addresses (should be at least 4): {}",
+                            valid_address_count
                         ),
                     );
                 }
-                rnat_cidr = Some(ikev2::IpCidr::new(ip, prefix_len));
+                rnat_cidr = Some(cidr);
             } else if action_type == ActionType::IkeV2 && name == "--id-hostname" {
                 id_hostname = Some(value.into());
             } else if action_type == ActionType::IkeV2 && name == "--cacert" {
