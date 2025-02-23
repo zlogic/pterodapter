@@ -543,6 +543,13 @@ impl Network {
         &self.tunnel_domains_idna
     }
 
+    pub fn traffic_selector_type(&self) -> message::TrafficSelectorType {
+        match &self.mode {
+            NetworkMode::Rnat(_) => message::TrafficSelectorType::TS_IPV6_ADDR_RANGE,
+            NetworkMode::Direct => message::TrafficSelectorType::TS_IPV4_ADDR_RANGE,
+        }
+    }
+
     pub fn expand_local_ts(&mut self, new_local_ts: &[message::TrafficSelector]) {
         for check_ts in new_local_ts {
             if !self

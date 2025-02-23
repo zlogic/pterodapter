@@ -946,10 +946,9 @@ impl IKEv2Session {
                             warn!("Failed to decode initiator traffic selectors: {}", err);
                             err
                         });
+                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| {
-                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
-                        });
+                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
                         ts_remote = ts
                     }
                 }
@@ -962,10 +961,9 @@ impl IKEv2Session {
                             warn!("Failed to decode responder traffic selectors: {}", err);
                             err
                         });
+                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| {
-                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
-                        });
+                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
                         ts_local = ts
                     }
                 }

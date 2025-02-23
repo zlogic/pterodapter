@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -727,10 +727,10 @@ impl Sessions {
                 (None, &[])
             };
         // TODO 0.5.0: Remove this debug code.
-        let internal_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10)));
+        let internal_addr = Some(IpAddr::V6(Ipv6Addr::new(64, 0, 0, 0, 0, 0, 0, 3)));
         let dns_addrs = &[
-            IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)),
-            IpAddr::V4(Ipv4Addr::new(10, 10, 10, 2)),
+            IpAddr::V6(Ipv6Addr::new(64, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(64, 0, 0, 0, 0, 0, 0, 2)),
         ];
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
