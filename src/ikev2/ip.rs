@@ -347,7 +347,7 @@ struct NatTable {
     global_to_local: HashMap<IpAddr, IpAddr>,
     ttl: HashMap<IpAddr, Instant>,
     // TODO 0.5.0: create a translate_packet function to rewrite headers & checksum, and modify DNS requests/responses.
-    // TODO 0.5.0: use same number of DNS as FortiVPN (e.g. empty), round robin, fallback, reserve fixed DNS range or only use first server?
+    // TODO 0.5.0: permanently allocate IPs for all real DNS servers. Disconnections will close IKEv2 sessions, so they're safe to share/reuse.
     // TODO 0.5.0: create a next_addr function to search through address space.
     // TODO 0.5.0: this should probably be an mpsc service - to keep the same mapping across SAs and sessions.
 }
