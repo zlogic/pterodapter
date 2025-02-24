@@ -1,4 +1,4 @@
-use ip::{Network, NetworkMode};
+use ip::{Nat64Prefix, Network};
 use log::{debug, info, trace, warn};
 use rand::Rng;
 use std::{
@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -41,8 +41,6 @@ const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 
 const SPLIT_TUNNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-pub type IpCidr = ip::Cidr;
-
 pub struct Config {
     pub port: u16,
     pub nat_port: u16,
@@ -51,7 +49,7 @@ pub struct Config {
     pub root_ca: Option<String>,
     pub server_cert: Option<(String, String)>,
     pub tunnel_domains: Vec<String>,
-    pub rnat_cidr: Option<ip::Cidr>,
+    pub nat64_prefix: Option<Ipv6Addr>,
 }
 
 pub struct Server {
@@ -60,7 +58,7 @@ pub struct Server {
     nat_port: u16,
     pki_processing: Arc<pki::PkiProcessing>,
     tunnel_domains: Vec<String>,
-    rnat_cidr: Option<ip::Cidr>,
+    nat64_prefix: Option<Nat64Prefix>,
 }
 
 impl Server {
@@ -79,7 +77,7 @@ impl Server {
             nat_port: config.nat_port,
             pki_processing: Arc::new(pki_processing),
             tunnel_domains: config.tunnel_domains,
-            rnat_cidr: config.rnat_cidr,
+            nat64_prefix: config.nat64_prefix.map(Nat64Prefix::new),
         })
     }
 
@@ -112,10 +110,8 @@ impl Server {
             CLEANUP_INTERVAL,
             command_sender.clone(),
         ));
-        let network = if let Some(cidr) = self.rnat_cidr {
-            ip::Network::new(NetworkMode::Rnat(cidr), self.tunnel_domains.clone())?
-        } else {
-            let mut network = Network::new(NetworkMode::Direct, self.tunnel_domains.clone())?;
+        let mut network = ip::Network::new(self.nat64_prefix, self.tunnel_domains.clone())?;
+        if !network.is_nat64() {
             network.refresh_addresses().await?;
             let routes_sender = command_sender.clone();
             let mut refresh_network = network.clone();
@@ -133,7 +129,6 @@ impl Server {
                         .await;
                 }
             });
-            network
         };
 
         let sessions = Sessions::new(
@@ -727,10 +722,10 @@ impl Sessions {
                 (None, &[])
             };
         // TODO 0.5.0: Remove this debug code.
-        let internal_addr = Some(IpAddr::V6(Ipv6Addr::new(64, 0, 0, 0, 0, 0, 0, 3)));
+        let internal_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10)));
         let dns_addrs = &[
-            IpAddr::V6(Ipv6Addr::new(64, 0, 0, 0, 0, 0, 0, 1)),
-            IpAddr::V6(Ipv6Addr::new(64, 0, 0, 0, 0, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         ];
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
