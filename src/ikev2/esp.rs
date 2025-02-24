@@ -2,16 +2,12 @@ use std::{error, fmt, net::SocketAddr};
 
 use log::warn;
 
-use super::{
-    crypto,
-    ip::{self, Network},
-    message,
-};
+use super::{crypto, ip, message};
 
 pub type SecurityAssociationID = u32;
 
 pub struct SecurityAssociation {
-    network: Network,
+    network: ip::Network,
     ts_remote: Vec<message::TrafficSelector>,
     local_spi: u32,
     remote_spi: u32,
@@ -26,7 +22,7 @@ pub struct SecurityAssociation {
 
 impl SecurityAssociation {
     pub fn new(
-        local_config: (Network, SocketAddr, u32),
+        local_config: (ip::Network, SocketAddr, u32),
         remote_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
         crypto_stack: crypto::CryptoStack,
         params: &crypto::TransformParameters,
@@ -179,7 +175,7 @@ fn ts_accepts_header(
 ) -> bool {
     ts.iter().any(|ts| {
         let accepts_procotol = ts.ip_protocol() == message::IPProtocolType::ANY
-            || ts.ip_protocol() == hdr.transport_protocol();
+            || hdr.transport_protocol() == ts.ip_protocol();
         if !accepts_procotol {
             return false;
         }
@@ -198,8 +194,8 @@ fn ts_accepts_header(
             ts.port_range().contains(check_port)
         } else {
             // If no port specified for TCP or UDP, this is an error.
-            hdr.transport_protocol() != message::IPProtocolType::TCP
-                && hdr.transport_protocol() != message::IPProtocolType::UDP
+            hdr.transport_protocol() != ip::TransportProtocolType::TCP
+                && hdr.transport_protocol() != ip::TransportProtocolType::UDP
         }
     })
 }

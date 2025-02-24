@@ -1041,10 +1041,30 @@ impl Sessions {
                 remote_addr,
                 fmt_slice_hex(decrypted_slice)
             );
-            let hdr = ip::IpHeader::from_packet(decrypted_slice)?;
-            trace!("IP header {}", hdr);
-            if !sa.accepts_esp_to_vpn(&hdr) {
-                debug!("ESP packet {} dropped by traffic selector", hdr);
+            let ip_packet = match ip::IpPacket::from_data(decrypted_slice) {
+                Ok(packet) => packet,
+                Err(err) => {
+                    warn!(
+                        "Failed to parse IP packet from ESP: {}\n{}",
+                        err,
+                        fmt_slice_hex(decrypted_slice),
+                    );
+                    return Err("Failed to parse IP packet from ESP".into());
+                }
+            };
+            trace!("Decoded IP packet from ESP {}", ip_packet);
+            let ip_header = match ip_packet.to_header() {
+                Ok(hdr) => hdr,
+                Err(err) => {
+                    warn!(
+                        "Failed to read header in IP packet from ESP: {}\n{}",
+                        err, ip_packet
+                    );
+                    return Err("Failed to read header in IP packet from ESP".into());
+                }
+            };
+            if !sa.accepts_esp_to_vpn(&ip_header) {
+                debug!("ESP packet {} dropped by traffic selector", ip_header);
                 // Microsoft Teams can spam the network with a lot of stray packets.
                 // Don't log an error if the packet is dropped to keep the logs clean on the info
                 // level.
@@ -1072,27 +1092,33 @@ impl Sessions {
         if buf.filled().is_empty() {
             return Ok(());
         }
-        let hdr = match ip::IpHeader::from_packet(buf.filled()) {
+        let ip_packet = match ip::IpPacket::from_data(buf.filled()) {
+            Ok(packet) => packet,
+            Err(err) => {
+                warn!(
+                    "Failed to decode IP packet from VPN: {}\n{}",
+                    err,
+                    fmt_slice_hex(buf.filled()),
+                );
+                return Err("Failed to decode IP packet from VPN".into());
+            }
+        };
+        trace!("Decoded IP packet from VPN {}", ip_packet);
+        let ip_header = match ip_packet.to_header() {
             Ok(hdr) => hdr,
             Err(err) => {
                 warn!(
                     "Failed to read header in IP packet from VPN: {}\n{}",
-                    err,
-                    fmt_slice_hex(buf.filled()),
+                    err, ip_packet
                 );
                 return Err("Failed to read header in IP packet from VPN".into());
             }
         };
-        trace!(
-            "Received packet from VPN {}\n{}",
-            hdr,
-            fmt_slice_hex(buf.filled())
-        );
         // Prefer an active, most recent SA.
         if let Some(sa) = self
             .security_associations
             .values_mut()
-            .filter(|sa| sa.accepts_vpn_to_esp(&hdr))
+            .filter(|sa| sa.accepts_vpn_to_esp(&ip_header))
             .reduce(|a, b| {
                 if a.is_active() && a.index() > b.index() {
                     a
@@ -1129,7 +1155,7 @@ impl Sessions {
         } else {
             debug!(
                 "No matching Security Associations found for VPN packet {}",
-                hdr
+                ip_header
             );
             Err("No matching Security Associations found for VPN packet".into())
         }
