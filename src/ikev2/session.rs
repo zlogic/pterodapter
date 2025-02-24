@@ -1140,7 +1140,7 @@ impl IKEv2Session {
                 IpNetmask::Ipv4Mask(_, _) | IpNetmask::Ipv6Prefix(_, _) => response
                     .write_configuration_payload(
                         ip_netmask,
-                        &self.network.dns_addrs(),
+                        self.network.dns_addrs(),
                         tunnel_domains,
                     )?,
                 IpNetmask::None => {

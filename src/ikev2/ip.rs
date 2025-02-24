@@ -1,9 +1,7 @@
 use std::{
-    collections::HashMap,
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::RangeInclusive,
-    time::Instant,
 };
 
 use log::warn;
@@ -180,176 +178,32 @@ impl IpHeader {
 }
 
 #[derive(Clone)]
-struct AddressRange {
-    full_ip_range: RangeInclusive<IpAddr>,
-    ranges: Vec<(RangeInclusive<IpAddr>, usize)>,
-    address_count: usize,
+pub struct Nat64Prefix {
+    range: RangeInclusive<Ipv6Addr>,
 }
 
-impl AddressRange {
-    fn new(full_ip_range: RangeInclusive<IpAddr>) -> Result<AddressRange, IpError> {
-        let ranges = vec![(full_ip_range.clone(), Self::address_count(&full_ip_range))];
-        let ranges = match (full_ip_range.start(), full_ip_range.end()) {
-            (IpAddr::V4(_), IpAddr::V4(_)) => {
-                // Exclude first and last IP address.
-                let ranges = Self::exclude(ranges, *full_ip_range.start()..=*full_ip_range.start());
-                Ok(Self::exclude(
-                    ranges,
-                    *full_ip_range.end()..=*full_ip_range.end(),
-                ))
-            }
-            (IpAddr::V6(_), IpAddr::V6(_)) => {
-                // Exclude first IP address.
-                // TODO: avoid anycast addresses for IPv6 (the rules are a bit too complex for now).
-                // The minimal size of an IPv6 network is /32.
-                Ok(Self::exclude(
-                    ranges,
-                    *full_ip_range.start()..=*full_ip_range.start(),
-                ))
-            }
-            // This should never happen (range is generated from a single address + prefix length).
-            _ => Err("Address range mixes IPv4 and IPv6 addresses"),
-        }?;
-        let address_count = ranges.iter().map(|(_, address_count)| address_count).sum();
-        Ok(AddressRange {
-            full_ip_range: full_ip_range.clone(),
-            ranges,
-            address_count,
-        })
-    }
-
-    fn next_addr(addr: &IpAddr) -> Option<IpAddr> {
-        match addr {
-            IpAddr::V4(addr) => {
-                if addr < &Ipv4Addr::from_bits(!0u32) {
-                    Some(IpAddr::V4(Ipv4Addr::from_bits(addr.to_bits() + 1)))
-                } else {
-                    None
-                }
-            }
-            IpAddr::V6(addr) => {
-                if addr < &Ipv6Addr::from_bits(!0u128) {
-                    Some(IpAddr::V6(Ipv6Addr::from_bits(addr.to_bits() + 1)))
-                } else {
-                    None
-                }
-            }
+impl Nat64Prefix {
+    pub fn new(prefix: Ipv6Addr) -> Nat64Prefix {
+        let mut start_addr = prefix.octets();
+        let mut end_addr = prefix.octets();
+        start_addr[12..16].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        end_addr[12..16].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        Nat64Prefix {
+            range: start_addr.into()..=end_addr.into(),
         }
     }
 
-    fn prev_addr(addr: &IpAddr) -> Option<IpAddr> {
-        match addr {
-            IpAddr::V4(addr) => {
-                if addr > &Ipv4Addr::from_bits(0u32) {
-                    Some(IpAddr::V4(Ipv4Addr::from_bits(addr.to_bits() - 1)))
-                } else {
-                    None
-                }
-            }
-            IpAddr::V6(addr) => {
-                if addr > &Ipv6Addr::from_bits(0u128) {
-                    Some(IpAddr::V6(Ipv6Addr::from_bits(addr.to_bits() - 1)))
-                } else {
-                    None
-                }
-            }
-        }
+    fn map_ipv4(&self, addr: &Ipv4Addr) -> Ipv6Addr {
+        let mut segments = self.range.start().octets();
+        segments[12..16].copy_from_slice(&addr.octets());
+        segments.into()
     }
 
-    fn exclude(
-        include_ranges: Vec<(RangeInclusive<IpAddr>, usize)>,
-        exclude_range: RangeInclusive<IpAddr>,
-    ) -> Vec<(RangeInclusive<IpAddr>, usize)> {
-        let mut ranges = vec![];
-        for (include_range, address_count) in include_ranges.into_iter() {
-            let mut intersection_found = false;
-            if include_range.contains(exclude_range.start()) {
-                intersection_found = true;
-                // If exclude_range starts at 0, clamp it to 0: the left address range will be
-                // excluded entirely.
-                let include_end =
-                    Self::prev_addr(exclude_range.start()).unwrap_or(*exclude_range.start());
-                if include_range.start() < &include_end {
-                    let range = *include_range.start()..=include_end;
-                    let address_count = Self::address_count(&range);
-                    ranges.push((range, address_count));
-                }
-            }
-            if include_range.contains(exclude_range.end()) {
-                intersection_found = true;
-                // If exclude_range ends with MAX, clamp it to MAX: the right address range will be
-                // excluded entirely.
-                let include_start =
-                    Self::next_addr(exclude_range.end()).unwrap_or(*exclude_range.start());
-                if &include_start < include_range.end() {
-                    let range = include_start..=*include_range.end();
-                    let address_count = Self::address_count(&range);
-                    ranges.push((range, address_count));
-                }
-            }
-            if !intersection_found {
-                ranges.push((include_range, address_count));
-            }
-        }
-        ranges
+    fn traffic_selector(&self) -> Result<message::TrafficSelector, message::FormatError> {
+        message::TrafficSelector::from_ip_range(
+            IpAddr::V6(*self.range.start())..=IpAddr::V6(*self.range.end()),
+        )
     }
-
-    fn address_count(range: &RangeInclusive<IpAddr>) -> usize {
-        match (range.start(), &range.end()) {
-            (IpAddr::V4(start), IpAddr::V4(end)) => {
-                let start = start.to_bits();
-                let end = end.to_bits();
-                if start < end {
-                    (end - start) as usize
-                } else {
-                    0
-                }
-            }
-            (IpAddr::V6(start), IpAddr::V6(end)) => {
-                let start = start.to_bits();
-                let end = end.to_bits();
-                if start < end {
-                    (end - start).min(usize::MAX as u128) as usize
-                } else {
-                    0
-                }
-            }
-            _ => 0,
-        }
-    }
-
-    fn total_address_count(&self) -> usize {
-        self.address_count
-    }
-
-    fn addr(&self, i: usize) -> Option<IpAddr> {
-        let mut skipped_addresses = 0;
-        for (range, count) in self.ranges.iter() {
-            if (skipped_addresses..skipped_addresses + count).contains(&i) {
-                let offset = i - skipped_addresses;
-                return match range.start() {
-                    IpAddr::V4(addr) => Some(IpAddr::V4(Ipv4Addr::from_bits(
-                        addr.to_bits() + offset as u32,
-                    ))),
-                    IpAddr::V6(addr) => Some(IpAddr::V6(Ipv6Addr::from_bits(
-                        addr.to_bits() + offset as u128,
-                    ))),
-                };
-            }
-            skipped_addresses += count;
-        }
-        None
-    }
-}
-
-struct NatTable {
-    local_to_global: HashMap<IpAddr, IpAddr>,
-    global_to_local: HashMap<IpAddr, IpAddr>,
-    ttl: HashMap<IpAddr, Instant>,
-    // TODO 0.5.0: create a translate_packet function to rewrite headers & checksum, and modify DNS requests/responses.
-    // TODO 0.5.0: permanently allocate IPs for all real DNS servers. Disconnections will close IKEv2 sessions, so they're safe to share/reuse.
-    // TODO 0.5.0: create a next_addr function to search through address space.
-    // TODO 0.5.0: this should probably be an mpsc service - to keep the same mapping across SAs and sessions.
 }
 
 pub enum IpNetmask {
@@ -359,94 +213,8 @@ pub enum IpNetmask {
 }
 
 #[derive(Clone)]
-pub struct Cidr {
-    prefix_len: u8,
-    addresses: AddressRange,
-}
-
-impl Cidr {
-    pub fn new(addr: IpAddr, prefix_len: u8) -> Result<Cidr, IpError> {
-        let full_ip_range = Self::full_ip_range(&addr, prefix_len);
-        let addresses = AddressRange::new(full_ip_range)?;
-        Ok(Cidr {
-            prefix_len,
-            addresses,
-        })
-    }
-
-    fn addr_mask<D>(prefix_len: u8) -> D
-    where
-        D: std::ops::Shr<D, Output = D>
-            + std::ops::Sub<D, Output = D>
-            + std::ops::Not<Output = D>
-            + From<u8>,
-    {
-        let full_mask = !D::from(0);
-        full_mask >> prefix_len.into()
-    }
-
-    fn full_ip_range(addr: &IpAddr, prefix_len: u8) -> RangeInclusive<IpAddr> {
-        match addr {
-            IpAddr::V4(addr) => {
-                let mask: u32 = Self::addr_mask(prefix_len);
-                let start_addr = addr.to_bits() & (!mask);
-                let end_addr = start_addr | mask;
-                IpAddr::V4(Ipv4Addr::from_bits(start_addr))
-                    ..=IpAddr::V4(Ipv4Addr::from_bits(end_addr))
-            }
-            IpAddr::V6(addr) => {
-                let mask: u128 = Self::addr_mask(prefix_len);
-                let start_addr = addr.to_bits() & (!mask);
-                let end_addr = start_addr | mask;
-                IpAddr::V6(Ipv6Addr::from_bits(start_addr))
-                    ..=IpAddr::V6(Ipv6Addr::from_bits(end_addr))
-            }
-        }
-    }
-
-    pub fn valid_address_count(&self) -> usize {
-        self.addresses.total_address_count()
-    }
-
-    fn internal_addr(&self) -> Option<IpAddr> {
-        // TODO 0.5.0: reserve address from NAT block.
-        self.addresses.addr(2)
-    }
-
-    fn dns_addr(&self) -> Vec<IpAddr> {
-        // TODO 0.5.0: reserve address from NAT block and use same number of addresses as the VPN.
-        if let (Some(first), Some(second)) = (self.addresses.addr(0), self.addresses.addr(1)) {
-            vec![first, second]
-        } else {
-            vec![]
-        }
-    }
-
-    fn ip_netmask(&self) -> IpNetmask {
-        match self.internal_addr() {
-            Some(IpAddr::V4(addr)) => {
-                let inv_mask: u32 = Self::addr_mask(self.prefix_len);
-                IpNetmask::Ipv4Mask(addr, Ipv4Addr::from_bits(!inv_mask))
-            }
-            Some(IpAddr::V6(addr)) => IpNetmask::Ipv6Prefix(addr, self.prefix_len),
-            None => IpNetmask::None,
-        }
-    }
-
-    fn traffic_selector(&self) -> Result<message::TrafficSelector, message::FormatError> {
-        message::TrafficSelector::from_ip_range(self.addresses.full_ip_range.clone())
-    }
-}
-
-#[derive(Clone)]
-pub enum NetworkMode {
-    Rnat(Cidr),
-    Direct,
-}
-
-#[derive(Clone)]
 pub struct Network {
-    mode: NetworkMode,
+    nat64_prefix: Option<Nat64Prefix>,
     real_ip: Option<IpAddr>,
     dns_addrs: Vec<IpAddr>,
     tunnel_domains: Vec<String>,
@@ -455,18 +223,23 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn new(mode: NetworkMode, tunnel_domains: Vec<String>) -> Result<Network, IpError> {
-        // TODO: convert domains into DNS IDNA A-label format for Unicode strings.
+    pub fn new(
+        nat64_prefix: Option<Nat64Prefix>,
+        tunnel_domains: Vec<String>,
+    ) -> Result<Network, IpError> {
+        // TODO: convert domains into DNS IDNA A-label format for Unicode strings, or
+        // request/validate that this is done by the end user.
         let tunnel_domains_idna = tunnel_domains
             .iter()
             .map(|domain| domain.as_bytes().to_vec())
             .collect::<Vec<_>>();
-        let traffic_selectors = match mode {
-            NetworkMode::Rnat(ref cidr) => vec![cidr.traffic_selector()?],
-            NetworkMode::Direct => vec![],
+        let traffic_selectors = if let Some(nat64_prefix) = &nat64_prefix {
+            vec![nat64_prefix.traffic_selector()?]
+        } else {
+            vec![]
         };
         Ok(Network {
-            mode,
+            nat64_prefix,
             real_ip: None,
             dns_addrs: vec![],
             tunnel_domains,
@@ -506,33 +279,44 @@ impl Network {
         Ok(())
     }
 
+    pub fn is_nat64(&self) -> bool {
+        self.nat64_prefix.is_some()
+    }
+
     pub fn update_ip_configuration(&mut self, internal_addr: Option<IpAddr>, dns_addrs: &[IpAddr]) {
         self.real_ip = internal_addr;
-        self.dns_addrs = dns_addrs.to_vec();
+        if let Some(nat64_prefix) = &self.nat64_prefix {
+            self.dns_addrs = dns_addrs
+                .iter()
+                .map(|dns_addr| match dns_addr {
+                    IpAddr::V4(addr) => IpAddr::V6(nat64_prefix.map_ipv4(addr)),
+                    IpAddr::V6(_) => *dns_addr,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.dns_addrs = dns_addrs.to_vec()
+        }
     }
 
     pub fn ip_netmask(&self) -> IpNetmask {
-        match &self.mode {
-            NetworkMode::Rnat(cidr) => {
-                if self.real_ip.is_some() {
-                    cidr.ip_netmask()
-                } else {
-                    IpNetmask::None
-                }
+        if let Some(nat64_prefix) = &self.nat64_prefix {
+            if let Some(IpAddr::V4(addr)) = &self.real_ip {
+                let addr = nat64_prefix.map_ipv4(addr);
+                IpNetmask::Ipv6Prefix(addr, 96)
+            } else {
+                IpNetmask::None
             }
-            NetworkMode::Direct => match self.real_ip {
+        } else {
+            match self.real_ip {
                 Some(IpAddr::V4(addr)) => IpNetmask::Ipv4Mask(addr, Ipv4Addr::from_bits(!0u32)),
                 Some(IpAddr::V6(addr)) => IpNetmask::Ipv6Prefix(addr, 128),
                 None => IpNetmask::None,
-            },
+            }
         }
     }
 
-    pub fn dns_addrs(&self) -> Vec<IpAddr> {
-        match &self.mode {
-            NetworkMode::Rnat(cidr) => cidr.dns_addr(),
-            NetworkMode::Direct => self.dns_addrs.clone(),
-        }
+    pub fn dns_addrs(&self) -> &[IpAddr] {
+        &self.dns_addrs
     }
 
     pub fn ts_local(&self) -> &[message::TrafficSelector] {
@@ -544,9 +328,13 @@ impl Network {
     }
 
     pub fn traffic_selector_type(&self) -> message::TrafficSelectorType {
-        match &self.mode {
-            NetworkMode::Rnat(_) => message::TrafficSelectorType::TS_IPV6_ADDR_RANGE,
-            NetworkMode::Direct => message::TrafficSelectorType::TS_IPV4_ADDR_RANGE,
+        if self.nat64_prefix.is_some() {
+            message::TrafficSelectorType::TS_IPV6_ADDR_RANGE
+        } else {
+            match &self.real_ip {
+                Some(IpAddr::V6(_)) => message::TrafficSelectorType::TS_IPV6_ADDR_RANGE,
+                Some(IpAddr::V4(_)) | None => message::TrafficSelectorType::TS_IPV4_ADDR_RANGE,
+            }
         }
     }
 
