@@ -78,13 +78,12 @@ impl Protocol {
 impl fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::IPV4 => write!(f, "Internet Protocol version 4")?,
-            Self::IPV6 => write!(f, "Internet Protocol version 6")?,
-            Self::LCP => write!(f, "Link Control Protocol")?,
-            Self::IPV4CP => write!(f, "Internet Protocol Control Protocol")?,
-            _ => write!(f, "Unknown protocol {:04x}", self.0)?,
+            Self::IPV4 => write!(f, "Internet Protocol version 4"),
+            Self::IPV6 => write!(f, "Internet Protocol version 6"),
+            Self::LCP => write!(f, "Link Control Protocol"),
+            Self::IPV4CP => write!(f, "Internet Protocol Control Protocol"),
+            _ => write!(f, "Unknown protocol {:04x}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -188,20 +187,19 @@ impl LcpCode {
 impl fmt::Display for LcpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::CONFIGURE_REQUEST => write!(f, "Configure-Request")?,
-            Self::CONFIGURE_ACK => write!(f, "Configure-Ack")?,
-            Self::CONFIGURE_NAK => write!(f, "Configure-Nak")?,
-            Self::CONFIGURE_REJECT => write!(f, "Configure-Reject")?,
-            Self::TERMINATE_REQUEST => write!(f, "Terminate-Request")?,
-            Self::TERMINATE_ACK => write!(f, "Terminate-Ack")?,
-            Self::CODE_REJECT => write!(f, "Code-Reject")?,
-            Self::PROTOCOL_REJECT => write!(f, "Protocol-Reject")?,
-            Self::ECHO_REQUEST => write!(f, "Echo-Request")?,
-            Self::ECHO_REPLY => write!(f, "Echo-Reply")?,
-            Self::DISCARD_REQUEST => write!(f, "Discard-Request")?,
-            _ => write!(f, "Unknown LCP code {:02x}", self.0)?,
+            Self::CONFIGURE_REQUEST => write!(f, "Configure-Request"),
+            Self::CONFIGURE_ACK => write!(f, "Configure-Ack"),
+            Self::CONFIGURE_NAK => write!(f, "Configure-Nak"),
+            Self::CONFIGURE_REJECT => write!(f, "Configure-Reject"),
+            Self::TERMINATE_REQUEST => write!(f, "Terminate-Request"),
+            Self::TERMINATE_ACK => write!(f, "Terminate-Ack"),
+            Self::CODE_REJECT => write!(f, "Code-Reject"),
+            Self::PROTOCOL_REJECT => write!(f, "Protocol-Reject"),
+            Self::ECHO_REQUEST => write!(f, "Echo-Request"),
+            Self::ECHO_REPLY => write!(f, "Echo-Reply"),
+            Self::DISCARD_REQUEST => write!(f, "Discard-Request"),
+            _ => write!(f, "Unknown LCP code {:02x}", self.0),
         }
-        Ok(())
     }
 }
 

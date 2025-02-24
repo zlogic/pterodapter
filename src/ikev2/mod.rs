@@ -1172,9 +1172,7 @@ impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(ref e) => {
-                write!(f, "IO error: {}", e)
-            }
+            Self::Io(ref e) => write!(f, "IO error: {}", e),
         }
     }
 }
