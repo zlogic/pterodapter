@@ -310,12 +310,8 @@ impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(ref e) => {
-                write!(f, "IO error: {}", e)
-            }
-            Self::Tls(ref e) => {
-                write!(f, "TLS error: {}", e)
-            }
+            Self::Io(ref e) => write!(f, "IO error: {}", e),
+            Self::Tls(ref e) => write!(f, "TLS error: {}", e),
         }
     }
 }

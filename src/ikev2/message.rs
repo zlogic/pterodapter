@@ -32,13 +32,12 @@ impl ExchangeType {
 impl fmt::Display for ExchangeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::IKE_SA_INIT => write!(f, "IKE_SA_INIT")?,
-            Self::IKE_AUTH => write!(f, "IKE_AUTH")?,
-            Self::CREATE_CHILD_SA => write!(f, "CREATE_CHILD_SA")?,
-            Self::INFORMATIONAL => write!(f, "INFORMATIONAL")?,
-            _ => write!(f, "Unknown exchange type {}", self.0)?,
+            Self::IKE_SA_INIT => write!(f, "IKE_SA_INIT"),
+            Self::IKE_AUTH => write!(f, "IKE_AUTH"),
+            Self::CREATE_CHILD_SA => write!(f, "CREATE_CHILD_SA"),
+            Self::INFORMATIONAL => write!(f, "INFORMATIONAL"),
+            _ => write!(f, "Unknown exchange type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -75,11 +74,10 @@ impl fmt::Display for Flags {
             f.write_str("Version")?;
         }
         if self.has(Flags::RESPONSE) {
-            f.write_str("Response")?;
+            f.write_str("Response")
         } else {
-            f.write_str("Request")?;
+            f.write_str("Request")
         }
-        Ok(())
     }
 }
 
@@ -1031,29 +1029,28 @@ impl PayloadType {
 impl fmt::Display for PayloadType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::NONE => write!(f, "No Next Payload")?,
-            Self::SECURITY_ASSOCIATION => write!(f, "Security Association")?,
-            Self::KEY_EXCHANGE => write!(f, "Key Exchange")?,
-            Self::ID_INITIATOR => write!(f, "Identification - Initiator")?,
-            Self::ID_RESPONDER => write!(f, "Identification - Responder")?,
-            Self::CERTIFICATE => write!(f, "Certificate")?,
-            Self::CERTIFICATE_REQUEST => write!(f, "Certificate Request")?,
-            Self::AUTHENTICATION => write!(f, "Authentication")?,
-            Self::NONCE => write!(f, "Nonce")?,
-            Self::NOTIFY => write!(f, "Notify")?,
-            Self::DELETE => write!(f, "Delete")?,
-            Self::VENDOR_ID => write!(f, "Vendor ID")?,
-            Self::TRAFFIC_SELECTOR_INITIATOR => write!(f, "Traffic Selector - Initiator")?,
-            Self::TRAFFIC_SELECTOR_RESPONDER => write!(f, "Traffic Selector - Responder")?,
-            Self::ENCRYPTED_AND_AUTHENTICATED => write!(f, "Encrypted and Authenticated")?,
-            Self::CONFIGURATION => write!(f, "Configuration")?,
-            Self::EXTENSIBLE_AUTHENTICATION => write!(f, "Extensible Authentication")?,
+            Self::NONE => write!(f, "No Next Payload"),
+            Self::SECURITY_ASSOCIATION => write!(f, "Security Association"),
+            Self::KEY_EXCHANGE => write!(f, "Key Exchange"),
+            Self::ID_INITIATOR => write!(f, "Identification - Initiator"),
+            Self::ID_RESPONDER => write!(f, "Identification - Responder"),
+            Self::CERTIFICATE => write!(f, "Certificate"),
+            Self::CERTIFICATE_REQUEST => write!(f, "Certificate Request"),
+            Self::AUTHENTICATION => write!(f, "Authentication"),
+            Self::NONCE => write!(f, "Nonce"),
+            Self::NOTIFY => write!(f, "Notify"),
+            Self::DELETE => write!(f, "Delete"),
+            Self::VENDOR_ID => write!(f, "Vendor ID"),
+            Self::TRAFFIC_SELECTOR_INITIATOR => write!(f, "Traffic Selector - Initiator"),
+            Self::TRAFFIC_SELECTOR_RESPONDER => write!(f, "Traffic Selector - Responder"),
+            Self::ENCRYPTED_AND_AUTHENTICATED => write!(f, "Encrypted and Authenticated"),
+            Self::CONFIGURATION => write!(f, "Configuration"),
+            Self::EXTENSIBLE_AUTHENTICATION => write!(f, "Extensible Authentication"),
             Self::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT => {
-                write!(f, "Encrypted and Authenticated Fragment")?
+                write!(f, "Encrypted and Authenticated Fragment")
             }
-            _ => write!(f, "Unknown exchange type {}", self.0)?,
+            _ => write!(f, "Unknown exchange type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -1091,12 +1088,11 @@ impl IPSecProtocolID {
 impl fmt::Display for IPSecProtocolID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::IKE => write!(f, "IKE")?,
-            Self::AH => write!(f, "AH")?,
-            Self::ESP => write!(f, "ESP")?,
-            _ => write!(f, "Unknown IPSec Protocol ID {}", self.0)?,
+            Self::IKE => write!(f, "IKE"),
+            Self::AH => write!(f, "AH"),
+            Self::ESP => write!(f, "ESP"),
+            _ => write!(f, "Unknown IPSec Protocol ID {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -1292,57 +1288,56 @@ impl TransformType {
 impl fmt::Display for TransformType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::ENCR_DES_IV64 => write!(f, "ENCR_DES_IV64")?,
-            Self::ENCR_DES => write!(f, "ENCR_DES")?,
-            Self::ENCR_3DES => write!(f, "ENCR_3DES")?,
-            Self::ENCR_RC5 => write!(f, "ENCR_RC5")?,
-            Self::ENCR_IDEA => write!(f, "ENCR_IDEA")?,
-            Self::ENCR_CAST => write!(f, "ENCR_CAST")?,
-            Self::ENCR_BLOWFISH => write!(f, "ENCR_BLOWFISH")?,
-            Self::ENCR_3IDEA => write!(f, "ENCR_3IDEA")?,
-            Self::ENCR_DES_IV32 => write!(f, "ENCR_DES_IV32")?,
-            Self::ENCR_NULL => write!(f, "ENCR_NULL")?,
-            Self::ENCR_AES_CBC => write!(f, "ENCR_AES_CBC")?,
-            Self::ENCR_AES_CTR => write!(f, "ENCR_AES_CTR")?,
-            Self::ENCR_AES_GCM_16 => write!(f, "ENCR_AES_GCM_16")?,
-            Self::PRF_HMAC_MD5 => write!(f, "PRF_HMAC_MD5")?,
-            Self::PRF_HMAC_SHA1 => write!(f, "PRF_HMAC_SHA1")?,
-            Self::PRF_HMAC_TIGER => write!(f, "PRF_HMAC_TIGER")?,
-            Self::PRF_HMAC_SHA2_256 => write!(f, "PRF_HMAC_SHA2_256")?,
-            Self::PRF_HMAC_SHA2_384 => write!(f, "PRF_HMAC_SHA2_384")?,
-            Self::AUTH_NONE => write!(f, "AUTH_NONE")?,
-            Self::AUTH_HMAC_MD5_96 => write!(f, "AUTH_HMAC_MD5_96")?,
-            Self::AUTH_HMAC_SHA1_96 => write!(f, "AUTH_HMAC_SHA1_96")?,
-            Self::AUTH_DES_MAC => write!(f, "AUTH_DES_MAC")?,
-            Self::AUTH_KPDK_MD5 => write!(f, "AUTH_KPDK_MD5")?,
-            Self::AUTH_AES_XCBC_96 => write!(f, "AUTH_AES_XCBC_96")?,
-            Self::AUTH_HMAC_SHA2_256_128 => write!(f, "AUTH_HMAC_SHA2_256_128")?,
-            Self::AUTH_HMAC_SHA2_384_192 => write!(f, "AUTH_HMAC_SHA2_384_192")?,
-            Self::DH_NONE => write!(f, "DH_NONE")?,
-            Self::DH_768_MODP => write!(f, "DH_768_MODP")?,
-            Self::DH_1024_MODP => write!(f, "DH_1024_MODP")?,
-            Self::DH_1536_MODP => write!(f, "DH_1536_MODP")?,
-            Self::DH_2048_MODP => write!(f, "DH_2048_MODP")?,
-            Self::DH_3072_MODP => write!(f, "DH_3072_MODP")?,
-            Self::DH_4096_MODP => write!(f, "DH_4096_MODP")?,
-            Self::DH_6144_MODP => write!(f, "DH_6144_MODP")?,
-            Self::DH_8192_MODP => write!(f, "DH_8192_MODP")?,
-            Self::DH_256_ECP => write!(f, "DH_256_ECP")?,
-            Self::NO_ESN => write!(f, "NO_ESN")?,
-            Self::ESN => write!(f, "ESN")?,
-            TransformType::Encryption(id) => write!(f, "Unknown Encryption Algorithm {}", id)?,
+            Self::ENCR_DES_IV64 => write!(f, "ENCR_DES_IV64"),
+            Self::ENCR_DES => write!(f, "ENCR_DES"),
+            Self::ENCR_3DES => write!(f, "ENCR_3DES"),
+            Self::ENCR_RC5 => write!(f, "ENCR_RC5"),
+            Self::ENCR_IDEA => write!(f, "ENCR_IDEA"),
+            Self::ENCR_CAST => write!(f, "ENCR_CAST"),
+            Self::ENCR_BLOWFISH => write!(f, "ENCR_BLOWFISH"),
+            Self::ENCR_3IDEA => write!(f, "ENCR_3IDEA"),
+            Self::ENCR_DES_IV32 => write!(f, "ENCR_DES_IV32"),
+            Self::ENCR_NULL => write!(f, "ENCR_NULL"),
+            Self::ENCR_AES_CBC => write!(f, "ENCR_AES_CBC"),
+            Self::ENCR_AES_CTR => write!(f, "ENCR_AES_CTR"),
+            Self::ENCR_AES_GCM_16 => write!(f, "ENCR_AES_GCM_16"),
+            Self::PRF_HMAC_MD5 => write!(f, "PRF_HMAC_MD5"),
+            Self::PRF_HMAC_SHA1 => write!(f, "PRF_HMAC_SHA1"),
+            Self::PRF_HMAC_TIGER => write!(f, "PRF_HMAC_TIGER"),
+            Self::PRF_HMAC_SHA2_256 => write!(f, "PRF_HMAC_SHA2_256"),
+            Self::PRF_HMAC_SHA2_384 => write!(f, "PRF_HMAC_SHA2_384"),
+            Self::AUTH_NONE => write!(f, "AUTH_NONE"),
+            Self::AUTH_HMAC_MD5_96 => write!(f, "AUTH_HMAC_MD5_96"),
+            Self::AUTH_HMAC_SHA1_96 => write!(f, "AUTH_HMAC_SHA1_96"),
+            Self::AUTH_DES_MAC => write!(f, "AUTH_DES_MAC"),
+            Self::AUTH_KPDK_MD5 => write!(f, "AUTH_KPDK_MD5"),
+            Self::AUTH_AES_XCBC_96 => write!(f, "AUTH_AES_XCBC_96"),
+            Self::AUTH_HMAC_SHA2_256_128 => write!(f, "AUTH_HMAC_SHA2_256_128"),
+            Self::AUTH_HMAC_SHA2_384_192 => write!(f, "AUTH_HMAC_SHA2_384_192"),
+            Self::DH_NONE => write!(f, "DH_NONE"),
+            Self::DH_768_MODP => write!(f, "DH_768_MODP"),
+            Self::DH_1024_MODP => write!(f, "DH_1024_MODP"),
+            Self::DH_1536_MODP => write!(f, "DH_1536_MODP"),
+            Self::DH_2048_MODP => write!(f, "DH_2048_MODP"),
+            Self::DH_3072_MODP => write!(f, "DH_3072_MODP"),
+            Self::DH_4096_MODP => write!(f, "DH_4096_MODP"),
+            Self::DH_6144_MODP => write!(f, "DH_6144_MODP"),
+            Self::DH_8192_MODP => write!(f, "DH_8192_MODP"),
+            Self::DH_256_ECP => write!(f, "DH_256_ECP"),
+            Self::NO_ESN => write!(f, "NO_ESN"),
+            Self::ESN => write!(f, "ESN"),
+            TransformType::Encryption(id) => write!(f, "Unknown Encryption Algorithm {}", id),
             TransformType::PseudorandomFunction(id) => {
-                write!(f, "Unknown Pseudorandom Function {}", id)?
+                write!(f, "Unknown Pseudorandom Function {}", id)
             }
             TransformType::IntegrityAlgorithm(id) => {
-                write!(f, "Unknown Integrity Algorithm {}", id)?
+                write!(f, "Unknown Integrity Algorithm {}", id)
             }
-            TransformType::DiffieHellman(id) => write!(f, "Unknown Diffie-Hellman Group {}", id)?,
+            TransformType::DiffieHellman(id) => write!(f, "Unknown Diffie-Hellman Group {}", id),
             TransformType::ExtendedSequenceNumbers(id) => {
-                write!(f, "Unknown Extended Sequence Numbers {}", id)?
+                write!(f, "Unknown Extended Sequence Numbers {}", id)
             }
         }
-        Ok(())
     }
 }
 
@@ -1440,10 +1435,9 @@ impl TransformAttributeType {
 impl fmt::Display for TransformAttributeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::KEY_LENGTH => write!(f, "Key Length")?,
-            _ => write!(f, "Unknown Transform Attribute Type {}", self.0)?,
+            Self::KEY_LENGTH => write!(f, "Key Length"),
+            _ => write!(f, "Unknown Transform Attribute Type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -1564,16 +1558,15 @@ impl IdentificationType {
 impl fmt::Display for IdentificationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::ID_IPV4_ADDR => write!(f, "ID_IPV4_ADDR")?,
-            Self::ID_FQDN => write!(f, "ID_FQDN")?,
-            Self::ID_RFC822_ADDR => write!(f, "ID_RFC822_ADDR")?,
-            Self::ID_IPV6_ADDR => write!(f, "ID_IPV6_ADDR")?,
-            Self::ID_DER_ASN1_DN => write!(f, "ID_DER_ASN1_DN")?,
-            Self::ID_DER_ASN1_GN => write!(f, "ID_DER_ASN1_GN")?,
-            Self::ID_KEY_ID => write!(f, "ID_KEY_ID")?,
-            _ => write!(f, "Unknown Identification Type {}", self.0)?,
+            Self::ID_IPV4_ADDR => write!(f, "ID_IPV4_ADDR"),
+            Self::ID_FQDN => write!(f, "ID_FQDN"),
+            Self::ID_RFC822_ADDR => write!(f, "ID_RFC822_ADDR"),
+            Self::ID_IPV6_ADDR => write!(f, "ID_IPV6_ADDR"),
+            Self::ID_DER_ASN1_DN => write!(f, "ID_DER_ASN1_DN"),
+            Self::ID_DER_ASN1_GN => write!(f, "ID_DER_ASN1_GN"),
+            Self::ID_KEY_ID => write!(f, "ID_KEY_ID"),
+            _ => write!(f, "Unknown Identification Type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -1629,21 +1622,20 @@ impl CertificateEncoding {
 impl fmt::Display for CertificateEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::PKCS7 => write!(f, "PKCS #7 wrapped X.509 certificate")?,
-            Self::PGP => write!(f, "PGP Certificate")?,
-            Self::DNS_SIGNED_KEY => write!(f, "DNS Signed Key")?,
-            Self::X509_SIGNATURE => write!(f, "X.509 Certificate - Signature")?,
-            Self::KERBEROS_TOKEN => write!(f, "Kerberos Token")?,
-            Self::CRL => write!(f, "Certificate Revocation List (CRL)")?,
-            Self::ARL => write!(f, "Authority Revocation List (ARL)")?,
-            Self::SPKI => write!(f, "SPKI Certificate")?,
-            Self::X509_ATTRIBUTE => write!(f, "X.509 Certificate - Attribute")?,
-            Self::DEPRECATED_RAW_RSA => write!(f, "Deprecated (was Raw RSA Key)")?,
-            Self::HASH_URL_X509_CERTIFICATE => write!(f, "Hash and URL of X.509 certificate")?,
-            Self::HASH_URL_X509_BUNDLE => write!(f, "Hash and URL of X.509 bundle")?,
-            _ => write!(f, "Unknown Certificate Encoding {}", self.0)?,
+            Self::PKCS7 => write!(f, "PKCS #7 wrapped X.509 certificate"),
+            Self::PGP => write!(f, "PGP Certificate"),
+            Self::DNS_SIGNED_KEY => write!(f, "DNS Signed Key"),
+            Self::X509_SIGNATURE => write!(f, "X.509 Certificate - Signature"),
+            Self::KERBEROS_TOKEN => write!(f, "Kerberos Token"),
+            Self::CRL => write!(f, "Certificate Revocation List (CRL)"),
+            Self::ARL => write!(f, "Authority Revocation List (ARL)"),
+            Self::SPKI => write!(f, "SPKI Certificate"),
+            Self::X509_ATTRIBUTE => write!(f, "X.509 Certificate - Attribute"),
+            Self::DEPRECATED_RAW_RSA => write!(f, "Deprecated (was Raw RSA Key)"),
+            Self::HASH_URL_X509_CERTIFICATE => write!(f, "Hash and URL of X.509 certificate"),
+            Self::HASH_URL_X509_BUNDLE => write!(f, "Hash and URL of X.509 bundle"),
+            _ => write!(f, "Unknown Certificate Encoding {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -1718,14 +1710,13 @@ impl AuthMethod {
 impl fmt::Display for AuthMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::RSA_DIGITAL_SIGNATURE => write!(f, "RSA Digital Signature")?,
-            Self::SHARED_MESSAGE_INTEGRITY_CODE => write!(f, "Shared Key Message Integrity Code")?,
-            Self::DSS_DIGITAL_SIGNATURE => write!(f, "DSS Digital Signature")?,
-            Self::ECDSA_SHA256_P256 => write!(f, "ECDSA with SHA-256 on the P-256 curve")?,
-            Self::DIGITAL_SIGNATURE => write!(f, "Digital Signature")?,
-            _ => write!(f, "Unknown Authentication Method {}", self.0)?,
+            Self::RSA_DIGITAL_SIGNATURE => write!(f, "RSA Digital Signature"),
+            Self::SHARED_MESSAGE_INTEGRITY_CODE => write!(f, "Shared Key Message Integrity Code"),
+            Self::DSS_DIGITAL_SIGNATURE => write!(f, "DSS Digital Signature"),
+            Self::ECDSA_SHA256_P256 => write!(f, "ECDSA with SHA-256 on the P-256 curve"),
+            Self::DIGITAL_SIGNATURE => write!(f, "Digital Signature"),
+            _ => write!(f, "Unknown Authentication Method {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -1810,42 +1801,41 @@ impl NotifyMessageType {
 impl fmt::Display for NotifyMessageType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::UNSUPPORTED_CRITICAL_PAYLOAD => write!(f, "UNSUPPORTED_CRITICAL_PAYLOAD")?,
-            Self::INVALID_IKE_SPI => write!(f, "INVALID_IKE_SPI")?,
-            Self::INVALID_MAJOR_VERSION => write!(f, "INVALID_MAJOR_VERSION")?,
-            Self::INVALID_SYNTAX => write!(f, "INVALID_SYNTAX")?,
-            Self::INVALID_MESSAGE_ID => write!(f, "INVALID_MESSAGE_ID")?,
-            Self::INVALID_SPI => write!(f, "INVALID_SPI")?,
-            Self::NO_PROPOSAL_CHOSEN => write!(f, "NO_PROPOSAL_CHOSEN")?,
-            Self::INVALID_KE_PAYLOAD => write!(f, "INVALID_KE_PAYLOAD")?,
-            Self::AUTHENTICATION_FAILED => write!(f, "AUTHENTICATION_FAILED")?,
-            Self::SINGLE_PAIR_REQUIRED => write!(f, "SINGLE_PAIR_REQUIRED")?,
-            Self::NO_ADDITIONAL_SAS => write!(f, "NO_ADDITIONAL_SAS")?,
-            Self::INTERNAL_ADDRESS_FAILURE => write!(f, "INTERNAL_ADDRESS_FAILURE")?,
-            Self::FAILED_CP_REQUIRED => write!(f, "FAILED_CP_REQUIRED")?,
-            Self::TS_UNACCEPTABLE => write!(f, "TS_UNACCEPTABLE")?,
-            Self::INVALID_SELECTORS => write!(f, "INVALID_SELECTORS")?,
-            Self::TEMPORARY_FAILURE => write!(f, "TEMPORARY_FAILURE")?,
-            Self::CHILD_SA_NOT_FOUND => write!(f, "CHILD_SA_NOT_FOUND")?,
-            Self::INITIAL_CONTACT => write!(f, "INITIAL_CONTACT")?,
-            Self::SET_WINDOW_SIZE => write!(f, "SET_WINDOW_SIZE")?,
-            Self::ADDITIONAL_TS_POSSIBLE => write!(f, "ADDITIONAL_TS_POSSIBLE")?,
-            Self::IPCOMP_SUPPORTED => write!(f, "IPCOMP_SUPPORTED")?,
-            Self::NAT_DETECTION_SOURCE_IP => write!(f, "NAT_DETECTION_SOURCE_IP")?,
-            Self::NAT_DETECTION_DESTINATION_IP => write!(f, "NAT_DETECTION_DESTINATION_IP")?,
-            Self::COOKIE => write!(f, "COOKIE")?,
-            Self::USE_TRANSPORT_MODE => write!(f, "USE_TRANSPORT_MODE")?,
-            Self::HTTP_CERT_LOOKUP_SUPPORTED => write!(f, "HTTP_CERT_LOOKUP_SUPPORTED")?,
-            Self::REKEY_SA => write!(f, "REKEY_SA")?,
-            Self::ESP_TFC_PADDING_NOT_SUPPORTED => write!(f, "ESP_TFC_PADDING_NOT_SUPPORTED")?,
-            Self::NON_FIRST_FRAGMENTS_ALSO => write!(f, "NON_FIRST_FRAGMENTS_ALSO")?,
-            Self::MOBIKE_SUPPORTED => write!(f, "MOBIKE_SUPPORTED")?,
-            Self::REDIRECT_SUPPORTED => write!(f, "REDIRECT_SUPPORTED")?,
-            Self::IKEV2_FRAGMENTATION_SUPPORTED => write!(f, "IKEV2_FRAGMENTATION_SUPPORTED")?,
-            Self::SIGNATURE_HASH_ALGORITHMS => write!(f, "SIGNATURE_HASH_ALGORITHMS")?,
-            _ => write!(f, "Unknown Notify Message Type {}", self.0)?,
+            Self::UNSUPPORTED_CRITICAL_PAYLOAD => write!(f, "UNSUPPORTED_CRITICAL_PAYLOAD"),
+            Self::INVALID_IKE_SPI => write!(f, "INVALID_IKE_SPI"),
+            Self::INVALID_MAJOR_VERSION => write!(f, "INVALID_MAJOR_VERSION"),
+            Self::INVALID_SYNTAX => write!(f, "INVALID_SYNTAX"),
+            Self::INVALID_MESSAGE_ID => write!(f, "INVALID_MESSAGE_ID"),
+            Self::INVALID_SPI => write!(f, "INVALID_SPI"),
+            Self::NO_PROPOSAL_CHOSEN => write!(f, "NO_PROPOSAL_CHOSEN"),
+            Self::INVALID_KE_PAYLOAD => write!(f, "INVALID_KE_PAYLOAD"),
+            Self::AUTHENTICATION_FAILED => write!(f, "AUTHENTICATION_FAILED"),
+            Self::SINGLE_PAIR_REQUIRED => write!(f, "SINGLE_PAIR_REQUIRED"),
+            Self::NO_ADDITIONAL_SAS => write!(f, "NO_ADDITIONAL_SAS"),
+            Self::INTERNAL_ADDRESS_FAILURE => write!(f, "INTERNAL_ADDRESS_FAILURE"),
+            Self::FAILED_CP_REQUIRED => write!(f, "FAILED_CP_REQUIRED"),
+            Self::TS_UNACCEPTABLE => write!(f, "TS_UNACCEPTABLE"),
+            Self::INVALID_SELECTORS => write!(f, "INVALID_SELECTORS"),
+            Self::TEMPORARY_FAILURE => write!(f, "TEMPORARY_FAILURE"),
+            Self::CHILD_SA_NOT_FOUND => write!(f, "CHILD_SA_NOT_FOUND"),
+            Self::INITIAL_CONTACT => write!(f, "INITIAL_CONTACT"),
+            Self::SET_WINDOW_SIZE => write!(f, "SET_WINDOW_SIZE"),
+            Self::ADDITIONAL_TS_POSSIBLE => write!(f, "ADDITIONAL_TS_POSSIBLE"),
+            Self::IPCOMP_SUPPORTED => write!(f, "IPCOMP_SUPPORTED"),
+            Self::NAT_DETECTION_SOURCE_IP => write!(f, "NAT_DETECTION_SOURCE_IP"),
+            Self::NAT_DETECTION_DESTINATION_IP => write!(f, "NAT_DETECTION_DESTINATION_IP"),
+            Self::COOKIE => write!(f, "COOKIE"),
+            Self::USE_TRANSPORT_MODE => write!(f, "USE_TRANSPORT_MODE"),
+            Self::HTTP_CERT_LOOKUP_SUPPORTED => write!(f, "HTTP_CERT_LOOKUP_SUPPORTED"),
+            Self::REKEY_SA => write!(f, "REKEY_SA"),
+            Self::ESP_TFC_PADDING_NOT_SUPPORTED => write!(f, "ESP_TFC_PADDING_NOT_SUPPORTED"),
+            Self::NON_FIRST_FRAGMENTS_ALSO => write!(f, "NON_FIRST_FRAGMENTS_ALSO"),
+            Self::MOBIKE_SUPPORTED => write!(f, "MOBIKE_SUPPORTED"),
+            Self::REDIRECT_SUPPORTED => write!(f, "REDIRECT_SUPPORTED"),
+            Self::IKEV2_FRAGMENTATION_SUPPORTED => write!(f, "IKEV2_FRAGMENTATION_SUPPORTED"),
+            Self::SIGNATURE_HASH_ALGORITHMS => write!(f, "SIGNATURE_HASH_ALGORITHMS"),
+            _ => write!(f, "Unknown Notify Message Type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -1930,14 +1920,13 @@ impl SignatureHashAlgorithm {
 impl fmt::Display for SignatureHashAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::RESERVED => write!(f, "RESERVED")?,
-            Self::SHA1 => write!(f, "SHA1")?,
-            Self::SHA2_256 => write!(f, "SHA2-256")?,
-            Self::SHA2_384 => write!(f, "SHA2-384")?,
-            Self::SHA2_512 => write!(f, "SHA2-512")?,
-            _ => write!(f, "Unknown Signature Hash Algorithm {}", self.0)?,
+            Self::RESERVED => write!(f, "RESERVED"),
+            Self::SHA1 => write!(f, "SHA1"),
+            Self::SHA2_256 => write!(f, "SHA2-256"),
+            Self::SHA2_384 => write!(f, "SHA2-384"),
+            Self::SHA2_512 => write!(f, "SHA2-512"),
+            _ => write!(f, "Unknown Signature Hash Algorithm {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -2079,11 +2068,10 @@ impl TrafficSelectorType {
 impl fmt::Display for TrafficSelectorType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::TS_IPV4_ADDR_RANGE => write!(f, "TS_IPV4_ADDR_RANGE")?,
-            Self::TS_IPV6_ADDR_RANGE => write!(f, "TS_IPV6_ADDR_RANGE")?,
-            _ => write!(f, "Unknown Traffic Select Type {}", self.0)?,
+            Self::TS_IPV4_ADDR_RANGE => write!(f, "TS_IPV4_ADDR_RANGE"),
+            Self::TS_IPV6_ADDR_RANGE => write!(f, "TS_IPV6_ADDR_RANGE"),
+            _ => write!(f, "Unknown Traffic Select Type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -2096,21 +2084,24 @@ impl IPProtocolType {
     pub const TCP: IPProtocolType = IPProtocolType(6);
     pub const UDP: IPProtocolType = IPProtocolType(17);
 
-    pub fn from_u8(value: u8) -> IPProtocolType {
+    fn from_u8(value: u8) -> IPProtocolType {
         IPProtocolType(value)
+    }
+
+    pub fn protocol_id(&self) -> u8 {
+        self.0
     }
 }
 
 impl fmt::Display for IPProtocolType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::ANY => write!(f, "ANY")?,
-            Self::ICMP => write!(f, "ICMP")?,
-            Self::TCP => write!(f, "TCP")?,
-            Self::UDP => write!(f, "UDP")?,
-            _ => write!(f, "Unknown IP Protocol Type {}", self.0)?,
+            Self::ANY => write!(f, "ANY"),
+            Self::ICMP => write!(f, "ICMP"),
+            Self::TCP => write!(f, "TCP"),
+            Self::UDP => write!(f, "UDP"),
+            _ => write!(f, "Unknown IP Protocol Type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -2290,13 +2281,12 @@ impl ConfigurationType {
 impl fmt::Display for ConfigurationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::CFG_REQUEST => write!(f, "CFG_REQUEST")?,
-            Self::CFG_REPLY => write!(f, "CFG_REPLY")?,
-            Self::CFG_SET => write!(f, "CFG_SET")?,
-            Self::CFG_ACK => write!(f, "CFG_ACK")?,
-            _ => write!(f, "Unknown Configuration Type {}", self.0)?,
+            Self::CFG_REQUEST => write!(f, "CFG_REQUEST"),
+            Self::CFG_REPLY => write!(f, "CFG_REPLY"),
+            Self::CFG_SET => write!(f, "CFG_SET"),
+            Self::CFG_ACK => write!(f, "CFG_ACK"),
+            _ => write!(f, "Unknown Configuration Type {}", self.0),
         }
-        Ok(())
     }
 }
 
@@ -2327,22 +2317,21 @@ impl ConfigurationAttributeType {
 impl fmt::Display for ConfigurationAttributeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::INTERNAL_IP4_ADDRESS => write!(f, "INTERNAL_IP4_ADDRESS")?,
-            Self::INTERNAL_IP4_NETMASK => write!(f, "INTERNAL_IP4_NETMASK")?,
-            Self::INTERNAL_IP4_DNS => write!(f, "INTERNAL_IP4_DNS")?,
-            Self::INTERNAL_IP4_NBNS => write!(f, "INTERNAL_IP4_NBNS")?,
-            Self::INTERNAL_IP4_DHCP => write!(f, "INTERNAL_IP4_DHCP")?,
-            Self::APPLICATION_VERSION => write!(f, "APPLICATION_VERSION")?,
-            Self::INTERNAL_IP6_ADDRESS => write!(f, "INTERNAL_IP6_ADDRESS")?,
-            Self::INTERNAL_IP6_DNS => write!(f, "INTERNAL_IP6_DNS")?,
-            Self::INTERNAL_IP6_DHCP => write!(f, "INTERNAL_IP6_DHCP")?,
-            Self::INTERNAL_IP4_SUBNET => write!(f, "INTERNAL_IP4_SUBNET")?,
-            Self::SUPPORTED_ATTRIBUTES => write!(f, "SUPPORTED_ATTRIBUTES")?,
-            Self::INTERNAL_IP6_SUBNET => write!(f, "INTERNAL_IP6_SUBNET")?,
-            Self::INTERNAL_DNS_DOMAIN => write!(f, "INTERNAL_DNS_DOMAIN")?,
-            _ => write!(f, "Unknown Configuration Attribute Type {}", self.0)?,
+            Self::INTERNAL_IP4_ADDRESS => write!(f, "INTERNAL_IP4_ADDRESS"),
+            Self::INTERNAL_IP4_NETMASK => write!(f, "INTERNAL_IP4_NETMASK"),
+            Self::INTERNAL_IP4_DNS => write!(f, "INTERNAL_IP4_DNS"),
+            Self::INTERNAL_IP4_NBNS => write!(f, "INTERNAL_IP4_NBNS"),
+            Self::INTERNAL_IP4_DHCP => write!(f, "INTERNAL_IP4_DHCP"),
+            Self::APPLICATION_VERSION => write!(f, "APPLICATION_VERSION"),
+            Self::INTERNAL_IP6_ADDRESS => write!(f, "INTERNAL_IP6_ADDRESS"),
+            Self::INTERNAL_IP6_DNS => write!(f, "INTERNAL_IP6_DNS"),
+            Self::INTERNAL_IP6_DHCP => write!(f, "INTERNAL_IP6_DHCP"),
+            Self::INTERNAL_IP4_SUBNET => write!(f, "INTERNAL_IP4_SUBNET"),
+            Self::SUPPORTED_ATTRIBUTES => write!(f, "SUPPORTED_ATTRIBUTES"),
+            Self::INTERNAL_IP6_SUBNET => write!(f, "INTERNAL_IP6_SUBNET"),
+            Self::INTERNAL_DNS_DOMAIN => write!(f, "INTERNAL_DNS_DOMAIN"),
+            _ => write!(f, "Unknown Configuration Attribute Type {}", self.0),
         }
-        Ok(())
     }
 }
 
