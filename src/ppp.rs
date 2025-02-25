@@ -8,36 +8,21 @@ use crate::logger::fmt_slice_hex;
  * PPP constants are defined in https://www.iana.org/assignments/ppp-numbers/ppp-numbers.xhtml
  */
 
-pub struct Packet<'a> {
-    protocol: Protocol,
-    data: &'a [u8],
+pub enum Packet<'a> {
+    Lcp(LcpPacket<'a>),
+    Ipcp(IpcpPacket<'a>),
+    Unknown(GenericPacket<'a>),
 }
 
 impl Packet<'_> {
     pub fn from_bytes(protocol: Protocol, data: &[u8]) -> Result<Packet, FormatError> {
-        let packet = Packet { protocol, data };
-        packet.validate()?;
+        protocol.validate()?;
+        let packet = match protocol {
+            Protocol::LCP => Packet::Lcp(LcpPacket::from_bytes(data)?),
+            Protocol::IPV4CP => Packet::Ipcp(IpcpPacket::from_bytes(data)?),
+            _ => Packet::Unknown(GenericPacket::from_bytes(protocol, data)),
+        };
         Ok(packet)
-    }
-
-    pub fn validate(&self) -> Result<(), FormatError> {
-        self.protocol.validate()
-    }
-
-    pub fn to_lcp(&self) -> Result<LcpPacket, FormatError> {
-        if self.protocol == Protocol::LCP {
-            LcpPacket::from_bytes(self.data)
-        } else {
-            Err("Protocol type is not LCP".into())
-        }
-    }
-
-    pub fn to_ipcp(&self) -> Result<IpcpPacket, FormatError> {
-        if self.protocol == Protocol::IPV4CP {
-            IpcpPacket::from_bytes(self.data)
-        } else {
-            Err("Protocol type is not IPCP".into())
-        }
     }
 }
 
@@ -84,6 +69,17 @@ impl fmt::Display for Protocol {
             Self::IPV4CP => write!(f, "Internet Protocol Control Protocol"),
             _ => write!(f, "Unknown protocol {:04x}", self.0),
         }
+    }
+}
+
+pub struct GenericPacket<'a> {
+    protocol: Protocol,
+    data: &'a [u8],
+}
+
+impl GenericPacket<'_> {
+    fn from_bytes(protocol: Protocol, data: &[u8]) -> GenericPacket {
+        GenericPacket { protocol, data }
     }
 }
 
@@ -641,30 +637,36 @@ pub fn encode_ipcp_config(
 
 impl fmt::Display for Packet<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Protocol: {}", self.protocol)?;
-        if let Ok(lcp) = self.to_lcp() {
-            write!(f, ", LCP code: {} id: {}", lcp.code(), lcp.identifier())?;
-            for opt in lcp.iter_options() {
-                match opt {
-                    Ok(opt) => write!(f, " {}", opt)?,
-                    Err(err) => write!(f, " invalid option: {}", err)?,
+        match self {
+            Packet::Lcp(lcp) => {
+                write!(f, "LCP code: {} id: {}", lcp.code(), lcp.identifier())?;
+                for opt in lcp.iter_options() {
+                    match opt {
+                        Ok(opt) => write!(f, " {}", opt)?,
+                        Err(err) => write!(f, " invalid option: {}", err)?,
+                    }
                 }
-            }
-            if let Some(magic) = lcp.read_magic() {
-                write!(f, ", magic: {:08x}", magic)?;
-            }
-            Ok(())
-        } else if let Ok(lcp) = self.to_ipcp() {
-            write!(f, ", IPCP code: {} id: {}", lcp.code(), lcp.identifier())?;
-            for opt in lcp.iter_options() {
-                match opt {
-                    Ok(opt) => write!(f, " {}", opt)?,
-                    Err(err) => write!(f, " invalid option: {}", err)?,
+                if let Some(magic) = lcp.read_magic() {
+                    write!(f, ", magic: {:08x}", magic)?;
                 }
+                Ok(())
             }
-            Ok(())
-        } else {
-            write!(f, ", data: {}", fmt_slice_hex(self.data))
+            Packet::Ipcp(ipcp) => {
+                write!(f, "IPCP code: {} id: {}", ipcp.code(), ipcp.identifier())?;
+                for opt in ipcp.iter_options() {
+                    match opt {
+                        Ok(opt) => write!(f, " {}", opt)?,
+                        Err(err) => write!(f, " invalid option: {}", err)?,
+                    }
+                }
+                Ok(())
+            }
+            Packet::Unknown(packet) => write!(
+                f,
+                "{}, data: {}",
+                packet.protocol,
+                fmt_slice_hex(packet.data)
+            ),
         }
     }
 }
