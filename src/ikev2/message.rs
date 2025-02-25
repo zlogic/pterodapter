@@ -788,136 +788,158 @@ impl MessageWriter<'_> {
     }
 }
 
-pub struct Payload<'a> {
-    payload_type: PayloadType,
-    encrypted_next_payload: Option<PayloadType>,
-    critical: bool,
-    data: &'a [u8],
-    start_offset: usize,
+pub enum Payload<'a> {
+    SecurityAssociation(PayloadSecurityAssociation<'a>),
+    KeyExchange(PayloadKeyExchange<'a>),
+    IdentificationResponder(PayloadIdentification<'a>),
+    IdentificationInitiator(PayloadIdentification<'a>),
+    Certificate(PayloadCertificate<'a>),
+    CertificateRequest(PayloadCertificateRequest<'a>),
+    Authentication(PayloadAuthentication<'a>),
+    Nonce(PayloadNonce<'a>),
+    Notify(PayloadNotify<'a>),
+    Delete(PayloadDelete<'a>),
+    TrafficSelectorInitiator(PayloadTrafficSelector<'a>),
+    TrafficSelectorResponder(PayloadTrafficSelector<'a>),
+    Configuration(PayloadConfiguration<'a>),
+    Encrypted(EncryptedMessage<'a>),
+    EncryptedFragment(EncryptedMessage<'a>),
+    Unknown(GenericPayload<'a>),
 }
 
 impl Payload<'_> {
+    fn from_data(
+        payload_type: PayloadType,
+        critical: bool,
+        data: &[u8],
+    ) -> Result<Payload, FormatError> {
+        let payload = match payload_type {
+            PayloadType::SECURITY_ASSOCIATION => {
+                Payload::SecurityAssociation(PayloadSecurityAssociation { critical, data })
+            }
+            PayloadType::KEY_EXCHANGE => {
+                Payload::KeyExchange(PayloadKeyExchange::from_payload(critical, data)?)
+            }
+            PayloadType::ID_INITIATOR => Payload::IdentificationInitiator(
+                PayloadIdentification::from_payload(critical, data)?,
+            ),
+            PayloadType::ID_RESPONDER => Payload::IdentificationResponder(
+                PayloadIdentification::from_payload(critical, data)?,
+            ),
+            PayloadType::CERTIFICATE => {
+                Payload::Certificate(PayloadCertificate::from_payload(critical, data)?)
+            }
+            PayloadType::CERTIFICATE_REQUEST => Payload::CertificateRequest(
+                PayloadCertificateRequest::from_payload(critical, data)?,
+            ),
+            PayloadType::AUTHENTICATION => {
+                Payload::Authentication(PayloadAuthentication::from_payload(critical, data)?)
+            }
+            PayloadType::NONCE => Payload::Nonce(PayloadNonce { critical, data }),
+            PayloadType::NOTIFY => Payload::Notify(PayloadNotify::from_payload(critical, data)?),
+            PayloadType::DELETE => Payload::Delete(PayloadDelete::from_payload(critical, data)?),
+            PayloadType::TRAFFIC_SELECTOR_INITIATOR => Payload::TrafficSelectorInitiator(
+                PayloadTrafficSelector::from_payload(critical, data)?,
+            ),
+            PayloadType::TRAFFIC_SELECTOR_RESPONDER => Payload::TrafficSelectorResponder(
+                PayloadTrafficSelector::from_payload(critical, data)?,
+            ),
+            PayloadType::CONFIGURATION => {
+                Payload::Configuration(PayloadConfiguration::from_payload(critical, data)?)
+            }
+            _ => Payload::Unknown(GenericPayload {
+                payload_type,
+                critical,
+                data,
+            }),
+        };
+        Ok(payload)
+    }
+
+    fn from_encrypted_data(
+        payload_type: PayloadType,
+        critical: bool,
+        encrypted_next_payload: PayloadType,
+        data: &[u8],
+        start_offset: usize,
+    ) -> Result<Payload, FormatError> {
+        match payload_type {
+            PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
+                Ok(Payload::Encrypted(EncryptedMessage::from_encrypted_data(
+                    critical,
+                    encrypted_next_payload,
+                    data,
+                    start_offset,
+                )))
+            }
+            PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT => Ok(Payload::EncryptedFragment(
+                EncryptedMessage::from_encrypted_fragment_data(
+                    critical,
+                    encrypted_next_payload,
+                    data,
+                    start_offset,
+                )?,
+            )),
+            _ => Err("Payload type is not ENCRYPTED_AND_AUTHENTICATED".into()),
+        }
+    }
+
     pub fn payload_type(&self) -> PayloadType {
-        self.payload_type
+        match self {
+            Payload::SecurityAssociation(_) => PayloadType::SECURITY_ASSOCIATION,
+            Payload::KeyExchange(_) => PayloadType::KEY_EXCHANGE,
+            Payload::IdentificationInitiator(_) => PayloadType::ID_INITIATOR,
+            Payload::IdentificationResponder(_) => PayloadType::ID_RESPONDER,
+            Payload::Certificate(_) => PayloadType::CERTIFICATE,
+            Payload::CertificateRequest(_) => PayloadType::CERTIFICATE_REQUEST,
+            Payload::Authentication(_) => PayloadType::AUTHENTICATION,
+            Payload::Nonce(_) => PayloadType::NONCE,
+            Payload::Notify(_) => PayloadType::NOTIFY,
+            Payload::Delete(_) => PayloadType::DELETE,
+            Payload::TrafficSelectorInitiator(_) => PayloadType::TRAFFIC_SELECTOR_INITIATOR,
+            Payload::TrafficSelectorResponder(_) => PayloadType::TRAFFIC_SELECTOR_RESPONDER,
+            Payload::Configuration(_) => PayloadType::CONFIGURATION,
+            Payload::Encrypted(_) => PayloadType::ENCRYPTED_AND_AUTHENTICATED,
+            Payload::EncryptedFragment(_) => PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT,
+            Payload::Unknown(generic) => generic.payload_type(),
+        }
     }
 
     pub fn is_critical(&self) -> bool {
+        match self {
+            Payload::SecurityAssociation(payload) => payload.critical,
+            Payload::KeyExchange(payload) => payload.critical,
+            Payload::IdentificationInitiator(payload)
+            | Payload::IdentificationResponder(payload) => payload.critical,
+            Payload::Certificate(payload) => payload.critical,
+            Payload::CertificateRequest(payload) => payload.critical,
+            Payload::Authentication(payload) => payload.critical,
+            Payload::Nonce(payload) => payload.critical,
+            Payload::Notify(payload) => payload.critical,
+            Payload::Delete(payload) => payload.critical,
+            Payload::TrafficSelectorInitiator(payload) => payload.critical,
+            Payload::TrafficSelectorResponder(payload) => payload.critical,
+            Payload::Configuration(payload) => payload.critical,
+            Payload::Encrypted(payload) => payload.critical,
+            Payload::EncryptedFragment(payload) => payload.critical,
+            Payload::Unknown(generic) => generic.is_critical(),
+        }
+    }
+}
+
+pub struct GenericPayload<'a> {
+    payload_type: PayloadType,
+    critical: bool,
+    data: &'a [u8],
+}
+
+impl GenericPayload<'_> {
+    fn payload_type(&self) -> PayloadType {
+        self.payload_type
+    }
+
+    fn is_critical(&self) -> bool {
         self.critical
-    }
-
-    pub fn to_security_association(&self) -> Result<PayloadSecurityAssociation, FormatError> {
-        if self.payload_type == PayloadType::SECURITY_ASSOCIATION {
-            Ok(PayloadSecurityAssociation { data: self.data })
-        } else {
-            Err("Payload type is not SECURITY_ASSOCIATION".into())
-        }
-    }
-
-    pub fn to_key_exchange(&self) -> Result<PayloadKeyExchange, FormatError> {
-        if self.payload_type == PayloadType::KEY_EXCHANGE {
-            PayloadKeyExchange::from_payload(self.data)
-        } else {
-            Err("Payload type is not KEY_EXCHANGE".into())
-        }
-    }
-
-    pub fn to_identification(&self) -> Result<PayloadIdentification, FormatError> {
-        if self.payload_type == PayloadType::ID_INITIATOR
-            || self.payload_type == PayloadType::ID_RESPONDER
-        {
-            PayloadIdentification::from_payload(self.data)
-        } else {
-            Err("Payload type is not ID".into())
-        }
-    }
-
-    pub fn to_certificate(&self) -> Result<PayloadCertificate, FormatError> {
-        if self.payload_type == PayloadType::CERTIFICATE {
-            PayloadCertificate::from_payload(self.data)
-        } else {
-            Err("Payload type is not CERTIFICATE".into())
-        }
-    }
-
-    pub fn to_certificate_request(&self) -> Result<PayloadCertificateRequest, FormatError> {
-        if self.payload_type == PayloadType::CERTIFICATE_REQUEST {
-            PayloadCertificateRequest::from_payload(self.data)
-        } else {
-            Err("Payload type is not CERTIFICATE_REQUEST".into())
-        }
-    }
-
-    pub fn to_authentication(&self) -> Result<PayloadAuthentication, FormatError> {
-        if self.payload_type == PayloadType::AUTHENTICATION {
-            PayloadAuthentication::from_payload(self.data)
-        } else {
-            Err("Payload type is not AUTHENTICATION".into())
-        }
-    }
-
-    pub fn to_nonce(&self) -> Result<PayloadNonce, FormatError> {
-        if self.payload_type == PayloadType::NONCE {
-            Ok(PayloadNonce { data: self.data })
-        } else {
-            Err("Payload type is not NONCE".into())
-        }
-    }
-
-    pub fn to_notify(&self) -> Result<PayloadNotify, FormatError> {
-        if self.payload_type == PayloadType::NOTIFY {
-            PayloadNotify::from_payload(self.data)
-        } else {
-            Err("Payload type is not NOTIFY".into())
-        }
-    }
-
-    pub fn to_delete(&self) -> Result<PayloadDelete, FormatError> {
-        if self.payload_type == PayloadType::DELETE {
-            PayloadDelete::from_payload(self.data)
-        } else {
-            Err("Payload type is not DELETE".into())
-        }
-    }
-
-    pub fn to_traffic_selector(&self) -> Result<PayloadTrafficSelector, FormatError> {
-        if self.payload_type == PayloadType::TRAFFIC_SELECTOR_INITIATOR
-            || self.payload_type == PayloadType::TRAFFIC_SELECTOR_RESPONDER
-        {
-            PayloadTrafficSelector::from_payload(self.data)
-        } else {
-            Err("Payload type is not TRAFFIC_SELECTOR".into())
-        }
-    }
-
-    pub fn to_configuration(&self) -> Result<PayloadConfiguration, FormatError> {
-        if self.payload_type == PayloadType::CONFIGURATION {
-            PayloadConfiguration::from_payload(self.data)
-        } else {
-            Err("Payload type is not CONFIGURATION".into())
-        }
-    }
-
-    pub fn encrypted_data(&self) -> Result<EncryptedMessage, FormatError> {
-        if self.payload_type == PayloadType::ENCRYPTED_AND_AUTHENTICATED {
-            let encrypted_next_payload = if let Some(next_payload) = self.encrypted_next_payload {
-                next_payload
-            } else {
-                return Err("Unspecified next encrypted payload".into());
-            };
-            Ok(EncryptedMessage::from_encrypted_payload(
-                encrypted_next_payload,
-                self,
-            ))
-        } else if self.payload_type == PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT {
-            let encrypted_next_payload = if let Some(next_payload) = self.encrypted_next_payload {
-                next_payload
-            } else {
-                return Err("Unspecified next encrypted payload".into());
-            };
-            EncryptedMessage::from_encrypted_fragment_payload(encrypted_next_payload, self)
-        } else {
-            Err("Payload type is not ENCRYPTED_AND_AUTHENTICATED".into())
-        }
     }
 }
 
@@ -975,19 +997,19 @@ impl<'a> Iterator for PayloadIter<'a> {
         }
         self.payload_encrypted = current_payload == PayloadType::ENCRYPTED_AND_AUTHENTICATED
             || current_payload == PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT;
-        let encrypted_next_payload = if self.payload_encrypted {
-            Some(self.next_payload)
+        let data = &data[4..payload_length];
+        let item = if self.payload_encrypted {
+            Payload::from_encrypted_data(
+                current_payload,
+                critical,
+                self.next_payload,
+                data,
+                start_offset,
+            )
         } else {
-            None
+            Payload::from_data(current_payload, critical, data)
         };
-        let item = Payload {
-            payload_type: current_payload,
-            encrypted_next_payload,
-            critical,
-            data: &data[4..payload_length],
-            start_offset,
-        };
-        Some(Ok(item))
+        Some(item)
     }
 }
 
@@ -1055,6 +1077,7 @@ impl fmt::Display for PayloadType {
 }
 
 pub struct PayloadSecurityAssociation<'a> {
+    critical: bool,
     data: &'a [u8],
 }
 
@@ -1509,16 +1532,17 @@ impl SecurityAssociationTransformAttribute<'_> {
 }
 
 pub struct PayloadKeyExchange<'a> {
+    critical: bool,
     data: &'a [u8],
 }
 
 impl<'a> PayloadKeyExchange<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadKeyExchange<'a>, FormatError> {
+    fn from_payload(critical: bool, data: &'a [u8]) -> Result<PayloadKeyExchange<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in key exchange payload");
             Err("Not enough data in key exchange payload".into())
         } else {
-            Ok(PayloadKeyExchange { data })
+            Ok(PayloadKeyExchange { critical, data })
         }
     }
 
@@ -1571,16 +1595,20 @@ impl fmt::Display for IdentificationType {
 }
 
 pub struct PayloadIdentification<'a> {
+    critical: bool,
     data: &'a [u8],
 }
 
 impl<'a> PayloadIdentification<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadIdentification<'a>, FormatError> {
+    fn from_payload(
+        critical: bool,
+        data: &'a [u8],
+    ) -> Result<PayloadIdentification<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in identification payload");
             Err("Not enough data in identification payload".into())
         } else {
-            Ok(PayloadIdentification { data })
+            Ok(PayloadIdentification { critical, data })
         }
     }
 
@@ -1640,12 +1668,13 @@ impl fmt::Display for CertificateEncoding {
 }
 
 pub struct PayloadCertificate<'a> {
+    critical: bool,
     encoding: CertificateEncoding,
     data: &'a [u8],
 }
 
 impl<'a> PayloadCertificate<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadCertificate<'a>, FormatError> {
+    fn from_payload(critical: bool, data: &'a [u8]) -> Result<PayloadCertificate<'a>, FormatError> {
         if data.is_empty() {
             debug!("Not enough data in certificate payload");
             return Err("Not enough data in certificate payload".into());
@@ -1654,6 +1683,7 @@ impl<'a> PayloadCertificate<'a> {
         let encoding = CertificateEncoding::from_u8(data[0]);
 
         Ok(PayloadCertificate {
+            critical,
             encoding,
             data: &data[1..],
         })
@@ -1669,16 +1699,20 @@ impl<'a> PayloadCertificate<'a> {
 }
 
 pub struct PayloadCertificateRequest<'a> {
+    critical: bool,
     data: &'a [u8],
 }
 
 impl<'a> PayloadCertificateRequest<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadCertificateRequest<'a>, FormatError> {
+    fn from_payload(
+        critical: bool,
+        data: &'a [u8],
+    ) -> Result<PayloadCertificateRequest<'a>, FormatError> {
         if data.is_empty() {
             debug!("Not enough data in certificate request payload");
             Err("Not enough data in certificate request payload".into())
         } else {
-            Ok(PayloadCertificateRequest { data })
+            Ok(PayloadCertificateRequest { critical, data })
         }
     }
 
@@ -1721,17 +1755,21 @@ impl fmt::Display for AuthMethod {
 }
 
 pub struct PayloadAuthentication<'a> {
+    critical: bool,
     data: &'a [u8],
 }
 
 impl<'a> PayloadAuthentication<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadAuthentication<'a>, FormatError> {
+    fn from_payload(
+        critical: bool,
+        data: &'a [u8],
+    ) -> Result<PayloadAuthentication<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in authentication payload");
             return Err("Not enough data in certificate payload".into());
         }
 
-        Ok(PayloadAuthentication { data })
+        Ok(PayloadAuthentication { critical, data })
     }
 
     pub fn read_method(&self) -> AuthMethod {
@@ -1744,6 +1782,7 @@ impl<'a> PayloadAuthentication<'a> {
 }
 
 pub struct PayloadNonce<'a> {
+    critical: bool,
     data: &'a [u8],
 }
 
@@ -1840,6 +1879,7 @@ impl fmt::Display for NotifyMessageType {
 }
 
 pub struct PayloadNotify<'a> {
+    critical: bool,
     protocol_id: Option<IPSecProtocolID>,
     message_type: NotifyMessageType,
     spi: Spi,
@@ -1847,7 +1887,7 @@ pub struct PayloadNotify<'a> {
 }
 
 impl<'a> PayloadNotify<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadNotify<'a>, FormatError> {
+    fn from_payload(critical: bool, data: &'a [u8]) -> Result<PayloadNotify<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in notify payload");
             return Err("Not enough data in notify payload".into());
@@ -1868,6 +1908,7 @@ impl<'a> PayloadNotify<'a> {
         let message_type = NotifyMessageType::from_u16(message_type);
         let spi = Spi::from_slice(&data[4..4 + spi_size])?;
         Ok(PayloadNotify {
+            critical,
             protocol_id,
             message_type,
             spi,
@@ -1954,12 +1995,13 @@ impl Iterator for SignatureHashAlgorithmIter<'_> {
 }
 
 pub struct PayloadDelete<'a> {
+    critical: bool,
     protocol_id: IPSecProtocolID,
     data: &'a [u8],
 }
 
 impl<'a> PayloadDelete<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadDelete<'a>, FormatError> {
+    fn from_payload(critical: bool, data: &'a [u8]) -> Result<PayloadDelete<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in delete payload");
             return Err("Not enough data in delete payload".into());
@@ -1972,6 +2014,7 @@ impl<'a> PayloadDelete<'a> {
         if protocol_id == IPSecProtocolID::IKE {
             return if spi_size == 0 && spi_count == 0 {
                 Ok(PayloadDelete {
+                    critical,
                     protocol_id,
                     data: &[],
                 })
@@ -1986,6 +2029,7 @@ impl<'a> PayloadDelete<'a> {
             return Err("Delete SPI size mismatch".into());
         }
         Ok(PayloadDelete {
+            critical,
             protocol_id,
             data: &data[4..],
         })
@@ -2019,16 +2063,20 @@ impl Iterator for DeleteSpiIter<'_> {
 }
 
 pub struct PayloadTrafficSelector<'a> {
+    critical: bool,
     data: &'a [u8],
 }
 
 impl<'a> PayloadTrafficSelector<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadTrafficSelector<'a>, FormatError> {
+    fn from_payload(
+        critical: bool,
+        data: &'a [u8],
+    ) -> Result<PayloadTrafficSelector<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in traffic selector payload");
             Err("Not enough data in traffic selector payload".into())
         } else {
-            Ok(PayloadTrafficSelector { data })
+            Ok(PayloadTrafficSelector { critical, data })
         }
     }
 
@@ -2232,12 +2280,16 @@ impl Iterator for TrafficSelectorIter<'_> {
 }
 
 pub struct PayloadConfiguration<'a> {
+    critical: bool,
     configuration_type: ConfigurationType,
     data: &'a [u8],
 }
 
 impl<'a> PayloadConfiguration<'a> {
-    fn from_payload(data: &'a [u8]) -> Result<PayloadConfiguration<'a>, FormatError> {
+    fn from_payload(
+        critical: bool,
+        data: &'a [u8],
+    ) -> Result<PayloadConfiguration<'a>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in configuration payload");
             return Err("Not enough data in configuration payload".into());
@@ -2245,6 +2297,7 @@ impl<'a> PayloadConfiguration<'a> {
 
         let configuration_type = ConfigurationType::from_u8(data[0])?;
         Ok(PayloadConfiguration {
+            critical,
             configuration_type,
             data: &data[4..],
         })
@@ -2397,6 +2450,7 @@ impl<'a> Iterator for ConfigurationAttributesIter<'a> {
 }
 
 pub struct EncryptedMessage<'a> {
+    critical: bool,
     next_payload: PayloadType,
     data: &'a [u8],
     start_offset: usize,
@@ -2405,25 +2459,29 @@ pub struct EncryptedMessage<'a> {
 }
 
 impl<'a> EncryptedMessage<'a> {
-    fn from_encrypted_payload(
+    fn from_encrypted_data(
+        critical: bool,
         next_payload: PayloadType,
-        payload: &'a Payload,
+        data: &'a [u8],
+        start_offset: usize,
     ) -> EncryptedMessage<'a> {
         EncryptedMessage {
+            critical,
             next_payload,
-            data: payload.data,
-            start_offset: payload.start_offset,
+            data,
+            start_offset,
             fragment_number: 1,
             total_fragments: 1,
         }
     }
 
-    fn from_encrypted_fragment_payload(
+    fn from_encrypted_fragment_data(
+        critical: bool,
         next_payload: PayloadType,
-        payload: &'a Payload,
+        data: &'a [u8],
+        start_offset: usize,
     ) -> Result<EncryptedMessage<'a>, FormatError> {
-        let data = payload.data;
-        if payload.data.len() < 4 {
+        if data.len() < 4 {
             Err("Not enough data in Encrypted Fragment payload".into())
         } else {
             let mut fragment_number = [0u8; 2];
@@ -2433,9 +2491,10 @@ impl<'a> EncryptedMessage<'a> {
             total_fragments.copy_from_slice(&data[2..4]);
             let total_fragments = u16::from_be_bytes(total_fragments);
             Ok(EncryptedMessage {
+                critical,
                 next_payload,
                 data: &data[4..],
-                start_offset: payload.start_offset + 4,
+                start_offset: start_offset + 4,
                 fragment_number,
                 total_fragments,
             })
@@ -2461,164 +2520,178 @@ impl<'a> EncryptedMessage<'a> {
 
 impl fmt::Debug for Payload<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let critical = if self.critical {
+        let critical = if self.is_critical() {
             "critical"
         } else {
             "not critical"
         };
-        writeln!(f, "  Payload type {}, {}", self.payload_type, critical)?;
-        if let Ok(pl_sa) = self.to_security_association() {
-            for prop in pl_sa.iter_proposals() {
-                let prop = match prop {
-                    Ok(prop) => prop,
-                    Err(err) => {
-                        writeln!(f, "    Proposal invalid {}", err)?;
-                        continue;
-                    }
-                };
-                writeln!(
-                    f,
-                    "    Proposal {} protocol ID {} SPI {:?}",
-                    prop.proposal_num, prop.protocol_id, prop.spi
-                )?;
-                for tf in prop.iter_transforms() {
-                    let tf = match tf {
-                        Ok(tf) => tf,
+        writeln!(f, "  Payload type {}, {}", self.payload_type(), critical)?;
+        match self {
+            Payload::SecurityAssociation(pl_sa) => {
+                for prop in pl_sa.iter_proposals() {
+                    let prop = match prop {
+                        Ok(prop) => prop,
                         Err(err) => {
-                            writeln!(f, "      Transform invalid {}", err)?;
+                            writeln!(f, "    Proposal invalid {}", err)?;
                             continue;
                         }
                     };
-                    writeln!(f, "      Transform type {}", tf.transform_type)?;
-                    for attr in tf.iter_attributes() {
-                        let attr = match attr {
-                            Ok(attr) => attr,
+                    writeln!(
+                        f,
+                        "    Proposal {} protocol ID {} SPI {:?}",
+                        prop.proposal_num, prop.protocol_id, prop.spi
+                    )?;
+                    for tf in prop.iter_transforms() {
+                        let tf = match tf {
+                            Ok(tf) => tf,
                             Err(err) => {
-                                writeln!(f, "        Attribute type invalid {}", err)?;
+                                writeln!(f, "      Transform invalid {}", err)?;
                                 continue;
                             }
                         };
-                        writeln!(
-                            f,
-                            "        Attribute {} value {}",
-                            attr.attribute_type,
-                            fmt_slice_hex(attr.data)
-                        )?;
+                        writeln!(f, "      Transform type {}", tf.transform_type)?;
+                        for attr in tf.iter_attributes() {
+                            let attr = match attr {
+                                Ok(attr) => attr,
+                                Err(err) => {
+                                    writeln!(f, "        Attribute type invalid {}", err)?;
+                                    continue;
+                                }
+                            };
+                            writeln!(
+                                f,
+                                "        Attribute {} value {}",
+                                attr.attribute_type,
+                                fmt_slice_hex(attr.data)
+                            )?;
+                        }
                     }
                 }
             }
-        } else if let Ok(pl_kex) = self.to_key_exchange() {
-            writeln!(
-                f,
-                "    DH Group num {} value {}",
-                pl_kex.read_group_num(),
-                fmt_slice_hex(pl_kex.read_value())
-            )?;
-        } else if let Ok(pl_id) = self.to_identification() {
-            let identification_type = pl_id.read_identification_type();
-            writeln!(
-                f,
-                "    Identification type {} value {}",
-                identification_type,
-                fmt_slice_hex(pl_id.read_value())
-            )?;
-        } else if let Ok(pl_cert) = self.to_certificate() {
-            writeln!(
-                f,
-                "    Certificate format {} data {}",
-                pl_cert.encoding(),
-                fmt_slice_hex(pl_cert.read_value())
-            )?;
-        } else if let Ok(pl_certreq) = self.to_certificate_request() {
-            writeln!(
-                f,
-                "    Certificate request format {} data {}",
-                pl_certreq.read_encoding(),
-                fmt_slice_hex(pl_certreq.read_value())
-            )?;
-        } else if let Ok(pl_auth) = self.to_authentication() {
-            writeln!(
-                f,
-                "    Authentication method {} data {}",
-                pl_auth.read_method(),
-                fmt_slice_hex(pl_auth.read_value())
-            )?;
-        } else if let Ok(pl_nonce) = self.to_nonce() {
-            writeln!(f, "    Value {}", fmt_slice_hex(pl_nonce.read_value()))?;
-        } else if let Ok(pl_notify) = self.to_notify() {
-            write!(f, "    Notify protocol ID ")?;
-            match pl_notify.protocol_id {
-                Some(protocol) => write!(f, "{}", protocol)?,
-                None => write!(f, "None")?,
+            Payload::KeyExchange(pl_kex) => {
+                writeln!(
+                    f,
+                    "    DH Group num {} value {}",
+                    pl_kex.read_group_num(),
+                    fmt_slice_hex(pl_kex.read_value())
+                )?;
             }
-            write!(f, " SPI {} type {}", pl_notify.spi, pl_notify.message_type,)?;
-            if pl_notify.message_type == NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
-                write!(f, " list",)?;
-                if let Ok(hash_algorithms) = pl_notify.to_signature_hash_algorithms() {
-                    for alg in hash_algorithms {
-                        write!(f, " {}", alg)?;
+            Payload::IdentificationInitiator(pl_id) | Payload::IdentificationResponder(pl_id) => {
+                let identification_type = pl_id.read_identification_type();
+                writeln!(
+                    f,
+                    "    Identification type {} value {}",
+                    identification_type,
+                    fmt_slice_hex(pl_id.read_value())
+                )?;
+            }
+            Payload::Certificate(pl_cert) => {
+                writeln!(
+                    f,
+                    "    Certificate format {} data {}",
+                    pl_cert.encoding(),
+                    fmt_slice_hex(pl_cert.read_value())
+                )?;
+            }
+            Payload::CertificateRequest(pl_certreq) => {
+                writeln!(
+                    f,
+                    "    Certificate request format {} data {}",
+                    pl_certreq.read_encoding(),
+                    fmt_slice_hex(pl_certreq.read_value())
+                )?;
+            }
+            Payload::Authentication(pl_auth) => {
+                writeln!(
+                    f,
+                    "    Authentication method {} data {}",
+                    pl_auth.read_method(),
+                    fmt_slice_hex(pl_auth.read_value())
+                )?;
+            }
+            Payload::Nonce(pl_nonce) => {
+                writeln!(f, "    Value {}", fmt_slice_hex(pl_nonce.read_value()))?;
+            }
+            Payload::Notify(pl_notify) => {
+                write!(f, "    Notify protocol ID ")?;
+                match pl_notify.protocol_id {
+                    Some(protocol) => write!(f, "{}", protocol)?,
+                    None => write!(f, "None")?,
+                }
+                write!(f, " SPI {} type {}", pl_notify.spi, pl_notify.message_type,)?;
+                if pl_notify.message_type == NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
+                    write!(f, " list",)?;
+                    if let Ok(hash_algorithms) = pl_notify.to_signature_hash_algorithms() {
+                        for alg in hash_algorithms {
+                            write!(f, " {}", alg)?;
+                        }
+                    } else {
+                        write!(f, " error")?;
                     }
+                    writeln!(f)?;
                 } else {
-                    write!(f, " error")?;
+                    writeln!(f, " value {}", fmt_slice_hex(pl_notify.read_value()))?;
+                }
+            }
+            Payload::Delete(pl_delete) => {
+                write!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
+                for delete_spi in pl_delete.iter_spi() {
+                    write!(f, " {}", delete_spi)?;
                 }
                 writeln!(f)?;
-            } else {
-                writeln!(f, " value {}", fmt_slice_hex(pl_notify.read_value()))?;
             }
-        } else if let Ok(pl_delete) = self.to_delete() {
-            write!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
-            for delete_spi in pl_delete.iter_spi() {
-                write!(f, " {}", delete_spi)?;
+            Payload::TrafficSelectorInitiator(pl_ts) | Payload::TrafficSelectorResponder(pl_ts) => {
+                for ts in pl_ts.iter_traffic_selectors() {
+                    let ts = match ts {
+                        Ok(ts) => ts,
+                        Err(err) => {
+                            writeln!(f, "    Traffic selector invalid {}", err)?;
+                            continue;
+                        }
+                    };
+                    writeln!(
+                        f,
+                        "    TS Type {} IP protocol {} ports {}-{} addresses {:?}-{:?}",
+                        ts.ts_type,
+                        ts.ip_protocol,
+                        ts.port.start(),
+                        ts.port.end(),
+                        ts.addr.start(),
+                        ts.addr.end(),
+                    )?;
+                }
             }
-            writeln!(f)?;
-        } else if let Ok(pl_ts) = self.to_traffic_selector() {
-            for ts in pl_ts.iter_traffic_selectors() {
-                let ts = match ts {
-                    Ok(ts) => ts,
-                    Err(err) => {
-                        writeln!(f, "    Traffic selector invalid {}", err)?;
-                        continue;
-                    }
-                };
+            Payload::Configuration(pl_ca) => {
+                writeln!(f, "    Configuration type {}", pl_ca.configuration_type())?;
+                for attr in pl_ca.iter_attributes() {
+                    let attr = match attr {
+                        Ok(attr) => attr,
+                        Err(err) => {
+                            writeln!(f, "      Configuration attribute invalid {}", err)?;
+                            continue;
+                        }
+                    };
+                    writeln!(
+                        f,
+                        "      Attribute Type {} value {}",
+                        attr.attribute_type(),
+                        fmt_slice_hex(attr.read_value()),
+                    )?;
+                }
+            }
+            Payload::Encrypted(pl_enc) | Payload::EncryptedFragment(pl_enc) => {
                 writeln!(
                     f,
-                    "    TS Type {} IP protocol {} ports {}-{} addresses {:?}-{:?}",
-                    ts.ts_type,
-                    ts.ip_protocol,
-                    ts.port.start(),
-                    ts.port.end(),
-                    ts.addr.start(),
-                    ts.addr.end(),
+                    "    Fragment {} out of {} next type {}",
+                    pl_enc.fragment_number(),
+                    pl_enc.total_fragments(),
+                    pl_enc.next_payload(),
                 )?;
+                writeln!(f, "    Data {}", fmt_slice_hex(pl_enc.encrypted_data()))?;
             }
-        } else if let Ok(pl_ca) = self.to_configuration() {
-            writeln!(f, "    Configuration type {}", pl_ca.configuration_type())?;
-            for attr in pl_ca.iter_attributes() {
-                let attr = match attr {
-                    Ok(attr) => attr,
-                    Err(err) => {
-                        writeln!(f, "      Configuration attribute invalid {}", err)?;
-                        continue;
-                    }
-                };
-                writeln!(
-                    f,
-                    "      Attribute Type {} value {}",
-                    attr.attribute_type(),
-                    fmt_slice_hex(attr.read_value()),
-                )?;
+            Payload::Unknown(pl_unknown) => {
+                writeln!(f, "    Data {}", fmt_slice_hex(pl_unknown.data))?;
             }
-        } else if let Ok(pl_enc) = self.encrypted_data() {
-            writeln!(
-                f,
-                "    Fragment {} out of {} next type {}",
-                pl_enc.fragment_number(),
-                pl_enc.total_fragments(),
-                pl_enc.next_payload(),
-            )?;
-            writeln!(f, "    Data {}", fmt_slice_hex(pl_enc.encrypted_data()))?;
-        } else {
-            writeln!(f, "    Data {}", fmt_slice_hex(self.data))?;
         }
         Ok(())
     }

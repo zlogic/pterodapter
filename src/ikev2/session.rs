@@ -341,13 +341,13 @@ impl IKEv2Session {
         request: &message::InputMessage,
     ) -> Result<Option<Vec<u8>>, SessionError> {
         let encrypted_payload = match request.iter_payloads().next() {
-            Some(Ok(payload)) => payload,
+            Some(Ok(message::Payload::Encrypted(payload))) => payload,
+            Some(Ok(message::Payload::EncryptedFragment(payload))) => payload,
             Some(Err(err)) => return Err(err.into()),
-            None => return Err("Request has no encrypted payloads".into()),
+            Some(Ok(_)) | None => return Err("Request has no encrypted payloads".into()),
         };
 
         let mut decrypted_data = [0u8; MAX_ENCRYPTED_FRAGMENT_SIZE];
-        let encrypted_payload = encrypted_payload.encrypted_data()?;
         let encrypted_data = encrypted_payload.encrypted_data();
         let decrypted_data = &mut decrypted_data[..encrypted_data.len()];
         decrypted_data.copy_from_slice(encrypted_data);
@@ -445,15 +445,12 @@ impl IKEv2Session {
         // Otherwise, the first payload should be an encrypted message
         // (avoid any retransmissions if request is not encrypted).
         match request.iter_payloads().next() {
-            Some(Ok(payload)) => match payload.payload_type() {
-                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED_FRAGMENT => payload
-                    .encrypted_data()
-                    .map_or(true, |payload| payload.fragment_number() == 1),
-                message::PayloadType::ENCRYPTED_AND_AUTHENTICATED => true,
-                _ => false,
-            },
+            Some(Ok(message::Payload::EncryptedFragment(payload))) => {
+                payload.fragment_number() == 1
+            }
+            Some(Ok(message::Payload::Encrypted(_))) => true,
             Some(Err(_)) => false,
-            None => false,
+            Some(Ok(_)) | None => false,
         }
     }
 
@@ -570,9 +567,8 @@ impl IKEv2Session {
             };
             // IKEv2 payloads need to be sent in a very specific order.
             // By the time the Nonce is reached, SA and KE should already be processed.
-            match payload.payload_type() {
-                message::PayloadType::SECURITY_ASSOCIATION => {
-                    let sa = payload.to_security_association()?;
+            match payload {
+                message::Payload::SecurityAssociation(sa) => {
                     let (prop, proposal_num) =
                         if let Some(transform) = crypto::choose_sa_parameters(&sa) {
                             transform
@@ -590,8 +586,7 @@ impl IKEv2Session {
                     }
                     self.params = Some(prop);
                 }
-                message::PayloadType::KEY_EXCHANGE => {
-                    let kex = payload.to_key_exchange()?;
+                message::Payload::KeyExchange(kex) => {
                     if let Some(ref mut dh) = dh_transform.as_mut() {
                         let public_key = dh.read_public_key();
                         shared_secret = match dh.compute_shared_secret(kex.read_value()) {
@@ -606,8 +601,7 @@ impl IKEv2Session {
                             .write_key_exchange_payload(dh.group_number(), public_key.as_slice())?;
                     }
                 }
-                message::PayloadType::NONCE => {
-                    let nonce = payload.to_nonce()?;
+                message::Payload::Nonce(nonce) => {
                     let nonce_remote = nonce.read_value();
                     nonce_initiator = {
                         let mut nonce_initiator = vec![0; nonce_remote.len()];
@@ -674,8 +668,7 @@ impl IKEv2Session {
                         .next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
                     dest.copy_from_slice(nonce_local);
                 }
-                message::PayloadType::NOTIFY => {
-                    let notify = payload.to_notify()?;
+                message::Payload::Notify(notify) => {
                     match notify.message_type() {
                         message::NotifyMessageType::SIGNATURE_HASH_ALGORITHMS => {
                             let supports_sha256 = notify
@@ -850,9 +843,8 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            match payload.payload_type() {
-                message::PayloadType::CERTIFICATE => {
-                    let certificate = payload.to_certificate()?;
+            match payload {
+                message::Payload::Certificate(certificate) => {
                     if certificate.encoding() != message::CertificateEncoding::X509_SIGNATURE {
                         warn!(
                             "Certificate encoding {} is unsupported",
@@ -874,16 +866,14 @@ impl IKEv2Session {
                         }
                     };
                 }
-                message::PayloadType::NOTIFY => {
-                    let notify = payload.to_notify()?;
+                message::Payload::Notify(notify) => {
                     if notify.message_type() == message::NotifyMessageType::INITIAL_CONTACT
                         && notify.spi() == message::Spi::None
                     {
                         initial_contact = true;
                     }
                 }
-                message::PayloadType::CERTIFICATE_REQUEST => {
-                    let certreq = payload.to_certificate_request()?;
+                message::Payload::CertificateRequest(certreq) => {
                     if certreq.read_encoding() != message::CertificateEncoding::X509_SIGNATURE {
                         warn!(
                             "Certificate request encoding {} is unsupported",
@@ -902,12 +892,10 @@ impl IKEv2Session {
                         }
                     };
                 }
-                message::PayloadType::ID_INITIATOR => {
-                    let id = payload.to_identification()?;
+                message::Payload::IdentificationInitiator(id) => {
                     id_initiator = Some(id.raw_value().to_vec());
                 }
-                message::PayloadType::AUTHENTICATION => {
-                    let auth = payload.to_authentication()?;
+                message::Payload::Authentication(auth) => {
                     client_auth = match auth.read_method() {
                         message::AuthMethod::ECDSA_SHA256_P256 => {
                             Some((auth.read_value().to_vec(), pki::SignatureFormat::Default))
@@ -929,17 +917,15 @@ impl IKEv2Session {
                         }
                     }
                 }
-                message::PayloadType::SECURITY_ASSOCIATION => {
-                    let sa = payload.to_security_association()?;
+                message::Payload::SecurityAssociation(sa) => {
                     transform_params = crypto::choose_sa_parameters(&sa);
                     if transform_params.is_none() {
                         warn!("No compatible SA parameters found");
                         continue;
                     };
                 }
-                message::PayloadType::TRAFFIC_SELECTOR_INITIATOR => {
-                    let ts = payload
-                        .to_traffic_selector()?
+                message::Payload::TrafficSelectorInitiator(ts) => {
+                    let ts = ts
                         .iter_traffic_selectors()
                         .collect::<Result<Vec<_>, message::FormatError>>()
                         .map_err(|err| {
@@ -952,9 +938,8 @@ impl IKEv2Session {
                         ts_remote = ts
                     }
                 }
-                message::PayloadType::TRAFFIC_SELECTOR_RESPONDER => {
-                    let ts = payload
-                        .to_traffic_selector()?
+                message::Payload::TrafficSelectorResponder(ts) => {
+                    let ts = ts
                         .iter_traffic_selectors()
                         .collect::<Result<Vec<_>, message::FormatError>>()
                         .map_err(|err| {
@@ -967,26 +952,23 @@ impl IKEv2Session {
                         ts_local = ts
                     }
                 }
-                message::PayloadType::CONFIGURATION => {
-                    payload
-                        .to_configuration()?
-                        .iter_attributes()
-                        .try_for_each(|attr| {
-                            let attr = attr.map_err(|err| {
-                                warn!("Failed to decode configuration attribute: {}", err);
-                                err
-                            })?;
-                            match attr.attribute_type() {
-                                message::ConfigurationAttributeType::INTERNAL_IP4_ADDRESS => {
-                                    ipv4_address_requested = true
-                                }
-                                message::ConfigurationAttributeType::INTERNAL_DNS_DOMAIN => {
-                                    internal_domain_requested = true
-                                }
-                                _ => {}
-                            }
-                            Ok::<_, SessionError>(())
+                message::Payload::Configuration(configuration) => {
+                    configuration.iter_attributes().try_for_each(|attr| {
+                        let attr = attr.map_err(|err| {
+                            warn!("Failed to decode configuration attribute: {}", err);
+                            err
                         })?;
+                        match attr.attribute_type() {
+                            message::ConfigurationAttributeType::INTERNAL_IP4_ADDRESS => {
+                                ipv4_address_requested = true
+                            }
+                            message::ConfigurationAttributeType::INTERNAL_DNS_DOMAIN => {
+                                internal_domain_requested = true
+                            }
+                            _ => {}
+                        }
+                        Ok::<_, SessionError>(())
+                    })?;
                 }
                 _ => {
                     if payload.is_critical() {
@@ -1223,9 +1205,8 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            match payload.payload_type() {
-                message::PayloadType::DELETE => {
-                    let delete = payload.to_delete()?;
+            match payload {
+                message::Payload::Delete(delete) => {
                     delete_spi = delete.iter_spi().collect::<Vec<_>>();
                     delete_ike = delete_spi.is_empty();
                 }
@@ -1325,15 +1306,13 @@ impl IKEv2Session {
                     continue;
                 }
             };
-            match payload.payload_type() {
-                message::PayloadType::NOTIFY => {
-                    let notify = payload.to_notify()?;
+            match payload {
+                message::Payload::Notify(notify) => {
                     if notify.message_type() == message::NotifyMessageType::REKEY_SA {
                         rekey_child_sa = Some(notify.spi());
                     }
                 }
-                message::PayloadType::SECURITY_ASSOCIATION => {
-                    let sa = payload.to_security_association()?;
+                message::Payload::SecurityAssociation(sa) => {
                     transform_params = crypto::choose_sa_parameters(&sa);
                     let prop = match transform_params {
                         Some(params) => params.0,
@@ -1349,8 +1328,7 @@ impl IKEv2Session {
                         }
                     }
                 }
-                message::PayloadType::NONCE => {
-                    let nonce = payload.to_nonce()?;
+                message::Payload::Nonce(nonce) => {
                     let nonce_remote = nonce.read_value();
                     nonce_initiator = {
                         let mut nonce_initiator = vec![0; nonce_remote.len()];
@@ -1366,8 +1344,7 @@ impl IKEv2Session {
                         Some(nonce_responder)
                     };
                 }
-                message::PayloadType::KEY_EXCHANGE => {
-                    let kex = payload.to_key_exchange()?;
+                message::Payload::KeyExchange(kex) => {
                     if let Some(ref mut dh) = dh_transform.as_mut() {
                         public_key = Some(dh.read_public_key());
                         shared_secret = match dh.compute_shared_secret(kex.read_value()) {
@@ -1380,9 +1357,8 @@ impl IKEv2Session {
                         };
                     }
                 }
-                message::PayloadType::TRAFFIC_SELECTOR_INITIATOR => {
-                    let ts = payload
-                        .to_traffic_selector()?
+                message::Payload::TrafficSelectorInitiator(ts) => {
+                    let ts = ts
                         .iter_traffic_selectors()
                         .collect::<Result<Vec<_>, message::FormatError>>()
                         .map_err(|err| {
@@ -1395,9 +1371,8 @@ impl IKEv2Session {
                         ts_remote = ts
                     }
                 }
-                message::PayloadType::TRAFFIC_SELECTOR_RESPONDER => {
-                    let ts = payload
-                        .to_traffic_selector()?
+                message::Payload::TrafficSelectorResponder(ts) => {
+                    let ts = ts
                         .iter_traffic_selectors()
                         .collect::<Result<Vec<_>, message::FormatError>>()
                         .map_err(|err| {
