@@ -4,7 +4,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use log::{debug, warn};
+use log::warn;
 
 use crate::logger::fmt_slice_hex;
 
@@ -559,7 +559,7 @@ impl fmt::Display for IpPacket<'_> {
             Ok(None) => writeln!(f, "{}", self.dst_addr())?,
             Err(err) => writeln!(f, "{} (port {}) -> ", self.dst_addr(), err)?,
         }
-        writeln!(
+        write!(
             f,
             "  Transport {}",
             fmt_slice_hex(self.transport_protocol_data())
