@@ -314,13 +314,13 @@ impl FortiVPNTunnel {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
-            debug!("Received LCP packet: {:?}", response);
-            let lcp_packet = match response.to_lcp() {
-                Ok(lcp) => lcp,
-                Err(err) => {
+            debug!("Received PPP packet: {}", response);
+            let lcp_packet = match &response {
+                ppp::Packet::Lcp(lcp) => lcp,
+                ppp::Packet::Unknown(_) | ppp::Packet::Ipcp(_) => {
                     debug!(
-                        "Received unexpected PPP packet during LCP handshake: {} (error {})",
-                        response, err
+                        "Received unexpected PPP packet during LCP handshake: {}",
+                        response
                     );
                     continue;
                 }
@@ -458,13 +458,13 @@ impl FortiVPNTunnel {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
-            debug!("Received IPCP packet: {:?}", response);
-            let ipcp_packet = match response.to_ipcp() {
-                Ok(lcp) => lcp,
-                Err(err) => {
+            debug!("Received PPP packet: {}", response);
+            let ipcp_packet = match &response {
+                ppp::Packet::Ipcp(ipcp_packet) => ipcp_packet,
+                ppp::Packet::Unknown(_) | ppp::Packet::Lcp(_) => {
                     debug!(
-                        "Received unexpected PPP packet during handshake: {} (error {})",
-                        response, err
+                        "Received unexpected PPP packet during handshake: {}",
+                        response
                     );
                     continue;
                 }
@@ -630,9 +630,12 @@ impl FortiVPNTunnel {
                 return Err("Failed to decode PPP packet".into());
             }
         };
-        let packet = packet
-            .to_lcp()
-            .map_err(|_| "Failed to convert packet to LCP")?;
+        let packet = match &packet {
+            ppp::Packet::Lcp(packet) => packet,
+            ppp::Packet::Unknown(_) | ppp::Packet::Ipcp(_) => {
+                return Err("Failed to convert packet to LCP".into());
+            }
+        };
         match packet.code() {
             ppp::LcpCode::ECHO_REPLY => {
                 self.last_echo_reply = Instant::now();
@@ -713,12 +716,13 @@ impl FortiVPNTunnel {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
-            let lcp_packet = match response.to_lcp() {
-                Ok(lcp) => lcp,
-                Err(err) => {
+            debug!("Received PPP packet: {}", response);
+            let lcp_packet = match &response {
+                ppp::Packet::Lcp(lcp) => lcp,
+                ppp::Packet::Unknown(_) | ppp::Packet::Ipcp(_) => {
                     debug!(
-                        "Received unexpected PPP packet during termination: {} (error {})",
-                        response, err
+                        "Received unexpected PPP packet during termination: {}",
+                        response
                     );
                     continue;
                 }
