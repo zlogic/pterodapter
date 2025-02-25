@@ -1389,10 +1389,9 @@ impl IKEv2Session {
                             warn!("Failed to decode initiator traffic selectors: {}", err);
                             err
                         });
+                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| {
-                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
-                        });
+                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
                         ts_remote = ts
                     }
                 }
@@ -1405,11 +1404,9 @@ impl IKEv2Session {
                             warn!("Failed to decode responder traffic selectors: {}", err);
                             err
                         });
+                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| {
-                            ts.ts_type() == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
-                        });
-                        self.network.expand_local_ts(&ts);
+                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
                         ts_local = ts
                     }
                 }
@@ -1518,6 +1515,14 @@ impl IKEv2Session {
             // TODO: return TS_UNACCEPTABLE notification.
             return Err("No traffic selectors offered by client".into());
         }
+        if !self.network.ts_local().iter().all(|local_ts| {
+            ts_local
+                .iter()
+                .any(|client_ts| client_ts.contains(local_ts))
+        }) {
+            // TODO: return TS_UNACCEPTABLE notification.
+            return Err("Failed to narrow traffic selector".into());
+        }
         if let Some(old_spi) = rekey_child_sa {
             debug!("Rekeying child SA");
             let old_spi = match old_spi {
@@ -1560,16 +1565,13 @@ impl IKEv2Session {
             ));
         } else if create_child_sa {
             debug!("Creating new child SA");
-            let local_spi = if let Some(local_spi) = new_ids.take_esp() {
-                local_spi
-            } else {
-                return Err("No pre-generated SA ID available".into());
-            };
-            transform_params.set_local_spi(message::Spi::U32(local_spi));
-            let remote_spi = match transform_params.remote_spi() {
-                message::Spi::U32(remote_spi) => remote_spi,
-                _ => return Err("Security Association has unsupported remote SPI type".into()),
-            };
+            let (remote_spi, local_spi) =
+                match (transform_params.remote_spi(), transform_params.local_spi()) {
+                    (message::Spi::U32(remote_spi), message::Spi::U32(local_spi)) => {
+                        (remote_spi, local_spi)
+                    }
+                    _ => return Err("Security Association has unsupported remote SPI type".into()),
+                };
             self.child_sas.insert(ChildSessionID {
                 remote_spi,
                 local_spi,
@@ -1635,7 +1637,7 @@ impl IKEv2Session {
             response.write_key_exchange_payload(dh_group, public_key.as_slice())?;
         }
 
-        if rekey_child_sa.is_some() {
+        if rekey_child_sa.is_some() || create_child_sa {
             response.write_traffic_selector_payload(true, &ts_remote)?;
             response.write_traffic_selector_payload(false, self.network.ts_local())?;
         }
