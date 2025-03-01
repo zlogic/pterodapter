@@ -1,6 +1,6 @@
 use std::{error, fmt, net::SocketAddr};
 
-use log::warn;
+use log::{trace, warn};
 
 use super::{crypto, ip, message};
 
@@ -160,6 +160,16 @@ impl SecurityAssociation {
                 Err("Failed to encrypt ESP packet".into())
             }
         }
+    }
+
+    pub fn nat_to_vpn(&self, packet: &ip::IpPacket) -> Result<(), EspError> {
+        if self.network.is_nat64() && ip::DnsPacket::is_dns(&packet.to_header()?) {
+            // TODO 0.5.0: Validate UDP header (length + checksum).
+            let dns_packet = ip::DnsPacket::from_udp_packet(packet.transport_protocol_data())
+                .map_err(|dns_err| ip::IpError::from(dns_err))?;
+            trace!("Decoded DNS packet: {}", dns_packet);
+        }
+        Ok(())
     }
 }
 

@@ -13,6 +13,10 @@ use super::message;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TransportProtocolType(u8);
 
+mod dns;
+
+pub type DnsPacket<'a> = dns::DnsPacket<'a>;
+
 impl TransportProtocolType {
     const HOP_BY_HOP_OPTIONS: TransportProtocolType = TransportProtocolType(0);
     const ICMP: TransportProtocolType = TransportProtocolType(1);
@@ -222,6 +226,7 @@ impl IpPacket<'_> {
         if data.is_empty() {
             return Err("IP packet is empty, cannot extract header data".into());
         }
+        // TODO 0.5.0: Extract header here, to return error immediately and reuse results for rewriting?
         match data[0] >> 4 {
             4 => Ok(IpPacket::V4(Ipv4Packet::from_data(data)?)),
             6 => Ok(IpPacket::V6(Ipv6Packet::from_data(data)?)),
@@ -570,6 +575,7 @@ impl fmt::Display for IpPacket<'_> {
 #[derive(Debug)]
 pub enum IpError {
     Internal(&'static str),
+    Dns(dns::DnsError),
     Format(message::FormatError),
     Io(io::Error),
 }
@@ -578,6 +584,7 @@ impl fmt::Display for IpError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Internal(msg) => f.write_str(msg),
+            Self::Dns(ref e) => write!(f, "DNS error: {}", e),
             Self::Format(ref e) => write!(f, "Format error: {}", e),
             Self::Io(ref e) => write!(f, "IO error: {}", e),
         }
@@ -588,9 +595,16 @@ impl error::Error for IpError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             Self::Internal(_msg) => None,
+            Self::Dns(ref err) => Some(err),
             Self::Format(ref err) => Some(err),
             Self::Io(ref err) => Some(err),
         }
+    }
+}
+
+impl From<dns::DnsError> for IpError {
+    fn from(err: dns::DnsError) -> IpError {
+        Self::Dns(err)
     }
 }
 
