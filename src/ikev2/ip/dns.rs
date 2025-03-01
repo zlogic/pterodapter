@@ -266,7 +266,6 @@ const LABEL_POINTER_MASK: u8 = 0xc0;
 struct LabelIter<'a> {
     start_offset: usize,
     data: &'a [u8],
-    bytes_read: usize,
 }
 
 impl<'a> Iterator for LabelIter<'a> {
@@ -278,12 +277,11 @@ impl<'a> Iterator for LabelIter<'a> {
             return None;
         }
         let mut start_offset = self.start_offset;
-        let mut length = 0u8;
+        let mut length;
         // Detect loops similar to Wireshark - if read more data than exists in a packet, break
         // loop.
-        while self.bytes_read < self.data.len() {
+        loop {
             length = self.data[start_offset];
-            self.bytes_read += 1;
             let is_pointer = (length as u8) & LABEL_POINTER_MASK == LABEL_POINTER_MASK;
             if self.start_offset + 1 > self.data.len() {
                 self.data = &[];
@@ -298,21 +296,23 @@ impl<'a> Iterator for LabelIter<'a> {
                     return Some(Err("Not enough data in pointer label".into()));
                 }
                 let pointer_offset = {
-                    let upper_half = (length & POINTER_UPPER_HALF_MASK) as u16;
-                    let lower_half = self.data[start_offset + 1] as u16;
-                    self.bytes_read += 1;
-                    (upper_half << 8 | lower_half) as usize
+                    let upper_half = length & POINTER_UPPER_HALF_MASK;
+                    let lower_half = self.data[start_offset + 1];
+                    let pointer_offset = [upper_half, lower_half];
+                    u16::from_be_bytes(pointer_offset) as usize
                 };
-                if pointer_offset == start_offset {
+                // Prevent loops as instructed in RFC 9267, Section 2.
+                if pointer_offset >= start_offset {
                     self.data = &[];
-                    return Some(Err("Self-referencing label pointer".into()));
+                    return Some(Err(
+                        "Label pointer pointing past its location, avoiding loop".into(),
+                    ));
+                } else if pointer_offset == 0 {
+                    self.data = &[];
+                    return Some(Err("Label pointer pointing beginning of packet".into()));
                 }
                 start_offset = pointer_offset;
             }
-        }
-        if self.bytes_read >= self.data.len() {
-            self.data = &[];
-            return Some(Err("Label loop detected".into()));
         }
         let length = length as usize;
         if length == 0 {
@@ -328,7 +328,6 @@ impl<'a> Iterator for LabelIter<'a> {
 
         let label = &self.data[start_offset..start_offset + length];
         self.start_offset = start_offset + length;
-        self.bytes_read += length;
 
         Some(Ok(label))
     }
@@ -508,7 +507,6 @@ impl Question<'_> {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
-            bytes_read: 0,
         }
     }
 
@@ -582,7 +580,6 @@ impl ResourceRecord<'_> {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
-            bytes_read: 0,
         }
     }
 
