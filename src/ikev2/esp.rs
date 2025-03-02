@@ -1,6 +1,12 @@
-use std::{error, fmt, net::SocketAddr};
+use std::{
+    error, fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use log::{trace, warn};
+use tokio::{net::UdpSocket, runtime};
+
+use crate::logger::fmt_slice_hex;
 
 use super::{crypto, ip, message};
 
@@ -168,6 +174,34 @@ impl SecurityAssociation {
             let dns_packet = ip::DnsPacket::from_udp_packet(packet.transport_protocol_data())
                 .map_err(|dns_err| ip::IpError::from(dns_err))?;
             trace!("Decoded DNS packet: {}", dns_packet);
+            let dns_request = packet.transport_protocol_data()[8..].to_vec();
+            let rt = runtime::Handle::current();
+            // TODO 0.5.0: Remove this temporary debug code.
+            rt.spawn(async move {
+                let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+                let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                let socket = UdpSocket::bind(local_addr)
+                    .await
+                    .expect("Failed to bind DNS socket");
+                socket
+                    .connect(&remote_addr)
+                    .await
+                    .expect("Failed to connect to DNS server");
+                socket
+                    .send(dns_request.as_slice())
+                    .await
+                    .expect("Failed to send DNS request");
+                let mut data = [0u8; 1500];
+                let len = socket
+                    .recv(&mut data[8..])
+                    .await
+                    .expect("Failed to receive DNS response");
+                let data = &data[..8 + len];
+                println!("Received DNS response {}", fmt_slice_hex(&data[8..]));
+                let dns_packet = ip::DnsPacket::from_udp_packet(data)
+                    .expect("Failed to parse DNS response packet");
+                trace!("Decoded DNS response: {}", dns_packet);
+            });
         }
         Ok(())
     }

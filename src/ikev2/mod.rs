@@ -1070,11 +1070,6 @@ impl Sessions {
                 // level.
                 return Ok(None);
             }
-            // TODO 0.5.0: Find a better place for this function call.
-            if let Err(err) = sa.nat_to_vpn(&ip_packet) {
-                warn!("Failed to NAT packet from ESP: {}", err);
-                return Err("Failed to NAT packet from ESP".into());
-            }
             if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
                 warn!(
                     "Decrypted packet size {} exceeds MTU {}",
@@ -1082,6 +1077,11 @@ impl Sessions {
                     MAX_ESP_PACKET_SIZE
                 );
                 return Err("Decrypted ESP packet size exceeds MTU".into());
+            }
+            // TODO 0.5.0: Find a better place for this function call.
+            if let Err(err) = sa.nat_to_vpn(&ip_packet) {
+                warn!("Failed to NAT packet from ESP: {}", err);
+                return Err("Failed to NAT packet from ESP".into());
             }
             Ok(Some(decrypted_slice))
         } else {
