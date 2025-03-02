@@ -129,6 +129,7 @@ impl DnsPacket<'_> {
 
     fn authoritative_answer(&self) -> bool {
         // bit 2.
+        // TODO 0.5.0: use message.flags for refence?
         self.data[2] >> 2 & 0x01 == 1
     }
 
@@ -149,7 +150,7 @@ impl DnsPacket<'_> {
 
     fn reserved_zero(&self) -> bool {
         // bits 6-4.
-        self.data[3] >> 4 == 0
+        (self.data[3] >> 4) & 0x7 == 0
     }
 
     fn response_code(&self) -> ResponseCode {
@@ -474,13 +475,14 @@ fn name_end_offset(data: &[u8], start_offset: usize) -> Option<usize> {
         let length = data[start_offset];
         start_offset += 1;
         let is_pointer = length & LABEL_POINTER_MASK == LABEL_POINTER_MASK;
-        if is_pointer || length == 0 {
-            break;
+        if is_pointer {
+            return Some(start_offset + 1);
+        } else if length == 0 {
+            return Some(start_offset);
         } else {
             start_offset += length as usize;
         }
     }
-    Some(start_offset)
 }
 
 impl Question<'_> {
@@ -558,17 +560,17 @@ impl ResourceRecord<'_> {
             return Err("Not enough bytes in NAME length".into());
         };
         if name_end_offset > data.len() {
-            Err("QNAME overflow".into())
+            Err("NAME overflow".into())
         } else if name_end_offset + 10 > data.len() {
-            Err("Not enough bytes in Question".into())
+            Err("Not enough bytes in Resource Record".into())
         } else {
             let rr = ResourceRecord {
                 data,
                 start_offset,
                 name_end_offset,
             };
-            let rdata_start = start_offset + 10 + rr.rd_length() as usize;
-            if rdata_start > data.len() {
+            let rdata_end = start_offset + 10 + rr.rd_length() as usize;
+            if rdata_end > data.len() {
                 Err("RDLENGTH overflow".into())
             } else {
                 Ok(rr)
@@ -602,14 +604,14 @@ impl ResourceRecord<'_> {
     }
 
     fn rd_length(&self) -> u16 {
-        let mut ttl = [0u8; 2];
-        ttl.copy_from_slice(&self.data[self.name_end_offset + 8..self.name_end_offset + 10]);
-        u16::from_be_bytes(ttl)
+        let mut rdlength = [0u8; 2];
+        rdlength.copy_from_slice(&self.data[self.name_end_offset + 8..self.name_end_offset + 10]);
+        u16::from_be_bytes(rdlength)
     }
 
     fn rdata(&self) -> &[u8] {
-        let start_offset = self.start_offset + 10 + self.rd_length() as usize;
-        &self.data[start_offset..]
+        let start_offset = self.name_end_offset + 10;
+        &self.data[start_offset..start_offset + self.rd_length() as usize]
     }
 }
 
@@ -632,7 +634,7 @@ impl fmt::Display for ResourceRecord<'_> {
         })?;
         write!(
             f,
-            " {} {} TTL {} {}",
+            " {} {} TTL={} {}",
             self.rr_type(),
             self.rr_class(),
             self.ttl(),
