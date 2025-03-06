@@ -1,4 +1,7 @@
-use std::{error, fmt};
+use std::{
+    error, fmt,
+    net::{Ipv4Addr, Ipv6Addr},
+};
 
 use crate::logger::fmt_slice_hex;
 
@@ -264,6 +267,7 @@ enum Section<'a> {
 // First two bits are 11.
 const LABEL_POINTER_MASK: u8 = 0xc0;
 
+#[derive(Clone, Copy)]
 struct LabelIter<'a> {
     start_offset: usize,
     data: &'a [u8],
@@ -331,6 +335,26 @@ impl<'a> Iterator for LabelIter<'a> {
         self.start_offset = start_offset + length;
 
         Some(Ok(label))
+    }
+}
+
+impl LabelIter<'_> {
+    fn fmt_domain(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.enumerate().try_for_each(|(i, segment)| {
+            let segment = match segment {
+                Ok(segment) => segment,
+                Err(err) => return write!(f, "[err: {}]", err),
+            };
+            let segment = match std::str::from_utf8(segment) {
+                Ok(segment) => segment,
+                Err(err) => return write!(f, "[utf8 err: {}]", err),
+            };
+            if i == 0 {
+                write!(f, "{}", segment)
+            } else {
+                write!(f, ".{}", segment)
+            }
+        })
     }
 }
 
@@ -527,22 +551,26 @@ impl Question<'_> {
 
 impl fmt::Display for Question<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.iter_qname().enumerate().try_for_each(|(i, segment)| {
-            let segment = match segment {
-                Ok(segment) => String::from_utf8_lossy(segment),
-                Err(err) => {
-                    write!(f, "err: {}", err)?;
-                    return Ok(());
-                }
-            };
-            if i == 0 {
-                write!(f, "{}", segment)?;
-            } else {
-                write!(f, ".{}", segment)?;
-            }
-            Ok(())
-        })?;
+        self.iter_qname().fmt_domain(f)?;
         write!(f, " {} {}", self.qtype(), self.qclass())
+    }
+}
+
+enum Rdata<'a> {
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+    Name(LabelIter<'a>),
+    Unknown(&'a [u8]),
+}
+
+impl fmt::Display for Rdata<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rdata::Ipv4(ipv4_addr) => ipv4_addr.fmt(f),
+            Rdata::Ipv6(ipv6_addr) => ipv6_addr.fmt(f),
+            Rdata::Name(label_iter) => label_iter.fmt_domain(f),
+            Rdata::Unknown(data) => fmt_slice_hex(data).fmt(f),
+        }
     }
 }
 
@@ -609,37 +637,57 @@ impl ResourceRecord<'_> {
         u16::from_be_bytes(rdlength)
     }
 
-    fn rdata(&self) -> &[u8] {
+    fn rdata(&self) -> Result<Rdata, DnsError> {
         let start_offset = self.name_end_offset + 10;
-        &self.data[start_offset..start_offset + self.rd_length() as usize]
+        let data = &self.data[start_offset..start_offset + self.rd_length() as usize];
+        match self.rr_type() {
+            RrType::CNAME
+            | RrType::MD
+            | RrType::MF
+            | RrType::MG
+            | RrType::MR
+            | RrType::NS
+            | RrType::PTR => Ok(Rdata::Name(LabelIter {
+                start_offset,
+                data: self.data,
+            })),
+            RrType::A => {
+                if data.len() == 4 {
+                    let mut ipv4_addr = [0u8; 4];
+                    ipv4_addr.copy_from_slice(data);
+                    Ok(Rdata::Ipv4(Ipv4Addr::from(ipv4_addr)))
+                } else {
+                    Err("Unexpected A record rdata length".into())
+                }
+            }
+            RrType::AAAA => {
+                if data.len() == 16 {
+                    let mut ipv6_addr = [0u8; 16];
+                    ipv6_addr.copy_from_slice(data);
+                    Ok(Rdata::Ipv6(Ipv6Addr::from(ipv6_addr)))
+                } else {
+                    Err("Unexpected AAAA record rdata length".into())
+                }
+            }
+            _ => Ok(Rdata::Unknown(data)),
+        }
     }
 }
 
 impl fmt::Display for ResourceRecord<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.iter_qname().enumerate().try_for_each(|(i, segment)| {
-            let segment = match segment {
-                Ok(segment) => String::from_utf8_lossy(segment),
-                Err(err) => {
-                    write!(f, "err: {}", err)?;
-                    return Ok(());
-                }
-            };
-            if i == 0 {
-                write!(f, "{}", segment)?;
-            } else {
-                write!(f, ".{}", segment)?;
-            }
-            Ok(())
-        })?;
+        self.iter_qname().fmt_domain(f)?;
         write!(
             f,
-            " {} {} TTL={} {}",
+            " {} {} TTL={}",
             self.rr_type(),
             self.rr_class(),
             self.ttl(),
-            fmt_slice_hex(self.rdata())
-        )
+        )?;
+        match self.rdata() {
+            Ok(data) => write!(f, " {}", data),
+            Err(err) => write!(f, " [err: {}]", err),
+        }
     }
 }
 

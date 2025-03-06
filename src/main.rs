@@ -174,6 +174,13 @@ impl Args {
                     ),
                 };
             } else if name == "--tunnel-domain" {
+                if !value.is_ascii() {
+                    fail_with_error(
+                        name,
+                        value,
+                        format_args!("Domain is not a valid ASCII string"),
+                    );
+                }
                 tunnel_domains.push(value.into());
             } else if action_type == ActionType::Proxy && name == "--pac-file" {
                 pac_path = Some(value.into());
