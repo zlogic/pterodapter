@@ -57,7 +57,7 @@ impl Network<'_> {
         use std::task::Poll;
 
         let mut next_wake = tokio::time::Instant::now();
-        let mut vpn_buffer = [0u8; fortivpn::PPP_MTU as usize];
+        let mut vpn_buffer = vec![0u8; fortivpn::PPP_MTU as usize];
         while !self.shutdown {
             let (vpn_event, command) = {
                 let mut vpn_event = pin!(self.device.wait_event(&mut vpn_buffer));

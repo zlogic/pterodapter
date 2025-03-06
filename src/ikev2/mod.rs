@@ -155,9 +155,9 @@ impl Server {
     ) -> Result<(), IKEv2Error> {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
-        let mut udp_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
-        let mut vpn_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
-        let mut vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
+        let mut udp_read_buffer = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut vpn_read_buffer = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut vpn_write_buffer = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut poll_seed = 0usize;
         loop {
             let vpn_is_connected = vpn_service.is_connected();
@@ -320,7 +320,7 @@ struct Sockets {
     sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
     socket_list: Vec<(SocketAddr, Arc<UdpSocket>)>,
     nat_port: u16,
-    send_buffer: [u8; MAX_DATAGRAM_SIZE],
+    send_buffer: Vec<u8>,
     pending_send: Option<UdpPendingSend>,
 }
 
@@ -348,7 +348,7 @@ impl Sockets {
             sockets,
             socket_list,
             nat_port,
-            send_buffer: [0u8; MAX_DATAGRAM_SIZE],
+            send_buffer: vec![0u8; MAX_DATAGRAM_SIZE],
             pending_send: None,
         })
     }
