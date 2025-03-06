@@ -275,10 +275,10 @@ impl FortiVPNTunnel {
         ppp_state: &mut PPPState,
         mtu: u16,
     ) -> Result<u32, FortiError> {
-        // Open PPP link.
+        // Open PPP link; 200 bytes should fit any PPP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
         let mut req = [0u8; 20];
-        let mut resp = vec![0u8; MAX_MTU];
+        let mut resp = [0u8; 200];
         let identifier = 1;
         let magic = rand::rng().random::<u32>();
         let opts = [
@@ -416,10 +416,10 @@ impl FortiVPNTunnel {
         ppp_state: &mut PPPState,
         addr: IpAddr,
     ) -> Result<(), FortiError> {
-        // Open IPCP link.
+        // Open IPCP link; 20 bytes should fit any IPCP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
         let mut req = [0u8; 20];
-        let mut resp = vec![0u8; MAX_MTU];
+        let mut resp = [0u8; 200];
         let identifier = 1;
         let addr = match addr {
             IpAddr::V4(addr) => addr,
@@ -432,7 +432,7 @@ impl FortiVPNTunnel {
                 debug!("Failed to encode IPCP Configure-Request: {}", err);
                 "Failed to encode IPCP Configure-Request"
             })?;
-        let mut opts = vec![0u8; MAX_MTU];
+        let mut opts = [0u8; 100];
         let opts_len = length - 4;
         opts[..opts_len].copy_from_slice(&req[4..length]);
         Self::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
@@ -683,7 +683,7 @@ impl FortiVPNTunnel {
     pub async fn terminate(&mut self) -> Result<(), FortiError> {
         let mut req = [0u8; 4];
         // Ensure that any stray IP packets are accepted.
-        let mut resp = vec![0u8; MAX_MTU + 8];
+        let mut resp = [0u8; MAX_MTU + 8];
         let length = ppp::encode_lcp_data(
             &mut req,
             ppp::LcpCode::TERMINATE_REQUEST,
