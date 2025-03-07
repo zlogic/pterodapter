@@ -546,6 +546,108 @@ impl fmt::Display for RrQclass {
     }
 }
 
+struct SoaRecord<'a> {
+    mname_start_offset: usize,
+    rname_start_offset: usize,
+    data: &'a [u8],
+    attributes: &'a [u8],
+}
+
+impl SoaRecord<'_> {
+    fn from_data(data: &[u8], start_offset: usize, length: usize) -> Result<SoaRecord, DnsError> {
+        if length < 22 {
+            return Err("Not enough data in SOA rdata length".into());
+        }
+        let mname_start_offset = start_offset;
+        let rname_start_offset =
+            if let Some(rname_start_offset) = name_end_offset(data, mname_start_offset) {
+                rname_start_offset
+            } else {
+                return Err("Not enough bytes in SOA MNAME length".into());
+            };
+        if rname_start_offset > start_offset + length {
+            return Err("SOA MNAME overflow".into());
+        }
+        if let Some(attributes_start_offset) = name_end_offset(data, rname_start_offset) {
+            if attributes_start_offset + 20 != start_offset + length {
+                return Err("SOA RNAME overflow".into());
+            }
+        } else {
+            return Err("Not enough bytes in SOA RNAME length".into());
+        }
+        Ok(SoaRecord {
+            mname_start_offset,
+            rname_start_offset,
+            data,
+            attributes: &data[start_offset + length - 20..start_offset + length],
+        })
+    }
+
+    fn iter_mname(&self) -> LabelIter {
+        LabelIter {
+            start_offset: self.mname_start_offset,
+            data: self.data,
+            remain: None,
+        }
+    }
+
+    fn iter_rname(&self) -> LabelIter {
+        LabelIter {
+            start_offset: self.rname_start_offset,
+            data: self.data,
+            remain: None,
+        }
+    }
+
+    fn serial(&self) -> u32 {
+        let mut serial = [0u8; 4];
+        serial.copy_from_slice(&self.attributes[0..4]);
+        u32::from_be_bytes(serial)
+    }
+
+    fn refresh(&self) -> u32 {
+        let mut refresh = [0u8; 4];
+        refresh.copy_from_slice(&self.attributes[4..8]);
+        u32::from_be_bytes(refresh)
+    }
+
+    fn retry(&self) -> u32 {
+        let mut retry = [0u8; 4];
+        retry.copy_from_slice(&self.attributes[8..12]);
+        u32::from_be_bytes(retry)
+    }
+
+    fn expire(&self) -> u32 {
+        let mut expire = [0u8; 4];
+        expire.copy_from_slice(&self.attributes[12..16]);
+        u32::from_be_bytes(expire)
+    }
+
+    fn minimum(&self) -> u32 {
+        let mut minimum = [0u8; 4];
+        minimum.copy_from_slice(&self.attributes[16..20]);
+        u32::from_be_bytes(minimum)
+    }
+}
+
+impl fmt::Display for SoaRecord<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MNAME=")?;
+        self.iter_mname().fmt_domain(f)?;
+        write!(f, " RNAME=")?;
+        self.iter_rname().fmt_domain(f)?;
+        write!(
+            f,
+            " SERIAL={} REFRESH={} RETRY={} EXPIRE={} MINIMUM={}",
+            self.serial(),
+            self.refresh(),
+            self.retry(),
+            self.expire(),
+            self.minimum()
+        )
+    }
+}
+
 struct Question<'a> {
     data: &'a [u8],
     start_offset: usize,
@@ -623,15 +725,17 @@ enum Rdata<'a> {
     Ipv4(Ipv4Addr),
     Ipv6(Ipv6Addr),
     Name(LabelIter<'a>),
+    Soa(SoaRecord<'a>),
     Unknown(&'a [u8]),
 }
 
 impl fmt::Display for Rdata<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Rdata::Ipv4(ipv4_addr) => ipv4_addr.fmt(f),
-            Rdata::Ipv6(ipv6_addr) => ipv6_addr.fmt(f),
-            Rdata::Name(label_iter) => label_iter.fmt_domain(f),
+            Rdata::Ipv4(addr) => addr.fmt(f),
+            Rdata::Ipv6(addr) => addr.fmt(f),
+            Rdata::Name(label) => label.fmt_domain(f),
+            Rdata::Soa(soa) => soa.fmt(f),
             Rdata::Unknown(data) => fmt_slice_hex(data).fmt(f),
         }
     }
@@ -702,8 +806,10 @@ impl ResourceRecord<'_> {
     }
 
     fn rdata(&self) -> Result<Rdata, DnsError> {
+        // This is validated in the constructor.
         let start_offset = self.name_end_offset + 10;
-        let data = &self.data[start_offset..start_offset + self.rd_length() as usize];
+        let rd_length = self.rd_length() as usize;
+        let data = &self.data[start_offset..start_offset + rd_length];
         match self.rr_type() {
             RrType::CNAME
             | RrType::MD
@@ -732,6 +838,17 @@ impl ResourceRecord<'_> {
                     Ok(Rdata::Ipv6(Ipv6Addr::from(ipv6_addr)))
                 } else {
                     Err("Unexpected AAAA record rdata length".into())
+                }
+            }
+            RrType::SOA => {
+                if rd_length > 20 {
+                    Ok(Rdata::Soa(SoaRecord::from_data(
+                        self.data,
+                        start_offset,
+                        rd_length,
+                    )?))
+                } else {
+                    Err("Not enough data in SOA rdata length".into())
                 }
             }
             _ => Ok(Rdata::Unknown(data)),
