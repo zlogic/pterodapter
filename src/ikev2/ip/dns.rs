@@ -3,6 +3,8 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
+use log::debug;
+
 use crate::logger::fmt_slice_hex;
 
 use super::{IpHeader, TransportProtocolType};
@@ -187,6 +189,41 @@ impl DnsPacket<'_> {
             arcount,
         }
     }
+
+    pub fn matches_suffix(&self, suffix: &[Vec<u8>]) -> bool {
+        self.iter_sections().any(|section| match section {
+            Ok(Section::Question(q)) => {
+                let qtype = q.qtype().to_rtype();
+                if qtype == Some(RrType::A) || qtype == Some(RrType::AAAA) {
+                    let label = q.iter_qname();
+                    let label_length = label.size_hint().0;
+                    if label_length < suffix.len() {
+                        false
+                    } else {
+                        label.skip(label_length - suffix.len()).zip(suffix).all(
+                            |(label, check_label)| match label {
+                                Ok(label) => label.eq_ignore_ascii_case(check_label),
+                                Err(err) => {
+                                    debug!("Failed to parse DNS packet while checking if it matches suffix: {}", err);
+                                    false
+                                }
+                            },
+                        )
+                    }
+                } else {
+                    false
+                }
+            }
+            Err(err) => {
+                debug!(
+                    "Failed to parse DNS packet while checking if it matches suffix: {}",
+                    err
+                );
+                false
+            }
+            _ => false,
+        })
+    }
 }
 
 struct SectionIter<'a> {
@@ -271,6 +308,7 @@ const LABEL_POINTER_MASK: u8 = 0xc0;
 struct LabelIter<'a> {
     start_offset: usize,
     data: &'a [u8],
+    remain: Option<usize>,
 }
 
 impl<'a> Iterator for LabelIter<'a> {
@@ -287,7 +325,14 @@ impl<'a> Iterator for LabelIter<'a> {
         // loop.
         loop {
             length = self.data[start_offset];
-            let is_pointer = (length as u8) & LABEL_POINTER_MASK == LABEL_POINTER_MASK;
+            let is_pointer = match (length as u8) & LABEL_POINTER_MASK {
+                LABEL_POINTER_MASK => true,
+                0x00 => false,
+                _ => {
+                    self.data = &[];
+                    return Some(Err("Unexpected bits in label length".into()));
+                }
+            };
             if self.start_offset + 1 > self.data.len() {
                 self.data = &[];
                 return Some(Err("Not enough data in label".into()));
@@ -335,6 +380,15 @@ impl<'a> Iterator for LabelIter<'a> {
         self.start_offset = start_offset + length;
 
         Some(Ok(label))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remain = if let Some(remain) = self.remain {
+            remain
+        } else {
+            self.clone().count()
+        };
+        (remain, Some(remain))
     }
 }
 
@@ -413,7 +467,7 @@ impl fmt::Display for RrType {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, PartialOrd)]
 struct RrQtype(u16);
 
 impl RrQtype {
@@ -424,6 +478,14 @@ impl RrQtype {
 
     fn from_u16(code: u16) -> RrQtype {
         RrQtype(code)
+    }
+
+    fn to_rtype(&self) -> Option<RrType> {
+        if (Self::AXFR..=Self::ALL).contains(self) {
+            None
+        } else {
+            Some(RrType::from_u16(self.0))
+        }
     }
 }
 
@@ -533,6 +595,7 @@ impl Question<'_> {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
+            remain: None,
         }
     }
 
@@ -610,6 +673,7 @@ impl ResourceRecord<'_> {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
+            remain: None,
         }
     }
 
@@ -650,6 +714,7 @@ impl ResourceRecord<'_> {
             | RrType::PTR => Ok(Rdata::Name(LabelIter {
                 start_offset,
                 data: self.data,
+                remain: None,
             })),
             RrType::A => {
                 if data.len() == 4 {

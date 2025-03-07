@@ -174,6 +174,9 @@ impl SecurityAssociation {
             let dns_packet = ip::DnsPacket::from_udp_packet(packet.transport_protocol_data())
                 .map_err(|dns_err| ip::IpError::from(dns_err))?;
             trace!("Decoded DNS packet: {}", dns_packet);
+            if self.network.dns_matches_tunnel(&dns_packet) {
+                println!("DNS matches tunnel");
+            }
             let dns_request = packet.transport_protocol_data()[8..].to_vec();
             let rt = runtime::Handle::current();
             // TODO 0.5.0: Remove this temporary debug code.

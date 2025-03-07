@@ -404,6 +404,7 @@ pub struct Network {
     dns_addrs: Vec<IpAddr>,
     tunnel_domains: Vec<String>,
     tunnel_domains_idna: Vec<Vec<u8>>,
+    tunnel_domains_dns: TunnelDomainsDns,
     local_ts: Vec<message::TrafficSelector>,
 }
 
@@ -412,8 +413,6 @@ impl Network {
         nat64_prefix: Option<Nat64Prefix>,
         tunnel_domains: Vec<String>,
     ) -> Result<Network, IpError> {
-        // TODO: convert domains into DNS IDNA A-label format for Unicode strings, or
-        // request/validate that this is done by the end user.
         let tunnel_domains_idna = tunnel_domains
             .iter()
             .map(|domain| domain.as_bytes().to_vec())
@@ -423,12 +422,14 @@ impl Network {
         } else {
             vec![]
         };
+        let tunnel_domains_dns = TunnelDomainsDns::new(&tunnel_domains);
         Ok(Network {
             nat64_prefix,
             real_ip: None,
             dns_addrs: vec![],
             tunnel_domains,
             tunnel_domains_idna,
+            tunnel_domains_dns,
             local_ts: traffic_selectors,
         })
     }
@@ -533,6 +534,44 @@ impl Network {
                 self.local_ts.push(check_ts.clone());
             }
         }
+    }
+
+    pub fn dns_matches_tunnel(&self, dns_packet: &DnsPacket) -> bool {
+        let tunnel_domains = self.tunnel_domains_dns.domains();
+        if tunnel_domains.is_empty() {
+            // Match all domains, without exception.
+            true
+        } else {
+            tunnel_domains
+                .iter()
+                .any(|domain| dns_packet.matches_suffix(domain))
+        }
+    }
+}
+
+type DomainLabels = Vec<Vec<u8>>;
+
+#[derive(Clone)]
+struct TunnelDomainsDns {
+    tunnel_domains: Vec<DomainLabels>,
+}
+
+impl TunnelDomainsDns {
+    fn new(tunnel_domains: &[String]) -> TunnelDomainsDns {
+        let tunnel_domains = tunnel_domains
+            .iter()
+            .map(|tunnel_domain| {
+                tunnel_domain
+                    .split(".")
+                    .map(|label| label.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        TunnelDomainsDns { tunnel_domains }
+    }
+
+    fn domains(&self) -> &[DomainLabels] {
+        &self.tunnel_domains
     }
 }
 

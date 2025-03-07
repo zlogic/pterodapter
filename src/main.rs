@@ -174,6 +174,8 @@ impl Args {
                     ),
                 };
             } else if name == "--tunnel-domain" {
+                // Domains should be in DNS IDNA A-label format for Unicode strings.
+                // All further processing assumes the domain is an ASCII UTF-8 string.
                 if !value.is_ascii() {
                     fail_with_error(
                         name,
