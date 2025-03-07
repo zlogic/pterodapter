@@ -138,6 +138,7 @@ In NAT64 mode, pterodapter will intercept DNS responses and remap external IPv4 
 This is done only for domains matching a suffix listed in `--tunnel-domain`.
 The IKEv2 client will use IPv6 traffic, which is translated into IPv4 and sent to VPN, based on the SIIT alrorithm documented in [RFC 7915](https://datatracker.ietf.org/doc/html/rfc7915).
 This approach simplifies the routing table (IKEv2 Traffic Selector) to use only one network or traffic selector; it also allows to use domain suffixes and handle DNS updates without reconnecting the client.
+Inspired by ideas from [Microsoft DirectAccess](https://en.wikipedia.org/wiki/DirectAccess).
 
 `--destination=<hostport>` specifies the hostname to send to the client when performing a client handshake. If not specified, will use `pterodapter` as the hostname. Windows refuses to connect if the hostname doesn't match connection settings; macOS prints a warning in the Console.
 
