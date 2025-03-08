@@ -578,9 +578,17 @@ impl Network {
             let dns_request = translated_packet.to_vec();
             let rt = runtime::Handle::current();
             let mut dns_translator = self.dns_translator.clone();
+            let destination_address = match packet.dst_addr() {
+                IpAddr::V4(addr) => addr,
+                IpAddr::V6(addr) => {
+                    let mut octets = [0u8; 4];
+                    octets.copy_from_slice(&addr.octets()[12..16]);
+                    Ipv4Addr::from(octets)
+                }
+            };
             // TODO 0.5.0: Remove this temporary debug code.
             rt.spawn(async move {
-                let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+                let remote_addr = SocketAddr::new(IpAddr::V4(destination_address), 53);
                 let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
                 let socket = UdpSocket::bind(local_addr)
                     .await
