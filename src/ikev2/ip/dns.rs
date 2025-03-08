@@ -3,16 +3,29 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
-use log::debug;
+use log::{debug, warn};
 
-use crate::logger::fmt_slice_hex;
+use crate::{logger::fmt_slice_hex, utils::subslice_range};
 
-use super::{IpHeader, TransportProtocolType};
+use super::{IpHeader, Nat64Prefix, TransportProtocolType};
+
+// As defined in RFC 1035, Sections 2.3.4 and 4.2.1.
+pub const MAX_PACKET_SIZE: usize = 512;
+
+// As defined in RFC 1035, Section 2.3.4 and 3.1.
+// The domain length is limited by the packet size.
+const MAX_DOMAIN_LENGTH: usize = 255;
+
+// If every subdomain is a single character and the domain length
+// is at maximum, every subdomain will consume 2 bytes:
+// length + character, or 2-byte offset.
+const MAX_DOMAIN_LABELS: usize = MAX_DOMAIN_LENGTH / 2;
 
 pub struct DnsPacket<'a> {
     data: &'a [u8],
 }
 
+#[derive(PartialEq)]
 enum Qr {
     Query,
     Response,
@@ -75,7 +88,19 @@ impl ResponseCode {
             3 => ResponseCode::NameError,
             4 => ResponseCode::NotImplemented,
             5 => ResponseCode::Refused,
-            code => ResponseCode::Reserved(code),
+            code => ResponseCode::Reserved(code & 0x0f),
+        }
+    }
+
+    fn to_u8(&self) -> u8 {
+        match self {
+            ResponseCode::NoError => 0,
+            ResponseCode::FormatError => 1,
+            ResponseCode::ServerFailure => 2,
+            ResponseCode::NameError => 3,
+            ResponseCode::NotImplemented => 4,
+            ResponseCode::Refused => 5,
+            ResponseCode::Reserved(code) => code & 0x0f,
         }
     }
 }
@@ -94,10 +119,98 @@ impl fmt::Display for ResponseCode {
     }
 }
 
+struct DnsPacketFlags(u16);
+
+impl DnsPacketFlags {
+    const RESPONSE_BIT: u16 = 1 << 15;
+    const AUTHORITATIVE_ANSWER: u16 = 1 << 10;
+    const TRUNCATION: u16 = 1 << 9;
+    const RECURSION_DESIRED: u16 = 1 << 8;
+    const RECURSION_AVAILABLE: u16 = 1 << 7;
+
+    const OPCODE_MASK: u8 = 0x0f;
+    const OPCODE_OFFSET: usize = 11;
+    const ZERO_BYTES_MASK: u16 = 0x07 << 4;
+
+    const RESPONSE_CODE_MASK: u16 = 0x000f;
+
+    fn from_data(data: &[u8]) -> DnsPacketFlags {
+        let mut flag_bits = [0u8; 2];
+        flag_bits.copy_from_slice(&data[2..4]);
+        DnsPacketFlags(u16::from_be_bytes(flag_bits))
+    }
+
+    fn to_be_bytes(&self) -> [u8; 2] {
+        self.0.to_be_bytes()
+    }
+
+    fn qr(&self) -> Qr {
+        if (self.0 & Self::RESPONSE_BIT) == 0 {
+            Qr::Query
+        } else {
+            Qr::Response
+        }
+    }
+
+    fn toggle_mask(&mut self, mask: u16, enable: bool) {
+        if enable {
+            self.0 |= mask
+        } else {
+            self.0 &= !mask
+        }
+    }
+
+    fn set_qr(&mut self, qr: Qr) {
+        match qr {
+            Qr::Query => self.toggle_mask(Self::RESPONSE_BIT, false),
+            Qr::Response => self.toggle_mask(Self::RESPONSE_BIT, true),
+        }
+    }
+
+    fn opcode(&self) -> Opcode {
+        let opcode = (self.0 >> Self::OPCODE_OFFSET) as u8 & Self::OPCODE_MASK;
+        Opcode::from_u8(opcode as u8)
+    }
+
+    fn authoritative_answer(&self) -> bool {
+        self.0 & Self::AUTHORITATIVE_ANSWER == Self::AUTHORITATIVE_ANSWER
+    }
+
+    fn truncation(&self) -> bool {
+        self.0 & Self::TRUNCATION == Self::TRUNCATION
+    }
+
+    fn recursion_desired(&self) -> bool {
+        self.0 & Self::RECURSION_DESIRED == Self::RECURSION_DESIRED
+    }
+
+    fn recursion_available(&self) -> bool {
+        self.0 & Self::RECURSION_AVAILABLE == Self::RECURSION_AVAILABLE
+    }
+
+    fn reserved_zero(&self) -> bool {
+        self.0 & Self::ZERO_BYTES_MASK == 0
+    }
+
+    fn clear_reserved_zero(&mut self) {
+        self.toggle_mask(Self::ZERO_BYTES_MASK, false)
+    }
+
+    fn response_code(&self) -> ResponseCode {
+        let response_code = (self.0 & Self::RESPONSE_CODE_MASK) as u8;
+        ResponseCode::from_u8(response_code)
+    }
+
+    fn set_response_code(&mut self, rcode: ResponseCode) {
+        self.0 = (self.0 & !Self::RESPONSE_CODE_MASK) | (rcode.to_u8() as u16)
+    }
+}
+
 impl DnsPacket<'_> {
     const DNS_HEADER_SIZE: usize = 12;
 
     pub fn is_dns(hdr: &IpHeader) -> bool {
+        // TODO 0.5.0: check if IP address matches one of the DNS servers.
         hdr.transport_protocol == TransportProtocolType::UDP
             && (hdr.src_port == Some(53) || hdr.dst_port == Some(53))
     }
@@ -118,49 +231,8 @@ impl DnsPacket<'_> {
         u16::from_be_bytes(id)
     }
 
-    fn qr(&self) -> Qr {
-        // bit 7.
-        if (self.data[2] >> 7 & 0x1) == 0 {
-            Qr::Query
-        } else {
-            Qr::Response
-        }
-    }
-
-    fn opcode(&self) -> Opcode {
-        // bits 6-3.
-        Opcode::from_u8(self.data[2] >> 3 & 0x0f)
-    }
-
-    fn authoritative_answer(&self) -> bool {
-        // bit 2.
-        // TODO 0.5.0: use message.flags for refence?
-        self.data[2] >> 2 & 0x01 == 1
-    }
-
-    fn truncation(&self) -> bool {
-        // bit 1.
-        self.data[2] >> 1 & 0x01 == 1
-    }
-
-    fn recursion_desired(&self) -> bool {
-        // bit 0.
-        self.data[2] & 0x01 == 1
-    }
-
-    fn recursion_available(&self) -> bool {
-        // bit 7.
-        self.data[3] >> 7 & 0x01 == 1
-    }
-
-    fn reserved_zero(&self) -> bool {
-        // bits 6-4.
-        (self.data[3] >> 4) & 0x7 == 0
-    }
-
-    fn response_code(&self) -> ResponseCode {
-        // bits 3-0.
-        ResponseCode::from_u8(self.data[3] & 0x0f)
+    fn flags(&self) -> DnsPacketFlags {
+        DnsPacketFlags::from_data(self.data)
     }
 
     fn iter_sections(&self) -> SectionIter {
@@ -204,7 +276,7 @@ impl DnsPacket<'_> {
                             |(label, check_label)| match label {
                                 Ok(label) => label.eq_ignore_ascii_case(check_label),
                                 Err(err) => {
-                                    debug!("Failed to parse DNS packet while checking if it matches suffix: {}", err);
+                                    warn!("Failed to parse DNS packet while checking if it matches suffix: {}", err);
                                     false
                                 }
                             },
@@ -215,7 +287,7 @@ impl DnsPacket<'_> {
                 }
             }
             Err(err) => {
-                debug!(
+                warn!(
                     "Failed to parse DNS packet while checking if it matches suffix: {}",
                     err
                 );
@@ -223,6 +295,45 @@ impl DnsPacket<'_> {
             }
             _ => false,
         })
+    }
+}
+
+impl fmt::Display for DnsPacket<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let flags = self.flags();
+        write!(f, "TXID {} {}: {}", self.id(), flags.qr(), flags.opcode())?;
+        if flags.authoritative_answer() {
+            write!(f, ", Authoritative Answer")?;
+        }
+        if flags.truncation() {
+            write!(f, ", Truncation")?;
+        }
+        if flags.recursion_desired() {
+            write!(f, ", Recursion desired")?;
+        }
+        if flags.recursion_available() {
+            write!(f, ", Recursion available")?;
+        }
+        if !flags.reserved_zero() {
+            write!(f, ", non-zero Reserved zero")?;
+        }
+        write!(f, ": {}", flags.response_code())?;
+
+        for (i, section) in self.iter_sections().enumerate() {
+            if i == 0 {
+                write!(f, " -> ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+            match &section {
+                Ok(Section::Question(q)) => write!(f, "Q: {}", q)?,
+                Ok(Section::Answer(a)) => write!(f, "A: {}", a)?,
+                Ok(Section::Nameserver(ns)) => write!(f, "NS: {}", ns)?,
+                Ok(Section::AdditionalRecord(ar)) => write!(f, "AR: {}", ar)?,
+                Err(err) => write!(f, "Error: {}", err)?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -304,11 +415,14 @@ enum Section<'a> {
 // First two bits are 11.
 const LABEL_POINTER_MASK: u8 = 0xc0;
 
+// First two bits are 11.
+const LABEL_POINTER_FULL_MASK: u16 = 0xc000;
+
 #[derive(Clone, Copy)]
 struct LabelIter<'a> {
     start_offset: usize,
     data: &'a [u8],
-    remain: Option<usize>,
+    read_labels: u8,
 }
 
 impl<'a> Iterator for LabelIter<'a> {
@@ -319,10 +433,13 @@ impl<'a> Iterator for LabelIter<'a> {
         if self.data.is_empty() {
             return None;
         }
+        if self.read_labels as usize >= MAX_DOMAIN_LABELS {
+            self.data = &[];
+            return Some(Err("Domain length exceeded, possible loop detected".into()));
+        }
         let mut start_offset = self.start_offset;
         let mut length;
-        // Detect loops similar to Wireshark - if read more data than exists in a packet, break
-        // loop.
+
         loop {
             length = self.data[start_offset];
             let is_pointer = match (length as u8) & LABEL_POINTER_MASK {
@@ -351,6 +468,7 @@ impl<'a> Iterator for LabelIter<'a> {
                     let pointer_offset = [upper_half, lower_half];
                     u16::from_be_bytes(pointer_offset) as usize
                 };
+
                 // Prevent loops as instructed in RFC 9267, Section 2.
                 if pointer_offset >= start_offset {
                     self.data = &[];
@@ -379,15 +497,16 @@ impl<'a> Iterator for LabelIter<'a> {
         let label = &self.data[start_offset..start_offset + length];
         self.start_offset = start_offset + length;
 
+        // Prevent another loop - where a sequence of labels ends with a backwards pointer to the
+        // first label in the sequence.
+        self.read_labels += 1;
+
         Some(Ok(label))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remain = if let Some(remain) = self.remain {
-            remain
-        } else {
-            self.clone().count()
-        };
+        // This can be time-consuming, better do it just once.
+        let remain = self.clone().count();
         (remain, Some(remain))
     }
 }
@@ -439,6 +558,14 @@ impl RrType {
     fn from_u16(code: u16) -> RrType {
         RrType(code)
     }
+
+    fn to_be_bytes(&self) -> [u8; 2] {
+        self.0.to_be_bytes()
+    }
+
+    fn to_qtype(&self) -> RrQtype {
+        RrQtype::from_u16(self.0)
+    }
 }
 
 impl fmt::Display for RrType {
@@ -478,6 +605,10 @@ impl RrQtype {
 
     fn from_u16(code: u16) -> RrQtype {
         RrQtype(code)
+    }
+
+    fn to_be_bytes(&self) -> [u8; 2] {
+        self.0.to_be_bytes()
     }
 
     fn to_rtype(&self) -> Option<RrType> {
@@ -535,6 +666,10 @@ impl RrQclass {
     fn from_u16(code: u16) -> RrQclass {
         RrQclass(code)
     }
+
+    fn to_be_bytes(&self) -> [u8; 2] {
+        self.0.to_be_bytes()
+    }
 }
 
 impl fmt::Display for RrQclass {
@@ -587,7 +722,7 @@ impl SoaRecord<'_> {
         LabelIter {
             start_offset: self.mname_start_offset,
             data: self.data,
-            remain: None,
+            read_labels: 0,
         }
     }
 
@@ -595,7 +730,7 @@ impl SoaRecord<'_> {
         LabelIter {
             start_offset: self.rname_start_offset,
             data: self.data,
-            remain: None,
+            read_labels: 0,
         }
     }
 
@@ -697,7 +832,7 @@ impl Question<'_> {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
-            remain: None,
+            read_labels: 0,
         }
     }
 
@@ -773,11 +908,11 @@ impl ResourceRecord<'_> {
         }
     }
 
-    fn iter_qname(&self) -> LabelIter {
+    fn iter_name(&self) -> LabelIter {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
-            remain: None,
+            read_labels: 0,
         }
     }
 
@@ -812,6 +947,7 @@ impl ResourceRecord<'_> {
         let data = &self.data[start_offset..start_offset + rd_length];
         match self.rr_type() {
             RrType::CNAME
+            | RrType::MB
             | RrType::MD
             | RrType::MF
             | RrType::MG
@@ -820,7 +956,7 @@ impl ResourceRecord<'_> {
             | RrType::PTR => Ok(Rdata::Name(LabelIter {
                 start_offset,
                 data: self.data,
-                remain: None,
+                read_labels: 0,
             })),
             RrType::A => {
                 if data.len() == 4 {
@@ -858,7 +994,7 @@ impl ResourceRecord<'_> {
 
 impl fmt::Display for ResourceRecord<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.iter_qname().fmt_domain(f)?;
+        self.iter_name().fmt_domain(f)?;
         write!(
             f,
             " {} {} TTL={}",
@@ -873,41 +1009,457 @@ impl fmt::Display for ResourceRecord<'_> {
     }
 }
 
-impl fmt::Display for DnsPacket<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TXID {} {}: {}", self.id(), self.qr(), self.opcode())?;
-        if self.authoritative_answer() {
-            write!(f, ", Authoritative Answer")?;
-        }
-        if self.truncation() {
-            write!(f, ", Truncation")?;
-        }
-        if self.recursion_desired() {
-            write!(f, ", Recursion desired")?;
-        }
-        if self.recursion_available() {
-            write!(f, ", Recursion available")?;
-        }
-        if !self.reserved_zero() {
-            write!(f, ", non-zero Reserved zero")?;
-        }
-        write!(f, ": {}", self.response_code())?;
+struct CompressionItem {
+    offset: usize,
+    length: u8,
+}
 
-        for (i, section) in self.iter_sections().enumerate() {
-            if i == 0 {
-                write!(f, " -> ")?;
+struct CompressionMap {
+    labels: Vec<CompressionItem>,
+}
+
+impl CompressionMap {
+    fn new() -> CompressionMap {
+        CompressionMap {
+            labels: Vec::with_capacity(MAX_DOMAIN_LABELS),
+        }
+    }
+
+    fn find_match(&self, domain: LabelIter, domain_length: u8) -> Option<usize> {
+        self.labels
+            .iter()
+            .find(|check_label| {
+                if check_label.length == domain_length {
+                    let check_label = LabelIter {
+                        start_offset: check_label.offset,
+                        data: domain.data,
+                        read_labels: 0,
+                    };
+                    check_label.zip(domain).all(|(check_label, domain_label)| {
+                        if let (Ok(check_label), Ok(domain_label)) = (check_label, domain_label) {
+                            check_label.eq_ignore_ascii_case(domain_label)
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                }
+            })
+            .map(|found_label| found_label.offset)
+    }
+
+    fn add_label(&mut self, offset: usize, length: u8) {
+        if self.labels.len() < self.labels.capacity() {
+            self.labels.push(CompressionItem { offset, length })
+        }
+    }
+
+    fn clear(&mut self) {
+        self.labels.clear()
+    }
+}
+
+pub struct Dns64Translator {
+    compression_map: CompressionMap,
+    nat64_prefix: Nat64Prefix,
+}
+
+impl Dns64Translator {
+    pub fn new(nat64_prefix: Nat64Prefix) -> Dns64Translator {
+        Dns64Translator {
+            compression_map: CompressionMap::new(),
+            nat64_prefix,
+        }
+    }
+
+    fn write_header(
+        dest: &mut [u8],
+        request_data: &[u8],
+        flags: DnsPacketFlags,
+        qdcount: usize,
+        ancount: usize,
+        nscount: usize,
+        arcount: usize,
+    ) {
+        dest[0..2].copy_from_slice(&request_data[0..2]);
+        dest[2..4].copy_from_slice(&flags.to_be_bytes());
+        dest[4..6].copy_from_slice(&(qdcount as u16).to_be_bytes());
+        dest[6..8].copy_from_slice(&(ancount as u16).to_be_bytes());
+        dest[8..10].copy_from_slice(&(nscount as u16).to_be_bytes());
+        dest[10..12].copy_from_slice(&(arcount as u16).to_be_bytes());
+    }
+
+    fn write_error_response(dest: &mut [u8], request_data: &[u8], rcode: ResponseCode) {
+        // Keep all questions and data for the client to observe.
+        dest[0..request_data.len()].copy_from_slice(&request_data);
+        let mut flags = DnsPacketFlags::from_data(dest);
+        flags.set_qr(Qr::Response);
+        flags.set_response_code(rcode);
+        flags.clear_reserved_zero();
+        dest[2..4].copy_from_slice(&flags.to_be_bytes());
+    }
+
+    fn write_label(
+        &mut self,
+        dest: &mut [u8],
+        mut length: usize,
+        domain: LabelIter,
+    ) -> Result<usize, DnsError> {
+        let domain_length = domain.size_hint().0;
+        for (label_index, label) in domain.enumerate() {
+            let label = label?;
+            let start_offset = match subslice_range(domain.data, label) {
+                Some(range) => range.start - 1,
+                None => {
+                    return Err("Compression map in source pointing outside its buffer".into());
+                }
+            };
+            let subdomain_iter = LabelIter {
+                start_offset,
+                data: domain.data,
+                read_labels: label_index as u8,
+            };
+
+            if let Some(found_match) = self
+                .compression_map
+                .find_match(subdomain_iter, (domain_length - label_index) as u8)
+            {
+                if length + 2 > dest.len() {
+                    return Err("Not enough data to write label".into());
+                }
+                let label_offset = LABEL_POINTER_FULL_MASK | (found_match as u16);
+                dest[length..length + 2].copy_from_slice(&label_offset.to_be_bytes());
+                length += 2;
+                return Ok(length);
             } else {
-                write!(f, "; ")?;
-            }
-            match &section {
-                Ok(Section::Question(q)) => write!(f, "Q: {}", q)?,
-                Ok(Section::Answer(a)) => write!(f, "A: {}", a)?,
-                Ok(Section::Nameserver(ns)) => write!(f, "NS: {}", ns)?,
-                Ok(Section::AdditionalRecord(ar)) => write!(f, "AR: {}", ar)?,
-                Err(err) => write!(f, "Error: {}", err)?,
+                if length + 1 + label.len() > dest.len() {
+                    return Err("Not enough data to write label".into());
+                }
+                self.compression_map
+                    .add_label(length, (domain_length - label_index) as u8);
+                dest[length] = label.len() as u8;
+                length += 1;
+                dest[length..length + label.len()].copy_from_slice(label);
+                length += label.len();
             }
         }
-        Ok(())
+        if length + 1 >= dest.len() {
+            return Err("Not enough data to complete NAME in question".into());
+        }
+        dest[length] = 0;
+        length += 1;
+        Ok(length)
+    }
+
+    fn write_question(
+        &mut self,
+        dest: &mut [u8],
+        length: usize,
+        qtype: RrQtype,
+        qclass: RrQclass,
+        domain: LabelIter,
+    ) -> Result<usize, DnsError> {
+        if dest.len() < 12 {
+            return Err("Not enough data to write question".into());
+        }
+        let length = self.write_label(dest, length, domain)?;
+        dest[length..length + 2].copy_from_slice(&qtype.to_be_bytes());
+        dest[length + 2..length + 4].copy_from_slice(&qclass.to_be_bytes());
+        Ok(length + 4)
+    }
+
+    pub fn translate_to_ipv4(
+        &mut self,
+        request: &DnsPacket,
+        dest: &mut [u8],
+    ) -> Result<usize, DnsError> {
+        self.compression_map.clear();
+        let mut flags = request.flags();
+        // TODO 0.5.0: ensure error responses are propagated back to sender.
+        // This is loosely based on RFC 6147.
+        if flags.qr() == Qr::Response {
+            Self::write_error_response(dest, request.data, ResponseCode::NotImplemented);
+            return Err("Response requests are not supported".into());
+        }
+        if flags.truncation() {
+            Self::write_error_response(dest, request.data, ResponseCode::NameError);
+            return Err("Truncated requests are not supported".into());
+        }
+        if dest.len() < MAX_PACKET_SIZE {
+            return Err("Not enough data for translated IPv4 DNS request".into());
+        }
+        if dest.len() < request.data.len() {
+            return Err("Destination slice cannot fit original request".into());
+        }
+        let mut qdcount = 0;
+        let mut length = 12;
+        request.iter_sections().try_for_each(|section| {
+            match section? {
+                Section::Question(q) => {
+                    if qdcount > 0 {
+                        // RFC 1035, Section 4.1.2 states that number of questions
+                        // is usually 1, and most implementations don't support >1 questions.
+                        warn!("Dropping unexpected additional question from request");
+                        return Ok(());
+                    }
+                    let qtype = q.qtype().to_rtype();
+                    match qtype {
+                        Some(RrType::AAAA) => {
+                            // Translate AAAA requests into A.
+                            qdcount += 1;
+                            length = self.write_question(
+                                dest,
+                                length,
+                                RrType::A.to_qtype(),
+                                q.qclass(),
+                                q.iter_qname(),
+                            )?
+                        }
+                        Some(RrType::A) => {
+                            // Drop A questions (IPv4 is not supported).
+                            qdcount += 1;
+                            length = self.write_question(
+                                dest,
+                                length,
+                                RrType::A.to_qtype(),
+                                q.qclass(),
+                                q.iter_qname(),
+                            )?;
+                            Self::write_error_response(dest, request.data, ResponseCode::NameError);
+                            return Err("Unsupported A record in DNS question".into());
+                        }
+                        _ => {
+                            qdcount += 1;
+                            length = self.write_question(
+                                dest,
+                                length,
+                                q.qtype(),
+                                q.qclass(),
+                                q.iter_qname(),
+                            )?
+                        }
+                    };
+                }
+                Section::Answer(_) => debug!("Dropping unsupported A section from request"),
+                Section::Nameserver(_) => debug!("Dropping unsupported NS section from request"),
+                Section::AdditionalRecord(_) => {
+                    debug!("Dropping unsupported AR section from request")
+                }
+            };
+            Ok::<(), DnsError>(())
+        })?;
+        if qdcount == 0 {
+            Self::write_error_response(dest, request.data, ResponseCode::FormatError);
+            return Err("No supported question types in request".into());
+        }
+        flags.clear_reserved_zero();
+        Self::write_header(dest, request.data, flags, qdcount, 0, 0, 0);
+        Ok(length)
+    }
+
+    fn write_resource_record(
+        &mut self,
+        dest: &mut [u8],
+        mut length: usize,
+        rr: &ResourceRecord,
+    ) -> Result<Option<usize>, DnsError> {
+        let rr_type = rr.rr_type();
+        match rr.rdata()? {
+            Rdata::Ipv4(addr) => {
+                let rr_type = if rr_type == RrType::A {
+                    RrType::AAAA
+                } else {
+                    return Err("IPv4 address record doesn't have type A".into());
+                };
+                length = self.write_label(dest, length, rr.iter_name())?;
+                if length + 10 + 16 > dest.len() {
+                    return Err("Not enough data to write AAAA record".into());
+                }
+                dest[length..length + 2].copy_from_slice(&rr_type.to_be_bytes());
+                // Copy all attributes except RDLENGTH.
+                dest[length + 2..length + 8]
+                    .copy_from_slice(&rr.data[rr.name_end_offset + 2..rr.name_end_offset + 8]);
+                // Static IPv6 address RDLENGTH.
+                dest[length + 8..length + 10].copy_from_slice(&16u16.to_be_bytes());
+                length += 10;
+                dest[length..length + 16]
+                    .copy_from_slice(&self.nat64_prefix.map_ipv4(&addr).octets());
+                length += 16;
+
+                Ok(Some(length))
+            }
+            Rdata::Ipv6(_) => {
+                warn!("Dropping unsupported AAAA record from response");
+                Ok(None)
+            }
+            Rdata::Name(name_label) => {
+                length = self.write_label(dest, length, rr.iter_name())?;
+                if length + 12 > dest.len() {
+                    return Err("Not enough data to write name record".into());
+                }
+                // Copy all attributes except RDLENGTH.
+                dest[length..length + 8]
+                    .copy_from_slice(&rr.data[rr.name_end_offset..rr.name_end_offset + 8]);
+                let rdlength_start_offset = length + 8;
+                length += 10;
+
+                length = self.write_label(dest, length, name_label)?;
+
+                let rdlength = (length - rdlength_start_offset - 2) as u16;
+                dest[rdlength_start_offset..rdlength_start_offset + 2]
+                    .copy_from_slice(&rdlength.to_be_bytes());
+
+                Ok(Some(length))
+            }
+            Rdata::Soa(soa_record) => {
+                length = self.write_label(dest, length, rr.iter_name())?;
+                if length + 12 > dest.len() {
+                    return Err("Not enough data to write SOA record".into());
+                }
+                // Copy all attributes except RDLENGTH.
+                dest[length..length + 8]
+                    .copy_from_slice(&rr.data[rr.name_end_offset..rr.name_end_offset + 8]);
+                let rdlength_start_offset = length + 8;
+                length += 10;
+
+                length = self.write_label(dest, length, soa_record.iter_mname())?;
+                length = self.write_label(dest, length, soa_record.iter_rname())?;
+                dest[length..length + 20].copy_from_slice(soa_record.attributes);
+                length += 20;
+
+                let rdlength = (length - rdlength_start_offset - 2) as u16;
+                dest[rdlength_start_offset..rdlength_start_offset + 2]
+                    .copy_from_slice(&rdlength.to_be_bytes());
+
+                Ok(Some(length))
+            }
+            Rdata::Unknown(_) => {
+                warn!(
+                    "Dropping unsupported {} resource record from response",
+                    rr_type
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn translate_to_ipv6(
+        &mut self,
+        request: &DnsPacket,
+        dest: &mut [u8],
+    ) -> Result<usize, DnsError> {
+        self.compression_map.clear();
+        // This is loosely based on RFC 6147.
+        let mut flags = request.flags();
+        if flags.qr() == Qr::Query {
+            return Err("Query responses are not supported".into());
+        }
+        if flags.truncation() {
+            return Err("Truncated responses are not supported".into());
+        }
+        if dest.len() < MAX_PACKET_SIZE {
+            return Err("Not enough data for translated IPv4 DNS request".into());
+        }
+        if dest.len() < request.data.len() {
+            return Err("Destination slice cannot fit original request".into());
+        }
+        let mut qdcount = 0;
+        let mut ancount = 0;
+        let mut nscount = 0;
+        let mut arcount = 0;
+        let mut length = 12;
+        request.iter_sections().try_for_each(|section| {
+            match section? {
+                Section::Question(q) => {
+                    if qdcount > 0 {
+                        // RFC 1035, Section 4.1.2 states that number of questions
+                        // is usually 1, and most implementations don't support >1 questions.
+                        warn!("Dropping unexpected additional question from request");
+                        return Ok(());
+                    }
+                    let qtype = q.qtype().to_rtype();
+                    match qtype {
+                        Some(RrType::A) => {
+                            // Translate A requests into AAAA.
+                            qdcount += 1;
+                            length = self.write_question(
+                                dest,
+                                length,
+                                RrType::A.to_qtype(),
+                                q.qclass(),
+                                q.iter_qname(),
+                            )?
+                        }
+                        Some(RrType::AAAA) => {
+                            // Drop AAAA questions (IPv4 is never asked for AAAA records).
+                            qdcount += 1;
+                            length = self.write_question(
+                                dest,
+                                length,
+                                RrType::A.to_qtype(),
+                                q.qclass(),
+                                q.iter_qname(),
+                            )?;
+                            return Err("Unsupported AAAA record in DNS response question".into());
+                        }
+                        _ => {
+                            // Keep all other questions unchanged.
+                            qdcount += 1;
+                            length = self.write_question(
+                                dest,
+                                length,
+                                q.qtype(),
+                                q.qclass(),
+                                q.iter_qname(),
+                            )?
+                        }
+                    };
+                }
+                Section::Answer(a) => {
+                    if let Some(new_length) = self.write_resource_record(dest, length, &a)? {
+                        ancount += 1;
+                        length = new_length;
+                    }
+                }
+                Section::Nameserver(ns) => {
+                    if let Some(new_length) = self.write_resource_record(dest, length, &ns)? {
+                        nscount += 1;
+                        length = new_length;
+                    }
+                }
+                Section::AdditionalRecord(ar) => {
+                    if let Some(new_length) = self.write_resource_record(dest, length, &ar)? {
+                        arcount += 1;
+                        length = new_length;
+                    }
+                }
+            };
+            Ok::<(), DnsError>(())
+        })?;
+        if qdcount == 0 {
+            return Err("No supported question types in response".into());
+        }
+        flags.clear_reserved_zero();
+        if ancount == 0 {
+            flags.set_response_code(ResponseCode::NameError);
+        }
+        Self::write_header(
+            dest,
+            request.data,
+            flags,
+            qdcount,
+            ancount,
+            nscount,
+            arcount,
+        );
+        Ok(length)
+    }
+}
+
+impl Clone for Dns64Translator {
+    fn clone(&self) -> Self {
+        Dns64Translator::new(self.nat64_prefix.clone())
     }
 }
 

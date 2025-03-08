@@ -1,10 +1,11 @@
 use std::{
     error, fmt, io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::RangeInclusive,
 };
 
-use log::warn;
+use log::{trace, warn};
+use tokio::{net::UdpSocket, runtime};
 
 use crate::logger::fmt_slice_hex;
 
@@ -406,6 +407,7 @@ pub struct Network {
     tunnel_domains_idna: Vec<Vec<u8>>,
     tunnel_domains_dns: TunnelDomainsDns,
     local_ts: Vec<message::TrafficSelector>,
+    dns_translator: Option<dns::Dns64Translator>,
 }
 
 impl Network {
@@ -423,6 +425,11 @@ impl Network {
             vec![]
         };
         let tunnel_domains_dns = TunnelDomainsDns::new(&tunnel_domains);
+        let dns_translator = if let Some(nat64_prefix) = &nat64_prefix {
+            Some(dns::Dns64Translator::new(nat64_prefix.clone()))
+        } else {
+            None
+        };
         Ok(Network {
             nat64_prefix,
             real_ip: None,
@@ -431,6 +438,7 @@ impl Network {
             tunnel_domains_idna,
             tunnel_domains_dns,
             local_ts: traffic_selectors,
+            dns_translator,
         })
     }
 
@@ -536,7 +544,7 @@ impl Network {
         }
     }
 
-    pub fn dns_matches_tunnel(&self, dns_packet: &DnsPacket) -> bool {
+    fn dns_matches_tunnel(&self, dns_packet: &DnsPacket) -> bool {
         let tunnel_domains = self.tunnel_domains_dns.domains();
         if tunnel_domains.is_empty() {
             // Match all domains, without exception.
@@ -546,6 +554,76 @@ impl Network {
                 .iter()
                 .any(|domain| dns_packet.matches_suffix(domain))
         }
+    }
+
+    pub fn translate_packet_from_esp(&mut self, packet: &IpPacket) -> Result<(), IpError> {
+        if self.is_nat64() && DnsPacket::is_dns(&packet.to_header()?) {
+            // TODO 0.5.0: Validate UDP header (length + checksum).
+            let dns_packet = DnsPacket::from_udp_packet(packet.transport_protocol_data())?;
+            trace!("Decoded DNS packet: {}", dns_packet);
+            let mut translated_packet = [0u8; 8 + dns::MAX_PACKET_SIZE];
+            let translated_packet = if self.dns_matches_tunnel(&dns_packet) {
+                println!("DNS matches tunnel");
+                let length = if let Some(translator) = &mut self.dns_translator {
+                    translator.translate_to_ipv4(&dns_packet, &mut translated_packet[8..])?
+                } else {
+                    0
+                };
+                let dns_packet = DnsPacket::from_udp_packet(&translated_packet[..8 + length])?;
+                println!("Rewrote DNS request: {}", dns_packet);
+                &translated_packet[8..8 + length]
+            } else {
+                &packet.transport_protocol_data()[8..]
+            };
+            let dns_request = translated_packet.to_vec();
+            let rt = runtime::Handle::current();
+            let mut dns_translator = self.dns_translator.clone();
+            // TODO 0.5.0: Remove this temporary debug code.
+            rt.spawn(async move {
+                let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+                let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                let socket = UdpSocket::bind(local_addr)
+                    .await
+                    .expect("Failed to bind DNS socket");
+                socket
+                    .connect(&remote_addr)
+                    .await
+                    .expect("Failed to connect to DNS server");
+                socket
+                    .send(dns_request.as_slice())
+                    .await
+                    .expect("Failed to send DNS request");
+                let mut data = [0u8; 1500];
+                let len = socket
+                    .recv(&mut data[8..])
+                    .await
+                    .expect("Failed to receive DNS response");
+                let data = &data[..8 + len];
+                println!("Received DNS response {}", fmt_slice_hex(&data[8..]));
+                let dns_packet =
+                    DnsPacket::from_udp_packet(data).expect("Failed to parse DNS response packet");
+                trace!("Decoded DNS response: {}", dns_packet);
+
+                let mut translated_packet = [0u8; 8 + dns::MAX_PACKET_SIZE];
+                let length = if let Some(translator) = &mut dns_translator {
+                    match translator.translate_to_ipv6(&dns_packet, &mut translated_packet[8..]) {
+                        Ok(length) => length,
+                        Err(err) => {
+                            println!("Failed to translate DNS response: {}", err);
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+                if length > 0 {
+                    let dns_packet = DnsPacket::from_udp_packet(&translated_packet[..8 + length])
+                        .expect("Failed to decode translated DNS response");
+                    println!("Rewrote DNS response: {}", dns_packet);
+                }
+            });
+        }
+        Ok(())
     }
 }
 
