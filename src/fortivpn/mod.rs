@@ -277,6 +277,7 @@ impl FortiVPNTunnel {
     ) -> Result<u32, FortiError> {
         // Open PPP link; 200 bytes should fit any PPP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
+        // TODO FUTUREHEAP
         let mut req = [0u8; 20];
         let mut resp = [0u8; 200];
         let identifier = 1;
@@ -418,6 +419,7 @@ impl FortiVPNTunnel {
     ) -> Result<(), FortiError> {
         // Open IPCP link; 20 bytes should fit any IPCP packet.
         // This is an oversimplified implementation of the RFC 1661 state machine.
+        // TODO FUTUREHEAP
         let mut req = [0u8; 20];
         let mut resp = [0u8; 200];
         let identifier = 1;
@@ -432,6 +434,7 @@ impl FortiVPNTunnel {
                 debug!("Failed to encode IPCP Configure-Request: {}", err);
                 "Failed to encode IPCP Configure-Request"
             })?;
+        // TODO FUTUREHEAP
         let mut opts = [0u8; 100];
         let opts_len = length - 4;
         opts[..opts_len].copy_from_slice(&req[4..length]);
@@ -557,6 +560,7 @@ impl FortiVPNTunnel {
     ) -> Result<(), FortiError> {
         let ppp_header = Self::write_ppp_header(protocol, ppp_data.len());
 
+        // TODO UNSHIFT
         socket.write_all(&ppp_header).await?;
         Ok(socket.write_all(ppp_data).await?)
     }
@@ -612,6 +616,7 @@ impl FortiVPNTunnel {
     pub async fn write_data(&mut self, data: &[u8]) -> Result<(), FortiError> {
         let ppp_header = Self::write_ppp_header(ppp::Protocol::IPV4, data.len());
 
+        // TODO UNSHIFT
         self.socket.write_all(&ppp_header).await?;
         Ok(self.socket.write_all(data).await?)
     }
@@ -683,6 +688,7 @@ impl FortiVPNTunnel {
     pub async fn terminate(&mut self) -> Result<(), FortiError> {
         let mut req = [0u8; 4];
         // Ensure that any stray IP packets are accepted.
+        // TODO FUTUREHEAP
         let mut resp = [0u8; MAX_MTU + 8];
         let length = ppp::encode_lcp_data(
             &mut req,

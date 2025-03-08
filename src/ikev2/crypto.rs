@@ -259,6 +259,7 @@ pub fn choose_sa_parameters(
 }
 
 pub struct Array<const M: usize> {
+    // TODO FUTUREHEAP
     data: [u8; M],
     len: usize,
 }
@@ -506,6 +507,7 @@ impl PseudorandomTransformPlus {
 }
 
 pub struct DerivedKeys {
+    // TODO FUTUREHEAP
     keys: [u8; MAX_KEY_MATERIAL_LENGTH],
     derive: Range<usize>,
     auth_initiator: Range<usize>,
@@ -1029,6 +1031,7 @@ impl Encryption for EncryptionAesGcm256 {
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.salt);
         // Move message to the right to make space for the explicit nonce.
+        // TODO UNSHIFT
         data.copy_within(..msg_len, 8);
         nonce[4..12].copy_from_slice(&self.iv.to_be_bytes());
         // Instead of a counter, using LFSR could also work.

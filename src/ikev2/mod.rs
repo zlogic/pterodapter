@@ -155,6 +155,7 @@ impl Server {
     ) -> Result<(), IKEv2Error> {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
+        // TODO FUTUREHEAP
         let mut udp_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut vpn_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
@@ -320,6 +321,7 @@ struct Sockets {
     sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
     socket_list: Vec<(SocketAddr, Arc<UdpSocket>)>,
     nat_port: u16,
+    // TODO FUTUREHEAP
     send_buffer: [u8; MAX_DATAGRAM_SIZE],
     pending_send: Option<UdpPendingSend>,
 }

@@ -135,6 +135,7 @@ impl SecurityAssociation {
         if self.local_seq == u32::MAX {
             return Err("Sequence number overflow".into());
         }
+        // TODO UNSHIFT
         data.copy_within(..msg_len, 8);
         data[0..4].copy_from_slice(&self.remote_spi.to_be_bytes());
         data[4..8].copy_from_slice(&self.local_seq.to_be_bytes());
