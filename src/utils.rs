@@ -1,6 +1,6 @@
 use std::{mem, ops::Range};
 
-pub fn elem_offset<T>(slice: &[T], element: &T) -> Option<usize> {
+pub fn element_offset<T>(slice: &[T], element: &T) -> Option<usize> {
     // TODO: replace this once https://github.com/rust-lang/rust/issues/76393 becomes stable.
     if mem::size_of::<T>() == 0 {
         panic!("elements are zero-sized");
@@ -29,6 +29,8 @@ pub fn subslice_range<T>(slice: &[T], subslice: &[T]) -> Option<Range<usize>> {
     if mem::size_of::<T>() == 0 {
         panic!("elements are zero-sized");
     }
+
+    // TODO: add special handling for empty slices like &[].
 
     let self_start = slice.as_ptr() as usize;
     let subslice_start = subslice.as_ptr() as usize;

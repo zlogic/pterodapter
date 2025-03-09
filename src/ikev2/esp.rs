@@ -80,42 +80,48 @@ impl SecurityAssociation {
             && ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Source)
     }
 
-    pub fn handle_esp<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
-        if data.len() < 8 + self.signature_length {
+    pub fn handle_esp(&mut self, exchange: &mut ip::Exchange) -> Result<(), EspError> {
+        if exchange.request().len() < 8 + self.signature_length {
             return Err("Not enough data in ESP packet".into());
         }
         let mut local_spi = [0u8; 4];
-        local_spi.copy_from_slice(&data[..4]);
+        local_spi.copy_from_slice(&exchange.request()[..4]);
         let local_spi = u32::from_be_bytes(local_spi);
         if self.local_spi != local_spi {
             return Err("Received packet for another local SPI".into());
         }
         let mut sequence_number = [0u8; 4];
-        sequence_number.copy_from_slice(&data[4..8]);
+        sequence_number.copy_from_slice(&exchange.request()[4..8]);
         let sequence_number = u32::from_be_bytes(sequence_number);
         if !self.replay_window.is_unique(sequence_number) {
             return Err("Received packet with replayed Sequence Number".into());
         }
-        let signed_data_len = data.len() - self.signature_length;
-        let valid_signature = self.crypto_stack.validate_signature(data);
+        let signed_data_len = exchange.request().len() - self.signature_length;
+        let valid_signature = self.crypto_stack.validate_signature(exchange.request());
         if !valid_signature {
             return Err("Packet has invalid signature".into());
         }
         let mut associated_data = [0u8; 8];
         let associated_data = if self.signature_length == 0 {
-            associated_data.copy_from_slice(&data[0..8]);
+            associated_data.copy_from_slice(&exchange.request()[0..8]);
             &associated_data[..]
         } else {
             &[]
         };
         match self.crypto_stack.decrypt_data(
-            &mut data[8..signed_data_len],
+            &mut exchange.request_mut()[8..signed_data_len],
             signed_data_len - 8,
             associated_data,
         ) {
-            Ok(data) => {
+            Ok(data_range) => {
+                // TODO UNSHIFT
+                // Reseve bytes for PPP header to avoid writing twice.
+                let data_len = data_range.len();
+                let data_range = data_range.start + 8..data_range.end + 8;
+                exchange.request_mut().copy_within(data_range, 0);
+                exchange.resize_request(data_len);
                 self.replay_window.update(sequence_number);
-                Ok(data)
+                Ok(())
             }
             Err(err) => {
                 warn!("Failed to decrypt ESP packet: {}", err);
@@ -124,37 +130,38 @@ impl SecurityAssociation {
         }
     }
 
-    pub fn handle_vpn<'a>(
-        &mut self,
-        data: &'a mut [u8],
-        msg_len: usize,
-    ) -> Result<&'a [u8], EspError> {
-        if data.len() < self.encoded_length(msg_len) {
+    pub fn handle_vpn(&mut self, exchange: &mut ip::Exchange) -> Result<(), EspError> {
+        let encoded_length = self.encoded_length(exchange.request().len());
+        if encoded_length > exchange.request_capacity() {
             return Err("Not enough capacity in ESP packet buffer".into());
         }
         if self.local_seq == u32::MAX {
             return Err("Sequence number overflow".into());
         }
-        // TODO UNSHIFT
-        data.copy_within(..msg_len, 8);
-        data[0..4].copy_from_slice(&self.remote_spi.to_be_bytes());
-        data[4..8].copy_from_slice(&self.local_seq.to_be_bytes());
+        let msg_len = exchange.request().len();
+        exchange.resize_request(encoded_length);
+        {
+            let data = exchange.request_mut();
+            data.copy_within(..msg_len, 8);
+            data[0..4].copy_from_slice(&self.remote_spi.to_be_bytes());
+            data[4..8].copy_from_slice(&self.local_seq.to_be_bytes());
+        }
         self.local_seq += 1;
         let mut associated_data = [0u8; 8];
         let associated_data = if self.signature_length == 0 {
-            associated_data.copy_from_slice(&data[0..8]);
+            associated_data.copy_from_slice(&exchange.request()[0..8]);
             &associated_data[..]
         } else {
             &[]
         };
-        match self
-            .crypto_stack
-            .encrypt_data(&mut data[8..], msg_len, associated_data)
-        {
-            Ok(encrypted_data) => {
-                let encrypted_data_len = 8 + encrypted_data.len();
-                let encrypted_data = &data[..encrypted_data_len];
-                Ok(encrypted_data)
+        match self.crypto_stack.encrypt_data(
+            &mut exchange.request_mut()[8..],
+            msg_len,
+            associated_data,
+        ) {
+            Ok(encrypted_data_range) => {
+                exchange.resize_request(8 + encrypted_data_range.len());
+                Ok(())
             }
             Err(err) => {
                 warn!("Failed to encrypt ESP packet: {}", err);

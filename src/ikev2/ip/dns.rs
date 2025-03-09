@@ -169,7 +169,7 @@ impl DnsPacketFlags {
 
     fn opcode(&self) -> Opcode {
         let opcode = (self.0 >> Self::OPCODE_OFFSET) as u8 & Self::OPCODE_MASK;
-        Opcode::from_u8(opcode as u8)
+        Opcode::from_u8(opcode)
     }
 
     fn authoritative_answer(&self) -> bool {
@@ -215,7 +215,7 @@ impl DnsPacket<'_> {
             && (hdr.src_port == Some(53) || hdr.dst_port == Some(53))
     }
 
-    pub fn from_udp_packet<'a>(data: &'a [u8]) -> Result<DnsPacket<'a>, DnsError> {
+    pub fn from_udp_packet(data: &[u8]) -> Result<DnsPacket, DnsError> {
         // First 8 bytes are the UDP header.
         if data.len() < 8 + Self::DNS_HEADER_SIZE {
             Err("DNS packet size is smaller than header size".into())
@@ -442,7 +442,7 @@ impl<'a> Iterator for LabelIter<'a> {
 
         loop {
             length = self.data[start_offset];
-            let is_pointer = match (length as u8) & LABEL_POINTER_MASK {
+            let is_pointer = match length & LABEL_POINTER_MASK {
                 LABEL_POINTER_MASK => true,
                 0x00 => false,
                 _ => {
@@ -506,7 +506,7 @@ impl<'a> Iterator for LabelIter<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // This can be time-consuming, better do it just once.
-        let remain = self.clone().count();
+        let remain = self.count();
         (remain, Some(remain))
     }
 }
@@ -1092,7 +1092,7 @@ impl Dns64Translator {
 
     fn write_error_response(dest: &mut [u8], request_data: &[u8], rcode: ResponseCode) {
         // Keep all questions and data for the client to observe.
-        dest[0..request_data.len()].copy_from_slice(&request_data);
+        dest[0..request_data.len()].copy_from_slice(request_data);
         let mut flags = DnsPacketFlags::from_data(dest);
         flags.set_qr(Qr::Response);
         flags.set_response_code(rcode);

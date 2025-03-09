@@ -1,7 +1,7 @@
 use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
 };
 
 use log::{trace, warn};
@@ -11,10 +11,14 @@ use crate::logger::fmt_slice_hex;
 
 use super::message;
 
+mod dns;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TransportProtocolType(u8);
 
-mod dns;
+// How much a header can grow, for the worst case scenario, based on RFC 7915:
+// a minimum size IPv4 header (20) that gets expanded into a fragmented IPv6 header (48).
+pub const MAX_TRANSLATED_HEADER_GROWTH: usize = 48 - 20;
 
 pub type DnsPacket<'a> = dns::DnsPacket<'a>;
 
@@ -306,6 +310,42 @@ impl IpPacket<'_> {
             dst_port: self.dst_port()?,
             transport_protocol: self.transport_protocol(),
         })
+    }
+}
+
+impl fmt::Display for IpPacket<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpPacket::V4(_) => write!(f, "IPv4 ")?,
+            IpPacket::V6(_) => write!(f, "IPv6 ")?,
+        }
+        match self.src_port() {
+            Ok(Some(src_port)) => write!(
+                f,
+                "{} {}:{} -> ",
+                self.transport_protocol(),
+                self.src_addr(),
+                src_port
+            )?,
+            Ok(None) => write!(f, "{} {} -> ", self.transport_protocol(), self.src_addr())?,
+            Err(err) => write!(
+                f,
+                "{} {} (port {}) -> ",
+                self.transport_protocol(),
+                self.src_addr(),
+                err
+            )?,
+        }
+        match self.dst_port() {
+            Ok(Some(dst_port)) => writeln!(f, "{}:{}", self.dst_addr(), dst_port)?,
+            Ok(None) => writeln!(f, "{}", self.dst_addr())?,
+            Err(err) => writeln!(f, "{} (port {}) -> ", self.dst_addr(), err)?,
+        }
+        write!(
+            f,
+            "  Transport {}",
+            fmt_slice_hex(self.transport_protocol_data())
+        )
     }
 }
 
@@ -635,6 +675,115 @@ impl Network {
     }
 }
 
+pub struct Exchange<'a> {
+    request: &'a mut [u8],
+    response: &'a mut [u8],
+    request_range: Range<usize>,
+    response_range: Range<usize>,
+}
+
+impl<'a> Exchange<'a> {
+    pub fn new(request: &'a mut [u8], response: &'a mut [u8]) -> Exchange<'a> {
+        Exchange {
+            request,
+            response,
+            request_range: 0..0,
+            response_range: 0..0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.request_range = 0..0;
+        self.response_range = 0..0;
+    }
+
+    #[inline]
+    pub fn request(&self) -> &[u8] {
+        &self.request[self.request_range.clone()]
+    }
+
+    #[inline]
+    pub fn response(&self) -> &[u8] {
+        &self.response[self.response_range.clone()]
+    }
+
+    #[inline]
+    pub fn request_mut(&mut self) -> &mut [u8] {
+        &mut self.request[self.request_range.clone()]
+    }
+
+    #[inline]
+    pub fn response_mut(&mut self) -> &mut [u8] {
+        &mut self.response[self.response_range.clone()]
+    }
+
+    #[inline]
+    pub fn request_capacity(&self) -> usize {
+        self.request.len() - self.request_range.start
+    }
+
+    pub fn resize_request(&mut self, size: usize) {
+        let new_end = self.request_range.end + size;
+        if new_end > self.request.len() {
+            panic!("Exchange request resized out of capacity");
+        } else {
+            if new_end > self.request.len() {
+                self.request[self.request_range.end..new_end].fill(0)
+            }
+            self.request_range.end = new_end;
+        }
+    }
+
+    pub fn entire_request_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> (Range<usize>, R),
+    {
+        let (range, r) = f(self.request);
+        self.request_range = if range.start < self.request.len() && range.end <= self.request.len()
+        {
+            range.clone()
+        } else {
+            panic!("Request range out of bounds");
+        };
+        r
+    }
+
+    pub async fn entire_request_mut_async<F, R>(&mut self, f: F) -> R
+    where
+        F: AsyncFnOnce(&mut [u8]) -> (Range<usize>, R),
+    {
+        let (range, r) = f(self.request).await;
+        self.request_range = if range.start < self.request.len() && range.end <= self.request.len()
+        {
+            range.clone()
+        } else {
+            panic!("Request range out of bounds");
+        };
+        r
+    }
+
+    pub fn entire_response_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> (Range<usize>, R),
+    {
+        let (range, r) = f(self.response);
+        self.response_range =
+            if range.start < self.response.len() && range.end <= self.response.len() {
+                range.clone()
+            } else {
+                panic!("Response range out of bounds");
+            };
+        r
+    }
+
+    pub fn into_slices(self) -> (&'a [u8], &'a [u8]) {
+        (
+            &self.request[self.request_range],
+            &self.response[self.response_range],
+        )
+    }
+}
+
 type DomainLabels = Vec<Vec<u8>>;
 
 #[derive(Clone)]
@@ -658,42 +807,6 @@ impl TunnelDomainsDns {
 
     fn domains(&self) -> &[DomainLabels] {
         &self.tunnel_domains
-    }
-}
-
-impl fmt::Display for IpPacket<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IpPacket::V4(_) => write!(f, "IPv4 ")?,
-            IpPacket::V6(_) => write!(f, "IPv6 ")?,
-        }
-        match self.src_port() {
-            Ok(Some(src_port)) => write!(
-                f,
-                "{} {}:{} -> ",
-                self.transport_protocol(),
-                self.src_addr(),
-                src_port
-            )?,
-            Ok(None) => write!(f, "{} {} -> ", self.transport_protocol(), self.src_addr())?,
-            Err(err) => write!(
-                f,
-                "{} {} (port {}) -> ",
-                self.transport_protocol(),
-                self.src_addr(),
-                err
-            )?,
-        }
-        match self.dst_port() {
-            Ok(Some(dst_port)) => writeln!(f, "{}:{}", self.dst_addr(), dst_port)?,
-            Ok(None) => writeln!(f, "{}", self.dst_addr())?,
-            Err(err) => writeln!(f, "{} (port {}) -> ", self.dst_addr(), err)?,
-        }
-        write!(
-            f,
-            "  Transport {}",
-            fmt_slice_hex(self.transport_protocol_data())
-        )
     }
 }
 

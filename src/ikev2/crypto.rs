@@ -260,6 +260,7 @@ pub fn choose_sa_parameters(
 
 pub struct Array<const M: usize> {
     // TODO FUTUREHEAP
+    // Only increase size where it exceeds AWS LC RS internal buffer sizes.
     data: [u8; M],
     len: usize,
 }
@@ -507,8 +508,7 @@ impl PseudorandomTransformPlus {
 }
 
 pub struct DerivedKeys {
-    // TODO FUTUREHEAP
-    keys: [u8; MAX_KEY_MATERIAL_LENGTH],
+    keys: Vec<u8>,
     derive: Range<usize>,
     auth_initiator: Range<usize>,
     auth_responder: Range<usize>,
@@ -532,7 +532,7 @@ impl DerivedKeys {
         let prf_initiator = enc_responder.end..enc_responder.end + prf_key_length;
         let prf_responder = prf_initiator.end..prf_initiator.end + prf_key_length;
         DerivedKeys {
-            keys: [0u8; MAX_KEY_MATERIAL_LENGTH],
+            keys: vec![0u8; MAX_KEY_MATERIAL_LENGTH],
             derive,
             auth_initiator,
             auth_responder,
@@ -554,7 +554,7 @@ impl DerivedKeys {
         let prf_initiator = 0..0;
         let prf_responder = 0..0;
         DerivedKeys {
-            keys: [0u8; MAX_KEY_MATERIAL_LENGTH],
+            keys: vec![0u8; MAX_KEY_MATERIAL_LENGTH],
             derive,
             auth_initiator,
             auth_responder,
@@ -768,21 +768,21 @@ impl CryptoStack {
             + self.auth_responder.signature_length()
     }
 
-    pub fn encrypt_data<'a>(
+    pub fn encrypt_data(
         &mut self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError> {
+    ) -> Result<Range<usize>, CryptoError> {
         self.enc_responder.encrypt(data, msg_len, associated_data)
     }
 
-    pub fn decrypt_data<'a>(
+    pub fn decrypt_data(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError> {
+    ) -> Result<Range<usize>, CryptoError> {
         self.enc_initiator.decrypt(data, msg_len, associated_data)
     }
 
@@ -831,19 +831,19 @@ impl<'a> Extend<&'a u8> for SliceBuffer<'_> {
 }
 
 pub trait Encryption {
-    fn encrypt<'a>(
+    fn encrypt(
         &mut self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError>;
+    ) -> Result<Range<usize>, CryptoError>;
 
-    fn decrypt<'a>(
+    fn decrypt(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError>;
+    ) -> Result<Range<usize>, CryptoError>;
 
     fn encrypted_payload_length(&self, msg_len: usize) -> usize;
 }
@@ -887,23 +887,23 @@ impl EncryptionType {
         }
     }
 
-    fn encrypt<'a>(
+    fn encrypt(
         &mut self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError> {
+    ) -> Result<Range<usize>, CryptoError> {
         match self {
             Self::AesGcm256(enc) => enc.encrypt(data, msg_len, associated_data),
         }
     }
 
-    fn decrypt<'a>(
+    fn decrypt(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError> {
+    ) -> Result<Range<usize>, CryptoError> {
         match self {
             Self::AesGcm256(dec) => dec.decrypt(data, msg_len, associated_data),
         }
@@ -925,16 +925,20 @@ impl PaddingType {
         }
     }
 
-    fn remove_padding<'a>(&self, data: &'a [u8]) -> Result<&'a [u8], CryptoError> {
+    fn remove_padding(
+        &self,
+        data: &[u8],
+        encrypted_range: Range<usize>,
+    ) -> Result<Range<usize>, CryptoError> {
         if data.len() < self.length() {
             return Err("Not enough data to get padding length".into());
         }
         let padding_length = match self {
-            Self::IKEv2 => data[data.len() - 1] + 1,
-            Self::Esp => data[data.len() - 2] + 2,
+            Self::IKEv2 => data[encrypted_range.end - 1] + 1,
+            Self::Esp => data[encrypted_range.end - 2] + 2,
         } as usize;
         if data.len() >= padding_length {
-            Ok(&data[..data.len() - padding_length])
+            Ok(encrypted_range.start..encrypted_range.end - padding_length)
         } else {
             Err("Padding exceeds message size".into())
         }
@@ -1008,12 +1012,12 @@ pub struct EncryptionAesGcm256 {
 }
 
 impl Encryption for EncryptionAesGcm256 {
-    fn encrypt<'a>(
+    fn encrypt(
         &mut self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError> {
+    ) -> Result<Range<usize>, CryptoError> {
         if data.len() < self.encrypted_payload_length(msg_len) {
             return Err("Message length is too short".into());
         }
@@ -1031,7 +1035,6 @@ impl Encryption for EncryptionAesGcm256 {
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.salt);
         // Move message to the right to make space for the explicit nonce.
-        // TODO UNSHIFT
         data.copy_within(..msg_len, 8);
         nonce[4..12].copy_from_slice(&self.iv.to_be_bytes());
         // Instead of a counter, using LFSR could also work.
@@ -1046,33 +1049,49 @@ impl Encryption for EncryptionAesGcm256 {
             aead::Aad::from(associated_data),
             &mut buffer,
         ) {
-            Ok(()) => {
-                let buffer_len = 8 + buffer.len;
-                let buffer = &data[..buffer_len];
-                Ok(buffer)
-            }
+            Ok(()) => Ok(0..8 + buffer.len),
             Err(_) => Err("Failed to encode AES GCM 16 256 message".into()),
         }
     }
 
-    fn decrypt<'a>(
+    fn decrypt(
         &self,
-        data: &'a mut [u8],
+        data: &mut [u8],
         msg_len: usize,
         associated_data: &[u8],
-    ) -> Result<&'a [u8], CryptoError> {
+    ) -> Result<Range<usize>, CryptoError> {
         if msg_len <= 8 {
             return Err("Message length is too short".into());
         }
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.salt);
         nonce[4..].copy_from_slice(&data[..8]);
+        // open_in_place borrows data as &mut, so it cannot be accessed later.
+        // To search for the subslice location, need to do some pointer math, similar to
+        // subslice_range from substr_range.
+        let data_ptr_range = data.as_ptr_range();
         match self.key.open_in_place(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(associated_data),
             &mut data[8..msg_len],
         ) {
-            Ok(decrypted_data) => self.padding.remove_padding(decrypted_data),
+            Ok(decrypted_data) => {
+                let decrypted_ptr_range = decrypted_data.as_ptr_range();
+                let decrypted_len = decrypted_data.len();
+                if decrypted_data.is_empty() {
+                    Ok(8..8)
+                } else if data_ptr_range.contains(&decrypted_ptr_range.start)
+                    && data_ptr_range.contains(&decrypted_ptr_range.end)
+                {
+                    let start_offset =
+                        decrypted_ptr_range.start.addr() - data_ptr_range.start.addr();
+                    let decrypted_range = start_offset..start_offset + decrypted_len;
+                    // Don't have to check for alignment, as u8 is always aligned.
+                    self.padding.remove_padding(data, decrypted_range)
+                } else {
+                    Err("Decrypted AES GCM 16 256 message is out of range".into())
+                }
+            }
             Err(_) => Err("Failed to decode AES GCM 16 256 message".into()),
         }
     }

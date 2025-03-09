@@ -155,10 +155,10 @@ impl Server {
     ) -> Result<(), IKEv2Error> {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
-        // TODO FUTUREHEAP
-        let mut udp_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
-        let mut vpn_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
-        let mut vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
+        let mut udp_read_buffer = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut udp_write_buffer = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut vpn_read_buffer = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut vpn_write_buffer = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut poll_seed = 0usize;
         loop {
             let vpn_is_connected = vpn_service.is_connected();
@@ -167,7 +167,7 @@ impl Server {
                 return Ok(());
             }
             // Wait until something is ready.
-            let mut udp_read_buf = ReadBuf::new(&mut udp_read_buffer);
+            let mut udp_exchange = UdpExchange::new(&mut udp_read_buffer, &mut udp_write_buffer);
             poll_seed = poll_seed.wrapping_add(1);
             let (command_message, udp_source, vpn_event) = {
                 let mut vpn_event = None;
@@ -191,7 +191,7 @@ impl Server {
                         };
                     }
                     if udp_source.is_none() {
-                        udp_source = match sockets.poll_recv(cx, poll_seed, &mut udp_read_buf) {
+                        udp_source = match sockets.poll_recv(cx, poll_seed, &mut udp_exchange) {
                             Poll::Ready(result) => Some(result),
                             Poll::Pending => None,
                         };
@@ -227,59 +227,73 @@ impl Server {
                 }
                 sessions.process_message(message).await;
             }
+            let mut vpn_exchange = VpnExchange::new(&mut vpn_read_buffer, &mut vpn_write_buffer);
             match vpn_event {
-                Some(Ok(())) => match vpn_service.read_packet(&mut vpn_read_buffer).await {
-                    Ok(data) => {
-                        let read_bytes = data.len();
-
-                        let mut read_buf =
-                            ReadBuf::new(&mut vpn_read_buffer[fortivpn::PPP_HEADER_SIZE..]);
-                        read_buf.set_filled(read_bytes);
-                        if let Err(err) = sessions.process_vpn_packet(read_buf).await {
-                            warn!("Failed to forward VPN packet to IKEv2: {}", err);
+                Some(Ok(())) => {
+                    match vpn_exchange
+                        .exchange_mut()
+                        .entire_request_mut_async(async |vpn_buffer| {
+                            match vpn_service.read_packet(vpn_buffer).await {
+                                Ok(read_range) => (read_range.clone(), Ok(read_range)),
+                                Err(err) => (0..0, Err(err)),
+                            }
+                        })
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Err(err) = sessions.process_vpn_packet(&mut vpn_exchange) {
+                                warn!("Failed to forward VPN packet to IKEv2: {}", err);
+                                vpn_exchange.clear();
+                            }
                         }
-                    }
-                    Err(err) => {
-                        warn!("Failed to read packet from VPN: {}", err);
-                    }
-                },
-                Some(Err(err)) => warn!("VPN reported an error status: {}", err),
-                None => {}
-            }
-            let send_slice_to_vpn = match udp_source {
-                Some(Ok(datagram)) => {
-                    let mut datagram = datagram.into_datagram(udp_read_buf);
-                    let remote_addr = datagram.remote_addr;
-                    let result = if datagram.is_ikev2() {
-                        sessions.update_ip(vpn_service.ip_configuration());
-                        sessions
-                            .process_ikev2_message(&datagram)
-                            .await
-                            .map(|()| None)
-                    } else {
-                        sessions.process_esp_packet(&mut datagram).await
-                    };
-                    match result {
-                        Ok(Some(send_slice)) => {
-                            vpn_write_buffer[..send_slice.len()].copy_from_slice(send_slice);
-                            Some(&vpn_write_buffer[..send_slice.len()])
-                        }
-                        Ok(None) => None,
                         Err(err) => {
-                            warn!("Failed to process message from {}: {}", remote_addr, err);
-                            None
+                            warn!("Failed to read packet from VPN: {}", err);
+                            vpn_exchange.clear();
                         }
                     }
                 }
                 Some(Err(err)) => {
-                    warn!("Failed to read data from UDP socket: {}", err);
-                    None
+                    warn!("VPN reported an error status: {}", err);
+                    vpn_exchange.clear();
                 }
-                None => None,
+                None => {
+                    vpn_exchange.clear();
+                }
             };
-            let (vpn_event, sent_udp) = {
-                let mut process_vpn_events = pin!(vpn_service.process_events(send_slice_to_vpn));
-                let mut sent_udp = None;
+            let (vpn_reply, vpn_send_to_udp) = vpn_exchange.into_packets();
+            match udp_source {
+                Some(Ok(udp_source)) => {
+                    let result = if udp_source.is_ikev2() {
+                        sessions.update_ip(vpn_service.ip_configuration());
+                        sessions
+                            .process_ikev2_message(udp_exchange.exchange(), &udp_source)
+                            .await
+                    } else {
+                        sessions.process_esp_packet(udp_exchange.exchange_mut(), &udp_source)
+                    };
+                    if let Err(err) = result {
+                        warn!(
+                            "Failed to process message from {}: {}",
+                            udp_source.remote_addr, err
+                        );
+                    } else {
+                        udp_exchange.source = Some(udp_source);
+                    }
+                }
+                Some(Err(err)) => {
+                    warn!("Failed to read data from UDP socket: {}", err);
+                    udp_exchange.clear();
+                }
+                None => {
+                    udp_exchange.clear();
+                }
+            };
+            let (udp_reply, udp_send_to_vpn) = udp_exchange.into_packets();
+            let (vpn_event, sent_udp_response, forwarded_udp_packet) = {
+                let send_slices_to_vpn = [vpn_reply, udp_send_to_vpn];
+                let mut process_vpn_events = pin!(vpn_service.process_events(&send_slices_to_vpn));
+                let mut sent_udp_response = None;
+                let mut forwarded_udp_packet = None;
                 let mut vpn_event = None;
                 let sockets = &mut sessions.sockets;
                 future::poll_fn(|cx| {
@@ -289,23 +303,54 @@ impl Server {
                             Poll::Pending => None,
                         };
                     }
-                    if sent_udp.is_none() {
-                        sent_udp = match sockets.poll_pending_send(cx) {
-                            Poll::Ready(result) => Some(result),
-                            Poll::Pending => None,
-                        };
+                    if sent_udp_response.is_none() {
+                        sent_udp_response = if let Some((source, udp_reply_data)) = &udp_reply {
+                            match sockets.poll_send(
+                                cx,
+                                source.local_addr,
+                                source.remote_addr,
+                                udp_reply_data,
+                            ) {
+                                Poll::Ready(result) => Some(result),
+                                Poll::Pending => None,
+                            }
+                        } else {
+                            Some(Ok(()))
+                        }
                     }
-                    if vpn_event.is_some() && sent_udp.is_some() {
+                    if forwarded_udp_packet.is_none() {
+                        forwarded_udp_packet =
+                            if let Some((destination, vpn_packet)) = &vpn_send_to_udp {
+                                match sockets.poll_send(
+                                    cx,
+                                    destination.local_addr,
+                                    destination.remote_addr,
+                                    vpn_packet,
+                                ) {
+                                    Poll::Ready(result) => Some(result),
+                                    Poll::Pending => None,
+                                }
+                            } else {
+                                Some(Ok(()))
+                            }
+                    }
+                    if vpn_event.is_some()
+                        && sent_udp_response.is_some()
+                        && forwarded_udp_packet.is_some()
+                    {
                         Poll::Ready(())
                     } else {
                         Poll::Pending
                     }
                 })
                 .await;
-                (vpn_event, sent_udp)
+                (vpn_event, sent_udp_response, forwarded_udp_packet)
             };
-            if let Some(Err(err)) = sent_udp {
-                warn!("Failed to send UDP ESP message: {}", err);
+            if let Some(Err(err)) = sent_udp_response {
+                warn!("Failed to send UDP ESP response: {}", err);
+            }
+            if let Some(Err(err)) = forwarded_udp_packet {
+                warn!("Failed to forward message to UDP ESP: {}", err);
             }
             if let Some(Err(err)) = vpn_event {
                 warn!("Failed to process VPN lifecycle events: {}", err);
@@ -321,9 +366,6 @@ struct Sockets {
     sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
     socket_list: Vec<(SocketAddr, Arc<UdpSocket>)>,
     nat_port: u16,
-    // TODO FUTUREHEAP
-    send_buffer: [u8; MAX_DATAGRAM_SIZE],
-    pending_send: Option<UdpPendingSend>,
 }
 
 impl Sockets {
@@ -350,36 +392,27 @@ impl Sockets {
             sockets,
             socket_list,
             nat_port,
-            send_buffer: [0u8; MAX_DATAGRAM_SIZE],
-            pending_send: None,
         })
     }
 
-    fn poll_pending_send(
-        &mut self,
+    fn poll_send(
+        &self,
         cx: &mut std::task::Context<'_>,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        data: &[u8],
     ) -> Poll<Result<(), IKEv2Error>> {
-        if let Some(ref pending_send) = self.pending_send {
-            if let Some(socket) = self.sockets.get(&pending_send.local_addr) {
-                match socket.poll_send_to(
-                    cx,
-                    &self.send_buffer[..pending_send.size],
-                    pending_send.remote_addr,
-                ) {
-                    Poll::Ready(Ok(_)) => {
-                        self.pending_send = None;
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Err(err)) => {
-                        self.pending_send = None;
-                        Poll::Ready(Err(err.into()))
-                    }
+        if !data.is_empty() {
+            if let Some(socket) = self.sockets.get(&local_addr) {
+                match socket.poll_send_to(cx, data, remote_addr) {
+                    Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+                    Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
                     Poll::Pending => Poll::Pending,
                 }
             } else {
                 warn!(
                     "No open sockets for source address {} (destination {})",
-                    pending_send.local_addr, pending_send.remote_addr
+                    local_addr, remote_addr
                 );
                 Poll::Ready(Err("No open sockets for source address".into()))
             }
@@ -392,21 +425,31 @@ impl Sockets {
         &self,
         cx: &mut std::task::Context<'_>,
         seed: usize,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<UdpDatagramOrigin, IKEv2Error>> {
+        udp_exchange: &mut UdpExchange,
+    ) -> Poll<Result<UdpDatagramSource, IKEv2Error>> {
         // Split socket list into two parts, then combine the second half with the first one.
         let seed = seed % self.socket_list.len();
         let (left, right) = self.socket_list.split_at(seed % self.socket_list.len());
         let it = right.iter().chain(left.iter());
         for (listen_addr, socket) in it {
             let is_nat_port = listen_addr.port() == self.nat_port;
-            buf.clear();
-            match socket.poll_recv_from(cx, buf) {
+            let result = udp_exchange
+                .exchange_mut()
+                .entire_request_mut(|udp_read_buffer| {
+                    let mut buf = ReadBuf::new(udp_read_buffer);
+                    let result = socket.poll_recv_from(cx, &mut buf);
+                    (0..buf.filled().len(), result)
+                });
+            match result {
                 Poll::Ready(Ok(remote_addr)) => {
-                    return Poll::Ready(Ok(UdpDatagramOrigin {
+                    let request = udp_exchange.exchange().request();
+                    let is_non_esp =
+                        request.len() >= 4 && request[0..4] == [0x00, 0x00, 0x00, 0x00];
+                    return Poll::Ready(Ok(UdpDatagramSource {
                         remote_addr,
                         local_addr: *listen_addr,
                         is_nat_port,
+                        is_non_esp,
                     }));
                 }
                 Poll::Ready(Err(err)) => {
@@ -442,76 +485,107 @@ impl Sockets {
             Err("No open sockets for source address".into())
         }
     }
-
-    fn enqueue_send_datagram(
-        &mut self,
-        local_addr: &SocketAddr,
-        remote_addr: &SocketAddr,
-        data: &[u8],
-    ) -> Result<(), SendError> {
-        if self.pending_send.is_some() {
-            warn!("UDP cannot enqeue more packets, dropping send request");
-        } else if !data.is_empty() {
-            self.pending_send = Some(UdpPendingSend {
-                remote_addr: *remote_addr,
-                local_addr: *local_addr,
-                size: data.len(),
-            });
-            self.send_buffer[..data.len()].copy_from_slice(data);
-        }
-        Ok(())
-    }
 }
 
-struct UdpDatagramOrigin {
+struct UdpDatagramSource {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
     is_nat_port: bool,
+    is_non_esp: bool,
 }
 
-impl UdpDatagramOrigin {
-    fn into_datagram(self, buf: ReadBuf<'_>) -> UdpDatagram<'_> {
-        UdpDatagram {
-            remote_addr: self.remote_addr,
-            local_addr: self.local_addr,
-            is_nat_port: self.is_nat_port,
-            bytes: buf,
-        }
-    }
-}
-
-struct UdpDatagram<'a> {
-    remote_addr: SocketAddr,
-    local_addr: SocketAddr,
-    is_nat_port: bool,
-    bytes: ReadBuf<'a>,
-}
-
-struct UdpPendingSend {
-    remote_addr: SocketAddr,
-    local_addr: SocketAddr,
-    size: usize,
-}
-
-impl UdpDatagram<'_> {
-    fn filled_bytes(&self) -> &[u8] {
-        self.bytes.filled()
-    }
-
-    fn filled_bytes_mut(&mut self) -> &mut [u8] {
-        self.bytes.filled_mut()
-    }
-
-    fn is_non_esp(&self) -> bool {
-        let bytes = self.filled_bytes();
-        bytes.len() >= 4 && bytes[0..4] == [0x00, 0x00, 0x00, 0x00]
-    }
-
+impl UdpDatagramSource {
     fn is_ikev2(&self) -> bool {
-        !self.is_nat_port || self.is_non_esp()
+        !self.is_nat_port || self.is_non_esp
     }
 }
 
+struct UdpExchange<'a> {
+    exchange: ip::Exchange<'a>,
+    source: Option<UdpDatagramSource>,
+}
+
+impl<'a> UdpExchange<'a> {
+    pub fn new(request: &'a mut [u8], response: &'a mut [u8]) -> UdpExchange<'a> {
+        UdpExchange {
+            exchange: ip::Exchange::new(request, response),
+            source: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.exchange.reset();
+        self.source = None;
+    }
+
+    #[inline]
+    fn exchange(&self) -> &ip::Exchange {
+        &self.exchange
+    }
+
+    #[inline]
+    fn exchange_mut(&mut self) -> &mut ip::Exchange<'a> {
+        &mut self.exchange
+    }
+
+    fn into_packets(self) -> (Option<(UdpDatagramSource, &'a [u8])>, &'a [u8]) {
+        let (request_slice, response_slice) = self.exchange.into_slices();
+        let udp_reply = if response_slice.is_empty() {
+            None
+        } else if let Some(source) = self.source {
+            Some((source, response_slice))
+        } else {
+            None
+        };
+        (udp_reply, request_slice)
+    }
+}
+
+struct UdpDatagramDestination {
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+}
+
+struct VpnExchange<'a> {
+    exchange: ip::Exchange<'a>,
+    destination: Option<UdpDatagramDestination>,
+}
+
+impl<'a> VpnExchange<'a> {
+    pub fn new(request: &'a mut [u8], response: &'a mut [u8]) -> VpnExchange<'a> {
+        VpnExchange {
+            exchange: ip::Exchange::new(request, response),
+            destination: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.exchange.reset();
+        self.destination = None;
+    }
+
+    #[inline]
+    fn exchange(&self) -> &ip::Exchange {
+        &self.exchange
+    }
+
+    #[inline]
+    fn exchange_mut(&mut self) -> &mut ip::Exchange<'a> {
+        &mut self.exchange
+    }
+
+    fn into_packets(self) -> (&'a [u8], Option<(UdpDatagramDestination, &'a [u8])>) {
+        let (request_slice, response_slice) = self.exchange.into_slices();
+        let udp_forward = if request_slice.is_empty() {
+            None
+        } else if let Some(destination) = self.destination {
+            Some((destination, request_slice))
+        } else {
+            None
+        };
+        (response_slice, udp_forward)
+    }
+}
 enum SessionMessage {
     DeleteSession(session::SessionID),
     DeleteSecurityAssociation(u32),
@@ -783,17 +857,18 @@ impl Sessions {
 
     async fn process_ikev2_message(
         &mut self,
-        datagram: &UdpDatagram<'_>,
+        exchange: &ip::Exchange<'_>,
+        udp_source: &UdpDatagramSource,
     ) -> Result<(), IKEv2Error> {
-        let is_nat = datagram.is_non_esp();
-        let ikev2_request = message::InputMessage::from_datagram(datagram.filled_bytes(), is_nat)?;
+        let is_nat = udp_source.is_non_esp;
+        let ikev2_request = message::InputMessage::from_datagram(exchange.request(), is_nat)?;
         if !ikev2_request.is_valid() {
             return Err("Invalid message received".into());
         }
 
         debug!(
             "Received packet from {}\n{:?}",
-            datagram.remote_addr, ikev2_request
+            udp_source.remote_addr, ikev2_request
         );
 
         let session_id = if ikev2_request.read_exchange_type()?
@@ -815,8 +890,8 @@ impl Sessions {
             self.get_init_session(
                 ikev2_request.read_initiator_spi(),
                 local_spi,
-                datagram.remote_addr,
-                datagram.local_addr,
+                udp_source.remote_addr,
+                udp_source.local_addr,
             )
         } else {
             session::SessionID::from_message(&ikev2_request)?
@@ -834,11 +909,15 @@ impl Sessions {
         };
 
         if ikev2_request.read_flags()?.has(message::Flags::RESPONSE) {
-            session.process_response(datagram.remote_addr, datagram.local_addr, &ikev2_request)?;
+            session.process_response(
+                udp_source.remote_addr,
+                udp_source.local_addr,
+                &ikev2_request,
+            )?;
         } else {
             let transmit_response = session.process_request(
-                datagram.remote_addr,
-                datagram.local_addr,
+                udp_source.remote_addr,
+                udp_source.local_addr,
                 &ikev2_request,
                 &mut reserved_spi,
             )?;
@@ -1013,43 +1092,45 @@ impl Sessions {
         });
     }
 
-    async fn process_esp_packet<'a>(
+    fn process_esp_packet(
         &mut self,
-        datagram: &'a mut UdpDatagram<'a>,
-    ) -> Result<Option<&'a [u8]>, IKEv2Error> {
-        let remote_addr = datagram.remote_addr;
-        if datagram.filled_bytes() == [0xff] {
-            debug!("Received ESP NAT keepalive from {}", datagram.remote_addr);
-            self.sockets
-                .send_datagram(&datagram.local_addr, &datagram.remote_addr, &[0xff])
-                .await?;
-            return Ok(None);
+        exchange: &mut ip::Exchange,
+        udp_source: &UdpDatagramSource,
+    ) -> Result<(), IKEv2Error> {
+        let remote_addr = udp_source.remote_addr;
+        if exchange.request() == [0xff] {
+            debug!("Received ESP NAT keepalive from {}", udp_source.remote_addr);
+            exchange.reset();
+            return exchange.entire_response_mut(|response| {
+                response[0] = 0xff;
+                (0..1, Ok(()))
+            });
         }
         trace!(
             "Received ESP packet from {}\n{}",
             remote_addr,
-            fmt_slice_hex(datagram.filled_bytes())
+            fmt_slice_hex(exchange.request())
         );
-        if datagram.filled_bytes().len() < 8 {
+        if exchange.request().len() < 8 {
             return Err("Not enough data in ESP packet".into());
         }
         let mut local_spi = [0u8; 4];
-        local_spi.copy_from_slice(&datagram.filled_bytes()[0..4]);
+        local_spi.copy_from_slice(&exchange.request()[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
         if let Some(sa) = self.security_associations.get_mut(&local_spi) {
-            let decrypted_slice = sa.handle_esp(datagram.filled_bytes_mut())?;
+            sa.handle_esp(exchange)?;
             trace!(
                 "Decrypted ESP packet from {}\n{}",
                 remote_addr,
-                fmt_slice_hex(decrypted_slice)
+                fmt_slice_hex(exchange.request())
             );
-            let ip_packet = match ip::IpPacket::from_data(decrypted_slice) {
+            let ip_packet = match ip::IpPacket::from_data(exchange.request()) {
                 Ok(packet) => packet,
                 Err(err) => {
                     warn!(
                         "Failed to parse IP packet from ESP: {}\n{}",
                         err,
-                        fmt_slice_hex(decrypted_slice),
+                        fmt_slice_hex(exchange.request()),
                     );
                     return Err("Failed to parse IP packet from ESP".into());
                 }
@@ -1070,12 +1151,13 @@ impl Sessions {
                 // Microsoft Teams can spam the network with a lot of stray packets.
                 // Don't log an error if the packet is dropped to keep the logs clean on the info
                 // level.
-                return Ok(None);
+                exchange.reset();
+                return Ok(());
             }
-            if decrypted_slice.len() > MAX_ESP_PACKET_SIZE {
+            if exchange.request().len() > MAX_ESP_PACKET_SIZE {
                 warn!(
                     "Decrypted packet size {} exceeds MTU {}",
-                    decrypted_slice.len(),
+                    exchange.request().len(),
                     MAX_ESP_PACKET_SIZE
                 );
                 return Err("Decrypted ESP packet size exceeds MTU".into());
@@ -1085,27 +1167,27 @@ impl Sessions {
                 warn!("Failed to NAT packet from ESP: {}", err);
                 return Err("Failed to NAT packet from ESP".into());
             }
-            Ok(Some(decrypted_slice))
+            Ok(())
         } else {
             warn!(
                 "Security Association {:x} from {} not found",
-                local_spi, datagram.remote_addr
+                local_spi, udp_source.remote_addr
             );
             Err("Security Association not found".into())
         }
     }
 
-    async fn process_vpn_packet(&mut self, mut buf: ReadBuf<'_>) -> Result<(), IKEv2Error> {
-        if buf.filled().is_empty() {
+    fn process_vpn_packet(&mut self, exchange: &mut VpnExchange<'_>) -> Result<(), IKEv2Error> {
+        if exchange.exchange().request().is_empty() {
             return Ok(());
         }
-        let ip_packet = match ip::IpPacket::from_data(buf.filled()) {
+        let ip_packet = match ip::IpPacket::from_data(exchange.exchange().request()) {
             Ok(packet) => packet,
             Err(err) => {
                 warn!(
                     "Failed to decode IP packet from VPN: {}\n{}",
                     err,
-                    fmt_slice_hex(buf.filled()),
+                    fmt_slice_hex(exchange.exchange().request()),
                 );
                 return Err("Failed to decode IP packet from VPN".into());
             }
@@ -1134,30 +1216,27 @@ impl Sessions {
                 }
             })
         {
-            let encoded_length = sa.encoded_length(buf.filled().len());
-            if encoded_length > buf.capacity() {
+            let encoded_length = sa.encoded_length(exchange.exchange().request().len());
+            if encoded_length > exchange.exchange().request_capacity() {
                 // This sometimes happens when FortiVPN returns a zero-padded packet.
                 warn!(
                     "Slice doesn't have capacity for ESP headers, message length is {}, buffer has {}",
                     encoded_length,
-                    buf.capacity()
+                    exchange.exchange().request_capacity()
                 );
                 return Err("Vector doesn't have capacity for ESP headers".into());
             }
-            buf.initialize_unfilled_to(encoded_length - buf.filled().len());
-            let data_len = buf.filled().len();
-            let encrypted_data = sa.handle_vpn(buf.initialized_mut(), data_len)?;
+            sa.handle_vpn(exchange.exchange_mut())?;
             trace!(
                 "Encrypted VPN packet to {}\n{}",
                 sa.remote_addr(),
-                fmt_slice_hex(encrypted_data)
+                fmt_slice_hex(exchange.exchange().request())
             );
 
-            self.sockets.enqueue_send_datagram(
-                &sa.local_addr(),
-                &sa.remote_addr(),
-                encrypted_data,
-            )?;
+            exchange.destination = Some(UdpDatagramDestination {
+                remote_addr: sa.remote_addr(),
+                local_addr: sa.local_addr(),
+            });
             Ok(())
         } else {
             debug!(

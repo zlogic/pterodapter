@@ -531,12 +531,12 @@ impl VpnDevice<'_> {
     }
 
     async fn read_next_packet(&mut self, buf: &mut [u8]) -> Result<bool, NetworkError> {
-        let data = self.vpn.read_packet(buf).await?;
-        if data.is_empty() {
+        let read_range = self.vpn.read_packet(buf).await?;
+        if read_range.is_empty() {
             Ok(false)
         } else if let Ok(dest) = self.read_buffers.enqueue_one() {
             dest.clear();
-            dest.extend_from_slice(data);
+            dest.extend_from_slice(&buf[read_range]);
             Ok(true)
         } else {
             // Read buffers are full.
@@ -548,11 +548,11 @@ impl VpnDevice<'_> {
     async fn process_lifecyle_events(&mut self) -> Result<bool, NetworkError> {
         if self.vpn.is_connected() {
             let send_packet = if let Ok(src) = self.write_buffers.dequeue_one() {
-                self.vpn.process_events(Some(src.as_slice())).await?;
+                self.vpn.process_events(&[src.as_slice()]).await?;
                 src.clear();
                 true
             } else {
-                self.vpn.process_events(None).await?;
+                self.vpn.process_events(&[]).await?;
                 false
             };
             Ok(send_packet)

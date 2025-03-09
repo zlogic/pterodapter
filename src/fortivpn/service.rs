@@ -1,4 +1,4 @@
-use std::{error, fmt, net::IpAddr};
+use std::{error, fmt, net::IpAddr, ops::Range};
 
 use log::{debug, info, warn};
 use tokio::{runtime, task::JoinHandle, time::Interval};
@@ -108,10 +108,10 @@ impl FortiService {
         }
     }
 
-    pub async fn read_packet<'a>(
+    pub async fn read_packet(
         &mut self,
-        buffer: &'a mut [u8],
-    ) -> Result<&'a [u8], VpnServiceError> {
+        buffer: &mut [u8],
+    ) -> Result<Range<usize>, VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
             match state.tunnel.try_read_packet(buffer).await {
                 Ok(data) => Ok(data),
@@ -121,16 +121,16 @@ impl FortiService {
                 }
             }
         } else {
-            Ok(&[])
+            Ok(0..0)
         }
     }
 
-    pub async fn process_events(
-        &mut self,
-        send_data: Option<&[u8]>,
-    ) -> Result<(), VpnServiceError> {
+    pub async fn process_events(&mut self, send_slices: &[&[u8]]) -> Result<(), VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
-            if let Some(send_data) = send_data {
+            for send_data in send_slices {
+                if send_data.is_empty() {
+                    continue;
+                }
                 match state.tunnel.write_data(send_data).await {
                     Ok(()) => {
                         state.unflushed_writes += 1;
@@ -151,7 +151,8 @@ impl FortiService {
                 }
             }
             if state.unflushed_writes > FLUSH_INTERVAL
-                || (state.unflushed_writes > 0 && send_data.is_none())
+                || (state.unflushed_writes > 0
+                    && send_slices.iter().all(|send_slice| send_slice.is_empty()))
             {
                 if let Err(err) = state.tunnel.flush().await {
                     warn!("Failed to flush data to VPN: {}", err);
