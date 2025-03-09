@@ -15,10 +15,6 @@ mod dns;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TransportProtocolType(u8);
 
-// How much a header can grow, for the worst case scenario, based on RFC 7915:
-// a minimum size IPv4 header (20) that gets expanded into a fragmented IPv6 header (48).
-pub const MAX_TRANSLATED_HEADER_GROWTH: usize = 48 - 20;
-
 pub type DnsPacket<'a> = dns::DnsPacket<'a>;
 
 impl TransportProtocolType {
