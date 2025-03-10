@@ -112,8 +112,6 @@ impl SecurityAssociation {
             associated_data,
         ) {
             Ok(data) => {
-                // TODO UNSHIFT
-                // Reseve bytes for PPP header to avoid writing twice.
                 self.replay_window.update(sequence_number);
                 Ok(data)
             }

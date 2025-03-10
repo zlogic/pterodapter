@@ -560,7 +560,6 @@ impl FortiVPNTunnel {
     ) -> Result<(), FortiError> {
         let ppp_header = Self::write_ppp_header(protocol, ppp_data.len());
 
-        // TODO UNSHIFT
         socket.write_all(&ppp_header).await?;
         Ok(socket.write_all(ppp_data).await?)
     }
@@ -616,7 +615,6 @@ impl FortiVPNTunnel {
     pub async fn write_data(&mut self, data: &[u8]) -> Result<(), FortiError> {
         let ppp_header = Self::write_ppp_header(ppp::Protocol::IPV4, data.len());
 
-        // TODO UNSHIFT
         self.socket.write_all(&ppp_header).await?;
         Ok(self.socket.write_all(data).await?)
     }
