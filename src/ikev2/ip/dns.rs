@@ -215,13 +215,13 @@ impl DnsPacket<'_> {
             && (hdr.src_port == Some(53) || hdr.dst_port == Some(53))
     }
 
-    pub fn from_udp_packet(data: &[u8]) -> Result<DnsPacket, DnsError> {
+    pub fn from_udp_payload(data: &[u8]) -> Result<DnsPacket, DnsError> {
         // First 8 bytes are the UDP header.
-        if data.len() < 8 + Self::DNS_HEADER_SIZE {
+        if data.len() < Self::DNS_HEADER_SIZE {
             Err("DNS packet size is smaller than header size".into())
         } else {
             // TODO: validate all headers.
-            Ok(DnsPacket { data: &data[8..] })
+            Ok(DnsPacket { data })
         }
     }
 

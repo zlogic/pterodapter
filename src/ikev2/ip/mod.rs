@@ -83,6 +83,7 @@ impl fmt::Display for TransportProtocolType {
 
 pub struct Ipv4Packet<'a> {
     data: &'a [u8],
+    transport_data: TransportData<'a>,
 }
 
 impl Ipv4Packet<'_> {
@@ -93,11 +94,19 @@ impl Ipv4Packet<'_> {
         if data.len() < Self::header_length(data) {
             return Err("IPv4 header length overflow".into());
         }
-        let packet = Ipv4Packet { data };
-        if packet.transport_protocol() == TransportProtocolType::from_u8(0) {
+
+        let header_length = Self::header_length(data);
+
+        let protocol_type = TransportProtocolType::from_u8(data[9]);
+        if protocol_type == TransportProtocolType::from_u8(0) {
             Err("IPv4 protocol is 0".into())
         } else {
-            Ok(packet)
+            let transport_data = &data[header_length..];
+            let transport_data = TransportData::from_data(protocol_type, transport_data)?;
+            Ok(Ipv4Packet {
+                data,
+                transport_data,
+            })
         }
     }
 
@@ -121,16 +130,22 @@ impl Ipv4Packet<'_> {
         TransportProtocolType::from_u8(self.data[9])
     }
 
-    fn transport_protocol_data(&self) -> &[u8] {
-        let header_length = Self::header_length(self.data);
-        &self.data[header_length..]
+    fn transport_protocol_data(&self) -> &TransportData {
+        &self.transport_data
+    }
+
+    fn pseudo_checksum(&self, transport_length: usize) -> Checksum {
+        let mut checksum = Checksum::new();
+        checksum.add_slice(&self.data[12..20]);
+        checksum.add_slice(&[0u8, self.transport_protocol().0]);
+        checksum.add_slice(&(transport_length as u16).to_be_bytes());
+        checksum
     }
 }
 
 pub struct Ipv6Packet<'a> {
     data: &'a [u8],
-    payload_type: TransportProtocolType,
-    payload_data: &'a [u8],
+    transport_data: TransportData<'a>,
 }
 
 impl Ipv6Packet<'_> {
@@ -144,10 +159,12 @@ impl Ipv6Packet<'_> {
             return Err("IPv6 packet has no payload".into());
         };
 
+        let transport_data =
+            TransportData::from_data(last_payload.protocol_type, last_payload.data)?;
+
         Ok(Ipv6Packet {
             data,
-            payload_type: last_payload.protocol_type,
-            payload_data: last_payload.data,
+            transport_data,
         })
     }
 
@@ -171,11 +188,19 @@ impl Ipv6Packet<'_> {
     }
 
     fn transport_protocol(&self) -> TransportProtocolType {
-        self.payload_type
+        self.transport_data.protocol()
     }
 
-    fn transport_protocol_data(&self) -> &[u8] {
-        self.payload_data
+    fn transport_protocol_data(&self) -> &TransportData {
+        &self.transport_data
+    }
+
+    fn pseudo_checksum(&self, transport_length: usize) -> Checksum {
+        let mut checksum = Checksum::new();
+        checksum.add_slice(&self.data[8..40]);
+        checksum.add_slice(&[0u8, self.transport_protocol().0]);
+        checksum.add_slice(&(transport_length as u32).to_be_bytes());
+        checksum
     }
 }
 
@@ -251,66 +276,42 @@ impl<'a> IpPacket<'a> {
         }
     }
 
-    pub fn transport_protocol(&self) -> TransportProtocolType {
-        match self {
-            IpPacket::V4(packet) => packet.transport_protocol(),
-            IpPacket::V6(packet) => packet.transport_protocol(),
-        }
-    }
-
-    pub fn transport_protocol_data(&self) -> &[u8] {
+    pub fn transport_protocol_data(&self) -> &TransportData {
         match self {
             IpPacket::V4(packet) => packet.transport_protocol_data(),
             IpPacket::V6(packet) => packet.transport_protocol_data(),
         }
     }
 
-    pub fn src_port(&self) -> Result<Option<u16>, IpError> {
-        match self.transport_protocol() {
-            TransportProtocolType::TCP | TransportProtocolType::UDP => {
-                let data = self.transport_protocol_data();
-                if data.len() < 2 {
-                    return Err("Not enough data in transport layer to extract source port".into());
-                }
-                let mut src_port = [0u8; 2];
-                src_port.copy_from_slice(&data[0..2]);
-                Ok(Some(u16::from_be_bytes(src_port)))
-            }
-            _ => Ok(None),
-        }
+    pub fn src_port(&self) -> Option<u16> {
+        self.transport_protocol_data().src_port()
     }
 
-    pub fn dst_port(&self) -> Result<Option<u16>, IpError> {
-        match self.transport_protocol() {
-            TransportProtocolType::TCP | TransportProtocolType::UDP => {
-                let data = self.transport_protocol_data();
-                if data.len() < 4 {
-                    return Err(
-                        "Not enough data in transport layer to extract destination port".into(),
-                    );
-                }
-                let mut dst_port = [0u8; 2];
-                dst_port.copy_from_slice(&data[2..4]);
-                Ok(Some(u16::from_be_bytes(dst_port)))
-            }
-            _ => Ok(None),
-        }
+    pub fn dst_port(&self) -> Option<u16> {
+        self.transport_protocol_data().dst_port()
     }
 
-    pub fn to_header(&self) -> Result<IpHeader, IpError> {
-        Ok(IpHeader {
+    pub fn to_header(&self) -> IpHeader {
+        IpHeader {
             src_addr: self.src_addr(),
             dst_addr: self.dst_addr(),
-            src_port: self.src_port()?,
-            dst_port: self.dst_port()?,
-            transport_protocol: self.transport_protocol(),
-        })
+            src_port: self.src_port(),
+            dst_port: self.dst_port(),
+            transport_protocol: self.transport_protocol_data().protocol(),
+        }
     }
 
     fn into_data(self) -> &'a [u8] {
         match self {
             IpPacket::V4(packet) => packet.data,
             IpPacket::V6(packet) => packet.data,
+        }
+    }
+
+    fn pseudo_checksum(&self, transport_length: usize) -> Checksum {
+        match self {
+            IpPacket::V4(packet) => packet.pseudo_checksum(transport_length),
+            IpPacket::V6(packet) => packet.pseudo_checksum(transport_length),
         }
     }
 }
@@ -322,32 +323,25 @@ impl fmt::Display for IpPacket<'_> {
             IpPacket::V6(_) => write!(f, "IPv6 ")?,
         }
         match self.src_port() {
-            Ok(Some(src_port)) => write!(
+            Some(src_port) => write!(
                 f,
                 "{} {}:{} -> ",
-                self.transport_protocol(),
+                self.transport_protocol_data().protocol(),
                 self.src_addr(),
                 src_port
             )?,
-            Ok(None) => write!(f, "{} {} -> ", self.transport_protocol(), self.src_addr())?,
-            Err(err) => write!(
+            None => write!(
                 f,
-                "{} {} (port {}) -> ",
-                self.transport_protocol(),
-                self.src_addr(),
-                err
+                "{} {} -> ",
+                self.transport_protocol_data().protocol(),
+                self.src_addr()
             )?,
         }
         match self.dst_port() {
-            Ok(Some(dst_port)) => writeln!(f, "{}:{}", self.dst_addr(), dst_port)?,
-            Ok(None) => writeln!(f, "{}", self.dst_addr())?,
-            Err(err) => writeln!(f, "{} (port {}) -> ", self.dst_addr(), err)?,
+            Some(dst_port) => writeln!(f, "{}:{}", self.dst_addr(), dst_port)?,
+            None => writeln!(f, "{}", self.dst_addr())?,
         }
-        write!(
-            f,
-            "  Transport {}",
-            fmt_slice_hex(self.transport_protocol_data())
-        )
+        write!(f, "  Transport {}", self.transport_protocol_data())
     }
 }
 
@@ -401,6 +395,127 @@ impl fmt::Display for IpHeader {
         match self.dst_port {
             Some(dst_port) => writeln!(f, "{}:{}", self.dst_addr(), dst_port),
             None => writeln!(f, "{}", self.dst_addr()),
+        }
+    }
+}
+
+pub enum TransportData<'a> {
+    Udp(&'a [u8]),
+    Tcp(&'a [u8], usize),
+    Unknown(TransportProtocolType, &'a [u8]),
+}
+
+impl TransportData<'_> {
+    fn from_data(protocol: TransportProtocolType, data: &[u8]) -> Result<TransportData, IpError> {
+        match protocol {
+            TransportProtocolType::UDP => {
+                if data.len() >= 4 {
+                    Ok(TransportData::Udp(data))
+                } else {
+                    Err("Not enough data for UDP header".into())
+                }
+            }
+            TransportProtocolType::TCP => {
+                if data.len() >= 20 {
+                    let data_offset = ((data[12] >> 4) & 0x0f) as usize * 4;
+                    if data_offset > data.len() {
+                        Err("TCP data offset overflow".into())
+                    } else if data_offset < 20 {
+                        Err("TCP data offset folds into the header".into())
+                    } else {
+                        Ok(TransportData::Tcp(data, data_offset))
+                    }
+                } else {
+                    Err("Not enough data for TCP header".into())
+                }
+            }
+            generic => Ok(TransportData::Unknown(generic, data)),
+        }
+    }
+
+    fn full_data(&self) -> &[u8] {
+        match self {
+            TransportData::Udp(data) => data,
+            TransportData::Tcp(data, _) => data,
+            TransportData::Unknown(_, data) => data,
+        }
+    }
+
+    fn payload_data(&self) -> &[u8] {
+        match self {
+            TransportData::Udp(data) => &data[8..],
+            TransportData::Tcp(data, data_offset) => &data[*data_offset..],
+            TransportData::Unknown(_, data) => data,
+        }
+    }
+
+    fn checksum(&self) -> Option<u16> {
+        match self {
+            TransportData::Udp(data) => {
+                let mut checksum = [0u8; 2];
+                checksum.copy_from_slice(&data[6..8]);
+                Some(u16::from_be_bytes(checksum))
+            }
+            TransportData::Tcp(data, _) => {
+                let mut checksum = [0u8; 2];
+                checksum.copy_from_slice(&data[16..18]);
+                Some(u16::from_be_bytes(checksum))
+            }
+            TransportData::Unknown(_, _) => None,
+        }
+    }
+
+    fn protocol(&self) -> TransportProtocolType {
+        match self {
+            TransportData::Udp(_) => TransportProtocolType::UDP,
+            TransportData::Tcp(_, _) => TransportProtocolType::TCP,
+            TransportData::Unknown(protocol, _) => *protocol,
+        }
+    }
+
+    fn src_port(&self) -> Option<u16> {
+        match self {
+            TransportData::Tcp(data, _) | TransportData::Udp(data) => {
+                let mut src_port = [0u8; 2];
+                src_port.copy_from_slice(&data[0..2]);
+                Some(u16::from_be_bytes(src_port))
+            }
+            TransportData::Unknown(_, _) => None,
+        }
+    }
+
+    fn dst_port(&self) -> Option<u16> {
+        match self {
+            TransportData::Tcp(data, _) | TransportData::Udp(data) => {
+                let mut dst_port = [0u8; 2];
+                dst_port.copy_from_slice(&data[2..4]);
+                Some(u16::from_be_bytes(dst_port))
+            }
+            TransportData::Unknown(_, _) => None,
+        }
+    }
+}
+
+impl fmt::Display for TransportData<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportData::Udp(data) => {
+                if let Some(checksum) = self.checksum() {
+                    write!(f, "UDP c={:#06X} {}", checksum, fmt_slice_hex(data))
+                } else {
+                    write!(f, "UDP c=? {}", fmt_slice_hex(data))
+                }
+            }
+            TransportData::Tcp(data, _) => {
+                if let Some(checksum) = self.checksum() {
+                    write!(f, "TCP c={:#06X} {}", checksum, fmt_slice_hex(data))
+                } else {
+                    write!(f, "TCP c=? {}", fmt_slice_hex(data))
+                }
+            }
+            TransportData::Unknown(protocol, data) => {
+                write!(f, "{} {}", protocol, fmt_slice_hex(data))
+            }
         }
     }
 }
@@ -603,23 +718,40 @@ impl Network {
         packet: IpPacket<'a>,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingDecision<'a>, IpError> {
-        if self.is_nat64() && DnsPacket::is_dns(&packet.to_header()?) {
+        if self.is_nat64() {
+            if let Some(checksum) = packet.transport_protocol_data().checksum() {
+                // TODO 0.5.0: remove this debug code.
+                let mut pseudo_checksum =
+                    packet.pseudo_checksum(packet.transport_protocol_data().full_data().len());
+                pseudo_checksum.add_slice(packet.transport_protocol_data().full_data());
+                pseudo_checksum.fold();
+                // The checksum is supposed to return 0 on success, otherwise (to get real
+                // checksum), the original checksum should be excluded.
+                println!(
+                    "Received checksum {:#06x}, calculated checksum {:#06x}",
+                    checksum,
+                    pseudo_checksum.value()
+                );
+            }
+        }
+        if self.is_nat64() && DnsPacket::is_dns(&packet.to_header()) {
             // TODO 0.5.0: Validate UDP header (length + checksum).
-            let dns_packet = DnsPacket::from_udp_packet(packet.transport_protocol_data())?;
+            let dns_packet =
+                DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
             trace!("Decoded DNS packet: {}", dns_packet);
-            let mut translated_packet = [0u8; 8 + dns::MAX_PACKET_SIZE];
+            let mut translated_packet = [0u8; dns::MAX_PACKET_SIZE];
             let translated_packet = if self.dns_matches_tunnel(&dns_packet) {
                 println!("DNS matches tunnel");
                 let length = if let Some(translator) = &mut self.dns_translator {
-                    translator.translate_to_ipv4(&dns_packet, &mut translated_packet[8..])?
+                    translator.translate_to_ipv4(&dns_packet, &mut translated_packet)?
                 } else {
                     0
                 };
-                let dns_packet = DnsPacket::from_udp_packet(&translated_packet[..8 + length])?;
+                let dns_packet = DnsPacket::from_udp_payload(&translated_packet[..length])?;
                 println!("Rewrote DNS request: {}", dns_packet);
-                &translated_packet[8..8 + length]
+                &translated_packet[..length]
             } else {
-                &packet.transport_protocol_data()[8..]
+                &packet.transport_protocol_data().payload_data()
             };
             let dns_request = translated_packet.to_vec();
             let mut dns_translator = self.dns_translator.clone();
@@ -643,16 +775,16 @@ impl Network {
                 .expect("Failed to send DNS request");
             let mut data = [0u8; 1500];
             let len = socket
-                .recv(&mut data[8..])
+                .recv(&mut data)
                 .expect("Failed to receive DNS response");
-            let data = &data[..8 + len];
-            println!("Received DNS response {}", fmt_slice_hex(&data[8..]));
+            let data = &data[..len];
+            println!("Received DNS response {}", fmt_slice_hex(&data));
             let dns_packet =
-                DnsPacket::from_udp_packet(data).expect("Failed to parse DNS response packet");
+                DnsPacket::from_udp_payload(data).expect("Failed to parse DNS response packet");
             trace!("Decoded DNS response: {}", dns_packet);
 
             let length = if let Some(translator) = &mut dns_translator {
-                match translator.translate_to_ipv6(&dns_packet, &mut out_buf[8..]) {
+                match translator.translate_to_ipv6(&dns_packet, out_buf) {
                     Ok(length) => length,
                     Err(err) => {
                         println!("Failed to translate DNS response: {}", err);
@@ -663,7 +795,7 @@ impl Network {
                 0
             };
             if length > 0 {
-                let dns_packet = DnsPacket::from_udp_packet(&out_buf[..8 + length])
+                let dns_packet = DnsPacket::from_udp_payload(&out_buf[..length])
                     .expect("Failed to decode translated DNS response");
                 println!("Rewrote DNS response: {}", dns_packet);
             }
@@ -677,6 +809,57 @@ impl Network {
 pub enum RoutingDecision<'a> {
     ReturnToSender(&'a [u8]),
     Forward(&'a [u8]),
+}
+
+struct Checksum(u32);
+
+impl Checksum {
+    fn new() -> Checksum {
+        Checksum(0)
+    }
+
+    fn from_inverted(inv: u16) -> Checksum {
+        Checksum((!inv) as u32)
+    }
+
+    #[inline]
+    fn fold(&mut self) {
+        let mut sum = self.0;
+        // RFC 1071 uses a loop, but at most two adds are needed:
+        // 0xffff + 0xffff = 0x1fffe, 0x1+0xfffe = ffff
+        sum = (sum >> 16) + (sum & 0x0000ffffu32);
+        sum = (sum >> 16) + (sum & 0x0000ffffu32);
+        self.0 = sum;
+    }
+
+    fn add_one(&mut self, add: u16) {
+        self.0 += add as u32
+    }
+
+    fn add_slice(&mut self, add: &[u8]) {
+        // LLVM can auto-vectorize at least part of the loop, validated with https://godbolt.org/.
+        // Using the following complier args:
+        // "-O -C target-cpu=x86-64-v3" for x86
+        // "-O --target=aarch64-apple-darwin -C target-cpu=apple-m4" for ARM64
+        let high_sum: u32 = add.iter().step_by(2).map(|&b| (b as u32) << 8).sum();
+        let low_sum: u32 = add.iter().skip(1).step_by(2).map(|&b| b as u32).sum();
+        self.0 += high_sum + low_sum;
+    }
+
+    fn value(&self) -> u16 {
+        // Must fold before calling!
+        !((self.0 & 0x0000ffff) as u16)
+    }
+
+    fn incremental_update(&mut self, mut remove: Checksum, add: Checksum) {
+        // There's a lot of discussion how to optimally/correctly update checksums with limited
+        // data. RFC 1624 appears to be undisputed and corrects errors in previous publications.
+
+        // Use first form of Eqn. 3 for simplicity (same as RFC 1071 incremental update formula).
+        remove.fold();
+        let remove = (!remove.0) & 0x0000ffff;
+        self.0 += remove + add.0;
+    }
 }
 
 type DomainLabels = Vec<Vec<u8>>;

@@ -1099,16 +1099,7 @@ impl Sessions {
                 }
             };
             trace!("Decoded IP packet from ESP {}", ip_packet);
-            let ip_header = match ip_packet.to_header() {
-                Ok(hdr) => hdr,
-                Err(err) => {
-                    warn!(
-                        "Failed to read header in IP packet from ESP: {}\n{}",
-                        err, ip_packet
-                    );
-                    return Err("Failed to read header in IP packet from ESP".into());
-                }
-            };
+            let ip_header = ip_packet.to_header();
             if !sa.accepts_esp_to_vpn(&ip_header) {
                 debug!("ESP packet {} dropped by traffic selector", ip_header);
                 // Microsoft Teams can spam the network with a lot of stray packets.
@@ -1162,16 +1153,7 @@ impl Sessions {
             }
         };
         trace!("Decoded IP packet from VPN {}", ip_packet);
-        let ip_header = match ip_packet.to_header() {
-            Ok(hdr) => hdr,
-            Err(err) => {
-                warn!(
-                    "Failed to read header in IP packet from VPN: {}\n{}",
-                    err, ip_packet
-                );
-                return Err("Failed to read header in IP packet from VPN".into());
-            }
-        };
+        let ip_header = ip_packet.to_header();
         // Prefer an active, most recent SA.
         if let Some(sa) = self
             .security_associations
