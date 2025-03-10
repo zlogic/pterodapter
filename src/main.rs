@@ -15,7 +15,6 @@ mod fortivpn;
 mod http;
 mod logger;
 mod ppp;
-mod utils;
 
 #[cfg(feature = "proxy")]
 mod proxy;

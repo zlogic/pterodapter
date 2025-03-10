@@ -5,7 +5,7 @@ use std::{
 
 use log::{debug, warn};
 
-use crate::{logger::fmt_slice_hex, utils::subslice_range};
+use crate::logger::fmt_slice_hex;
 
 use super::{IpHeader, Nat64Prefix, TransportProtocolType};
 
@@ -274,7 +274,7 @@ impl DnsPacket<'_> {
                     } else {
                         label.skip(label_length - suffix.len()).zip(suffix).all(
                             |(label, check_label)| match label {
-                                Ok(label) => label.eq_ignore_ascii_case(check_label),
+                                Ok((_, label)) => label.eq_ignore_ascii_case(check_label),
                                 Err(err) => {
                                     warn!("Failed to parse DNS packet while checking if it matches suffix: {}", err);
                                     false
@@ -426,7 +426,7 @@ struct LabelIter<'a> {
 }
 
 impl<'a> Iterator for LabelIter<'a> {
-    type Item = Result<&'a [u8], DnsError>;
+    type Item = Result<(usize, &'a [u8]), DnsError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         const POINTER_UPPER_HALF_MASK: u8 = !LABEL_POINTER_MASK;
@@ -501,7 +501,7 @@ impl<'a> Iterator for LabelIter<'a> {
         // first label in the sequence.
         self.read_labels += 1;
 
-        Some(Ok(label))
+        Some(Ok((start_offset - 1, label)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -514,7 +514,7 @@ impl<'a> Iterator for LabelIter<'a> {
 impl LabelIter<'_> {
     fn fmt_domain(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.enumerate().try_for_each(|(i, segment)| {
-            let segment = match segment {
+            let (_, segment) = match segment {
                 Ok(segment) => segment,
                 Err(err) => return write!(f, "[err: {}]", err),
             };
@@ -1036,7 +1036,9 @@ impl CompressionMap {
                         read_labels: 0,
                     };
                     check_label.zip(domain).all(|(check_label, domain_label)| {
-                        if let (Ok(check_label), Ok(domain_label)) = (check_label, domain_label) {
+                        if let (Ok((_, check_label)), Ok((_, domain_label))) =
+                            (check_label, domain_label)
+                        {
                             check_label.eq_ignore_ascii_case(domain_label)
                         } else {
                             false
@@ -1108,13 +1110,7 @@ impl Dns64Translator {
     ) -> Result<usize, DnsError> {
         let domain_length = domain.size_hint().0;
         for (label_index, label) in domain.enumerate() {
-            let label = label?;
-            let start_offset = match subslice_range(domain.data, label) {
-                Some(range) => range.start - 1,
-                None => {
-                    return Err("Compression map in source pointing outside its buffer".into());
-                }
-            };
+            let (start_offset, label) = label?;
             let subdomain_iter = LabelIter {
                 start_offset,
                 data: domain.data,
