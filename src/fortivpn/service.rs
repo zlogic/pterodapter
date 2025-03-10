@@ -1,4 +1,4 @@
-use std::{error, fmt, net::IpAddr, ops::Range};
+use std::{error, fmt, net::IpAddr};
 
 use log::{debug, info, warn};
 use tokio::{runtime, task::JoinHandle, time::Interval};
@@ -108,10 +108,10 @@ impl FortiService {
         }
     }
 
-    pub async fn read_packet(
+    pub async fn read_packet<'a>(
         &mut self,
-        buffer: &mut [u8],
-    ) -> Result<Range<usize>, VpnServiceError> {
+        buffer: &'a mut [u8],
+    ) -> Result<&'a [u8], VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
             match state.tunnel.try_read_packet(buffer).await {
                 Ok(data) => Ok(data),
@@ -121,7 +121,7 @@ impl FortiService {
                 }
             }
         } else {
-            Ok(0..0)
+            Ok(&[])
         }
     }
 

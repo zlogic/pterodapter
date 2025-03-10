@@ -1,7 +1,6 @@
 use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    ops::Range,
     str::FromStr,
     sync::Arc,
 };
@@ -311,8 +310,8 @@ impl FortiVPNTunnel {
             } else {
                 return Err("Unable to read PPP protocol".into());
             };
-            let resp_range = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
-            let response = ppp::Packet::from_bytes(protocol, &resp[resp_range]).map_err(|err| {
+            let resp = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
+            let response = ppp::Packet::from_bytes(protocol, resp).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
@@ -457,8 +456,8 @@ impl FortiVPNTunnel {
             } else {
                 return Err("Unable to read PPP protocol".into());
             };
-            let resp_range = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
-            let response = ppp::Packet::from_bytes(protocol, &resp[resp_range]).map_err(|err| {
+            let resp = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
+            let response = ppp::Packet::from_bytes(protocol, resp).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
@@ -566,11 +565,11 @@ impl FortiVPNTunnel {
         Ok(socket.write_all(ppp_data).await?)
     }
 
-    async fn read_ppp_packet(
+    async fn read_ppp_packet<'a>(
         socket: &mut BufTlsStream,
         state: &mut PPPState,
-        dest: &mut [u8],
-    ) -> Result<Range<usize>, FortiError> {
+        dest: &'a mut [u8],
+    ) -> Result<&'a [u8], FortiError> {
         state.read_header(socket, dest).await.map_err(|err| {
             debug!("Failed to read PPP header: {}", err);
             "Failed to read PPP header"
@@ -627,9 +626,9 @@ impl FortiVPNTunnel {
     }
 
     async fn process_lcp_packet(&mut self, buf: &mut [u8]) -> Result<(), FortiError> {
-        let dest_range = Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, buf).await?;
+        let dest = Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, buf).await?;
 
-        let packet = match ppp::Packet::from_bytes(ppp::Protocol::LCP, &buf[dest_range]) {
+        let packet = match ppp::Packet::from_bytes(ppp::Protocol::LCP, dest) {
             Ok(packet) => packet,
             Err(err) => {
                 info!("Failed to decode PPP packet: {}", err);
@@ -665,20 +664,23 @@ impl FortiVPNTunnel {
         self.ppp_state.read_data(&mut self.socket, buf).await
     }
 
-    pub async fn try_read_packet(&mut self, dest: &mut [u8]) -> Result<Range<usize>, FortiError> {
+    pub async fn try_read_packet<'a>(
+        &mut self,
+        dest: &'a mut [u8],
+    ) -> Result<&'a [u8], FortiError> {
         let protocol = match self.ppp_state.read_protocol(dest) {
             Some(protocol) => protocol,
-            None => return Ok(0..0),
+            None => return Ok(&[]),
         };
         match protocol {
             ppp::Protocol::LCP => {
                 self.process_lcp_packet(dest).await?;
-                Ok(0..0)
+                Ok(&[])
             }
             ppp::Protocol::IPV4 | ppp::Protocol::IPV6 => Ok(self.ppp_state.consume_packet(dest)),
             _ => {
                 info!("Received unexpected PPP packet {}, ignoring", protocol);
-                Ok(0..0)
+                Ok(&[])
             }
         }
     }
@@ -714,9 +716,9 @@ impl FortiVPNTunnel {
             } else {
                 return Err("Unable to read PPP protocol".into());
             };
-            let resp_range =
+            let resp =
                 Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut resp).await?;
-            let response = ppp::Packet::from_bytes(protocol, &resp[resp_range]).map_err(|err| {
+            let response = ppp::Packet::from_bytes(protocol, resp).map_err(|err| {
                 debug!("Failed to decode PPP packet: {}", err);
                 "Failed to decode PPP packet"
             })?;
@@ -845,18 +847,18 @@ impl PPPState {
         self.bytes_consumed < self.read_packet_size(buf)
     }
 
-    fn consume_packet(&mut self, buf: &[u8]) -> Range<usize> {
+    fn consume_packet<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
         let packet_size = self.read_packet_size(buf);
         if self.bytes_consumed >= packet_size {
             self.bytes_consumed = 0;
             if self.bytes_consumed > buf.len() {
                 // Return empty packet if data was drained.
-                0..0
+                &[]
             } else {
-                PPP_HEADER_SIZE..packet_size
+                &buf[PPP_HEADER_SIZE..packet_size]
             }
         } else {
-            0..0
+            &[]
         }
     }
 

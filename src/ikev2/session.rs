@@ -378,15 +378,14 @@ impl IKEv2Session {
         } else {
             encrypted_data.len()
         };
-        let decrypted_range =
+        let decrypted_slice =
             match crypto_stack.decrypt_data(decrypted_data, encrypted_data_len, associated_data) {
-                Ok(decrypted_range) => decrypted_range,
+                Ok(decrypted_slice) => decrypted_slice,
                 Err(err) => {
                     info!("Failed to decrypt data: {}", err);
                     return Err("Failed to decrypt data".into());
                 }
             };
-        let decrypted_slice = &decrypted_data[decrypted_range];
         if encrypted_payload.total_fragments() == 1 {
             let mut header = request.header();
             let full_length = decrypted_slice.len() + header.len();

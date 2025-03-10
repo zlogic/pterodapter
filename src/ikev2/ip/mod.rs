@@ -1,7 +1,7 @@
 use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    ops::{Range, RangeInclusive},
+    ops::RangeInclusive,
 };
 
 use log::{trace, warn};
@@ -221,7 +221,7 @@ pub enum IpPacket<'a> {
     V6(Ipv6Packet<'a>),
 }
 
-impl IpPacket<'_> {
+impl<'a> IpPacket<'a> {
     pub fn from_data(data: &[u8]) -> Result<IpPacket, IpError> {
         if data.is_empty() {
             return Err("IP packet is empty, cannot extract header data".into());
@@ -305,6 +305,13 @@ impl IpPacket<'_> {
             dst_port: self.dst_port()?,
             transport_protocol: self.transport_protocol(),
         })
+    }
+
+    fn into_data(self) -> &'a [u8] {
+        match self {
+            IpPacket::V4(packet) => packet.data,
+            IpPacket::V6(packet) => packet.data,
+        }
     }
 }
 
@@ -591,7 +598,11 @@ impl Network {
         }
     }
 
-    pub fn translate_packet_from_esp(&mut self, packet: &IpPacket) -> Result<(), IpError> {
+    pub fn translate_packet_from_esp<'a>(
+        &mut self,
+        packet: IpPacket<'a>,
+        out_buf: &'a mut [u8],
+    ) -> Result<RoutingDecision<'a>, IpError> {
         if self.is_nat64() && DnsPacket::is_dns(&packet.to_header()?) {
             // TODO 0.5.0: Validate UDP header (length + checksum).
             let dns_packet = DnsPacket::from_udp_packet(packet.transport_protocol_data())?;
@@ -625,7 +636,7 @@ impl Network {
             let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
             let socket = UdpSocket::bind(local_addr).expect("Failed to bind DNS socket");
             socket
-                .connect(&remote_addr)
+                .connect(remote_addr)
                 .expect("Failed to connect to DNS server");
             socket
                 .send(dns_request.as_slice())
@@ -640,9 +651,8 @@ impl Network {
                 DnsPacket::from_udp_packet(data).expect("Failed to parse DNS response packet");
             trace!("Decoded DNS response: {}", dns_packet);
 
-            let mut translated_packet = [0u8; 8 + dns::MAX_PACKET_SIZE];
             let length = if let Some(translator) = &mut dns_translator {
-                match translator.translate_to_ipv6(&dns_packet, &mut translated_packet[8..]) {
+                match translator.translate_to_ipv6(&dns_packet, &mut out_buf[8..]) {
                     Ok(length) => length,
                     Err(err) => {
                         println!("Failed to translate DNS response: {}", err);
@@ -653,122 +663,20 @@ impl Network {
                 0
             };
             if length > 0 {
-                let dns_packet = DnsPacket::from_udp_packet(&translated_packet[..8 + length])
+                let dns_packet = DnsPacket::from_udp_packet(&out_buf[..8 + length])
                     .expect("Failed to decode translated DNS response");
                 println!("Rewrote DNS response: {}", dns_packet);
             }
+            Ok(RoutingDecision::ReturnToSender(out_buf))
+        } else {
+            Ok(RoutingDecision::Forward(packet.into_data()))
         }
-        Ok(())
     }
 }
 
-pub struct Exchange<'a> {
-    request: &'a mut [u8],
-    response: &'a mut [u8],
-    request_range: Range<usize>,
-    response_range: Range<usize>,
-}
-
-impl<'a> Exchange<'a> {
-    pub fn new(request: &'a mut [u8], response: &'a mut [u8]) -> Exchange<'a> {
-        Exchange {
-            request,
-            response,
-            request_range: 0..0,
-            response_range: 0..0,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.request_range = 0..0;
-        self.response_range = 0..0;
-    }
-
-    #[inline]
-    pub fn request(&self) -> &[u8] {
-        &self.request[self.request_range.clone()]
-    }
-
-    #[inline]
-    pub fn response(&self) -> &[u8] {
-        &self.response[self.response_range.clone()]
-    }
-
-    #[inline]
-    pub fn request_mut(&mut self) -> &mut [u8] {
-        &mut self.request[self.request_range.clone()]
-    }
-
-    #[inline]
-    pub fn response_mut(&mut self) -> &mut [u8] {
-        &mut self.response[self.response_range.clone()]
-    }
-
-    #[inline]
-    pub fn request_capacity(&self) -> usize {
-        self.request.len() - self.request_range.start
-    }
-
-    pub fn resize_request(&mut self, size: usize) {
-        let new_end = self.request_range.end + size;
-        if new_end > self.request.len() {
-            panic!("Exchange request resized out of capacity");
-        } else {
-            if new_end > self.request.len() {
-                self.request[self.request_range.end..new_end].fill(0)
-            }
-            self.request_range.end = new_end;
-        }
-    }
-
-    pub fn entire_request_mut<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> (Range<usize>, R),
-    {
-        let (range, r) = f(self.request);
-        self.request_range = if range.start < self.request.len() && range.end <= self.request.len()
-        {
-            range.clone()
-        } else {
-            panic!("Request range out of bounds");
-        };
-        r
-    }
-
-    pub async fn entire_request_mut_async<F, R>(&mut self, f: F) -> R
-    where
-        F: AsyncFnOnce(&mut [u8]) -> (Range<usize>, R),
-    {
-        let (range, r) = f(self.request).await;
-        self.request_range = if range.start < self.request.len() && range.end <= self.request.len()
-        {
-            range.clone()
-        } else {
-            panic!("Request range out of bounds");
-        };
-        r
-    }
-
-    pub fn entire_response_mut<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> (Range<usize>, R),
-    {
-        let (range, r) = f(self.response);
-        self.response_range =
-            if range.start < self.response.len() && range.end <= self.response.len() {
-                range.clone()
-            } else {
-                panic!("Response range out of bounds");
-            };
-        r
-    }
-
-    pub fn into_slices(self) -> (&'a [u8], &'a [u8]) {
-        (
-            &self.request[self.request_range],
-            &self.response[self.response_range],
-        )
-    }
+pub enum RoutingDecision<'a> {
+    ReturnToSender(&'a [u8]),
+    Forward(&'a [u8]),
 }
 
 type DomainLabels = Vec<Vec<u8>>;
