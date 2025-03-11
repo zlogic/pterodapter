@@ -4,6 +4,9 @@ use std::{error, fmt, ops::Range};
 
 use super::message;
 
+// Extra padding size: nonce + tag + worst-case ESP padding.
+pub const MAX_PADDING_SIZE: usize = 8 + aead::MAX_TAG_LEN + 8;
+
 const MAX_DH_KEY_LENGTH: usize = 64;
 const MAX_PRF_KEY_LENGTH: usize = 256 / 8;
 const MAX_AUTH_KEY_LENGTH: usize = 256 / 8;
@@ -259,8 +262,6 @@ pub fn choose_sa_parameters(
 }
 
 pub struct Array<const M: usize> {
-    // TODO FUTUREHEAP
-    // Only increase size where it exceeds AWS LC RS internal buffer sizes.
     data: [u8; M],
     len: usize,
 }

@@ -582,11 +582,10 @@ impl Network {
             vec![]
         };
         let tunnel_domains_dns = TunnelDomainsDns::new(&tunnel_domains);
-        let dns_translator = if let Some(nat64_prefix) = &nat64_prefix {
-            Some(dns::Dns64Translator::new(nat64_prefix.clone()))
-        } else {
-            None
-        };
+
+        let dns_translator = nat64_prefix
+            .as_ref()
+            .map(|nat64_prefix| dns::Dns64Translator::new(nat64_prefix.clone()));
         Ok(Network {
             nat64_prefix,
             real_ip: None,
@@ -751,7 +750,7 @@ impl Network {
                 println!("Rewrote DNS request: {}", dns_packet);
                 &translated_packet[..length]
             } else {
-                &packet.transport_protocol_data().payload_data()
+                packet.transport_protocol_data().payload_data()
             };
             let dns_request = translated_packet.to_vec();
             let mut dns_translator = self.dns_translator.clone();
@@ -778,7 +777,7 @@ impl Network {
                 .recv(&mut data)
                 .expect("Failed to receive DNS response");
             let data = &data[..len];
-            println!("Received DNS response {}", fmt_slice_hex(&data));
+            println!("Received DNS response {}", fmt_slice_hex(data));
             let dns_packet =
                 DnsPacket::from_udp_payload(data).expect("Failed to parse DNS response packet");
             trace!("Decoded DNS response: {}", dns_packet);
@@ -842,14 +841,14 @@ impl Checksum {
         // Using the following complier args:
         // "-O -C target-cpu=x86-64-v3" for x86
         // "-O --target=aarch64-apple-darwin -C target-cpu=apple-m4" for ARM64
-        let mut full_sum = 0u32;
         let mut iter = add.chunks_exact(2);
-        while let Some(bytes) = iter.next() {
-            full_sum += (bytes[0] as u32) << 8 | bytes[1] as u32;
-        }
-        let remain_sum = match iter.remainder() {
-            &[high] => (high as u32) << 8,
-            &[] => 0u32,
+        let full_sum = iter
+            .by_ref()
+            .map(|bytes| ((bytes[0] as u32) << 8) | (bytes[1] as u32))
+            .sum::<u32>();
+        let remain_sum = match *iter.remainder() {
+            [high] => (high as u32) << 8,
+            [] => 0u32,
             _ => panic!("Checksum chunks_exact returned unexpected slice size"),
         };
 

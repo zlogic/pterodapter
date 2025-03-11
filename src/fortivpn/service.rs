@@ -127,10 +127,12 @@ impl FortiService {
 
     pub async fn process_events(&mut self, send_slices: &[&[u8]]) -> Result<(), VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
+            let mut sent_data = false;
             for send_data in send_slices {
                 if send_data.is_empty() {
                     continue;
                 }
+                sent_data = true;
                 match state.tunnel.write_data(send_data).await {
                     Ok(()) => {
                         state.unflushed_writes += 1;
@@ -150,9 +152,7 @@ impl FortiService {
                     return Err(err.into());
                 }
             }
-            if state.unflushed_writes > FLUSH_INTERVAL
-                || (state.unflushed_writes > 0
-                    && send_slices.iter().all(|send_slice| send_slice.is_empty()))
+            if state.unflushed_writes > FLUSH_INTERVAL || (state.unflushed_writes > 0 && !sent_data)
             {
                 if let Err(err) = state.tunnel.flush().await {
                     warn!("Failed to flush data to VPN: {}", err);

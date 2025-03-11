@@ -268,7 +268,6 @@ impl IKEv2Session {
 
         let exchange_type = request.read_exchange_type()?;
 
-        // TODO FUTUREHEAP
         let mut response_bytes = [0u8; MAX_ENCRYPTED_DATA_SIZE];
         let mut response = message::MessageWriter::new(&mut response_bytes[4..])?;
         response.write_header(
@@ -348,7 +347,6 @@ impl IKEv2Session {
             Some(Ok(_)) | None => return Err("Request has no encrypted payloads".into()),
         };
 
-        // TODO FUTUREHEAP
         let mut decrypted_data = [0u8; MAX_ENCRYPTED_FRAGMENT_SIZE];
         let encrypted_data = encrypted_payload.encrypted_data();
         let decrypted_data = &mut decrypted_data[..encrypted_data.len()];
@@ -610,7 +608,6 @@ impl IKEv2Session {
                         nonce_initiator.copy_from_slice(nonce_remote);
                         Some(nonce_initiator)
                     };
-                    // TODO FUTUREHEAP
                     let mut nonce_local = [0u8; MAX_NONCE];
                     let nonce_local = &mut nonce_local[..nonce_remote.len()];
                     rand::rng().fill(nonce_local);
@@ -1050,7 +1047,6 @@ impl IKEv2Session {
 
         let initiator_signed_len =
             ctx.message_initiator.len() + ctx.nonce_responder.len() + prf_key_len;
-        // TODO FUTUREHEAP
         let mut initiator_signed = [0u8; MAX_DATAGRAM_SIZE];
         initiator_signed[..ctx.message_initiator.len()].copy_from_slice(&ctx.message_initiator);
         initiator_signed
@@ -1088,7 +1084,6 @@ impl IKEv2Session {
         if let Some(id_responder) = self.pki_processing.server_id() {
             let responder_signed_len =
                 ctx.message_responder.len() + ctx.nonce_initiator.len() + prf_key_len;
-            // TODO FUTUREHEAP
             let mut responder_signed = [0u8; MAX_DATAGRAM_SIZE];
             responder_signed[..ctx.message_responder.len()].copy_from_slice(&ctx.message_responder);
             responder_signed[ctx.message_responder.len()
@@ -1100,7 +1095,6 @@ impl IKEv2Session {
                     [ctx.message_responder.len() + ctx.nonce_initiator.len()..responder_signed_len],
             );
 
-            // TODO FUTUREHEAP
             let mut signature = [0u8; MAX_SIGNATURE_LENGTH];
             let signature_length = self.pki_processing.sign_auth(
                 signature_format,
@@ -1341,7 +1335,6 @@ impl IKEv2Session {
                         nonce_initiator.copy_from_slice(nonce_remote);
                         Some(nonce_initiator)
                     };
-                    // TODO FUTUREHEAP
                     let mut nonce_local = [0u8; MAX_NONCE];
                     let nonce_local = &mut nonce_local[..nonce_remote.len()];
                     rand::rng().fill(nonce_local);
@@ -1649,7 +1642,6 @@ impl IKEv2Session {
         if self.sent_request.is_some() || !self.last_sent_request.is_empty() {
             return Err("Already processing another command".into());
         }
-        // TODO FUTUREHEAP
         let mut request_bytes = [0u8; MAX_DATAGRAM_SIZE];
         let mut ikev2_request = message::MessageWriter::new(&mut request_bytes)?;
         ikev2_request.write_header(
@@ -1886,7 +1878,6 @@ pub enum RequestContext {
 }
 
 fn nat_detection_ip(initiator_spi: u64, responder_spi: u64, addr: IpAddr, port: u16) -> [u8; 20] {
-    // TODO FUTUREHEAP
     let mut src_data = [0u8; 8 + 8 + 16 + 2];
     src_data[0..8].copy_from_slice(&initiator_spi.to_be_bytes());
     src_data[8..16].copy_from_slice(&responder_spi.to_be_bytes());

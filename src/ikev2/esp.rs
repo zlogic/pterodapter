@@ -4,6 +4,8 @@ use log::warn;
 
 use super::{crypto, ip, message};
 
+pub const MAX_EXTRA_HEADERS_SIZE: usize = 8 + super::crypto::MAX_PADDING_SIZE;
+
 pub type SecurityAssociationID = u32;
 
 pub struct SecurityAssociation {
