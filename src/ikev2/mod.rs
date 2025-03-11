@@ -159,7 +159,7 @@ impl Server {
         let mut shutdown = false;
         let mut udp_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
         let mut udp_write_buffer = [0u8; MAX_ESP_PACKET_SIZE];
-        let mut vpn_read_buffer = [0u8; MAX_DATAGRAM_SIZE];
+        let mut vpn_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
         let mut vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
         let mut poll_seed = 0usize;
         loop {
