@@ -146,12 +146,11 @@ impl SecurityAssociation {
         };
         match self
             .crypto_stack
-            .encrypt_data(data, msg_len, associated_data)
+            .encrypt_data(&mut data[8..], msg_len, associated_data)
         {
             Ok(encrypted_data) => {
-                let encrypted_data_len = 8 + encrypted_data.len();
-                let encrypted_data = &data[..encrypted_data_len];
-                Ok(encrypted_data)
+                let encrypted_data_len = encrypted_data.len();
+                Ok(&data[..8 + encrypted_data_len])
             }
             Err(err) => {
                 warn!("Failed to encrypt ESP packet: {}", err);
