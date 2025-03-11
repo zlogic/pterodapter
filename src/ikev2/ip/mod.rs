@@ -837,13 +837,23 @@ impl Checksum {
     }
 
     fn add_slice(&mut self, add: &[u8]) {
-        // LLVM can auto-vectorize at least part of the loop, validated with https://godbolt.org/.
+        // As seen on https://www.nickwilcox.com/blog/autovec/:
+        // LLVM auto-vectorizes the loop, validated with https://godbolt.org/.
         // Using the following complier args:
         // "-O -C target-cpu=x86-64-v3" for x86
         // "-O --target=aarch64-apple-darwin -C target-cpu=apple-m4" for ARM64
-        let high_sum: u32 = add.iter().step_by(2).map(|&b| (b as u32) << 8).sum();
-        let low_sum: u32 = add.iter().skip(1).step_by(2).map(|&b| b as u32).sum();
-        self.0 += high_sum + low_sum;
+        let mut full_sum = 0u32;
+        let mut iter = add.chunks_exact(2);
+        while let Some(bytes) = iter.next() {
+            full_sum += (bytes[0] as u32) << 8 | bytes[1] as u32;
+        }
+        let remain_sum = match iter.remainder() {
+            &[high] => (high as u32) << 8,
+            &[] => 0u32,
+            _ => panic!("Checksum chunks_exact returned unexpected slice size"),
+        };
+
+        self.0 += full_sum + remain_sum;
     }
 
     fn value(&self) -> u16 {
