@@ -1490,14 +1490,6 @@ impl IKEv2Session {
             // TODO: return TS_UNACCEPTABLE notification.
             return Err("No traffic selectors offered by client".into());
         }
-        if !self.network.ts_local().iter().all(|local_ts| {
-            ts_local
-                .iter()
-                .any(|client_ts| client_ts.contains(local_ts))
-        }) {
-            // TODO: return TS_UNACCEPTABLE notification.
-            return Err("Failed to narrow traffic selector".into());
-        }
         if let Some(old_spi) = rekey_child_sa {
             debug!("Rekeying child SA");
             let old_spi = match old_spi {
