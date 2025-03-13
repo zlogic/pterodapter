@@ -1,6 +1,8 @@
 use std::{error, fmt, net::SocketAddr};
 
-use log::warn;
+use log::{debug, trace, warn};
+
+use crate::logger::fmt_slice_hex;
 
 use super::{crypto, ip, message};
 
@@ -20,6 +22,12 @@ pub struct SecurityAssociation {
     replay_window: ReplayWindow,
     local_seq: u32,
     index: usize,
+}
+
+pub enum RoutingAction<'a> {
+    Forward(&'a [u8]),
+    ReturnToSender(&'a [u8]),
+    Drop,
 }
 
 impl SecurityAssociation {
@@ -82,7 +90,7 @@ impl SecurityAssociation {
             && ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Source)
     }
 
-    pub fn handle_esp<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
+    fn decrypt_esp<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
         if data.len() < 8 + self.signature_length {
             return Err("Not enough data in ESP packet".into());
         }
@@ -124,7 +132,52 @@ impl SecurityAssociation {
         }
     }
 
-    pub fn handle_vpn<'a>(
+    pub fn handle_esp<'a>(
+        &mut self,
+        in_data: &'a mut [u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<RoutingAction<'a>, EspError> {
+        let decrypted_slice = self.decrypt_esp(in_data)?;
+        trace!("Decrypted ESP packet\n{}", fmt_slice_hex(decrypted_slice));
+        let ip_packet = match ip::IpPacket::from_data(decrypted_slice) {
+            Ok(packet) => packet,
+            Err(err) => {
+                warn!(
+                    "Failed to parse IP packet from ESP: {}\n{}",
+                    err,
+                    fmt_slice_hex(decrypted_slice),
+                );
+                return Err("Failed to parse IP packet from ESP".into());
+            }
+        };
+        trace!("Decoded IP packet from ESP {}", ip_packet);
+        let ip_header = ip_packet.to_header();
+        if !self.accepts_esp_to_vpn(&ip_header) {
+            debug!("ESP packet {} dropped by traffic selector", ip_header);
+            // Microsoft Teams can spam the network with a lot of stray packets.
+            // Don't log an error if the packet is dropped to keep the logs clean on the info
+            // level.
+            return Ok(RoutingAction::Drop);
+        }
+
+        match self.network.translate_packet_from_esp(ip_packet, out_buf) {
+            Ok(ip::RoutingActionEsp::Forward(buf)) => Ok(RoutingAction::Forward(buf)),
+            Ok(ip::RoutingActionEsp::ReturnToSender(buf, msg_len)) => {
+                trace!(
+                    "Encrypting response to sender: {}",
+                    fmt_slice_hex(&buf[..msg_len])
+                );
+                let encrypted_response = self.encrypt_esp(buf, msg_len)?;
+                Ok(RoutingAction::ReturnToSender(encrypted_response))
+            }
+            Err(err) => {
+                warn!("Failed to NAT packet from ESP: {}", err);
+                Err("Failed to NAT packet from ESP".into())
+            }
+        }
+    }
+
+    fn encrypt_esp<'a>(
         &mut self,
         data: &'a mut [u8],
         msg_len: usize,
@@ -161,12 +214,12 @@ impl SecurityAssociation {
         }
     }
 
-    pub fn nat_to_vpn<'a>(
+    pub fn handle_vpn<'a>(
         &mut self,
-        packet: ip::IpPacket<'a>,
-        buf: &'a mut [u8],
-    ) -> Result<ip::RoutingDecision<'a>, EspError> {
-        Ok(self.network.translate_packet_from_esp(packet, buf)?)
+        data: &'a mut [u8],
+        msg_len: usize,
+    ) -> Result<&'a [u8], EspError> {
+        self.encrypt_esp(data, msg_len)
     }
 }
 

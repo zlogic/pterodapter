@@ -554,6 +554,8 @@ impl RrType {
 
     const AAAA: RrType = RrType(28);
     const OPT: RrType = RrType(41);
+    const SVCB: RrType = RrType(64);
+    const HTTPS: RrType = RrType(65);
 
     fn from_u16(code: u16) -> RrType {
         RrType(code)
@@ -589,6 +591,8 @@ impl fmt::Display for RrType {
             Self::TXT => write!(f, "TXT"),
             Self::AAAA => write!(f, "AAAA"),
             Self::OPT => write!(f, "OPT"),
+            Self::SVCB => write!(f, "SVCB"),
+            Self::HTTPS => write!(f, "HTTPS"),
             RrType(code) => write!(f, "Unknown({})", code),
         }
     }
@@ -1067,6 +1071,11 @@ pub struct Dns64Translator {
     nat64_prefix: Nat64Prefix,
 }
 
+pub enum DnsTranslationAction {
+    Forward(usize),
+    ReplyToSender(usize),
+}
+
 impl Dns64Translator {
     pub fn new(nat64_prefix: Nat64Prefix) -> Dns64Translator {
         Dns64Translator {
@@ -1092,14 +1101,20 @@ impl Dns64Translator {
         dest[10..12].copy_from_slice(&(arcount as u16).to_be_bytes());
     }
 
-    fn write_error_response(dest: &mut [u8], request_data: &[u8], rcode: ResponseCode) {
+    fn write_error_response(
+        dest: &mut [u8],
+        request_data: &[u8],
+        rcode: ResponseCode,
+        qdcount: usize,
+        length: usize,
+    ) -> DnsTranslationAction {
         // Keep all questions and data for the client to observe.
-        dest[0..request_data.len()].copy_from_slice(request_data);
-        let mut flags = DnsPacketFlags::from_data(dest);
+        let mut flags = DnsPacketFlags::from_data(request_data);
         flags.set_qr(Qr::Response);
         flags.set_response_code(rcode);
         flags.clear_reserved_zero();
-        dest[2..4].copy_from_slice(&flags.to_be_bytes());
+        Self::write_header(dest, request_data, flags, qdcount, 0, 0, 0);
+        DnsTranslationAction::ReplyToSender(length)
     }
 
     fn write_label(
@@ -1165,39 +1180,42 @@ impl Dns64Translator {
         Ok(length + 4)
     }
 
-    pub fn translate_to_ipv4(
+    pub fn translate_to_vpn(
         &mut self,
         request: &DnsPacket,
         dest: &mut [u8],
-    ) -> Result<usize, DnsError> {
+    ) -> Result<DnsTranslationAction, DnsError> {
         self.compression_map.clear();
         let mut flags = request.flags();
-        // TODO 0.5.0: ensure error responses are propagated back to sender.
         // This is loosely based on RFC 6147.
         if flags.qr() == Qr::Response {
-            Self::write_error_response(dest, request.data, ResponseCode::NotImplemented);
             return Err("Response requests are not supported".into());
         }
         if flags.truncation() {
-            Self::write_error_response(dest, request.data, ResponseCode::NameError);
             return Err("Truncated requests are not supported".into());
         }
         if dest.len() < MAX_PACKET_SIZE {
-            return Err("Not enough data for translated IPv4 DNS request".into());
+            return Err("Not enough data for translated request".into());
         }
         if dest.len() < request.data.len() {
             return Err("Destination slice cannot fit original request".into());
         }
         let mut qdcount = 0;
         let mut length = 12;
-        request.iter_sections().try_for_each(|section| {
-            match section? {
-                Section::Question(q) => {
+        for section in request.iter_sections() {
+            match section {
+                Ok(Section::Question(q)) => {
                     if qdcount > 0 {
                         // RFC 1035, Section 4.1.2 states that number of questions
                         // is usually 1, and most implementations don't support >1 questions.
                         warn!("Dropping unexpected additional question from request");
-                        return Ok(());
+                        return Ok(Self::write_error_response(
+                            dest,
+                            request.data,
+                            ResponseCode::FormatError,
+                            qdcount,
+                            length,
+                        ));
                     }
                     let qtype = q.qtype().to_rtype();
                     match qtype {
@@ -1212,18 +1230,29 @@ impl Dns64Translator {
                                 q.iter_qname(),
                             )?
                         }
-                        Some(RrType::A) => {
+                        Some(RrType::A) | Some(RrType::SVCB) | Some(RrType::HTTPS) => {
                             // Drop A questions (IPv4 is not supported).
+                            // Drop SVCB and HTTPS questions (DoH is not supported).
+                            debug!(
+                                "Dropping unsupported {} record in DNS question: {}",
+                                q.qtype(),
+                                q
+                            );
                             qdcount += 1;
                             length = self.write_question(
                                 dest,
                                 length,
-                                RrType::A.to_qtype(),
+                                q.qtype(),
                                 q.qclass(),
                                 q.iter_qname(),
                             )?;
-                            Self::write_error_response(dest, request.data, ResponseCode::NameError);
-                            return Err("Unsupported A record in DNS question".into());
+                            return Ok(Self::write_error_response(
+                                dest,
+                                request.data,
+                                ResponseCode::NameError,
+                                qdcount,
+                                length,
+                            ));
                         }
                         _ => {
                             qdcount += 1;
@@ -1237,21 +1266,41 @@ impl Dns64Translator {
                         }
                     };
                 }
-                Section::Answer(_) => debug!("Dropping unsupported A section from request"),
-                Section::Nameserver(_) => debug!("Dropping unsupported NS section from request"),
-                Section::AdditionalRecord(_) => {
-                    debug!("Dropping unsupported AR section from request")
+                Ok(Section::Answer(a)) => {
+                    debug!("Dropping unsupported A section from request: {}", a)
+                }
+                Ok(Section::Nameserver(ns)) => {
+                    debug!("Dropping unsupported NS section from request: {}", ns)
+                }
+                Ok(Section::AdditionalRecord(ar)) => {
+                    debug!("Dropping unsupported AR section from request: {}", ar)
+                }
+                Err(err) => {
+                    warn!("Failed to parse DNS section: {}", err);
+                    return Ok(Self::write_error_response(
+                        dest,
+                        request.data,
+                        ResponseCode::FormatError,
+                        qdcount,
+                        length,
+                    ));
                 }
             };
-            Ok::<(), DnsError>(())
-        })?;
-        if qdcount == 0 {
-            Self::write_error_response(dest, request.data, ResponseCode::FormatError);
-            return Err("No supported question types in request".into());
         }
-        flags.clear_reserved_zero();
-        Self::write_header(dest, request.data, flags, qdcount, 0, 0, 0);
-        Ok(length)
+        if qdcount == 0 {
+            warn!("No supported question types in DNS request");
+            Ok(Self::write_error_response(
+                dest,
+                request.data,
+                ResponseCode::FormatError,
+                qdcount,
+                length,
+            ))
+        } else {
+            flags.clear_reserved_zero();
+            Self::write_header(dest, request.data, flags, qdcount, 0, 0, 0);
+            Ok(DnsTranslationAction::Forward(length))
+        }
     }
 
     fn write_resource_record(
@@ -1340,7 +1389,7 @@ impl Dns64Translator {
         }
     }
 
-    pub fn translate_to_ipv6(
+    pub fn translate_to_esp(
         &mut self,
         request: &DnsPacket,
         dest: &mut [u8],
@@ -1355,7 +1404,7 @@ impl Dns64Translator {
             return Err("Truncated responses are not supported".into());
         }
         if dest.len() < MAX_PACKET_SIZE {
-            return Err("Not enough data for translated IPv4 DNS request".into());
+            return Err("Not enough data to translate DNS request into IPv4".into());
         }
         if dest.len() < request.data.len() {
             return Err("Destination slice cannot fit original request".into());
@@ -1389,8 +1438,7 @@ impl Dns64Translator {
                         }
                         Some(RrType::AAAA) => {
                             // Drop AAAA questions (IPv4 is never asked for AAAA records).
-                            qdcount += 1;
-                            length = self.write_question(
+                            self.write_question(
                                 dest,
                                 length,
                                 RrType::A.to_qtype(),

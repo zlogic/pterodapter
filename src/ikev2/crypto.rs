@@ -935,7 +935,7 @@ impl PaddingType {
                     6 => 41, //IPv6
                     _ => {
                         warn!("ESP IP packet is not a supported IP version: {:x}", data[0]);
-                        return Err("Unsupported IP prococol version".into());
+                        return Err("Unsupported IP protocol version".into());
                     }
                 };
                 data[data.len() - 2] = padding_length;
