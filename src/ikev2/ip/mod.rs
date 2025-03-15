@@ -72,32 +72,29 @@ impl TransportProtocolType {
         }
     }
 
-    fn to_u8(&self) -> u8 {
+    fn to_u8(self) -> u8 {
         self.0
     }
 
     fn is_ipv6_extension(&self) -> bool {
         // Based on https://www.iana.org/assignments/ipv6-parameters/ipv6-parameters.xhtml.
         // ESP is not included, as it's identical to how IPv4 ESP works.
-        match *self {
+        matches!(
+            *self,
             Self::HOP_BY_HOP_OPTIONS
-            | Self::IPV6_ROUTING
-            | Self::IPV6_FRAGMENT
-            | Self::IPV6_DESTINATION_OPTIONS
-            | Self::IPV6_NO_NEXT_HEADER
-            | Self::IPV6_AH
-            | Self::IPV6_MOBILITY
-            | Self::IPV6_HOST_IDENTITY_PROTOCOL
-            | Self::IPV6_SHIM6_PROTOCOL => true,
-            _ => false,
-        }
+                | Self::IPV6_ROUTING
+                | Self::IPV6_FRAGMENT
+                | Self::IPV6_DESTINATION_OPTIONS
+                | Self::IPV6_NO_NEXT_HEADER
+                | Self::IPV6_AH
+                | Self::IPV6_MOBILITY
+                | Self::IPV6_HOST_IDENTITY_PROTOCOL
+                | Self::IPV6_SHIM6_PROTOCOL,
+        )
     }
 
     fn supports_checksum(&self) -> bool {
-        match *self {
-            Self::TCP | Self::UDP => true,
-            _ => false,
-        }
+        matches!(*self, Self::TCP | Self::UDP)
     }
 }
 
@@ -129,6 +126,7 @@ impl fmt::Display for TransportProtocolType {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct TrafficClass(u8);
 
 impl TrafficClass {
@@ -140,7 +138,7 @@ impl TrafficClass {
         self.0 & 0x03
     }
 
-    fn to_u8(&self) -> u8 {
+    fn to_u8(self) -> u8 {
         self.0
     }
 }
@@ -361,7 +359,7 @@ impl<'a> Ipv4Packet<'a> {
         dest[header_len..header_len + transport_data.len()].copy_from_slice(transport_data);
         if transport_protocol.supports_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
-            let add = Ipv6Packet::pseudo_checksum(&dest, transport_protocol, transport_data.len());
+            let add = Ipv6Packet::pseudo_checksum(dest, transport_protocol, transport_data.len());
             self.transport_data.write_translated_checksum(
                 &mut dest[header_len..header_len + transport_data.len()],
                 remove,
@@ -619,7 +617,7 @@ impl<'a> Ipv6Packet<'a> {
         dest[20..20 + transport_data.len()].copy_from_slice(transport_data);
         if transport_protocol.supports_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
-            let add = Ipv4Packet::pseudo_checksum(&dest, transport_protocol, transport_data.len());
+            let add = Ipv4Packet::pseudo_checksum(dest, transport_protocol, transport_data.len());
             self.transport_data.write_translated_checksum(
                 &mut dest[20..20 + transport_data.len()],
                 remove,
@@ -1510,10 +1508,6 @@ impl Checksum {
         sum = (sum >> 16) + (sum & 0x0000ffffu32);
         sum = (sum >> 16) + (sum & 0x0000ffffu32);
         self.0 = sum;
-    }
-
-    fn add_one(&mut self, add: u16) {
-        self.0 += add as u32
     }
 
     fn add_slice(&mut self, add: &[u8]) {
