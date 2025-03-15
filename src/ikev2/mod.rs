@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -499,13 +499,6 @@ enum EspRoutingAction<'a> {
 }
 
 impl<'a> EspRoutingAction<'a> {
-    fn process(
-        action: esp::RoutingAction<'a>,
-        remote_side: UdpDatagramSource,
-    ) -> EspRoutingAction<'a> {
-        EspRoutingAction::Process(action, remote_side)
-    }
-
     fn into_packets(self) -> (Option<(UdpDatagramSource, &'a [u8])>, &'a [u8]) {
         match self {
             EspRoutingAction::Process(esp::RoutingAction::Forward(data), _) => (None, data),
@@ -526,28 +519,21 @@ struct UdpDatagramDestination {
 }
 
 enum VpnRoutingAction<'a> {
-    Process(ip::RoutingActionEsp<'a>, UdpDatagramDestination),
+    Process(esp::RoutingAction<'a>, UdpDatagramDestination),
     Drop,
 }
 
 impl<'a> VpnRoutingAction<'a> {
-    fn process(
-        action: ip::RoutingActionEsp<'a>,
-        remote_side: UdpDatagramDestination,
-    ) -> VpnRoutingAction<'a> {
-        VpnRoutingAction::Process(action, remote_side)
-    }
-
     fn into_packets(self) -> (&'a [u8], Option<(UdpDatagramDestination, &'a [u8])>) {
         match self {
             VpnRoutingAction::Process(
-                ip::RoutingActionEsp::Forward(data),
+                esp::RoutingAction::Forward(data),
                 udp_datagram_destination,
             ) => (&[], Some((udp_datagram_destination, data))),
-            VpnRoutingAction::Process(ip::RoutingActionEsp::ReturnToSender(data, msg_len), _) => {
-                (data, None)
+            VpnRoutingAction::Process(esp::RoutingAction::ReturnToSender(data), _) => (data, None),
+            VpnRoutingAction::Process(esp::RoutingAction::Drop, _) | VpnRoutingAction::Drop => {
+                (&[], None)
             }
-            VpnRoutingAction::Drop => (&[], None),
         }
     }
 }
@@ -763,12 +749,6 @@ impl Sessions {
             } else {
                 (None, &[])
             };
-        // TODO 0.5.0: Remove this debug code.
-        let internal_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10)));
-        let dns_addrs = &[
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        ];
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
     }
@@ -1068,7 +1048,7 @@ impl Sessions {
         let remote_addr = udp_source.remote_addr;
         if in_buf == [0xff] {
             debug!("Received ESP NAT keepalive from {}", udp_source.remote_addr);
-            return Ok(EspRoutingAction::process(
+            return Ok(EspRoutingAction::Process(
                 esp::RoutingAction::ReturnToSender(in_buf),
                 udp_source,
             ));
@@ -1086,7 +1066,7 @@ impl Sessions {
         let local_spi = u32::from_be_bytes(local_spi);
         if let Some(sa) = self.security_associations.get_mut(&local_spi) {
             let action = sa.handle_esp(in_buf, out_buf)?;
-            Ok(EspRoutingAction::process(action, udp_source))
+            Ok(EspRoutingAction::Process(action, udp_source))
         } else {
             warn!(
                 "Security Association {:x} from {} not found",
@@ -1100,7 +1080,7 @@ impl Sessions {
         &mut self,
         in_buf: &'a mut [u8],
         data_len: usize,
-        output_buf: &'a mut [u8],
+        out_buf: &'a mut [u8],
     ) -> Result<VpnRoutingAction<'a>, IKEv2Error> {
         if data_len == 0 {
             return Ok(VpnRoutingAction::Drop);
@@ -1131,31 +1111,12 @@ impl Sessions {
                 }
             })
         {
-            let encoded_length = sa.encoded_length(data_len);
-            if encoded_length > in_buf.len() {
-                // This sometimes happens when FortiVPN returns a zero-padded packet.
-                warn!(
-                    "Slice doesn't have capacity for ESP headers, message length is {}, buffer has {}",
-                    encoded_length,
-                    in_buf.len()
-                );
-                return Err("Vector doesn't have capacity for ESP headers".into());
-            }
-            in_buf[data_len..encoded_length].fill(0);
-            let encrypted_data = sa.handle_vpn(&mut in_buf[..encoded_length], data_len)?;
-            trace!(
-                "Encrypted VPN packet to {}\n{}",
-                sa.remote_addr(),
-                fmt_slice_hex(encrypted_data)
-            );
-
+            let routing_action = sa.handle_vpn(ip_header, in_buf, out_buf, data_len)?;
             let destination = UdpDatagramDestination {
                 remote_addr: sa.remote_addr(),
                 local_addr: sa.local_addr(),
             };
-            // TODO 0.5.0: use another routing action here.
-            let action = ip::RoutingActionEsp::Forward(encrypted_data);
-            Ok(VpnRoutingAction::process(action, destination))
+            Ok(VpnRoutingAction::Process(routing_action, destination))
         } else {
             debug!(
                 "No matching Security Associations found for VPN packet {}",

@@ -7,7 +7,7 @@ use log::{debug, warn};
 
 use crate::logger::fmt_slice_hex;
 
-use super::{IpHeader, Nat64Prefix, TransportProtocolType};
+use super::Nat64Prefix;
 
 // As defined in RFC 1035, Sections 2.3.4 and 4.2.1.
 pub const MAX_PACKET_SIZE: usize = 512;
@@ -209,12 +209,6 @@ impl DnsPacketFlags {
 impl DnsPacket<'_> {
     const DNS_HEADER_SIZE: usize = 12;
 
-    pub fn is_dns(hdr: &IpHeader) -> bool {
-        // TODO 0.5.0: check if IP address matches one of the DNS servers.
-        hdr.transport_protocol == TransportProtocolType::UDP
-            && (hdr.src_port == Some(53) || hdr.dst_port == Some(53))
-    }
-
     pub fn from_udp_payload(data: &[u8]) -> Result<DnsPacket, DnsError> {
         // First 8 bytes are the UDP header.
         if data.len() < Self::DNS_HEADER_SIZE {
@@ -266,7 +260,10 @@ impl DnsPacket<'_> {
         self.iter_sections().any(|section| match section {
             Ok(Section::Question(q)) => {
                 let qtype = q.qtype().to_rtype();
-                if qtype == Some(RrType::A) || qtype == Some(RrType::AAAA) {
+                if qtype == Some(RrType::SVCB) || qtype == Some(RrType::HTTPS) {
+                    // Always match SVCB and HTTPS questions (DoH is not supported).
+                    true
+                } else if qtype == Some(RrType::A) || qtype == Some(RrType::AAAA) {
                     let label = q.iter_qname();
                     let label_length = label.size_hint().0;
                     if label_length < suffix.len() {
@@ -1431,20 +1428,13 @@ impl Dns64Translator {
                             length = self.write_question(
                                 dest,
                                 length,
-                                RrType::A.to_qtype(),
+                                RrType::AAAA.to_qtype(),
                                 q.qclass(),
                                 q.iter_qname(),
                             )?
                         }
                         Some(RrType::AAAA) => {
                             // Drop AAAA questions (IPv4 is never asked for AAAA records).
-                            self.write_question(
-                                dest,
-                                length,
-                                RrType::A.to_qtype(),
-                                q.qclass(),
-                                q.iter_qname(),
-                            )?;
                             return Err("Unsupported AAAA record in DNS response question".into());
                         }
                         _ => {

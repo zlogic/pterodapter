@@ -86,6 +86,12 @@ impl SecurityAssociation {
     }
 
     pub fn accepts_vpn_to_esp(&self, hdr: &ip::IpHeader) -> bool {
+        let translated_hdr = self.network.translate_ipv4_header(hdr);
+        let hdr = if let Some(hdr) = translated_hdr.as_ref() {
+            hdr
+        } else {
+            hdr
+        };
         ts_accepts_header(&self.ts_remote, hdr, TsCheck::Destination)
             && ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Source)
     }
@@ -160,7 +166,10 @@ impl SecurityAssociation {
             return Ok(RoutingAction::Drop);
         }
 
-        match self.network.translate_packet_from_esp(ip_packet, out_buf) {
+        match self
+            .network
+            .translate_packet_from_esp(ip_packet, ip_header, out_buf)
+        {
             Ok(ip::RoutingActionEsp::Forward(buf)) => Ok(RoutingAction::Forward(buf)),
             Ok(ip::RoutingActionEsp::ReturnToSender(buf, msg_len)) => {
                 trace!(
@@ -170,6 +179,7 @@ impl SecurityAssociation {
                 let encrypted_response = self.encrypt_esp(buf, msg_len)?;
                 Ok(RoutingAction::ReturnToSender(encrypted_response))
             }
+            Ok(ip::RoutingActionEsp::Drop) => Ok(RoutingAction::Drop),
             Err(err) => {
                 warn!("Failed to NAT packet from ESP: {}", err);
                 Err("Failed to NAT packet from ESP".into())
@@ -216,10 +226,43 @@ impl SecurityAssociation {
 
     pub fn handle_vpn<'a>(
         &mut self,
-        data: &'a mut [u8],
-        msg_len: usize,
-    ) -> Result<&'a [u8], EspError> {
-        self.encrypt_esp(data, msg_len)
+        ip_header: ip::IpHeader,
+        in_buf: &'a mut [u8],
+        out_buf: &'a mut [u8],
+        data_len: usize,
+    ) -> Result<RoutingAction<'a>, EspError> {
+        match self
+            .network
+            .translate_packet_from_vpn(ip_header, in_buf, data_len, out_buf)
+        {
+            Ok(ip::RoutingActionVpn::Forward(buf, data_len)) => {
+                let encoded_length = self.encoded_length(data_len);
+                if encoded_length > buf.len() {
+                    // This sometimes happens when FortiVPN returns a zero-padded packet.
+                    warn!(
+                        "Slice doesn't have capacity for ESP headers, message length is {}, buffer has {}",
+                        encoded_length,
+                        buf.len()
+                    );
+                    return Err("Vector doesn't have capacity for ESP headers".into());
+                }
+                buf[data_len..encoded_length].fill(0);
+                let encrypted_data = self.encrypt_esp(&mut buf[..encoded_length], data_len)?;
+                trace!(
+                    "Encrypted VPN packet to {}\n{}",
+                    self.remote_addr,
+                    fmt_slice_hex(encrypted_data)
+                );
+
+                Ok(RoutingAction::Forward(encrypted_data))
+            }
+            Ok(ip::RoutingActionVpn::ReturnToSender(buf)) => Ok(RoutingAction::ReturnToSender(buf)),
+            Ok(ip::RoutingActionVpn::Drop) => Ok(RoutingAction::Drop),
+            Err(err) => {
+                warn!("Failed to NAT packet from VPN: {}", err);
+                Err("Failed to NAT packet from VPN".into())
+            }
+        }
     }
 }
 

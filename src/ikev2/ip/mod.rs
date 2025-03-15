@@ -1,6 +1,6 @@
 use std::{
     error, fmt, io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::{Range, RangeInclusive},
 };
 
@@ -32,9 +32,12 @@ impl TransportProtocolType {
     const IPV6_ICMP: TransportProtocolType = TransportProtocolType(58);
     const IPV6_DESTINATION_OPTIONS: TransportProtocolType = TransportProtocolType(60);
     const IPV6_NO_NEXT_HEADER: TransportProtocolType = TransportProtocolType(59);
-}
 
-impl TransportProtocolType {
+    const IPV6_AH: TransportProtocolType = TransportProtocolType(51);
+    const IPV6_MOBILITY: TransportProtocolType = TransportProtocolType(135);
+    const IPV6_HOST_IDENTITY_PROTOCOL: TransportProtocolType = TransportProtocolType(139);
+    const IPV6_SHIM6_PROTOCOL: TransportProtocolType = TransportProtocolType(140);
+
     fn from_u8(value: u8) -> TransportProtocolType {
         TransportProtocolType(value)
     }
@@ -46,6 +49,10 @@ impl TransportProtocolType {
             Self::IPV6_FRAGMENT => 8,
             Self::IPV6_DESTINATION_OPTIONS => data[1] as usize + 1,
             Self::IPV6_NO_NEXT_HEADER => data.len(),
+            Self::IPV6_AH => 2 + (data[1] as usize) * 4,
+            Self::IPV6_MOBILITY => 8 + (data[1] as usize) * 8,
+            Self::IPV6_HOST_IDENTITY_PROTOCOL => 8 + (data[1] as usize) * 8,
+            Self::IPV6_SHIM6_PROTOCOL => 8 + (data[1] as usize) * 8,
             _ => data.len(),
         }
     }
@@ -57,7 +64,39 @@ impl TransportProtocolType {
             Self::IPV6_FRAGMENT => 8,
             Self::IPV6_DESTINATION_OPTIONS => 2,
             Self::IPV6_NO_NEXT_HEADER => 0,
+            Self::IPV6_AH => 2 + 3 * 4,
+            Self::IPV6_MOBILITY => 8,
+            Self::IPV6_HOST_IDENTITY_PROTOCOL => 8 + 8 * 4,
+            Self::IPV6_SHIM6_PROTOCOL => 8 + 8,
             _ => 0,
+        }
+    }
+
+    fn to_u8(&self) -> u8 {
+        self.0
+    }
+
+    fn is_ipv6_extension(&self) -> bool {
+        // Based on https://www.iana.org/assignments/ipv6-parameters/ipv6-parameters.xhtml.
+        // ESP is not included, as it's identical to how IPv4 ESP works.
+        match *self {
+            Self::HOP_BY_HOP_OPTIONS
+            | Self::IPV6_ROUTING
+            | Self::IPV6_FRAGMENT
+            | Self::IPV6_DESTINATION_OPTIONS
+            | Self::IPV6_NO_NEXT_HEADER
+            | Self::IPV6_AH
+            | Self::IPV6_MOBILITY
+            | Self::IPV6_HOST_IDENTITY_PROTOCOL
+            | Self::IPV6_SHIM6_PROTOCOL => true,
+            _ => false,
+        }
+    }
+
+    fn supports_checksum(&self) -> bool {
+        match *self {
+            Self::TCP | Self::UDP => true,
+            _ => false,
         }
     }
 }
@@ -81,6 +120,10 @@ impl fmt::Display for TransportProtocolType {
             Self::IPV6_DESTINATION_OPTIONS => write!(f, "IPv6-Opts"),
             Self::IPV6_ICMP => write!(f, "IPv6-ICMP"),
             Self::IPV6_NO_NEXT_HEADER => write!(f, "IPv6-NoNxt"),
+            Self::IPV6_AH => write!(f, "IPv6-AH"),
+            Self::IPV6_MOBILITY => write!(f, "IPv6-Mobility"),
+            Self::IPV6_HOST_IDENTITY_PROTOCOL => write!(f, "IPv6-HIP"),
+            Self::IPV6_SHIM6_PROTOCOL => write!(f, "IPv6-Shim6"),
             _ => write!(f, "Unknown IP transport protocol or header type {}", self.0),
         }
     }
@@ -96,6 +139,10 @@ impl TrafficClass {
     fn ecn(&self) -> u8 {
         self.0 & 0x03
     }
+
+    fn to_u8(&self) -> u8 {
+        self.0
+    }
 }
 
 impl fmt::Display for TrafficClass {
@@ -109,9 +156,11 @@ pub struct Ipv4Packet<'a> {
     transport_data: TransportData<'a>,
 }
 
-impl Ipv4Packet<'_> {
+impl<'a> Ipv4Packet<'a> {
     const FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
     const FRAGMENT_MF_MASK: u16 = 1 << 13;
+    const FRAGMENT_DF_MASK: u16 = 1 << 14;
+    const FRAGMENT_USED_MASK: u16 = Self::FRAGMENT_OFFSET_MASK | Self::FRAGMENT_MF_MASK;
 
     fn from_data(data: &[u8]) -> Result<Ipv4Packet, IpError> {
         if data.len() < 20 {
@@ -134,6 +183,10 @@ impl Ipv4Packet<'_> {
                 transport_data,
             })
         }
+    }
+
+    fn into_data(self) -> &'a [u8] {
+        self.data
     }
 
     fn header_length(data: &[u8]) -> usize {
@@ -181,12 +234,39 @@ impl Ipv4Packet<'_> {
         }
     }
 
-    fn pseudo_checksum(&self, transport_length: usize) -> Checksum {
+    fn ttl(&self) -> u8 {
+        self.data[8]
+    }
+
+    fn pseudo_checksum(
+        data: &[u8],
+        transport_protocol: TransportProtocolType,
+        transport_length: usize,
+    ) -> Checksum {
         let mut checksum = Checksum::new();
-        checksum.add_slice(&self.data[12..20]);
-        checksum.add_slice(&[0u8, self.transport_protocol().0]);
+        checksum.add_slice(&data[12..20]);
+        checksum.add_slice(&[0u8, transport_protocol.to_u8()]);
         checksum.add_slice(&(transport_length as u16).to_be_bytes());
         checksum
+    }
+
+    fn validate_transport_checksum(&self) -> bool {
+        let transport_data = self.transport_protocol_data();
+        if let Some(checksum) = transport_data.checksum() {
+            if transport_data.protocol() == TransportProtocolType::UDP && checksum == 0x0000 {
+                return true;
+            }
+            let mut calculated_checksum = Self::pseudo_checksum(
+                self.data,
+                self.transport_protocol(),
+                transport_data.full_data().len(),
+            );
+            calculated_checksum.add_slice(transport_data.full_data());
+            calculated_checksum.fold();
+            calculated_checksum.value() == 0x0000
+        } else {
+            true
+        }
     }
 
     fn validate_ip_checksum(&self) -> bool {
@@ -196,9 +276,137 @@ impl Ipv4Packet<'_> {
         checksum.value() == 0x0000
     }
 
-    fn write_converted(&self, dest: &mut [u8]) -> Result<usize, IpError> {
-        // TODO 0.5.0: implement https://datatracker.ietf.org/doc/html/rfc7915#section-4.1
-        Ok(0)
+    fn is_fragmented(&self) -> bool {
+        let mut fragment_offset = [0u8; 2];
+        fragment_offset.copy_from_slice(&self.data[6..8]);
+        let fragment = u16::from_be_bytes(fragment_offset);
+
+        fragment & Self::FRAGMENT_USED_MASK != 0x0000
+    }
+
+    fn write_converted_ip_header(
+        &self,
+        dest: &mut [u8],
+        fragmentation_extension: bool,
+        transport_data_len: usize,
+        nat64_prefix: [u8; 12],
+    ) -> Result<(), IpError> {
+        // RFC 7915, Section 4.1.
+        if fragmentation_extension && dest.len() != 48 {
+            return Err(
+                "Destination slice for IPv4 to IPv6 header conversion (with fragmentation) needs exactly 48 bytes"
+                    .into(),
+            );
+        } else if !fragmentation_extension && dest.len() != 40 {
+            return Err(
+                "Destination slice for IPv4 to IPv6 header conversion needs exactly 40 bytes"
+                    .into(),
+            );
+        }
+
+        let traffic_class = (self.data[1] as u32) << 20;
+        let flow_label = (6u32 << 28) | traffic_class;
+        dest[0..4].copy_from_slice(&flow_label.to_be_bytes());
+        let payload_len = if fragmentation_extension { 8 } else { 0 } + transport_data_len as u16;
+        dest[4..6].copy_from_slice(&payload_len.to_be_bytes());
+
+        let next_header = if fragmentation_extension {
+            TransportProtocolType::IPV6_FRAGMENT
+        } else {
+            self.transport_protocol()
+        };
+        dest[6] = next_header.to_u8();
+        dest[7] = self.ttl().saturating_sub(0);
+
+        dest[8..20].copy_from_slice(&nat64_prefix);
+        dest[20..24].copy_from_slice(&self.data[12..16]);
+        dest[24..36].copy_from_slice(&nat64_prefix);
+        dest[36..40].copy_from_slice(&self.data[16..20]);
+
+        if fragmentation_extension {
+            let mut fragment_offset = [0u8; 2];
+            fragment_offset.copy_from_slice(&self.data[6..8]);
+            let fragment = u16::from_be_bytes(fragment_offset);
+            let more_fragments = fragment & Self::FRAGMENT_MF_MASK == Self::FRAGMENT_MF_MASK;
+            let fragment_offset = fragment & Self::FRAGMENT_OFFSET_MASK;
+
+            dest[40] = self.transport_protocol().to_u8();
+            dest[41] = 0;
+            let fragment_offset = (fragment_offset << 3) & (!0x0007);
+            let mf_flag = if more_fragments {
+                Ipv6Packet::FRAGMENT_MF_MASK
+            } else {
+                0x0000
+            };
+            let fragment_offset_ipv6 = fragment_offset | mf_flag;
+            dest[42..44].copy_from_slice(&fragment_offset_ipv6.to_be_bytes());
+            dest[44..46].fill(0);
+            dest[46..48].copy_from_slice(&self.data[4..6]);
+        }
+
+        Ok(())
+    }
+
+    fn write_converted(&self, dest: &mut [u8], nat64_prefix: [u8; 12]) -> Result<usize, IpError> {
+        let transport_data = self.transport_data.full_data();
+        let transport_protocol = self.transport_protocol();
+        let fragmentation_extension = self.is_fragmented();
+        let header_len = if fragmentation_extension { 48 } else { 40 };
+        self.write_converted_ip_header(
+            &mut dest[0..header_len],
+            fragmentation_extension,
+            transport_data.len(),
+            nat64_prefix,
+        )?;
+        dest[header_len..header_len + transport_data.len()].copy_from_slice(transport_data);
+        if transport_protocol.supports_checksum() {
+            let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
+            let add = Ipv6Packet::pseudo_checksum(&dest, transport_protocol, transport_data.len());
+            self.transport_data.write_translated_checksum(
+                &mut dest[header_len..header_len + transport_data.len()],
+                remove,
+                add,
+            );
+        }
+
+        Ok(header_len + transport_data.len())
+    }
+
+    fn write_udp_forward(
+        &self,
+        dest: &mut [u8],
+        data_range: Range<usize>,
+        nat64_prefix: [u8; 12],
+    ) -> Result<usize, IpError> {
+        if data_range.start < 40 + 8 {
+            return Err("Not enough space to add IPv6 header in UDP translation".into());
+        }
+        let start_offset = data_range.start - 40 - 8;
+
+        self.write_converted_ip_header(
+            &mut dest[start_offset..start_offset + 40],
+            false,
+            data_range.len() + 8,
+            nat64_prefix,
+        )?;
+        dest[start_offset + 40..start_offset + 40 + 4]
+            .copy_from_slice(&self.transport_data.full_data()[0..4]);
+        dest[start_offset + 40 + 4..start_offset + 40 + 6]
+            .copy_from_slice(&(data_range.len() as u16 + 8).to_be_bytes());
+
+        dest[start_offset + 40 + 6..start_offset + 40 + 8].fill(0);
+        let mut checksum = Ipv6Packet::pseudo_checksum(
+            &dest[start_offset..],
+            self.transport_protocol(),
+            data_range.len() + 8,
+        );
+        checksum.add_slice(&dest[start_offset + 40..data_range.end]);
+        checksum.fold();
+
+        let checksum = checksum.value();
+        let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
+        dest[start_offset + 40 + 6..start_offset + 40 + 8].copy_from_slice(&checksum.to_be_bytes());
+        Ok(start_offset)
     }
 }
 
@@ -208,7 +416,7 @@ pub struct Ipv6Packet<'a> {
     fragment_extension_data: Option<&'a [u8]>,
 }
 
-impl Ipv6Packet<'_> {
+impl<'a> Ipv6Packet<'a> {
     const FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
     const FRAGMENT_MF_MASK: u16 = 1;
 
@@ -239,6 +447,10 @@ impl Ipv6Packet<'_> {
             transport_data,
             fragment_extension_data,
         })
+    }
+
+    fn into_data(self) -> &'a [u8] {
+        self.data
     }
 
     fn iter_payloads(data: &[u8]) -> Ipv6PacketIter {
@@ -304,17 +516,153 @@ impl Ipv6Packet<'_> {
         }
     }
 
-    fn pseudo_checksum(&self, transport_length: usize) -> Checksum {
+    fn pseudo_checksum(
+        data: &[u8],
+        transport_protocol: TransportProtocolType,
+        transport_length: usize,
+    ) -> Checksum {
         let mut checksum = Checksum::new();
-        checksum.add_slice(&self.data[8..40]);
-        checksum.add_slice(&[0u8, self.transport_protocol().0]);
+        checksum.add_slice(&data[8..40]);
+        checksum.add_slice(&[0u8, transport_protocol.to_u8()]);
         checksum.add_slice(&(transport_length as u32).to_be_bytes());
         checksum
     }
 
+    fn validate_transport_checksum(&self) -> bool {
+        let transport_data = self.transport_protocol_data();
+        if let Some(checksum) = transport_data.checksum() {
+            if transport_data.protocol() == TransportProtocolType::UDP && checksum == 0x0000 {
+                return true;
+            }
+            let mut calculated_checksum = Self::pseudo_checksum(
+                self.data,
+                self.transport_protocol(),
+                transport_data.full_data().len(),
+            );
+            calculated_checksum.add_slice(transport_data.full_data());
+            calculated_checksum.fold();
+            calculated_checksum.value() == 0x0000
+        } else {
+            true
+        }
+    }
+
+    fn write_converted_ip_header(
+        &self,
+        dest: &mut [u8],
+        fragment_extension: Option<&[u8]>,
+        transport_data_len: usize,
+    ) -> Result<(), IpError> {
+        // RFC 7915, Section 5.1.
+        if dest.len() != 20 {
+            return Err(
+                "Destination slice for IPv6 to IPv4 header conversion needs exactly 20 bytes"
+                    .into(),
+            );
+        }
+        dest[0] = (4 << 4) | 5;
+        dest[1] = self.traffic_class().to_u8();
+        dest[2..4].copy_from_slice(&(transport_data_len as u16 + 20u16).to_be_bytes());
+        let df_flag = if transport_data_len + 20 <= 1260 {
+            0x0000u16
+        } else {
+            Ipv4Packet::FRAGMENT_DF_MASK
+        };
+        if let Some(fragment_data) = fragment_extension {
+            // RFC 7915, Section 5.1.1.
+            let next_header = TransportProtocolType::from_u8(fragment_data[0]);
+            if next_header.is_ipv6_extension() {
+                return Err("Cannot translate unsupported IPv6 extension header to IPv4".into());
+            }
+            dest[4..6].copy_from_slice(&fragment_data[6..8]);
+
+            let mut fragment_offset = [0u8; 2];
+            fragment_offset.copy_from_slice(&fragment_data[2..4]);
+
+            let fragment_offset = u16::from_be_bytes(fragment_offset);
+            let mf_flag = if fragment_offset & Self::FRAGMENT_MF_MASK == Self::FRAGMENT_MF_MASK {
+                Ipv4Packet::FRAGMENT_MF_MASK
+            } else {
+                0x0000u16
+            };
+            let fragment_offset = (fragment_offset >> 3) & Self::FRAGMENT_OFFSET_MASK;
+            let fragment_offset_ipv4 = df_flag | mf_flag | fragment_offset;
+            dest[6..8].copy_from_slice(&fragment_offset_ipv4.to_be_bytes());
+        } else {
+            dest[4..6].fill(0);
+            dest[6..8].copy_from_slice(&df_flag.to_be_bytes());
+        };
+        dest[8] = self.hop_limit().saturating_sub(0);
+        dest[9] = self.transport_protocol().to_u8();
+        dest[12..16].copy_from_slice(&self.data[20..24]);
+        dest[16..20].copy_from_slice(&self.data[36..40]);
+
+        dest[10..12].fill(0);
+        let mut checksum = Checksum::new();
+        checksum.add_slice(dest);
+        checksum.fold();
+        dest[10..12].copy_from_slice(&checksum.value().to_be_bytes());
+        Ok(())
+    }
+
     fn write_converted(&self, dest: &mut [u8]) -> Result<usize, IpError> {
-        // TODO 0.5.0: implement https://datatracker.ietf.org/doc/html/rfc7915#section-5.1
-        Ok(0)
+        let transport_data = self.transport_data.full_data();
+        let transport_protocol = self.transport_protocol();
+        if dest.len() < 20 + transport_data.len() {
+            return Err("Not enough space to translate from IPv6 to IPv4".into());
+        }
+        self.write_converted_ip_header(
+            &mut dest[0..20],
+            self.fragment_extension_data,
+            transport_data.len(),
+        )?;
+        dest[20..20 + transport_data.len()].copy_from_slice(transport_data);
+        if transport_protocol.supports_checksum() {
+            let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
+            let add = Ipv4Packet::pseudo_checksum(&dest, transport_protocol, transport_data.len());
+            self.transport_data.write_translated_checksum(
+                &mut dest[20..20 + transport_data.len()],
+                remove,
+                add,
+            );
+        }
+
+        Ok(20 + transport_data.len())
+    }
+
+    fn write_udp_forward(
+        &self,
+        dest: &mut [u8],
+        data_range: Range<usize>,
+    ) -> Result<usize, IpError> {
+        if data_range.start < 20 + 8 {
+            return Err("Not enough space to add IPv4 header in UDP translation".into());
+        }
+        let start_offset = data_range.start - 28;
+        self.write_converted_ip_header(
+            &mut dest[start_offset..start_offset + 20],
+            None,
+            data_range.len() + 8,
+        )?;
+        dest[start_offset + 20..start_offset + 24]
+            .copy_from_slice(&self.transport_data.full_data()[0..4]);
+        dest[start_offset + 24..start_offset + 26]
+            .copy_from_slice(&(data_range.len() as u16 + 8).to_be_bytes());
+
+        dest[start_offset + 26..start_offset + 28].fill(0);
+        let mut checksum = Ipv4Packet::pseudo_checksum(
+            &dest[start_offset..start_offset + 20],
+            self.transport_protocol(),
+            data_range.len() + 8,
+        );
+        checksum.add_slice(&dest[start_offset + 20..data_range.end]);
+        checksum.fold();
+
+        let checksum = checksum.value();
+        let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
+        dest[start_offset + 26..start_offset + 28].copy_from_slice(&checksum.to_be_bytes());
+
+        Ok(start_offset)
     }
 
     fn write_udp_response(
@@ -337,7 +685,7 @@ impl Ipv6Packet<'_> {
             ip_header[0..2].copy_from_slice(&first.to_be_bytes());
             ip_header[2..4].fill(0);
             ip_header[4..6].copy_from_slice(&udp_length.to_be_bytes());
-            ip_header[6] = TransportProtocolType::UDP.0;
+            ip_header[6] = TransportProtocolType::UDP.to_u8();
             ip_header[7] = 1;
             ip_header[8..24].copy_from_slice(&self.data[24..40]);
             ip_header[24..40].copy_from_slice(&self.data[8..24]);
@@ -353,7 +701,7 @@ impl Ipv6Packet<'_> {
         udp_header[4..6].copy_from_slice(&udp_length.to_be_bytes());
         udp_header[6..8].fill(0);
 
-        checksum.add_slice(&[0u8, TransportProtocolType::UDP.0]);
+        checksum.add_slice(&[0u8, TransportProtocolType::UDP.to_u8()]);
         checksum.add_slice(udp_header);
         checksum.fold();
 
@@ -463,37 +811,8 @@ impl<'a> IpPacket<'a> {
 
     fn into_data(self) -> &'a [u8] {
         match self {
-            IpPacket::V4(packet) => packet.data,
-            IpPacket::V6(packet) => packet.data,
-        }
-    }
-
-    fn pseudo_checksum(&self, transport_length: usize) -> Checksum {
-        match self {
-            IpPacket::V4(packet) => packet.pseudo_checksum(transport_length),
-            IpPacket::V6(packet) => packet.pseudo_checksum(transport_length),
-        }
-    }
-
-    fn validate_ip_checksum(&self) -> bool {
-        match self {
-            IpPacket::V4(packet) => packet.validate_ip_checksum(),
-            IpPacket::V6(_) => true,
-        }
-    }
-
-    fn validate_transport_checksum(&self) -> bool {
-        let transport_data = self.transport_protocol_data();
-        if let Some(checksum) = transport_data.checksum() {
-            if transport_data.protocol() == TransportProtocolType::UDP && checksum == 0x0000 {
-                return true;
-            }
-            let mut calculated_checksum = self.pseudo_checksum(transport_data.full_data().len());
-            calculated_checksum.add_slice(transport_data.full_data());
-            calculated_checksum.fold();
-            calculated_checksum.value() == 0x0000
-        } else {
-            true
+            IpPacket::V4(packet) => packet.into_data(),
+            IpPacket::V6(packet) => packet.into_data(),
         }
     }
 
@@ -501,25 +820,6 @@ impl<'a> IpPacket<'a> {
         match self {
             IpPacket::V4(packet) => packet.fragment_offset(),
             IpPacket::V6(packet) => packet.fragment_offset(),
-        }
-    }
-
-    fn write_converted(&self, dest: &mut [u8]) -> Result<usize, IpError> {
-        // TODO 0.5.0: copy packet contents or rewrite in place?
-        match self {
-            IpPacket::V4(packet) => packet.write_converted(dest),
-            IpPacket::V6(packet) => packet.write_converted(dest),
-        }
-    }
-
-    fn write_udp_response(
-        &self,
-        dest: &mut [u8],
-        data_range: Range<usize>,
-    ) -> Result<usize, IpError> {
-        match self {
-            IpPacket::V4(_) => Err("UDP responses not implemented for IPv4".into()),
-            IpPacket::V6(packet) => packet.write_udp_response(dest, data_range),
         }
     }
 }
@@ -682,6 +982,31 @@ impl TransportData<'_> {
         }
     }
 
+    fn write_translated_checksum(&self, dest: &mut [u8], remove: Checksum, add: Checksum) {
+        match self {
+            TransportData::Udp(data) => {
+                let mut checksum = [0u8; 2];
+                checksum.copy_from_slice(&data[6..8]);
+                let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+                checksum.incremental_update(remove, add);
+                checksum.fold();
+
+                let checksum = checksum.value();
+                let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
+                dest[6..8].copy_from_slice(&checksum.to_be_bytes());
+            }
+            TransportData::Tcp(data, _) => {
+                let mut checksum = [0u8; 2];
+                checksum.copy_from_slice(&data[16..18]);
+                let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+                checksum.incremental_update(remove, add);
+                checksum.fold();
+                dest[16..18].copy_from_slice(&checksum.value().to_be_bytes());
+            }
+            TransportData::Unknown(_, _) => {}
+        }
+    }
+
     fn protocol(&self) -> TransportProtocolType {
         match self {
             TransportData::Udp(_) => TransportProtocolType::UDP,
@@ -740,6 +1065,7 @@ impl fmt::Display for TransportData<'_> {
 #[derive(Clone)]
 pub struct Nat64Prefix {
     range: RangeInclusive<Ipv6Addr>,
+    prefix_octets: [u8; 12],
 }
 
 impl Nat64Prefix {
@@ -748,9 +1074,16 @@ impl Nat64Prefix {
         let mut end_addr = prefix.octets();
         start_addr[12..16].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         end_addr[12..16].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        let mut prefix_octets = [0u8; 12];
+        prefix_octets[0..12].copy_from_slice(&prefix.octets()[0..12]);
         Nat64Prefix {
             range: start_addr.into()..=end_addr.into(),
+            prefix_octets,
         }
+    }
+
+    fn prefix(&self) -> [u8; 12] {
+        self.prefix_octets
     }
 
     fn map_ipv4(&self, addr: &Ipv4Addr) -> Ipv6Addr {
@@ -917,6 +1250,25 @@ impl Network {
         }
     }
 
+    pub fn translate_ipv4_header(&self, hdr: &IpHeader) -> Option<IpHeader> {
+        let nat64_prefix = self.nat64_prefix.as_ref()?;
+        let src_addr = match &hdr.src_addr {
+            IpAddr::V4(addr) => IpAddr::V6(nat64_prefix.map_ipv4(addr)),
+            IpAddr::V6(_) => return None,
+        };
+        let dst_addr = match &hdr.dst_addr {
+            IpAddr::V4(addr) => IpAddr::V6(nat64_prefix.map_ipv4(addr)),
+            IpAddr::V6(_) => return None,
+        };
+        Some(IpHeader {
+            src_addr,
+            dst_addr,
+            src_port: hdr.src_port,
+            dst_port: hdr.dst_port,
+            transport_protocol: hdr.transport_protocol,
+        })
+    }
+
     fn dns_matches_tunnel(&self, dns_packet: &DnsPacket) -> bool {
         let tunnel_domains = self.tunnel_domains_dns.domains();
         if tunnel_domains.is_empty() {
@@ -932,48 +1284,63 @@ impl Network {
     pub fn translate_packet_from_esp<'a>(
         &mut self,
         packet: IpPacket<'a>,
+        header: IpHeader,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionEsp<'a>, IpError> {
         if !self.is_nat64() {
             let data = packet.into_data();
-            Ok(RoutingActionEsp::Forward(data))
-        } else if DnsPacket::is_dns(&packet.to_header()) {
-            if !packet.validate_ip_checksum() {
-                return Err("DNS packet has invalid IP checksum".into());
-            }
+            return Ok(RoutingActionEsp::Forward(data));
+        };
+        let packet = match packet {
+            IpPacket::V6(packet) => packet,
+            IpPacket::V4(_) => return Err("Cannot translate IPv6 packet in NAT64".into()),
+        };
+        // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
+        // limit is 1 (would be reduced to 1)
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1
+        // TODO 0.5.0: if fragment header is followed by an unsupported payload, drop it.
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1.1
+
+        let is_dns_ip = self.dns_addrs.contains(&IpAddr::V6(packet.dst_addr()));
+        if !is_dns_ip {
+            let length = packet.write_converted(out_buf)?;
+            debug_print_packet(&out_buf[..length]);
+            Ok(RoutingActionEsp::Forward(&out_buf[..length]))
+        } else {
             if !packet.validate_transport_checksum() {
                 return Err("DNS packet has invalid UDP checksum".into());
             }
             if packet.fragment_offset().is_some() {
                 return Err("DNS packet is fragmented".into());
             }
-            self.translate_dns_packet_from_esp(packet, out_buf)
-        } else {
-            let data = packet.into_data();
-            Ok(RoutingActionEsp::Forward(data))
+            self.translate_dns_packet_from_esp(packet, header, out_buf)
         }
     }
 
-    pub fn translate_dns_packet_from_esp<'a>(
+    fn translate_dns_packet_from_esp<'a>(
         &mut self,
-        packet: IpPacket<'a>,
+        packet: Ipv6Packet<'a>,
+        header: IpHeader,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionEsp<'a>, IpError> {
-        let nat64_prefix = if let Some(nat64_prefix) = &self.nat64_prefix {
-            nat64_prefix
-        } else {
-            let data = packet.into_data();
-            return Ok(RoutingActionEsp::Forward(data));
-        };
+        let is_dns_port = packet.transport_protocol_data().protocol() == TransportProtocolType::UDP
+            && header.dst_port() == Some(&53);
+        // TODO 0.5.0: To send back error responses, add ICMP handling from
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-5.2
+        if !is_dns_port {
+            warn!("Dropping non-standard packet to DNS server {}", header);
+            return Ok(RoutingActionEsp::Drop);
+        }
         let dns_packet =
             DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
-        trace!("Decoded DNS packet: {}", dns_packet);
+        trace!("Decoded DNS packet from ESP: {}", dns_packet);
         // Reserve space for UDP header.
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE];
         if !self.dns_matches_tunnel(&dns_packet) {
-            let data = packet.into_data();
-            return Ok(RoutingActionEsp::Forward(data));
+            let length = packet.write_converted(out_buf)?;
+            debug_print_packet(&out_buf[..length]);
+            return Ok(RoutingActionEsp::Forward(&out_buf[..length]));
         }
 
         let dns_translator = if let Some(dns_translator) = &mut self.dns_translator {
@@ -990,9 +1357,13 @@ impl Network {
                     trace!("Rewrote DNS request from ESP: {}", dns_packet);
                 }
 
-                // let length = packet.write_converted(out_buf);
-                // TODO 0.5.0: prepend IP + UDP header.
-                RoutingActionEsp::Forward(&out_buf[..length])
+                let start_offset = packet.write_udp_forward(
+                    out_buf,
+                    MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
+                )?;
+                let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
+                debug_print_packet(&out_buf[start_offset..data_end]);
+                RoutingActionEsp::Forward(&out_buf[start_offset..data_end])
             }
             dns::DnsTranslationAction::ReplyToSender(length) => {
                 if log::log_enabled!(log::Level::Trace) {
@@ -1003,83 +1374,121 @@ impl Network {
                     out_buf,
                     MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
                 )?;
-                let full_length = MAX_TRANSLATED_IP_HEADER_LENGTH + length - start_offset;
-                {
-                    let test_packet = IpPacket::from_data(
-                        &out_buf[start_offset..MAX_TRANSLATED_IP_HEADER_LENGTH + length],
-                    )
-                    .unwrap();
-                    println!("Checksum is {}", test_packet.validate_transport_checksum());
-                }
-                RoutingActionEsp::ReturnToSender(&mut out_buf[start_offset..], full_length)
+                let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
+                debug_print_packet(&out_buf[start_offset..data_end]);
+                RoutingActionEsp::ReturnToSender(
+                    &mut out_buf[start_offset..],
+                    data_end - start_offset,
+                )
             }
         };
         Ok(action)
-        // TODO 0.5.0: Remove this temporary debug code.
-        /*
-        let translated_packet = match action {
-            RoutingActionEsp::Forward(data) => data,
-            RoutingActionEsp::ReturnToSender(ref dest_buf, translated_length) => {
-                &dest_buf[..translated_length]
-            }
-        };
-        let dns_request = translated_packet.to_vec();
-        drop(action);
-        let mut dns_translator = self.dns_translator.clone();
-        let destination_address = match packet.dst_addr() {
-            IpAddr::V4(addr) => addr,
-            IpAddr::V6(addr) => {
-                let mut octets = [0u8; 4];
-                octets.copy_from_slice(&addr.octets()[12..16]);
-                Ipv4Addr::from(octets)
-            }
-        };
-        let remote_addr = SocketAddr::new(IpAddr::V4(destination_address), 53);
-        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let socket = UdpSocket::bind(local_addr).expect("Failed to bind DNS socket");
-        socket
-            .connect(remote_addr)
-            .expect("Failed to connect to DNS server");
-        socket
-            .send(dns_request.as_slice())
-            .expect("Failed to send DNS request");
-        let mut data = [0u8; 1500];
-        let len = socket
-            .recv(&mut data)
-            .expect("Failed to receive DNS response");
-        let data = &data[..len];
-        println!("Received DNS response {}", fmt_slice_hex(data));
-        let dns_packet =
-            DnsPacket::from_udp_payload(data).expect("Failed to parse DNS response packet");
-        trace!("Decoded DNS response: {}", dns_packet);
+    }
 
-        // TODO 0.5.0: add IP header to out_buf.
-
-        let length = if let Some(translator) = &mut dns_translator {
-            match translator.translate_to_esp(&dns_packet, out_buf) {
-                Ok(length) => length,
-                Err(err) => {
-                    println!("Failed to translate DNS response: {}", err);
-                    0
-                }
-            }
+    pub fn translate_packet_from_vpn<'a>(
+        &mut self,
+        ip_header: IpHeader,
+        in_buf: &'a mut [u8],
+        data_len: usize,
+        out_buf: &'a mut [u8],
+    ) -> Result<RoutingActionVpn<'a>, IpError> {
+        let nat64_prefix = if let Some(nat64_prefix) = &self.nat64_prefix {
+            nat64_prefix
         } else {
-            0
+            return Ok(RoutingActionVpn::Forward(in_buf, data_len));
         };
-        if length > 0 {
-            let dns_packet = DnsPacket::from_udp_payload(&out_buf[..length])
-                .expect("Failed to decode translated DNS response");
-            println!("Rewrote DNS response: {}", dns_packet);
+        let packet = IpPacket::from_data(&in_buf[..data_len])?;
+        // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
+        // limit is 1 (would be reduced to 1)
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.1
+
+        let packet = match packet {
+            IpPacket::V4(packet) => packet,
+            IpPacket::V6(_) => return Err("Cannot translate IPv6 packet in NAT64".into()),
+        };
+        let dns_translated = IpAddr::V6(nat64_prefix.map_ipv4(&packet.src_addr()));
+        let is_dns_ip = self.dns_addrs.contains(&dns_translated);
+        if !is_dns_ip {
+            let length = packet.write_converted(out_buf, nat64_prefix.prefix())?;
+            debug_print_packet(&out_buf[..length]);
+            Ok(RoutingActionVpn::Forward(out_buf, length))
+        } else {
+            if !packet.validate_ip_checksum() {
+                return Err("DNS packet has invalid IP checksum".into());
+            }
+            if !packet.validate_transport_checksum() {
+                return Err("DNS packet has invalid UDP checksum".into());
+            }
+            if packet.fragment_offset().is_some() {
+                return Err("DNS packet is fragmented".into());
+            }
+            self.translate_dns_packet_from_vpn(packet, ip_header, out_buf, nat64_prefix.prefix())
+        }
+    }
+
+    fn translate_dns_packet_from_vpn<'a>(
+        &mut self,
+        packet: Ipv4Packet<'a>,
+        header: IpHeader,
+        out_buf: &'a mut [u8],
+        nat_prefix: [u8; 12],
+    ) -> Result<RoutingActionVpn<'a>, IpError> {
+        let is_dns_port = packet.transport_protocol_data().protocol() == TransportProtocolType::UDP
+            && header.src_port() == Some(&53);
+        // TODO 0.5.0: To send back error responses, add ICMP handling from
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.2
+        if !is_dns_port {
+            warn!("Dropping non-standard packet to DNS server {}", header);
+            return Ok(RoutingActionVpn::Drop);
+        }
+        let dns_packet =
+            DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
+        trace!("Decoded DNS packet from VPN: {}", dns_packet);
+        // Reserve space for UDP header.
+        let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
+            ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE];
+        if !self.dns_matches_tunnel(&dns_packet) {
+            let length = packet.write_converted(out_buf, nat_prefix)?;
+            debug_print_packet(&out_buf[..length]);
+            return Ok(RoutingActionVpn::Forward(out_buf, length));
         }
 
-        Ok(RoutingActionEsp::ReturnToSender(out_buf, length))
-        */
+        let dns_translator = if let Some(dns_translator) = &mut self.dns_translator {
+            dns_translator
+        } else {
+            return Err("DNS translator is not available".into());
+        };
+
+        let length = dns_translator.translate_to_esp(&dns_packet, dest_buf)?;
+        if log::log_enabled!(log::Level::Trace) {
+            let dns_packet = DnsPacket::from_udp_payload(&dest_buf[..length])?;
+            trace!("Rewrote DNS response from VPN: {}", dns_packet);
+        }
+
+        let start_offset = packet.write_udp_forward(
+            out_buf,
+            MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
+            nat_prefix,
+        )?;
+        let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length - start_offset;
+        debug_print_packet(&out_buf[start_offset..data_end]);
+        Ok(RoutingActionVpn::Forward(
+            &mut out_buf[start_offset..],
+            data_end - start_offset,
+        ))
     }
 }
 
 pub enum RoutingActionEsp<'a> {
     Forward(&'a [u8]),
     ReturnToSender(&'a mut [u8], usize),
+    Drop,
+}
+
+pub enum RoutingActionVpn<'a> {
+    Forward(&'a mut [u8], usize),
+    ReturnToSender(&'a [u8]),
+    Drop,
 }
 
 struct Checksum(u32);
@@ -1220,5 +1629,35 @@ impl From<io::Error> for IpError {
 impl From<&'static str> for IpError {
     fn from(msg: &'static str) -> IpError {
         Self::Internal(msg)
+    }
+}
+
+fn debug_print_packet(data: &[u8]) {
+    // TODO 0.5.0: Remove this debug code once everything's ready.
+    let packet = match IpPacket::from_data(data) {
+        Ok(packet) => packet,
+        Err(err) => {
+            println!("Error validating packet: {}\n{}", err, fmt_slice_hex(data));
+            return;
+        }
+    };
+
+    println!("> Processed packet {}\n  - {}", packet, fmt_slice_hex(data));
+    match &packet {
+        IpPacket::V4(packet) => {
+            let valid_transport = packet.validate_transport_checksum();
+            let valid_ip = packet.validate_ip_checksum();
+            if !valid_transport || !valid_ip {
+                println!(
+                    "! Checksum validation failed: transport={} ip={}",
+                    valid_transport, valid_ip
+                );
+            }
+        }
+        IpPacket::V6(packet) => {
+            if !packet.validate_transport_checksum() {
+                println!("! Checksum validation for transport failed",)
+            }
+        }
     }
 }
