@@ -757,7 +757,6 @@ impl<'a> IpPacket<'a> {
         if data.is_empty() {
             return Err("IP packet is empty, cannot extract header data".into());
         }
-        // TODO 0.5.0: Extract header here, to return error immediately and reuse results for rewriting?
         match data[0] >> 4 {
             4 => Ok(IpPacket::V4(Ipv4Packet::from_data(data)?)),
             6 => Ok(IpPacket::V6(Ipv6Packet::from_data(data)?)),
@@ -1636,7 +1635,9 @@ fn debug_print_packet(data: &[u8]) {
         }
     };
 
-    println!("> Processed packet {}\n  - {}", packet, fmt_slice_hex(data));
+    if packet.fragment_offset().is_some() {
+        println!("> Packet is fragmented: {}", fmt_slice_hex(data));
+    }
     match &packet {
         IpPacket::V4(packet) => {
             let valid_transport = packet.validate_transport_checksum();
