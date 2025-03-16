@@ -984,13 +984,16 @@ impl TransportData<'_> {
             TransportData::Udp(data) => {
                 let mut checksum = [0u8; 2];
                 checksum.copy_from_slice(&data[6..8]);
-                let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
-                checksum.incremental_update(remove, add);
-                checksum.fold();
+                let checksum = u16::from_be_bytes(checksum);
+                if checksum != 0x0000 {
+                    let mut checksum = Checksum::from_inverted(checksum);
+                    checksum.incremental_update(remove, add);
+                    checksum.fold();
 
-                let checksum = checksum.value();
-                let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
-                dest[6..8].copy_from_slice(&checksum.to_be_bytes());
+                    let checksum = checksum.value();
+                    let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
+                    dest[6..8].copy_from_slice(&checksum.to_be_bytes());
+                }
             }
             TransportData::Tcp(data, _) => {
                 let mut checksum = [0u8; 2];
