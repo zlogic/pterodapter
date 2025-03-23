@@ -43,10 +43,10 @@ impl TransportProtocolType {
 
     fn length(&self, data: &[u8]) -> usize {
         match *self {
-            Self::HOP_BY_HOP_OPTIONS => data[1] as usize + 1,
-            Self::IPV6_ROUTING => data[1] as usize + 1,
+            Self::HOP_BY_HOP_OPTIONS => 8 + data[1] as usize,
+            Self::IPV6_ROUTING => 8 + data[1] as usize,
             Self::IPV6_FRAGMENT => 8,
-            Self::IPV6_DESTINATION_OPTIONS => data[1] as usize + 1,
+            Self::IPV6_DESTINATION_OPTIONS => 8 + data[1] as usize,
             Self::IPV6_NO_NEXT_HEADER => data.len(),
             Self::IPV6_AH => 2 + (data[1] as usize) * 4,
             Self::IPV6_MOBILITY => 8 + (data[1] as usize) * 8,
