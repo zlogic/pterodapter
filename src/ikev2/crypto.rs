@@ -1122,13 +1122,11 @@ impl From<&'static str> for InitError {
     }
 }
 
-pub struct CryptoError {
-    msg: &'static str,
-}
+pub struct CryptoError(&'static str);
 
 impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(self.msg)
+        f.write_str(self.0)
     }
 }
 
@@ -1140,12 +1138,12 @@ impl fmt::Debug for CryptoError {
 
 impl error::Error for CryptoError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(self)
+        None
     }
 }
 
 impl From<&'static str> for CryptoError {
     fn from(msg: &'static str) -> CryptoError {
-        CryptoError { msg }
+        CryptoError(msg)
     }
 }

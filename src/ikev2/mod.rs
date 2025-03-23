@@ -1135,18 +1135,18 @@ pub enum SendError {
 
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(ref e) => write!(f, "IO error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {}", e),
         }
     }
 }
 
 impl error::Error for SendError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Io(ref err) => Some(err),
+            Self::Io(err) => Some(err),
         }
     }
 }
@@ -1180,36 +1180,36 @@ pub enum IKEv2Error {
 
 impl fmt::Display for IKEv2Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Format(ref e) => write!(f, "Format error: {}", e),
+            Self::Format(e) => write!(f, "Format error: {}", e),
             Self::NotEnoughSpace(_) => write!(f, "Not enough space error"),
-            Self::CertError(ref e) => write!(f, "PKI cert error: {}", e),
-            Self::Session(ref e) => write!(f, "IKEv2 session error: {}", e),
-            Self::Esp(ref e) => write!(f, "ESP error: {}", e),
-            Self::Ip(ref e) => write!(f, "IP error: {}", e),
-            Self::Forti(ref e) => write!(f, "VPN error: {}", e),
-            Self::SendError(ref e) => write!(f, "Send error: {}", e),
-            Self::Join(ref e) => write!(f, "Tokio join error: {}", e),
-            Self::Io(ref e) => write!(f, "IO error: {}", e),
+            Self::CertError(e) => write!(f, "PKI cert error: {}", e),
+            Self::Session(e) => write!(f, "IKEv2 session error: {}", e),
+            Self::Esp(e) => write!(f, "ESP error: {}", e),
+            Self::Ip(e) => write!(f, "IP error: {}", e),
+            Self::Forti(e) => write!(f, "VPN error: {}", e),
+            Self::SendError(e) => write!(f, "Send error: {}", e),
+            Self::Join(e) => write!(f, "Tokio join error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {}", e),
         }
     }
 }
 
 impl error::Error for IKEv2Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Format(ref err) => Some(err),
-            Self::NotEnoughSpace(ref err) => Some(err),
-            Self::CertError(ref err) => Some(err),
-            Self::Session(ref err) => Some(err),
-            Self::Esp(ref err) => Some(err),
-            Self::Ip(ref err) => Some(err),
-            Self::Forti(ref err) => Some(err),
-            Self::SendError(ref err) => Some(err),
-            Self::Join(ref err) => Some(err),
-            Self::Io(ref err) => Some(err),
+            Self::Format(err) => Some(err),
+            Self::NotEnoughSpace(err) => Some(err),
+            Self::CertError(err) => Some(err),
+            Self::Session(err) => Some(err),
+            Self::Esp(err) => Some(err),
+            Self::Ip(err) => Some(err),
+            Self::Forti(err) => Some(err),
+            Self::SendError(err) => Some(err),
+            Self::Join(err) => Some(err),
+            Self::Io(err) => Some(err),
         }
     }
 }

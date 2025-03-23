@@ -408,13 +408,13 @@ pub enum CertError {
 
 impl fmt::Display for CertError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Rustls(ref e) => write!(f, "Rustls error: {}", e),
-            Self::Webpki(ref e) => write!(f, "WebPKI error: {}", e),
-            Self::VerifierBuilder(ref e) => write!(f, "Verifier Builder error: {}", e),
-            Self::X509(ref e) => write!(f, "X509 error: {}", e),
-            Self::Base64(ref e) => write!(f, "Base64 decode error: {}", e),
+            Self::Rustls(e) => write!(f, "Rustls error: {}", e),
+            Self::Webpki(e) => write!(f, "WebPKI error: {}", e),
+            Self::VerifierBuilder(e) => write!(f, "Verifier Builder error: {}", e),
+            Self::X509(e) => write!(f, "X509 error: {}", e),
+            Self::Base64(e) => write!(f, "Base64 decode error: {}", e),
         }
     }
 }

@@ -381,18 +381,18 @@ pub enum EspError {
 
 impl fmt::Display for EspError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Ip(ref err) => write!(f, "IP error {}", err),
+            Self::Ip(err) => write!(f, "IP error {}", err),
         }
     }
 }
 
 impl error::Error for EspError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Ip(ref err) => Some(err),
+            Self::Ip(err) => Some(err),
         }
     }
 }

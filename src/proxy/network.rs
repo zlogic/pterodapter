@@ -662,28 +662,22 @@ pub enum NetworkError {
 
 impl fmt::Display for NetworkError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Connect(ref e) => {
-                write!(f, "Connect error: {}", e)
-            }
-            Self::Io(ref e) => {
-                write!(f, "IO error: {}", e)
-            }
-            Self::Forti(ref e) => {
-                write!(f, "VPN error: {}", e)
-            }
+            Self::Connect(e) => write!(f, "Connect error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {}", e),
+            Self::Forti(e) => write!(f, "VPN error: {}", e),
         }
     }
 }
 
 impl error::Error for NetworkError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Connect(ref err) => Some(err),
-            Self::Io(ref err) => Some(err),
-            Self::Forti(ref err) => Some(err),
+            Self::Connect(err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::Forti(err) => Some(err),
         }
     }
 }

@@ -11,6 +11,7 @@ use crate::logger::fmt_slice_hex;
 use super::message;
 
 mod dns;
+mod icmp;
 
 // Reserve this amount of bytes for the translated IP header.
 // The worst case scenario is IPv6 with fragmentation.
@@ -19,8 +20,6 @@ const MAX_TRANSLATED_IP_HEADER_LENGTH: usize = 40 + 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TransportProtocolType(u8);
-
-pub type DnsPacket<'a> = dns::DnsPacket<'a>;
 
 impl TransportProtocolType {
     const HOP_BY_HOP_OPTIONS: TransportProtocolType = TransportProtocolType(0);
@@ -256,6 +255,7 @@ impl<'a> Ipv4Packet<'a> {
             if transport_data.protocol() == TransportProtocolType::UDP && checksum == 0x0000 {
                 return true;
             }
+            // TODO 0.5.0: ICMPv4 doesn't use pseudoheaders.
             let mut calculated_checksum = Self::pseudo_checksum(
                 self.data,
                 self.transport_protocol(),
@@ -357,6 +357,9 @@ impl<'a> Ipv4Packet<'a> {
     fn write_converted(&self, dest: &mut [u8], nat64_prefix: [u8; 12]) -> Result<usize, IpError> {
         let transport_data = self.transport_data.full_data();
         let transport_protocol = self.transport_protocol();
+        if transport_protocol == TransportProtocolType::IPV6_ICMP {
+            return Err("ICMPv6 payload found in IPv4 packet".into());
+        }
         let fragmentation_extension = self.is_fragmented();
         let header_len = if fragmentation_extension { 48 } else { 40 };
         self.write_converted_ip_header(
@@ -625,6 +628,9 @@ impl<'a> Ipv6Packet<'a> {
     fn write_converted(&self, dest: &mut [u8]) -> Result<usize, IpError> {
         let transport_data = self.transport_data.full_data();
         let transport_protocol = self.transport_protocol();
+        if transport_protocol == TransportProtocolType::ICMP {
+            return Err("ICMPv4 payload found in IPv6 packet".into());
+        }
         if dest.len() < 20 + transport_data.len() {
             return Err("Not enough space to translate from IPv6 to IPv4".into());
         }
@@ -950,7 +956,7 @@ impl fmt::Display for IpHeader {
 pub enum TransportData<'a> {
     Udp(&'a [u8]),
     Tcp(&'a [u8], usize),
-    Unknown(TransportProtocolType, &'a [u8]),
+    Generic(TransportProtocolType, &'a [u8]),
 }
 
 impl TransportData<'_> {
@@ -977,7 +983,7 @@ impl TransportData<'_> {
                     Err("Not enough data for TCP header".into())
                 }
             }
-            generic => Ok(TransportData::Unknown(generic, data)),
+            generic => Ok(TransportData::Generic(generic, data)),
         }
     }
 
@@ -985,7 +991,7 @@ impl TransportData<'_> {
         match self {
             TransportData::Udp(data) => data,
             TransportData::Tcp(data, _) => data,
-            TransportData::Unknown(_, data) => data,
+            TransportData::Generic(_, data) => data,
         }
     }
 
@@ -993,7 +999,7 @@ impl TransportData<'_> {
         match self {
             TransportData::Udp(data) => &data[8..],
             TransportData::Tcp(data, data_offset) => &data[*data_offset..],
-            TransportData::Unknown(_, data) => data,
+            TransportData::Generic(_, data) => data,
         }
     }
 
@@ -1009,7 +1015,14 @@ impl TransportData<'_> {
                 checksum.copy_from_slice(&data[16..18]);
                 Some(u16::from_be_bytes(checksum))
             }
-            TransportData::Unknown(_, _) => None,
+            TransportData::Generic(protocol, data) => match *protocol {
+                TransportProtocolType::ICMP | TransportProtocolType::IPV6_ICMP => {
+                    let mut checksum = [0u8; 2];
+                    checksum.copy_from_slice(&data[2..4]);
+                    Some(u16::from_be_bytes(checksum))
+                }
+                _ => None,
+            },
         }
     }
 
@@ -1037,7 +1050,7 @@ impl TransportData<'_> {
                 checksum.fold();
                 dest[16..18].copy_from_slice(&checksum.value().to_be_bytes());
             }
-            TransportData::Unknown(_, _) => {}
+            TransportData::Generic(_, _) => {}
         }
     }
 
@@ -1045,7 +1058,7 @@ impl TransportData<'_> {
         match self {
             TransportData::Udp(_) => TransportProtocolType::UDP,
             TransportData::Tcp(_, _) => TransportProtocolType::TCP,
-            TransportData::Unknown(protocol, _) => *protocol,
+            TransportData::Generic(protocol, _) => *protocol,
         }
     }
 
@@ -1056,7 +1069,7 @@ impl TransportData<'_> {
                 src_port.copy_from_slice(&data[0..2]);
                 Some(u16::from_be_bytes(src_port))
             }
-            TransportData::Unknown(_, _) => None,
+            TransportData::Generic(_, _) => None,
         }
     }
 
@@ -1067,7 +1080,7 @@ impl TransportData<'_> {
                 dst_port.copy_from_slice(&data[2..4]);
                 Some(u16::from_be_bytes(dst_port))
             }
-            TransportData::Unknown(_, _) => None,
+            TransportData::Generic(_, _) => None,
         }
     }
 }
@@ -1089,9 +1102,19 @@ impl fmt::Display for TransportData<'_> {
                     write!(f, "TCP C=?: {}", fmt_slice_hex(data))
                 }
             }
-            TransportData::Unknown(protocol, data) => {
-                write!(f, "{} {}", protocol, fmt_slice_hex(data))
-            }
+            TransportData::Generic(protocol, data) => match *protocol {
+                TransportProtocolType::ICMP => match icmp::IcmpMessage::from_icmpv4_data(data) {
+                    Ok(icmp) => icmp.fmt(f),
+                    Err(err) => write!(f, "ICMPv4 error: {}", err),
+                },
+                TransportProtocolType::IPV6_ICMP => {
+                    match icmp::IcmpMessage::from_icmpv6_data(data) {
+                        Ok(icmp) => icmp.fmt(f),
+                        Err(err) => write!(f, "ICMPv6 error: {}", err),
+                    }
+                }
+                protocol => write!(f, "{} {}", protocol, fmt_slice_hex(data)),
+            },
         }
     }
 }
@@ -1303,7 +1326,7 @@ impl Network {
         })
     }
 
-    fn dns_matches_tunnel(&self, dns_packet: &DnsPacket) -> bool {
+    fn dns_matches_tunnel(&self, dns_packet: &dns::DnsPacket) -> bool {
         let tunnel_domains = self.tunnel_domains_dns.domains();
         if tunnel_domains.is_empty() {
             // Match all domains, without exception.
@@ -1327,11 +1350,14 @@ impl Network {
         };
         let packet = match packet {
             IpPacket::V6(packet) => packet,
-            IpPacket::V4(_) => return Err("Cannot translate IPv6 packet in NAT64".into()),
+            IpPacket::V4(_) => return Err("Cannot translate IPv4 packet in NAT64".into()),
         };
         // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
         // limit is 1 (would be reduced to 1)
         // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1
+        if packet.transport_protocol() == TransportProtocolType::IPV6_ICMP {
+            return self.translate_icmp_packet_from_esp(packet, header, out_buf);
+        }
         // TODO 0.5.0: if fragment header is followed by an unsupported payload, drop it.
         // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1.1
 
@@ -1341,12 +1367,6 @@ impl Network {
             debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionEsp::Forward(&out_buf[..length]))
         } else {
-            if !packet.validate_transport_checksum() {
-                return Err("DNS packet has invalid UDP checksum".into());
-            }
-            if packet.fragment_offset().is_some() {
-                return Err("DNS packet is fragmented".into());
-            }
             self.translate_dns_packet_from_esp(packet, header, out_buf)
         }
     }
@@ -1357,7 +1377,12 @@ impl Network {
         header: IpHeader,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionEsp<'a>, IpError> {
-        // Packets with a non-zero fragment offset will be ignored.
+        if !packet.validate_transport_checksum() {
+            return Err("DNS packet has invalid UDP checksum".into());
+        }
+        if packet.fragment_offset().is_some() {
+            return Err("DNS packet is fragmented".into());
+        }
         let is_dns_port = packet.transport_protocol_data().protocol() == TransportProtocolType::UDP
             && header.dst_port() == Some(&53);
         // TODO 0.5.0: To send back error responses, add ICMP handling from
@@ -1367,7 +1392,7 @@ impl Network {
             return Ok(RoutingActionEsp::Drop);
         }
         let dns_packet =
-            DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
+            dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
         trace!("Decoded DNS packet from ESP: {}", dns_packet);
         // Reserve space for UDP header.
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
@@ -1388,7 +1413,7 @@ impl Network {
         let action = match translation {
             dns::DnsTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
-                    let dns_packet = DnsPacket::from_udp_payload(&dest_buf[..length])?;
+                    let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
                     trace!("Rewrote DNS request from ESP: {}", dns_packet);
                 }
 
@@ -1402,7 +1427,7 @@ impl Network {
             }
             dns::DnsTranslationAction::ReplyToSender(length) => {
                 if log::log_enabled!(log::Level::Trace) {
-                    let dns_packet = DnsPacket::from_udp_payload(&dest_buf[..length])?;
+                    let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
                     trace!("Sending immediate DNS reply to ESP: {}", dns_packet);
                 }
                 let start_offset = packet.write_udp_response(
@@ -1420,9 +1445,30 @@ impl Network {
         Ok(action)
     }
 
+    fn translate_icmp_packet_from_esp<'a>(
+        &mut self,
+        packet: Ipv6Packet<'a>,
+        header: IpHeader,
+        out_buf: &'a mut [u8],
+    ) -> Result<RoutingActionEsp<'a>, IpError> {
+        if !packet.validate_transport_checksum() {
+            return Err("ICMPv6 packet has invalid ICMP checksum".into());
+        }
+        if packet.fragment_offset().is_some() {
+            return Err("ICMPv6 packet is fragmented".into());
+        }
+        // TODO 0.5.0 Implement ICMP translation as documented in
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.2
+
+        let icmp_packet =
+            icmp::IcmpMessage::from_icmpv6_data(packet.transport_protocol_data().full_data())?;
+        println!("Received ICMPv6 packet {}", icmp_packet);
+        return Err("Not implemented".into());
+    }
+
     pub fn translate_packet_from_vpn<'a>(
         &mut self,
-        ip_header: IpHeader,
+        header: IpHeader,
         in_buf: &'a mut [u8],
         data_len: usize,
         out_buf: &'a mut [u8],
@@ -1433,14 +1479,21 @@ impl Network {
             return Ok(RoutingActionVpn::Forward(in_buf, data_len));
         };
         let packet = IpPacket::from_data(&in_buf[..data_len])?;
-        // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
-        // limit is 1 (would be reduced to 1)
-        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.1
-
         let packet = match packet {
             IpPacket::V4(packet) => packet,
             IpPacket::V6(_) => return Err("Cannot translate IPv6 packet in NAT64".into()),
         };
+        // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
+        // limit is 1 (would be reduced to 1)
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.1
+        if packet.transport_protocol() == TransportProtocolType::ICMP {
+            return self.translate_icmp_packet_from_vpn(
+                packet,
+                header,
+                out_buf,
+                nat64_prefix.prefix(),
+            );
+        }
         let dns_translated = IpAddr::V6(nat64_prefix.map_ipv4(&packet.src_addr()));
         let is_dns_ip = self.dns_addrs.contains(&dns_translated);
         if !is_dns_ip {
@@ -1448,16 +1501,7 @@ impl Network {
             debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionVpn::Forward(out_buf, length))
         } else {
-            if !packet.validate_ip_checksum() {
-                return Err("DNS packet has invalid IP checksum".into());
-            }
-            if !packet.validate_transport_checksum() {
-                return Err("DNS packet has invalid UDP checksum".into());
-            }
-            if packet.fragment_offset().is_some() {
-                return Err("DNS packet is fragmented".into());
-            }
-            self.translate_dns_packet_from_vpn(packet, ip_header, out_buf, nat64_prefix.prefix())
+            self.translate_dns_packet_from_vpn(packet, header, out_buf, nat64_prefix.prefix())
         }
     }
 
@@ -1468,7 +1512,15 @@ impl Network {
         out_buf: &'a mut [u8],
         nat_prefix: [u8; 12],
     ) -> Result<RoutingActionVpn<'a>, IpError> {
-        // Packets with a non-zero fragment offset will be ignored.
+        if !packet.validate_ip_checksum() {
+            return Err("DNS packet has invalid IP checksum".into());
+        }
+        if !packet.validate_transport_checksum() {
+            return Err("DNS packet has invalid UDP checksum".into());
+        }
+        if packet.fragment_offset().is_some() {
+            return Err("DNS packet is fragmented".into());
+        }
         let is_dns_port = packet.transport_protocol_data().protocol() == TransportProtocolType::UDP
             && header.src_port() == Some(&53);
         // TODO 0.5.0: To send back error responses, add ICMP handling from
@@ -1478,7 +1530,7 @@ impl Network {
             return Ok(RoutingActionVpn::Drop);
         }
         let dns_packet =
-            DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
+            dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
         trace!("Decoded DNS packet from VPN: {}", dns_packet);
         // Reserve space for UDP header.
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
@@ -1497,7 +1549,7 @@ impl Network {
 
         let length = dns_translator.translate_to_esp(&dns_packet, dest_buf)?;
         if log::log_enabled!(log::Level::Trace) {
-            let dns_packet = DnsPacket::from_udp_payload(&dest_buf[..length])?;
+            let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
             trace!("Rewrote DNS response from VPN: {}", dns_packet);
         }
 
@@ -1512,6 +1564,30 @@ impl Network {
             &mut out_buf[start_offset..],
             data_end - start_offset,
         ))
+    }
+
+    fn translate_icmp_packet_from_vpn<'a>(
+        &mut self,
+        packet: Ipv4Packet<'a>,
+        header: IpHeader,
+        out_buf: &'a mut [u8],
+        nat_prefix: [u8; 12],
+    ) -> Result<RoutingActionVpn<'a>, IpError> {
+        if !packet.validate_ip_checksum() {
+            return Err("ICMPv4 packet has invalid IP checksum".into());
+        }
+        if !packet.validate_transport_checksum() {
+            return Err("ICMPv4 packet has invalid ICMP checksum".into());
+        }
+        if packet.fragment_offset().is_some() {
+            return Err("ICMPv4 packet is fragmented".into());
+        }
+        // TODO 0.5.0 Implement ICMP translation as documented in
+        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.2
+        let icmp_packet =
+            icmp::IcmpMessage::from_icmpv4_data(packet.transport_protocol_data().full_data())?;
+        println!("Received ICMPv4 packet {}", icmp_packet);
+        return Err("Not implemented".into());
     }
 }
 
@@ -1614,28 +1690,31 @@ impl TunnelDomainsDns {
 pub enum IpError {
     Internal(&'static str),
     Dns(dns::DnsError),
+    Icmp(icmp::IcmpError),
     Format(message::FormatError),
     Io(io::Error),
 }
 
 impl fmt::Display for IpError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Dns(ref e) => write!(f, "DNS error: {}", e),
-            Self::Format(ref e) => write!(f, "Format error: {}", e),
-            Self::Io(ref e) => write!(f, "IO error: {}", e),
+            Self::Dns(e) => write!(f, "DNS error: {}", e),
+            Self::Icmp(e) => write!(f, "ICMP error: {}", e),
+            Self::Format(e) => write!(f, "Format error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {}", e),
         }
     }
 }
 
 impl error::Error for IpError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Dns(ref err) => Some(err),
-            Self::Format(ref err) => Some(err),
-            Self::Io(ref err) => Some(err),
+            Self::Dns(err) => Some(err),
+            Self::Icmp(err) => Some(err),
+            Self::Format(err) => Some(err),
+            Self::Io(err) => Some(err),
         }
     }
 }
@@ -1643,6 +1722,12 @@ impl error::Error for IpError {
 impl From<dns::DnsError> for IpError {
     fn from(err: dns::DnsError) -> IpError {
         Self::Dns(err)
+    }
+}
+
+impl From<icmp::IcmpError> for IpError {
+    fn from(err: icmp::IcmpError) -> IpError {
+        Self::Icmp(err)
     }
 }
 

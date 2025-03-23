@@ -2049,24 +2049,24 @@ pub enum SessionError {
 
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Format(ref e) => write!(f, "Format error: {}", e),
+            Self::Format(e) => write!(f, "Format error: {}", e),
             Self::NotEnoughSpace(_) => write!(f, "Not enough space error"),
-            Self::CryptoInit(ref e) => write!(f, "Crypto init error: {}", e),
-            Self::CertError(ref e) => write!(f, "PKI cert error: {}", e),
+            Self::CryptoInit(e) => write!(f, "Crypto init error: {}", e),
+            Self::CertError(e) => write!(f, "PKI cert error: {}", e),
         }
     }
 }
 
 impl error::Error for SessionError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Format(ref err) => Some(err),
-            Self::NotEnoughSpace(ref err) => Some(err),
-            Self::CryptoInit(ref err) => Some(err),
-            Self::CertError(ref err) => Some(err),
+            Self::Format(err) => Some(err),
+            Self::NotEnoughSpace(err) => Some(err),
+            Self::CryptoInit(err) => Some(err),
+            Self::CertError(err) => Some(err),
         }
     }
 }

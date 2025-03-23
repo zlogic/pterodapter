@@ -308,20 +308,20 @@ pub enum HttpError {
 
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(ref e) => write!(f, "IO error: {}", e),
-            Self::Tls(ref e) => write!(f, "TLS error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {}", e),
+            Self::Tls(e) => write!(f, "TLS error: {}", e),
         }
     }
 }
 
 impl error::Error for HttpError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Io(ref err) => Some(err),
-            Self::Tls(ref err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::Tls(err) => Some(err),
         }
     }
 }

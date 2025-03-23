@@ -567,26 +567,23 @@ pub enum ProxyError {
 
 impl fmt::Display for ProxyError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Join(ref e) => write!(f, "Tokio join error: {}", e),
-            Self::Io(ref e) => {
-                write!(f, "IO error: {}", e)
-            }
-            Self::Http(ref e) => {
-                write!(f, "HTTP error: {}", e)
-            }
+            Self::Join(e) => write!(f, "Tokio join error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {}", e),
+
+            Self::Http(e) => write!(f, "HTTP error: {}", e),
         }
     }
 }
 
 impl error::Error for ProxyError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Join(ref err) => Some(err),
-            Self::Io(ref err) => Some(err),
-            Self::Http(ref err) => Some(err),
+            Self::Join(err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::Http(err) => Some(err),
         }
     }
 }

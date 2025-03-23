@@ -198,20 +198,20 @@ pub enum VpnServiceError {
 
 impl fmt::Display for VpnServiceError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::FortiVpn(ref e) => write!(f, "VPN client error: {}", e),
-            Self::Join(ref e) => write!(f, "Tokio join error: {}", e),
+            Self::FortiVpn(e) => write!(f, "VPN client error: {}", e),
+            Self::Join(e) => write!(f, "Tokio join error: {}", e),
         }
     }
 }
 
 impl error::Error for VpnServiceError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::FortiVpn(ref err) => Some(err),
-            Self::Join(ref err) => Some(err),
+            Self::FortiVpn(err) => Some(err),
+            Self::Join(err) => Some(err),
         }
     }
 }

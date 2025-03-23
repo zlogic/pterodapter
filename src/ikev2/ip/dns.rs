@@ -10,7 +10,7 @@ use crate::logger::fmt_slice_hex;
 use super::Nat64Prefix;
 
 // As defined in RFC 1035, Sections 2.3.4 and 4.2.1.
-pub const MAX_PACKET_SIZE: usize = 512;
+pub(super) const MAX_PACKET_SIZE: usize = 512;
 
 // As defined in RFC 1035, Section 2.3.4 and 3.1.
 // The domain length is limited by the packet size.
@@ -21,7 +21,7 @@ const MAX_DOMAIN_LENGTH: usize = 255;
 // length + character, or 2-byte offset.
 const MAX_DOMAIN_LABELS: usize = MAX_DOMAIN_LENGTH / 2;
 
-pub struct DnsPacket<'a> {
+pub(super) struct DnsPacket<'a> {
     data: &'a [u8],
 }
 
@@ -284,10 +284,7 @@ impl DnsPacket<'_> {
                 }
             }
             Err(err) => {
-                warn!(
-                    "Failed to parse DNS packet while checking if it matches suffix: {}",
-                    err
-                );
+                warn!("Failed to parse DNS packet while checking if it matches suffix: {}", err);
                 false
             }
             _ => false,
@@ -1063,12 +1060,12 @@ impl CompressionMap {
     }
 }
 
-pub struct Dns64Translator {
+pub(super) struct Dns64Translator {
     compression_map: CompressionMap,
     nat64_prefix: Nat64Prefix,
 }
 
-pub enum DnsTranslationAction {
+pub(super) enum DnsTranslationAction {
     Forward(usize),
     ReplyToSender(usize),
 }
@@ -1498,28 +1495,22 @@ impl Clone for Dns64Translator {
 }
 
 #[derive(Debug)]
-pub enum DnsError {
-    Internal(&'static str),
-}
+pub struct DnsError(&'static str);
 
 impl fmt::Display for DnsError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Self::Internal(msg) => f.write_str(msg),
-        }
+        f.write_str(self.0)
     }
 }
 
 impl error::Error for DnsError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            Self::Internal(_msg) => None,
-        }
+        None
     }
 }
 
 impl From<&'static str> for DnsError {
     fn from(msg: &'static str) -> DnsError {
-        Self::Internal(msg)
+        DnsError(msg)
     }
 }

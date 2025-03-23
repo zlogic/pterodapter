@@ -892,24 +892,24 @@ pub enum FortiError {
 
 impl fmt::Display for FortiError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(ref e) => write!(f, "IO error: {}", e),
-            Self::Tls(ref e) => write!(f, "TLS error: {}", e),
-            Self::Dns(ref e) => write!(f, "DNS error: {}", e),
-            Self::Http(ref e) => write!(f, "HTTP error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {}", e),
+            Self::Tls(e) => write!(f, "TLS error: {}", e),
+            Self::Dns(e) => write!(f, "DNS error: {}", e),
+            Self::Http(e) => write!(f, "HTTP error: {}", e),
         }
     }
 }
 
 impl error::Error for FortiError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_msg) => None,
-            Self::Io(ref err) => Some(err),
-            Self::Tls(ref err) => Some(err),
-            Self::Dns(ref err) => Some(err),
-            Self::Http(ref err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::Tls(err) => Some(err),
+            Self::Dns(err) => Some(err),
+            Self::Http(err) => Some(err),
         }
     }
 }
