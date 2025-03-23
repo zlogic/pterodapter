@@ -164,11 +164,10 @@ impl<'a> Ipv4Packet<'a> {
         if data.len() < 20 {
             return Err("Not enough bytes in IPv4 header".into());
         }
-        if data.len() < Self::header_length(data) {
+        let header_length = Self::header_length(data);
+        if data.len() < header_length {
             return Err("IPv4 header length overflow".into());
         }
-
-        let header_length = Self::header_length(data);
 
         let protocol_type = TransportProtocolType::from_u8(data[9]);
         if protocol_type == TransportProtocolType::from_u8(0) {
@@ -249,6 +248,9 @@ impl<'a> Ipv4Packet<'a> {
     }
 
     fn validate_transport_checksum(&self) -> bool {
+        if self.is_fragment_shifted() {
+            return true;
+        }
         let transport_data = self.transport_protocol_data();
         if let Some(checksum) = transport_data.checksum() {
             if transport_data.protocol() == TransportProtocolType::UDP && checksum == 0x0000 {
@@ -280,6 +282,13 @@ impl<'a> Ipv4Packet<'a> {
         let fragment = u16::from_be_bytes(fragment_offset);
 
         fragment & Self::FRAGMENT_USED_MASK != 0x0000
+    }
+
+    fn is_fragment_shifted(&self) -> bool {
+        match self.fragment_offset() {
+            Some(0) | None => false,
+            Some(_) => true,
+        }
     }
 
     fn write_converted_ip_header(
@@ -357,7 +366,7 @@ impl<'a> Ipv4Packet<'a> {
             nat64_prefix,
         )?;
         dest[header_len..header_len + transport_data.len()].copy_from_slice(transport_data);
-        if transport_protocol.supports_checksum() {
+        if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
             let add = Ipv6Packet::pseudo_checksum(dest, transport_protocol, transport_data.len());
             self.transport_data.write_translated_checksum(
@@ -514,6 +523,13 @@ impl<'a> Ipv6Packet<'a> {
         }
     }
 
+    fn is_fragment_shifted(&self) -> bool {
+        match self.fragment_offset() {
+            Some(0) | None => false,
+            Some(_) => true,
+        }
+    }
+
     fn pseudo_checksum(
         data: &[u8],
         transport_protocol: TransportProtocolType,
@@ -527,6 +543,9 @@ impl<'a> Ipv6Packet<'a> {
     }
 
     fn validate_transport_checksum(&self) -> bool {
+        if self.is_fragment_shifted() {
+            return true;
+        }
         let transport_data = self.transport_protocol_data();
         if let Some(checksum) = transport_data.checksum() {
             if transport_data.protocol() == TransportProtocolType::UDP && checksum == 0x0000 {
@@ -615,7 +634,7 @@ impl<'a> Ipv6Packet<'a> {
             transport_data.len(),
         )?;
         dest[20..20 + transport_data.len()].copy_from_slice(transport_data);
-        if transport_protocol.supports_checksum() {
+        if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
             let add = Ipv4Packet::pseudo_checksum(dest, transport_protocol, transport_data.len());
             self.transport_data.write_translated_checksum(
@@ -789,11 +808,19 @@ impl<'a> IpPacket<'a> {
     }
 
     pub fn src_port(&self) -> Option<u16> {
-        self.transport_protocol_data().src_port()
+        if self.is_fragment_shifted() {
+            None
+        } else {
+            self.transport_protocol_data().src_port()
+        }
     }
 
     pub fn dst_port(&self) -> Option<u16> {
-        self.transport_protocol_data().dst_port()
+        if self.is_fragment_shifted() {
+            None
+        } else {
+            self.transport_protocol_data().dst_port()
+        }
     }
 
     pub fn to_header(&self) -> IpHeader {
@@ -817,6 +844,13 @@ impl<'a> IpPacket<'a> {
         match self {
             IpPacket::V4(packet) => packet.fragment_offset(),
             IpPacket::V6(packet) => packet.fragment_offset(),
+        }
+    }
+
+    fn is_fragment_shifted(&self) -> bool {
+        match self {
+            IpPacket::V4(packet) => packet.is_fragment_shifted(),
+            IpPacket::V6(packet) => packet.is_fragment_shifted(),
         }
     }
 }
@@ -1323,6 +1357,7 @@ impl Network {
         header: IpHeader,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionEsp<'a>, IpError> {
+        // Packets with a non-zero fragment offset will be ignored.
         let is_dns_port = packet.transport_protocol_data().protocol() == TransportProtocolType::UDP
             && header.dst_port() == Some(&53);
         // TODO 0.5.0: To send back error responses, add ICMP handling from
@@ -1433,6 +1468,7 @@ impl Network {
         out_buf: &'a mut [u8],
         nat_prefix: [u8; 12],
     ) -> Result<RoutingActionVpn<'a>, IpError> {
+        // Packets with a non-zero fragment offset will be ignored.
         let is_dns_port = packet.transport_protocol_data().protocol() == TransportProtocolType::UDP
             && header.src_port() == Some(&53);
         // TODO 0.5.0: To send back error responses, add ICMP handling from
