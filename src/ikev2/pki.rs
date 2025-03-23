@@ -421,11 +421,11 @@ impl fmt::Display for CertError {
 
 impl error::Error for CertError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
+        match self {
             Self::Internal(_) => None,
-            Self::Rustls(ref err) => Some(err),
-            Self::Webpki(ref err) => Some(err),
-            Self::VerifierBuilder(ref err) => Some(err),
+            Self::Rustls(err) => Some(err),
+            Self::Webpki(err) => Some(err),
+            Self::VerifierBuilder(err) => Some(err),
             Self::X509(_) => None,
             Self::Base64(_) => None,
         }
