@@ -424,7 +424,7 @@ impl<'a> Ipv4Packet<'a> {
             TransportProtocolType::IPV6_ICMP,
             icmp_data.len(),
         );
-        checksum.add_slice(&icmp_data);
+        checksum.add_slice(icmp_data);
         checksum.fold();
         icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
 
@@ -720,7 +720,7 @@ impl<'a> Ipv6Packet<'a> {
     fn write_icmp_forward(&self, dest: &mut [u8], icmp_len: usize) -> Result<usize, IpError> {
         let (ip_header, icmp_data) = dest[..20 + icmp_len].split_at_mut(20);
         let mut checksum = Checksum::new();
-        checksum.add_slice(&icmp_data);
+        checksum.add_slice(icmp_data);
         checksum.fold();
         icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
 
@@ -1988,7 +1988,7 @@ enum IcmpMessage<'a> {
 }
 
 impl IcmpMessage<'_> {
-    pub fn from_icmpv4_data<'a>(data: &'a [u8]) -> Result<IcmpMessage<'a>, IpError> {
+    pub fn from_icmpv4_data(data: &[u8]) -> Result<IcmpMessage, IpError> {
         if data.len() >= 8 {
             Ok(IcmpMessage::V4(data))
         } else {
@@ -1996,7 +1996,7 @@ impl IcmpMessage<'_> {
         }
     }
 
-    pub fn from_icmpv6_data<'a>(data: &'a [u8]) -> Result<IcmpMessage<'a>, IpError> {
+    pub fn from_icmpv6_data(data: &[u8]) -> Result<IcmpMessage, IpError> {
         if data.len() >= 4 {
             Ok(IcmpMessage::V6(data))
         } else {
@@ -2371,7 +2371,7 @@ impl IcmpTranslator {
                         dest[4..8].copy_from_slice(&mtu.to_be_bytes());
                     }
                     5 => dest[1] = 0,
-                    6 | 7 | 8 => dest[1] = 0,
+                    6..=8 => dest[1] = 0,
                     9 | 10 => dest[1] = 1,
                     11 | 12 => dest[1] = 0,
                     13 => dest[1] = 1,
