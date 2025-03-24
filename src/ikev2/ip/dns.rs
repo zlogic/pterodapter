@@ -1322,8 +1322,8 @@ impl Dns64Translator {
                 // Static IPv6 address RDLENGTH.
                 dest[length + 8..length + 10].copy_from_slice(&16u16.to_be_bytes());
                 length += 10;
-                dest[length..length + 16]
-                    .copy_from_slice(&self.nat64_prefix.map_ipv4(&addr).octets());
+                dest[length..length + 12].copy_from_slice(&self.nat64_prefix.0);
+                dest[length + 12..length + 16].copy_from_slice(&addr.octets());
                 length += 16;
 
                 Ok(Some(length))

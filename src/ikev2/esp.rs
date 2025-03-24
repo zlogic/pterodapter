@@ -236,6 +236,10 @@ impl SecurityAssociation {
             .translate_packet_from_vpn(ip_header, in_buf, data_len, out_buf)
         {
             Ok(ip::RoutingActionVpn::Forward(buf, data_len)) => {
+                trace!(
+                    "Encrypting response to sender: {}",
+                    fmt_slice_hex(&buf[..data_len])
+                );
                 let encoded_length = self.encoded_length(data_len);
                 if encoded_length > buf.len() {
                     // This sometimes happens when FortiVPN returns a zero-padded packet.

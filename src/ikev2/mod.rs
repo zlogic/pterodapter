@@ -1085,6 +1085,10 @@ impl Sessions {
         if data_len == 0 {
             return Ok(VpnRoutingAction::Drop);
         }
+        trace!(
+            "Received packet from VPN\n{}",
+            fmt_slice_hex(&in_buf[..data_len])
+        );
         let ip_packet = match ip::IpPacket::from_data(&in_buf[..data_len]) {
             Ok(packet) => packet,
             Err(err) => {

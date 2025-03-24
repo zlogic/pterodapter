@@ -1,17 +1,16 @@
 use std::{
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    ops::{Range, RangeInclusive},
+    ops::{Deref, Range},
 };
 
-use log::{trace, warn};
+use log::{debug, trace, warn};
 
 use crate::logger::fmt_slice_hex;
 
 use super::message;
 
 mod dns;
-mod icmp;
 
 // Reserve this amount of bytes for the translated IP header.
 // The worst case scenario is IPv6 with fragmentation.
@@ -93,7 +92,7 @@ impl TransportProtocolType {
     }
 
     fn supports_checksum(&self) -> bool {
-        matches!(*self, Self::TCP | Self::UDP)
+        matches!(*self, Self::TCP | Self::UDP | Self::ICMP | Self::IPV6_ICMP)
     }
 }
 
@@ -189,6 +188,12 @@ impl<'a> Ipv4Packet<'a> {
         (data[0] & 0x0f) as usize * 4
     }
 
+    fn total_length_header(&self) -> u16 {
+        let mut total_length = [0u8; 2];
+        total_length.copy_from_slice(&self.data[2..4]);
+        u16::from_be_bytes(total_length)
+    }
+
     fn src_addr(&self) -> Ipv4Addr {
         let mut src_addr = [0u8; 4];
         src_addr.copy_from_slice(&self.data[12..16]);
@@ -255,12 +260,15 @@ impl<'a> Ipv4Packet<'a> {
             if transport_data.protocol() == TransportProtocolType::UDP && checksum == 0x0000 {
                 return true;
             }
-            // TODO 0.5.0: ICMPv4 doesn't use pseudoheaders.
             let mut calculated_checksum = Self::pseudo_checksum(
                 self.data,
                 self.transport_protocol(),
                 transport_data.full_data().len(),
             );
+            if transport_data.protocol() == TransportProtocolType::ICMP {
+                // ICMPv4 doesn't include IPv4 pseudoheaders.
+                calculated_checksum = Checksum::new();
+            }
             calculated_checksum.add_slice(transport_data.full_data());
             calculated_checksum.fold();
             calculated_checksum.value() == 0x0000
@@ -296,7 +304,7 @@ impl<'a> Ipv4Packet<'a> {
         dest: &mut [u8],
         fragmentation_extension: bool,
         transport_data_len: usize,
-        nat64_prefix: [u8; 12],
+        nat64_prefix: Nat64Prefix,
     ) -> Result<(), IpError> {
         // RFC 7915, Section 4.1.
         if fragmentation_extension && dest.len() != 48 {
@@ -317,12 +325,17 @@ impl<'a> Ipv4Packet<'a> {
         let payload_len = if fragmentation_extension { 8 } else { 0 } + transport_data_len as u16;
         dest[4..6].copy_from_slice(&payload_len.to_be_bytes());
 
+        let transport_protocol = match self.transport_protocol() {
+            TransportProtocolType::ICMP => TransportProtocolType::IPV6_ICMP,
+            protocol => protocol,
+        };
         let next_header = if fragmentation_extension {
             TransportProtocolType::IPV6_FRAGMENT
         } else {
-            self.transport_protocol()
+            transport_protocol
         };
         dest[6] = next_header.to_u8();
+        // As technically this runs on the same host, keep original TTL.
         dest[7] = self.ttl().saturating_sub(0);
 
         dest[8..20].copy_from_slice(&nat64_prefix);
@@ -337,7 +350,7 @@ impl<'a> Ipv4Packet<'a> {
             let more_fragments = fragment & Self::FRAGMENT_MF_MASK == Self::FRAGMENT_MF_MASK;
             let fragment_offset = fragment & Self::FRAGMENT_OFFSET_MASK;
 
-            dest[40] = self.transport_protocol().to_u8();
+            dest[40] = transport_protocol.to_u8();
             dest[41] = 0;
             let fragment_offset = (fragment_offset << 3) & (!0x0007);
             let mf_flag = if more_fragments {
@@ -354,7 +367,12 @@ impl<'a> Ipv4Packet<'a> {
         Ok(())
     }
 
-    fn write_converted(&self, dest: &mut [u8], nat64_prefix: [u8; 12]) -> Result<usize, IpError> {
+    fn write_converted(
+        &self,
+        dest: &mut [u8],
+        nat64_prefix: Nat64Prefix,
+        truncated: bool,
+    ) -> Result<usize, IpError> {
         let transport_data = self.transport_data.full_data();
         let transport_protocol = self.transport_protocol();
         if transport_protocol == TransportProtocolType::IPV6_ICMP {
@@ -362,16 +380,26 @@ impl<'a> Ipv4Packet<'a> {
         }
         let fragmentation_extension = self.is_fragmented();
         let header_len = if fragmentation_extension { 48 } else { 40 };
+        let transport_data_len = if truncated {
+            let original_payload_length = self.total_length_header();
+            let original_header_length = self.data.len() - transport_data.len();
+            original_payload_length as usize - original_header_length
+        } else {
+            transport_data.len()
+        };
         self.write_converted_ip_header(
             &mut dest[0..header_len],
             fragmentation_extension,
-            transport_data.len(),
+            transport_data_len,
             nat64_prefix,
         )?;
+        // TODO 0.5.0: if data contains an ICMPv6 payload, translate it into ICMPv4.
+        // e.g. TTL exceeded responses for ICMPv6 pings need to contain original ICMPv6 headers.
+        // This can be done recursively.
         dest[header_len..header_len + transport_data.len()].copy_from_slice(transport_data);
         if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
-            let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
-            let add = Ipv6Packet::pseudo_checksum(dest, transport_protocol, transport_data.len());
+            let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
+            let add = Ipv6Packet::pseudo_checksum(dest, transport_protocol, transport_data_len);
             self.transport_data.write_translated_checksum(
                 &mut dest[header_len..header_len + transport_data.len()],
                 remove,
@@ -382,11 +410,32 @@ impl<'a> Ipv4Packet<'a> {
         Ok(header_len + transport_data.len())
     }
 
+    fn write_icmp_forward(
+        &self,
+        dest: &mut [u8],
+        icmp_len: usize,
+        nat64_prefix: Nat64Prefix,
+    ) -> Result<usize, IpError> {
+        let (ip_header, icmp_data) = dest[..40 + icmp_len].split_at_mut(40);
+
+        self.write_converted_ip_header(ip_header, false, icmp_len, nat64_prefix)?;
+        let mut checksum = Ipv6Packet::pseudo_checksum(
+            ip_header,
+            TransportProtocolType::IPV6_ICMP,
+            icmp_data.len(),
+        );
+        checksum.add_slice(&icmp_data);
+        checksum.fold();
+        icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
+
+        Ok(40 + icmp_len)
+    }
+
     fn write_udp_forward(
         &self,
         dest: &mut [u8],
         data_range: Range<usize>,
-        nat64_prefix: [u8; 12],
+        nat64_prefix: Nat64Prefix,
     ) -> Result<usize, IpError> {
         if data_range.start < 40 + 8 {
             return Err("Not enough space to add IPv6 header in UDP translation".into());
@@ -502,7 +551,7 @@ impl<'a> Ipv6Packet<'a> {
         (fl >> 12) & 0x03ffffff
     }
 
-    fn payload_length(&self) -> u16 {
+    fn payload_length_header(&self) -> u16 {
         let mut pl = [0u8; 2];
         pl.copy_from_slice(&self.data[4..6]);
         u16::from_be_bytes(pl)
@@ -612,8 +661,13 @@ impl<'a> Ipv6Packet<'a> {
             dest[4..6].fill(0);
             dest[6..8].copy_from_slice(&df_flag.to_be_bytes());
         };
+        // As technically this runs on the same host, keep original hop limit.
         dest[8] = self.hop_limit().saturating_sub(0);
-        dest[9] = self.transport_protocol().to_u8();
+        let transport_protocol = match self.transport_protocol() {
+            TransportProtocolType::IPV6_ICMP => TransportProtocolType::ICMP,
+            protocol => protocol,
+        };
+        dest[9] = transport_protocol.to_u8();
         dest[12..16].copy_from_slice(&self.data[20..24]);
         dest[16..20].copy_from_slice(&self.data[36..40]);
 
@@ -625,7 +679,7 @@ impl<'a> Ipv6Packet<'a> {
         Ok(())
     }
 
-    fn write_converted(&self, dest: &mut [u8]) -> Result<usize, IpError> {
+    fn write_converted(&self, dest: &mut [u8], truncated: bool) -> Result<usize, IpError> {
         let transport_data = self.transport_data.full_data();
         let transport_protocol = self.transport_protocol();
         if transport_protocol == TransportProtocolType::ICMP {
@@ -634,15 +688,25 @@ impl<'a> Ipv6Packet<'a> {
         if dest.len() < 20 + transport_data.len() {
             return Err("Not enough space to translate from IPv6 to IPv4".into());
         }
+        let transport_data_len = if truncated {
+            let original_payload_length = self.payload_length_header();
+            let original_header_length = self.data.len() - transport_data.len();
+            original_payload_length as usize - original_header_length
+        } else {
+            transport_data.len()
+        };
         self.write_converted_ip_header(
             &mut dest[0..20],
             self.fragment_extension_data,
-            transport_data.len(),
+            transport_data_len,
         )?;
+        // TODO 0.5.0: if data contains an ICMPv6 payload, translate it into ICMPv4.
+        // e.g. TTL exceeded responses for ICMPv6 pings need to contain original ICMPv6 headers.
+        // This can be done recursively.
         dest[20..20 + transport_data.len()].copy_from_slice(transport_data);
         if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
-            let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data.len());
-            let add = Ipv4Packet::pseudo_checksum(dest, transport_protocol, transport_data.len());
+            let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
+            let add = Ipv4Packet::pseudo_checksum(dest, transport_protocol, transport_data_len);
             self.transport_data.write_translated_checksum(
                 &mut dest[20..20 + transport_data.len()],
                 remove,
@@ -651,6 +715,18 @@ impl<'a> Ipv6Packet<'a> {
         }
 
         Ok(20 + transport_data.len())
+    }
+
+    fn write_icmp_forward(&self, dest: &mut [u8], icmp_len: usize) -> Result<usize, IpError> {
+        let (ip_header, icmp_data) = dest[..20 + icmp_len].split_at_mut(20);
+        let mut checksum = Checksum::new();
+        checksum.add_slice(&icmp_data);
+        checksum.fold();
+        icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
+
+        self.write_converted_ip_header(ip_header, None, icmp_len)?;
+
+        Ok(20 + icmp_len)
     }
 
     fn write_udp_forward(
@@ -890,13 +966,20 @@ impl fmt::Display for IpPacket<'_> {
             write!(f, " F={}", offset)?;
         }
         match self {
-            IpPacket::V4(packet) => write!(f, " DCSP={} ECN={:02b}", packet.dscp(), packet.ecn())?,
+            IpPacket::V4(packet) => write!(
+                f,
+                " DCSP={} ECN={:02b} L={} TTL={}",
+                packet.dscp(),
+                packet.ecn(),
+                packet.total_length_header(),
+                packet.ttl()
+            )?,
             IpPacket::V6(packet) => write!(
                 f,
                 " {} FL={:#06X} L={} H={}",
                 packet.traffic_class(),
                 packet.flow_label(),
-                packet.payload_length(),
+                packet.payload_length_header(),
                 packet.hop_limit()
             )?,
         }
@@ -1050,7 +1133,27 @@ impl TransportData<'_> {
                 checksum.fold();
                 dest[16..18].copy_from_slice(&checksum.value().to_be_bytes());
             }
-            TransportData::Generic(_, _) => {}
+            TransportData::Generic(protocol, data) => {
+                // Translating from ICMPv6 to ICMPv4 should drop the header checksum.
+                let (remove, add) = match *protocol {
+                    TransportProtocolType::IPV6_ICMP => (remove, Checksum::new()),
+                    TransportProtocolType::ICMP => (Checksum::new(), add),
+                    _ => (remove, add),
+                };
+                match *protocol {
+                    TransportProtocolType::ICMP | TransportProtocolType::IPV6_ICMP => {
+                        let mut checksum = [0u8; 2];
+                        checksum.copy_from_slice(&data[2..4]);
+                        let checksum = u16::from_be_bytes(checksum);
+                        let mut checksum = Checksum::from_inverted(checksum);
+                        checksum.incremental_update(remove, add);
+                        checksum.fold();
+                        let checksum = checksum.value();
+                        dest[2..4].copy_from_slice(&checksum.to_be_bytes());
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1103,16 +1206,14 @@ impl fmt::Display for TransportData<'_> {
                 }
             }
             TransportData::Generic(protocol, data) => match *protocol {
-                TransportProtocolType::ICMP => match icmp::IcmpMessage::from_icmpv4_data(data) {
+                TransportProtocolType::ICMP => match IcmpMessage::from_icmpv4_data(data) {
                     Ok(icmp) => icmp.fmt(f),
                     Err(err) => write!(f, "ICMPv4 error: {}", err),
                 },
-                TransportProtocolType::IPV6_ICMP => {
-                    match icmp::IcmpMessage::from_icmpv6_data(data) {
-                        Ok(icmp) => icmp.fmt(f),
-                        Err(err) => write!(f, "ICMPv6 error: {}", err),
-                    }
-                }
+                TransportProtocolType::IPV6_ICMP => match IcmpMessage::from_icmpv6_data(data) {
+                    Ok(icmp) => icmp.fmt(f),
+                    Err(err) => write!(f, "ICMPv6 error: {}", err),
+                },
                 protocol => write!(f, "{} {}", protocol, fmt_slice_hex(data)),
             },
         }
@@ -1120,39 +1221,39 @@ impl fmt::Display for TransportData<'_> {
 }
 
 #[derive(Clone)]
-pub struct Nat64Prefix {
-    range: RangeInclusive<Ipv6Addr>,
-    prefix_octets: [u8; 12],
-}
+pub struct Nat64Prefix([u8; 12]);
 
 impl Nat64Prefix {
     pub fn new(prefix: Ipv6Addr) -> Nat64Prefix {
-        let mut start_addr = prefix.octets();
-        let mut end_addr = prefix.octets();
-        start_addr[12..16].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        end_addr[12..16].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
         let mut prefix_octets = [0u8; 12];
         prefix_octets[0..12].copy_from_slice(&prefix.octets()[0..12]);
-        Nat64Prefix {
-            range: start_addr.into()..=end_addr.into(),
-            prefix_octets,
-        }
-    }
-
-    fn prefix(&self) -> [u8; 12] {
-        self.prefix_octets
+        Nat64Prefix(prefix_octets)
     }
 
     fn map_ipv4(&self, addr: &Ipv4Addr) -> Ipv6Addr {
-        let mut segments = self.range.start().octets();
+        let mut segments = [0u8; 16];
+        segments[0..12].copy_from_slice(&self.0);
         segments[12..16].copy_from_slice(&addr.octets());
         segments.into()
     }
 
     fn traffic_selector(&self) -> Result<message::TrafficSelector, message::FormatError> {
+        let mut start_addr = [0u8; 16];
+        start_addr[0..12].copy_from_slice(&self.0);
+        let mut end_addr = start_addr;
+        start_addr[12..16].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        end_addr[12..16].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
         message::TrafficSelector::from_ip_range(
-            IpAddr::V6(*self.range.start())..=IpAddr::V6(*self.range.end()),
+            IpAddr::V6(start_addr.into())..=IpAddr::V6(end_addr.into()),
         )
+    }
+}
+
+impl Deref for Nat64Prefix {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -1172,6 +1273,7 @@ pub struct Network {
     tunnel_domains_dns: TunnelDomainsDns,
     local_ts: Vec<message::TrafficSelector>,
     dns_translator: Option<dns::Dns64Translator>,
+    icmp_translator: Option<IcmpTranslator>,
 }
 
 impl Network {
@@ -1190,9 +1292,14 @@ impl Network {
         };
         let tunnel_domains_dns = TunnelDomainsDns::new(&tunnel_domains);
 
-        let dns_translator = nat64_prefix
-            .as_ref()
-            .map(|nat64_prefix| dns::Dns64Translator::new(nat64_prefix.clone()));
+        let (dns_translator, icmp_translator) = if let Some(nat64_prefix) = nat64_prefix.as_ref() {
+            (
+                Some(dns::Dns64Translator::new(nat64_prefix.clone())),
+                Some(IcmpTranslator::new(nat64_prefix.clone())),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Network {
             nat64_prefix,
             real_ip: None,
@@ -1202,6 +1309,7 @@ impl Network {
             tunnel_domains_dns,
             local_ts: traffic_selectors,
             dns_translator,
+            icmp_translator,
         })
     }
 
@@ -1356,14 +1464,14 @@ impl Network {
         // limit is 1 (would be reduced to 1)
         // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1
         if packet.transport_protocol() == TransportProtocolType::IPV6_ICMP {
-            return self.translate_icmp_packet_from_esp(packet, header, out_buf);
+            return self.translate_icmp_packet_from_esp(packet, out_buf);
         }
-        // TODO 0.5.0: if fragment header is followed by an unsupported payload, drop it.
+        // TODO 0.5.0: if fragment header is followed by an unsupported extension header, drop it.
         // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1.1
 
         let is_dns_ip = self.dns_addrs.contains(&IpAddr::V6(packet.dst_addr()));
         if !is_dns_ip {
-            let length = packet.write_converted(out_buf)?;
+            let length = packet.write_converted(out_buf, false)?;
             debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionEsp::Forward(&out_buf[..length]))
         } else {
@@ -1398,7 +1506,7 @@ impl Network {
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE];
         if !self.dns_matches_tunnel(&dns_packet) {
-            let length = packet.write_converted(out_buf)?;
+            let length = packet.write_converted(out_buf, false)?;
             debug_print_packet(&out_buf[..length]);
             return Ok(RoutingActionEsp::Forward(&out_buf[..length]));
         }
@@ -1448,7 +1556,6 @@ impl Network {
     fn translate_icmp_packet_from_esp<'a>(
         &mut self,
         packet: Ipv6Packet<'a>,
-        header: IpHeader,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionEsp<'a>, IpError> {
         if !packet.validate_transport_checksum() {
@@ -1457,13 +1564,34 @@ impl Network {
         if packet.fragment_offset().is_some() {
             return Err("ICMPv6 packet is fragmented".into());
         }
-        // TODO 0.5.0 Implement ICMP translation as documented in
-        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.2
 
         let icmp_packet =
-            icmp::IcmpMessage::from_icmpv6_data(packet.transport_protocol_data().full_data())?;
-        println!("Received ICMPv6 packet {}", icmp_packet);
-        return Err("Not implemented".into());
+            IcmpMessage::from_icmpv6_data(packet.transport_protocol_data().full_data())?;
+        trace!("Decoded ICMPv6 packet {}", icmp_packet);
+        // Reserve space for IPv4 header.
+        let dest_buf = &mut out_buf[20..];
+
+        let icmp_translator = if let Some(icmp_translator) = &mut self.icmp_translator {
+            icmp_translator
+        } else {
+            return Err("ICMP translator is not available".into());
+        };
+
+        let translation = icmp_translator.translate_to_vpn(&icmp_packet, dest_buf)?;
+        let action = match translation {
+            IcmpTranslationAction::Forward(length) => {
+                if log::log_enabled!(log::Level::Trace) {
+                    let icmp_packet = IcmpMessage::from_icmpv4_data(&dest_buf[..length])?;
+                    trace!("Rewrote ICMPv6 packet from ESP: {}", icmp_packet);
+                }
+
+                let length = packet.write_icmp_forward(out_buf, length)?;
+                debug_print_packet(&out_buf[..length]);
+                RoutingActionEsp::Forward(&out_buf[..length])
+            }
+            IcmpTranslationAction::Drop => RoutingActionEsp::Drop,
+        };
+        Ok(action)
     }
 
     pub fn translate_packet_from_vpn<'a>(
@@ -1473,8 +1601,8 @@ impl Network {
         data_len: usize,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionVpn<'a>, IpError> {
-        let nat64_prefix = if let Some(nat64_prefix) = &self.nat64_prefix {
-            nat64_prefix
+        let nat64_prefix = if let Some(nat64_prefix) = self.nat64_prefix.as_ref() {
+            nat64_prefix.clone()
         } else {
             return Ok(RoutingActionVpn::Forward(in_buf, data_len));
         };
@@ -1487,21 +1615,16 @@ impl Network {
         // limit is 1 (would be reduced to 1)
         // https://datatracker.ietf.org/doc/html/rfc7915#section-4.1
         if packet.transport_protocol() == TransportProtocolType::ICMP {
-            return self.translate_icmp_packet_from_vpn(
-                packet,
-                header,
-                out_buf,
-                nat64_prefix.prefix(),
-            );
+            return self.translate_icmp_packet_from_vpn(packet, out_buf, nat64_prefix);
         }
         let dns_translated = IpAddr::V6(nat64_prefix.map_ipv4(&packet.src_addr()));
         let is_dns_ip = self.dns_addrs.contains(&dns_translated);
         if !is_dns_ip {
-            let length = packet.write_converted(out_buf, nat64_prefix.prefix())?;
+            let length = packet.write_converted(out_buf, nat64_prefix, false)?;
             debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionVpn::Forward(out_buf, length))
         } else {
-            self.translate_dns_packet_from_vpn(packet, header, out_buf, nat64_prefix.prefix())
+            self.translate_dns_packet_from_vpn(packet, header, out_buf, nat64_prefix)
         }
     }
 
@@ -1510,7 +1633,7 @@ impl Network {
         packet: Ipv4Packet<'a>,
         header: IpHeader,
         out_buf: &'a mut [u8],
-        nat_prefix: [u8; 12],
+        nat_prefix: Nat64Prefix,
     ) -> Result<RoutingActionVpn<'a>, IpError> {
         if !packet.validate_ip_checksum() {
             return Err("DNS packet has invalid IP checksum".into());
@@ -1536,7 +1659,7 @@ impl Network {
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE];
         if !self.dns_matches_tunnel(&dns_packet) {
-            let length = packet.write_converted(out_buf, nat_prefix)?;
+            let length = packet.write_converted(out_buf, nat_prefix, false)?;
             debug_print_packet(&out_buf[..length]);
             return Ok(RoutingActionVpn::Forward(out_buf, length));
         }
@@ -1569,9 +1692,8 @@ impl Network {
     fn translate_icmp_packet_from_vpn<'a>(
         &mut self,
         packet: Ipv4Packet<'a>,
-        header: IpHeader,
         out_buf: &'a mut [u8],
-        nat_prefix: [u8; 12],
+        nat_prefix: Nat64Prefix,
     ) -> Result<RoutingActionVpn<'a>, IpError> {
         if !packet.validate_ip_checksum() {
             return Err("ICMPv4 packet has invalid IP checksum".into());
@@ -1582,12 +1704,32 @@ impl Network {
         if packet.fragment_offset().is_some() {
             return Err("ICMPv4 packet is fragmented".into());
         }
-        // TODO 0.5.0 Implement ICMP translation as documented in
-        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.2
         let icmp_packet =
-            icmp::IcmpMessage::from_icmpv4_data(packet.transport_protocol_data().full_data())?;
-        println!("Received ICMPv4 packet {}", icmp_packet);
-        return Err("Not implemented".into());
+            IcmpMessage::from_icmpv4_data(packet.transport_protocol_data().full_data())?;
+        trace!("Decoded ICMPv4 packet {}", icmp_packet);
+        // Reserve space for IPv6 header.
+        let dest_buf = &mut out_buf[40..];
+        let icmp_translator = if let Some(icmp_translator) = &mut self.icmp_translator {
+            icmp_translator
+        } else {
+            return Err("ICMP translator is not available".into());
+        };
+
+        let translation = icmp_translator.translate_to_esp(&icmp_packet, dest_buf)?;
+        let action = match translation {
+            IcmpTranslationAction::Forward(length) => {
+                if log::log_enabled!(log::Level::Trace) {
+                    let icmp_packet = IcmpMessage::from_icmpv6_data(&dest_buf[..length])?;
+                    trace!("Rewrote ICMPv4 packet from VPN: {}", icmp_packet);
+                }
+
+                let length = packet.write_icmp_forward(out_buf, length, nat_prefix)?;
+                debug_print_packet(&out_buf[..length]);
+                RoutingActionVpn::Forward(out_buf, length)
+            }
+            IcmpTranslationAction::Drop => RoutingActionVpn::Drop,
+        };
+        Ok(action)
     }
 }
 
@@ -1686,11 +1828,602 @@ impl TunnelDomainsDns {
     }
 }
 
+enum IcmpV4 {
+    EchoReply,
+    EchoRequest,
+    DestinationUnreachable(IcmpV4DestinationUnreachable),
+    TimeExceeded(IcmpV4TimeExceeded),
+    ParameterProblem(IcmpV4ParameterProblem),
+    Unknown(u8, u8),
+}
+
+struct IcmpV4DestinationUnreachable(u8);
+
+impl fmt::Display for IcmpV4DestinationUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str("Destination network unreachable"),
+            1 => f.write_str("Destination host unreachable"),
+            2 => f.write_str("Destination protocol unreachable"),
+            3 => f.write_str("Destination port unreachable"),
+            4 => f.write_str("Fragmentation required, and DF flag set"),
+            5 => f.write_str("Source route failed"),
+            6 => f.write_str("Destination network unknown"),
+            7 => f.write_str("Destination host unknown"),
+            8 => f.write_str("Source host isolated"),
+            9 => f.write_str("Network administratively prohibited"),
+            10 => f.write_str("Host administratively prohibited"),
+            11 => f.write_str("Network unreachable for ToS"),
+            12 => f.write_str("Host unreachable for ToS"),
+            13 => f.write_str("Communication administratively prohibited"),
+            14 => f.write_str("Host Precedence Violation"),
+            15 => f.write_str("Precedence cutoff in effect"),
+            other => write!(f, "{}", other),
+        }
+    }
+}
+
+struct IcmpV4TimeExceeded(u8);
+
+impl fmt::Display for IcmpV4TimeExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str("Time to live (TTL) expired in transit"),
+            1 => f.write_str("Fragment reassembly time exceeded"),
+            other => write!(f, "{}", other),
+        }
+    }
+}
+
+struct IcmpV4ParameterProblem(u8);
+
+impl fmt::Display for IcmpV4ParameterProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str("Pointer indicates the error"),
+            1 => f.write_str("Missing a required option"),
+            2 => f.write_str("Bad length"),
+            other => write!(f, "{}", other),
+        }
+    }
+}
+
+impl fmt::Display for IcmpV4 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IcmpV4::EchoReply => write!(f, "Echo Reply"),
+            IcmpV4::EchoRequest => write!(f, "Echo Request"),
+            IcmpV4::DestinationUnreachable(code) => write!(f, "Destination Unreachable ({})", code),
+            IcmpV4::TimeExceeded(code) => write!(f, "Time Exceeded ({})", code),
+            IcmpV4::ParameterProblem(code) => write!(f, "Parameter Problem ({})", code),
+            IcmpV4::Unknown(t, code) => write!(f, "{} ({})", t, code),
+        }
+    }
+}
+
+enum IcmpV6 {
+    EchoRequest,
+    EchoReply,
+    DestinationUnreachable(IcmpV6DestinationUnreachable),
+    PacketTooBig,
+    TimeExceeded(IcmpV6TimeExceeded),
+    ParameterProblem(IcmpV6ParameterProblem),
+    Unknown(u8, u8),
+}
+
+struct IcmpV6DestinationUnreachable(u8);
+
+impl fmt::Display for IcmpV6DestinationUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str("No route to destination"),
+            1 => f.write_str("Communication with destination administratively prohibited"),
+            2 => f.write_str("Beyond scope of source address"),
+            3 => f.write_str("Address unreachable"),
+            4 => f.write_str("Port unreachable"),
+            5 => f.write_str("Source address failed ingress/egress policy"),
+            6 => f.write_str("Reject route to destination"),
+            7 => f.write_str("Error in Source Routing Header"),
+            other => write!(f, "{}", other),
+        }
+    }
+}
+
+struct IcmpV6TimeExceeded(u8);
+
+impl fmt::Display for IcmpV6TimeExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str("Hop limit exceeded in transit"),
+            1 => f.write_str("Fragment reassembly time exceeded"),
+            other => write!(f, "{}", other),
+        }
+    }
+}
+
+struct IcmpV6ParameterProblem(u8);
+
+impl fmt::Display for IcmpV6ParameterProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str("Erroneous header field encountered"),
+            1 => f.write_str("Unrecognized Next Header type encountered"),
+            2 => f.write_str("Unrecognized IPv6 option encountered"),
+            other => write!(f, "{}", other),
+        }
+    }
+}
+
+impl fmt::Display for IcmpV6 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IcmpV6::EchoRequest => write!(f, "Echo Request"),
+            IcmpV6::EchoReply => write!(f, "Echo Reply"),
+            IcmpV6::DestinationUnreachable(code) => write!(f, "Destination Unreachable ({})", code),
+            IcmpV6::PacketTooBig => write!(f, "Packet Too Big"),
+            IcmpV6::TimeExceeded(code) => write!(f, "Time Exceeded ({})", code),
+            IcmpV6::ParameterProblem(code) => write!(f, "Parameter Problem ({})", code),
+            IcmpV6::Unknown(t, code) => write!(f, "{} ({})", t, code),
+        }
+    }
+}
+
+enum IcmpMessageType {
+    V4(IcmpV4),
+    V6(IcmpV6),
+}
+
+impl fmt::Display for IcmpMessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IcmpMessageType::V4(t) => t.fmt(f),
+            IcmpMessageType::V6(t) => t.fmt(f),
+        }
+    }
+}
+
+enum IcmpMessage<'a> {
+    V4(&'a [u8]),
+    V6(&'a [u8]),
+}
+
+impl IcmpMessage<'_> {
+    pub fn from_icmpv4_data<'a>(data: &'a [u8]) -> Result<IcmpMessage<'a>, IpError> {
+        if data.len() >= 8 {
+            Ok(IcmpMessage::V4(data))
+        } else {
+            Err("Not enough data in ICMPv4 header".into())
+        }
+    }
+
+    pub fn from_icmpv6_data<'a>(data: &'a [u8]) -> Result<IcmpMessage<'a>, IpError> {
+        if data.len() >= 4 {
+            Ok(IcmpMessage::V6(data))
+        } else {
+            Err("Not enough data in ICMPv6 header".into())
+        }
+    }
+
+    pub fn icmp_type(&self) -> IcmpMessageType {
+        match self {
+            IcmpMessage::V4(data) => {
+                let icmp_type = data[0];
+                let icmp_code = data[1];
+                let icmp_type = match icmp_type {
+                    0 => IcmpV4::EchoReply,
+                    3 => IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(icmp_code)),
+                    8 => IcmpV4::EchoRequest,
+                    11 => IcmpV4::TimeExceeded(IcmpV4TimeExceeded(icmp_code)),
+                    12 => IcmpV4::ParameterProblem(IcmpV4ParameterProblem(icmp_code)),
+                    icmp_type => IcmpV4::Unknown(icmp_type, icmp_code),
+                };
+                IcmpMessageType::V4(icmp_type)
+            }
+            IcmpMessage::V6(data) => {
+                let icmp_type = data[0];
+                let icmp_code = data[1];
+                let icmp_type = match icmp_type {
+                    1 => IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(icmp_code)),
+                    2 => IcmpV6::PacketTooBig,
+                    3 => IcmpV6::TimeExceeded(IcmpV6TimeExceeded(icmp_code)),
+                    4 => IcmpV6::ParameterProblem(IcmpV6ParameterProblem(icmp_code)),
+                    128 => IcmpV6::EchoRequest,
+                    129 => IcmpV6::EchoReply,
+                    icmp_type => IcmpV6::Unknown(icmp_type, icmp_code),
+                };
+                IcmpMessageType::V6(icmp_type)
+            }
+        }
+    }
+
+    pub fn checksum(&self) -> u16 {
+        let data = match self {
+            IcmpMessage::V4(data) => data,
+            IcmpMessage::V6(data) => data,
+        };
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&data[2..4]);
+        u16::from_be_bytes(checksum)
+    }
+}
+
+impl fmt::Display for IcmpMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IcmpMessage::V4(data) => {
+                write!(
+                    f,
+                    "ICMPv4 {} C={:#06X}: {}",
+                    self.icmp_type(),
+                    self.checksum(),
+                    fmt_slice_hex(data)
+                )
+            }
+            IcmpMessage::V6(data) => {
+                write!(
+                    f,
+                    "ICMPv6 {} C={:#06X}: {}",
+                    self.icmp_type(),
+                    self.checksum(),
+                    fmt_slice_hex(data)
+                )
+            }
+        }
+    }
+}
+
+enum IcmpTranslationAction {
+    Forward(usize),
+    Drop,
+}
+
+#[derive(Clone)]
+struct IcmpTranslator {
+    nat64_prefix: Nat64Prefix,
+}
+
+impl IcmpTranslator {
+    const ICMPV4_ORIGINAL_MESSAGE_LIMIT: usize = 576 - 8 - 20;
+    const ICMPV6_ORIGINAL_MESSAGE_LIMIT: usize = 1280 - 8 - 40;
+
+    fn new(nat64_prefix: Nat64Prefix) -> IcmpTranslator {
+        IcmpTranslator { nat64_prefix }
+    }
+
+    fn translate_original_datagram_to_vpn(
+        &mut self,
+        src_data: &[u8],
+        dest: &mut [u8],
+    ) -> Result<IcmpTranslationAction, IpError> {
+        // RFC 4884, Section 4 states that the fifth octet contains the datagram length.
+        // All following octets (after the datagram) contain extensions.
+        let data_len = src_data[4] as usize * 8;
+        let (original_datagram, icmp_extensions) = if data_len == 0 {
+            // No extensions.
+            (&src_data[8..], &[] as &[u8])
+        } else {
+            (
+                &src_data[8..8 + data_len * 8],
+                &src_data[8 + data_len * 8..],
+            )
+        };
+
+        // TODO 0.5.0: Verify that there's enough space in destination slice.
+        let original_packet = match IpPacket::from_data(original_datagram) {
+            Ok(IpPacket::V4(_)) => Err("ICMPv6 header contains IPv4 original data".into()),
+            Ok(IpPacket::V6(packet)) => Ok(packet),
+            Err(err) => {
+                warn!(
+                    "Failed to parse original datagram in ICMPv6 packet: {}",
+                    err
+                );
+                Err(err)
+            }
+        }?;
+        // RFC 7915, Section 5.5.
+        let translated_length = original_packet
+            .write_converted(&mut dest[8..], true)
+            .map_err(|err| {
+                warn!(
+                    "Failed to translate ICMPv6 original datagram to IPv4: {}",
+                    err
+                );
+                err
+            })?;
+
+        // RFC 792 requires the first 20+8 bytes to be provided.
+        // RFC 4884, Section 5.1 states that at least 128 bytes of the original message should be
+        // provided; and in Section 5.3 that IP+ICMPv4 packets should be limited to 576 bytes.
+        let translated_length_padded = if translated_length < 128 {
+            128 / 8
+        } else if translated_length % 8 != 0 {
+            translated_length / 8 + 1
+        } else {
+            translated_length / 8
+        };
+        if !icmp_extensions.is_empty()
+            && translated_length_padded + icmp_extensions.len()
+                < Self::ICMPV4_ORIGINAL_MESSAGE_LIMIT
+        {
+            dest[4] = translated_length_padded as u8;
+            let translated_length_padded = translated_length_padded * 8;
+            dest[8 + translated_length..8 + translated_length_padded * 8].fill(0);
+            let dest = &mut dest[8 + translated_length_padded..];
+            dest[0..icmp_extensions.len()].copy_from_slice(icmp_extensions);
+            Ok(IcmpTranslationAction::Forward(
+                8 + translated_length_padded + icmp_extensions.len(),
+            ))
+        } else {
+            // Drop ICMP extensions if they won't fit into an ICMPv4 packet.
+            let translated_length = translated_length.min(Self::ICMPV4_ORIGINAL_MESSAGE_LIMIT);
+            Ok(IcmpTranslationAction::Forward(8 + translated_length))
+        }
+    }
+
+    fn translate_to_vpn(
+        &mut self,
+        request: &IcmpMessage,
+        dest: &mut [u8],
+    ) -> Result<IcmpTranslationAction, IpError> {
+        // RFC 7915, Section 5.2.
+        let request_type = match request.icmp_type() {
+            IcmpMessageType::V4(_) => return Err("Cannot translate ICMPv6 packet to VPN".into()),
+            IcmpMessageType::V6(t) => t,
+        };
+        let request_data = match request {
+            IcmpMessage::V4(_) => return Err("Cannot translate ICMPv6 packet to VPN".into()),
+            IcmpMessage::V6(data) => data,
+        };
+        match request_type {
+            IcmpV6::EchoRequest => {
+                dest[0] = 8;
+                dest[1..4].fill(0);
+                dest[4..request_data.len()].copy_from_slice(&request_data[4..]);
+                Ok(IcmpTranslationAction::Forward(request_data.len()))
+            }
+            IcmpV6::EchoReply => {
+                dest[0] = 0;
+                dest[1..4].fill(0);
+                dest[4..request_data.len()].copy_from_slice(&request_data[4..]);
+                Ok(IcmpTranslationAction::Forward(request_data.len()))
+            }
+            IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(code)) => {
+                dest[0] = 3;
+                match code {
+                    0 => dest[1] = 1,
+                    1 => dest[1] = 10,
+                    2 => dest[1] = 1,
+                    3 => dest[1] = 1,
+                    4 => dest[1] = 3,
+                    _ => {
+                        debug!("Dropping unsupported ICMPv6 request {}", request);
+                        return Ok(IcmpTranslationAction::Drop);
+                    }
+                }
+                dest[2..8].fill(0);
+
+                self.translate_original_datagram_to_vpn(request_data, dest)
+            }
+            IcmpV6::PacketTooBig => {
+                dest[0] = 3;
+                dest[1] = 4;
+                dest[2..4].fill(0);
+                let mut mtu = [0u8; 4];
+                mtu.copy_from_slice(&request_data[4..8]);
+                // Assuming MTU for IPv4 and IPv6 next hop is large enough.
+                let mtu = u32::from_be_bytes(mtu);
+                let mtu = mtu.min(u16::MAX as u32).saturating_sub(20) as u16;
+                dest[6..8].copy_from_slice(&mtu.to_be_bytes());
+
+                self.translate_original_datagram_to_vpn(request_data, dest)
+            }
+            IcmpV6::TimeExceeded(IcmpV6TimeExceeded(code)) => {
+                dest[0] = 11;
+                dest[1] = code;
+                dest[2..8].fill(0);
+
+                self.translate_original_datagram_to_vpn(request_data, dest)
+            }
+            IcmpV6::ParameterProblem(IcmpV6ParameterProblem(code)) => {
+                match code {
+                    0 => {
+                        dest[0] = 12;
+                        dest[1] = 0;
+                        // TODO 0.5.0: set pointer value.
+
+                        self.translate_original_datagram_to_vpn(request_data, dest)
+                    }
+                    1 => {
+                        dest[0] = 3;
+                        dest[1] = 2;
+                        dest[2..8].fill(0);
+
+                        self.translate_original_datagram_to_vpn(request_data, dest)
+                    }
+                    _ => {
+                        debug!("Dropping unsupported ICMPv6 request {}", request);
+                        Ok(IcmpTranslationAction::Drop)
+                    }
+                }
+            }
+            IcmpV6::Unknown(_, _) => {
+                debug!("Dropping unsupported ICMPv6 request {}", request);
+                Ok(IcmpTranslationAction::Drop)
+            }
+        }
+    }
+
+    fn translate_original_datagram_to_esp(
+        &mut self,
+        src_data: &[u8],
+        dest: &mut [u8],
+    ) -> Result<IcmpTranslationAction, IpError> {
+        // RFC 4884, Section 4 states that the sixth octet contains the datagram length.
+        // All following octets (after the datagram) contain extensions.
+        let data_len = src_data[5] as usize * 8;
+        let (original_datagram, icmp_extensions) = if data_len == 0 {
+            // No extensions.
+            (&src_data[8..], &[] as &[u8])
+        } else {
+            (
+                &src_data[8..8 + data_len * 8],
+                &src_data[8 + data_len * 8..],
+            )
+        };
+
+        // TODO 0.5.0: Verify that there's enough space in destination slice.
+        let original_packet = match IpPacket::from_data(original_datagram) {
+            Ok(IpPacket::V4(packet)) => Ok(packet),
+            Ok(IpPacket::V6(_)) => Err("ICMPv4 header contains IPv6 original data".into()),
+            Err(err) => {
+                warn!(
+                    "Failed to parse original datagram in ICMPv4 packet: {}",
+                    err
+                );
+                Err(err)
+            }
+        }?;
+        // RFC 7915, Section 4.5.
+        let translated_length = original_packet
+            .write_converted(&mut dest[8..], self.nat64_prefix.clone(), true)
+            .map_err(|err| {
+                warn!(
+                    "Failed to translate ICMPv4 original datagram to IPv6: {}",
+                    err
+                );
+                err
+            })?;
+
+        // RFC 4884, Section 5.1 states that at least 128 bytes of the original message should be
+        // provided; and in Section 5.3 that IP+ICMPv6 packets should be limited to 1280 bytes.
+        let translated_length_padded = if translated_length < 128 {
+            128 / 8
+        } else if translated_length % 8 != 0 {
+            translated_length / 8 + 1
+        } else {
+            translated_length / 8
+        };
+        if !icmp_extensions.is_empty()
+            && translated_length_padded + icmp_extensions.len()
+                < Self::ICMPV6_ORIGINAL_MESSAGE_LIMIT
+        {
+            dest[4] = translated_length_padded as u8;
+            let translated_length_padded = translated_length_padded * 8;
+            dest[8 + translated_length..8 + translated_length_padded * 8].fill(0);
+            let dest = &mut dest[8 + translated_length_padded..];
+            dest[0..icmp_extensions.len()].copy_from_slice(icmp_extensions);
+            Ok(IcmpTranslationAction::Forward(
+                8 + translated_length_padded + icmp_extensions.len(),
+            ))
+        } else {
+            // Drop ICMP extensions if they won't fit into an ICMPv4 packet.
+            let translated_length = translated_length.min(Self::ICMPV4_ORIGINAL_MESSAGE_LIMIT);
+            Ok(IcmpTranslationAction::Forward(8 + translated_length))
+        }
+    }
+
+    fn translate_to_esp(
+        &mut self,
+        request: &IcmpMessage,
+        dest: &mut [u8],
+    ) -> Result<IcmpTranslationAction, IpError> {
+        // RFC 7915, Section 4.2.
+        let request_type = match request.icmp_type() {
+            IcmpMessageType::V4(t) => t,
+            IcmpMessageType::V6(_) => return Err("Cannot translate ICMPv4 packet to ESP".into()),
+        };
+        let request_data = match request {
+            IcmpMessage::V4(data) => data,
+            IcmpMessage::V6(_) => return Err("Cannot translate ICMPv4 packet to ESP".into()),
+        };
+        match request_type {
+            IcmpV4::EchoRequest => {
+                dest[0] = 128;
+                dest[1..4].fill(0);
+                dest[4..request_data.len()].copy_from_slice(&request_data[4..]);
+                Ok(IcmpTranslationAction::Forward(request_data.len()))
+            }
+            IcmpV4::EchoReply => {
+                dest[0] = 129;
+                dest[1..4].fill(0);
+                dest[4..request_data.len()].copy_from_slice(&request_data[4..]);
+                Ok(IcmpTranslationAction::Forward(request_data.len()))
+            }
+            IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(code)) => {
+                dest[0] = 1;
+                dest[2..8].fill(0);
+                match code {
+                    0 | 1 => dest[1] = 0,
+                    2 => {
+                        dest[0] = 4;
+                        dest[1] = 1;
+                        // TODO 0.5.0: set pointer value.
+                    }
+                    3 => dest[1] = 4,
+                    4 => {
+                        dest[0] = 2;
+                        dest[1] = 0;
+                        let mut mtu = [0u8; 2];
+                        mtu.copy_from_slice(&request_data[6..8]);
+                        // Assuming MTU for IPv4 and IPv6 next hop is large enough.
+                        let mtu = u16::from_be_bytes(mtu) as u32;
+                        let mtu = mtu.saturating_add(20);
+                        dest[4..8].copy_from_slice(&mtu.to_be_bytes());
+                    }
+                    5 => dest[1] = 0,
+                    6 | 7 | 8 => dest[1] = 0,
+                    9 | 10 => dest[1] = 1,
+                    11 | 12 => dest[1] = 0,
+                    13 => dest[1] = 1,
+                    14 => dest[1] = 1,
+                    _ => {
+                        debug!("Dropping unsupported ICMPv6 request {}", request);
+                        return Ok(IcmpTranslationAction::Drop);
+                    }
+                }
+
+                self.translate_original_datagram_to_esp(request_data, dest)
+            }
+            IcmpV4::TimeExceeded(IcmpV4TimeExceeded(code)) => {
+                dest[0] = 3;
+                dest[1] = code;
+                dest[2..8].fill(0);
+
+                self.translate_original_datagram_to_esp(request_data, dest)
+            }
+            IcmpV4::ParameterProblem(IcmpV4ParameterProblem(code)) => {
+                dest[0] = 4;
+                match code {
+                    0 => {
+                        dest[1] = 0;
+                        // TODO 0.5.0: set pointer value.
+
+                        self.translate_original_datagram_to_esp(request_data, dest)
+                    }
+                    2 => {
+                        dest[1] = 0;
+                        // TODO 0.5.0: set pointer value.
+
+                        self.translate_original_datagram_to_esp(request_data, dest)
+                    }
+                    _ => {
+                        debug!("Dropping unsupported ICMPv4 request {}", request);
+                        Ok(IcmpTranslationAction::Drop)
+                    }
+                }
+            }
+            IcmpV4::Unknown(_, _) => {
+                debug!("Dropping unsupported ICMPv6 request {}", request);
+                Ok(IcmpTranslationAction::Drop)
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IpError {
     Internal(&'static str),
     Dns(dns::DnsError),
-    Icmp(icmp::IcmpError),
     Format(message::FormatError),
     Io(io::Error),
 }
@@ -1700,7 +2433,6 @@ impl fmt::Display for IpError {
         match self {
             Self::Internal(msg) => f.write_str(msg),
             Self::Dns(e) => write!(f, "DNS error: {}", e),
-            Self::Icmp(e) => write!(f, "ICMP error: {}", e),
             Self::Format(e) => write!(f, "Format error: {}", e),
             Self::Io(e) => write!(f, "IO error: {}", e),
         }
@@ -1712,7 +2444,6 @@ impl error::Error for IpError {
         match self {
             Self::Internal(_msg) => None,
             Self::Dns(err) => Some(err),
-            Self::Icmp(err) => Some(err),
             Self::Format(err) => Some(err),
             Self::Io(err) => Some(err),
         }
@@ -1722,12 +2453,6 @@ impl error::Error for IpError {
 impl From<dns::DnsError> for IpError {
     fn from(err: dns::DnsError) -> IpError {
         Self::Dns(err)
-    }
-}
-
-impl From<icmp::IcmpError> for IpError {
-    fn from(err: icmp::IcmpError) -> IpError {
-        Self::Icmp(err)
     }
 }
 
@@ -1768,14 +2493,19 @@ fn debug_print_packet(data: &[u8]) {
             let valid_ip = packet.validate_ip_checksum();
             if !valid_transport || !valid_ip {
                 println!(
-                    "! Checksum validation failed: transport={} ip={}",
-                    valid_transport, valid_ip
+                    "! Checksum validation failed: transport={} ip={} packet: {}",
+                    valid_transport,
+                    valid_ip,
+                    fmt_slice_hex(data)
                 );
             }
         }
         IpPacket::V6(packet) => {
             if !packet.validate_transport_checksum() {
-                println!("! Checksum validation for transport failed",)
+                println!(
+                    "! Checksum validation for transport failed, packet: {}",
+                    fmt_slice_hex(data)
+                )
             }
         }
     }
