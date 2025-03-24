@@ -1995,6 +1995,46 @@ impl IcmpV4Message<'_> {
         u16::from_be_bytes(checksum)
     }
 
+    fn check_translate_echo(
+        original_packet: &Ipv4Packet,
+        dest: &mut [u8],
+        nat64_prefix: Nat64Prefix,
+    ) -> Option<usize> {
+        if original_packet.transport_protocol() != TransportProtocolType::ICMP
+            || dest.len() < 40 + 8
+        {
+            return None;
+        }
+        // Reserve space for IPv6 header.
+        let out_buf = &mut dest[40..];
+        let original_icmp =
+            match IcmpV4Message::from_data(original_packet.transport_protocol_data().full_data()) {
+                Ok(icmp) => icmp,
+                Err(_) => return None,
+            };
+        let length = match original_icmp.icmp_type() {
+            IcmpV4::EchoRequest => {
+                out_buf[0] = 128;
+                out_buf[1..4].fill(0);
+                let copy_bytes = out_buf.len().min(original_icmp[..].len());
+                out_buf[4..copy_bytes].copy_from_slice(&original_icmp[4..copy_bytes]);
+                Some(copy_bytes)
+            }
+            IcmpV4::EchoReply => {
+                out_buf[0] = 129;
+                out_buf[1..4].fill(0);
+                let copy_bytes = out_buf.len().min(original_icmp[..].len());
+                out_buf[4..copy_bytes].copy_from_slice(&original_icmp[4..copy_bytes]);
+                Some(copy_bytes)
+            }
+            _ => None,
+        }?;
+        original_packet
+            .write_icmp_forward(dest, length, nat64_prefix)
+            .map_err(|err| warn!("Failed to translate Echo original header: {}", err))
+            .ok()
+    }
+
     fn translate_original_datagram_to_esp(
         &self,
         dest: &mut [u8],
@@ -2021,16 +2061,25 @@ impl IcmpV4Message<'_> {
                 Err(err)
             }
         }?;
-        // RFC 7915, Section 4.5.
-        let translated_length = original_packet
-            .write_converted(&mut dest[8..], nat64_prefix, true)
-            .map_err(|err| {
-                warn!(
-                    "Failed to translate ICMPv4 original datagram to IPv6: {}",
+
+        let translated_length = if let Some(translated_echo_length) =
+            Self::check_translate_echo(&original_packet, &mut dest[8..], nat64_prefix.clone())
+        {
+            // This is a deviation from RFC 7915 - allowing failed ping responses to be matched
+            // with requests.
+            translated_echo_length
+        } else {
+            // RFC 7915, Section 4.5.
+            original_packet
+                .write_converted(&mut dest[8..], nat64_prefix, true)
+                .map_err(|err| {
+                    warn!(
+                        "Failed to translate ICMPv4 original datagram to IPv6: {}",
+                        err
+                    );
                     err
-                );
-                err
-            })?;
+                })?
+        };
 
         // RFC 4884, Section 5.1 states that at least 128 bytes of the original message should be
         // provided; and in Section 5.3 that IP+ICMPv6 packets should be limited to 1280 bytes.
@@ -2204,6 +2253,42 @@ impl IcmpV6Message<'_> {
         u16::from_be_bytes(checksum)
     }
 
+    fn check_translate_echo(original_packet: &Ipv6Packet, dest: &mut [u8]) -> Option<usize> {
+        if original_packet.transport_protocol() != TransportProtocolType::IPV6_ICMP
+            || dest.len() < 20 + 8
+        {
+            return None;
+        }
+        // Reserve space for IPv4 header.
+        let out_buf = &mut dest[20..];
+        let original_icmp =
+            match IcmpV6Message::from_data(original_packet.transport_protocol_data().full_data()) {
+                Ok(icmp) => icmp,
+                Err(_) => return None,
+            };
+        let length = match original_icmp.icmp_type() {
+            IcmpV6::EchoRequest => {
+                out_buf[0] = 8;
+                out_buf[1..4].fill(0);
+                let copy_bytes = out_buf.len().min(original_icmp[..].len());
+                out_buf[4..copy_bytes].copy_from_slice(&original_icmp[4..copy_bytes]);
+                Some(copy_bytes)
+            }
+            IcmpV6::EchoReply => {
+                out_buf[0] = 0;
+                out_buf[1..4].fill(0);
+                let copy_bytes = out_buf.len().min(original_icmp[..].len());
+                out_buf[4..copy_bytes].copy_from_slice(&original_icmp[4..copy_bytes]);
+                Some(copy_bytes)
+            }
+            _ => None,
+        }?;
+        original_packet
+            .write_icmp_forward(dest, length)
+            .map_err(|err| warn!("Failed to translate Echo original header: {}", err))
+            .ok()
+    }
+
     fn translate_original_datagram_to_vpn(
         &self,
         dest: &mut [u8],
@@ -2229,16 +2314,25 @@ impl IcmpV6Message<'_> {
                 Err(err)
             }
         }?;
-        // RFC 7915, Section 5.5.
-        let translated_length = original_packet
-            .write_converted(&mut dest[8..], true)
-            .map_err(|err| {
-                warn!(
-                    "Failed to translate ICMPv6 original datagram to IPv4: {}",
+
+        let translated_length = if let Some(translated_echo_length) =
+            Self::check_translate_echo(&original_packet, &mut dest[8..])
+        {
+            // This is a deviation from RFC 7915 - allowing failed ping responses to be matched
+            // with requests.
+            translated_echo_length
+        } else {
+            // RFC 7915, Section 5.5.
+            original_packet
+                .write_converted(&mut dest[8..], true)
+                .map_err(|err| {
+                    warn!(
+                        "Failed to translate ICMPv6 original datagram to IPv4: {}",
+                        err
+                    );
                     err
-                );
-                err
-            })?;
+                })?
+        };
 
         // RFC 792 requires the first 20+8 bytes to be provided.
         // RFC 4884, Section 5.1 states that at least 128 bytes of the original message should be
