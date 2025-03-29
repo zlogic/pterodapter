@@ -443,10 +443,6 @@ fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
     Ok(())
 }
 
-fn how_big_is_that_future<F: Future>(_fut: &F) -> usize {
-    std::mem::size_of::<F>()
-}
-
 #[cfg(feature = "ikev2")]
 fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
     use tokio::sync::oneshot;
@@ -469,9 +465,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
 
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
 
-    let r = server.run(config.fortivpn, shutdown_receiver);
-    print!("Mega = {}", how_big_is_that_future(&r));
-    let service_handle = rt.spawn(r);
+    let service_handle = rt.spawn(server.run(config.fortivpn, shutdown_receiver));
 
     rt.block_on(async move {
         if let Err(err) = signal::ctrl_c().await {
