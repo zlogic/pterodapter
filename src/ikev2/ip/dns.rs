@@ -10,7 +10,13 @@ use crate::logger::fmt_slice_hex;
 use super::Nat64Prefix;
 
 // As defined in RFC 1035, Sections 2.3.4 and 4.2.1.
-pub(super) const MAX_PACKET_SIZE: usize = 512;
+pub(super) const MAX_PACKET_SIZE_IPV4: usize = 512;
+
+// As documented in
+// https://www.ietf.org/archive/id/draft-hinden-v6ops-dns-00.html#name-dns-over-udp,
+// IPv6 has a larger MTU.
+// Also, local-link IKEv2 has a larger MTU on IPv4 as well.
+pub(super) const MAX_PACKET_SIZE_RESPONSE: usize = 1280 - 40;
 
 // As defined in RFC 1035, Section 2.3.4 and 3.1.
 // The domain length is limited by the packet size.
@@ -1191,9 +1197,6 @@ impl Dns64Translator {
         if flags.truncation() {
             return Err("Truncated requests are not supported".into());
         }
-        if dest.len() < MAX_PACKET_SIZE {
-            return Err("Not enough data for translated request".into());
-        }
         if dest.len() < request.data.len() {
             return Err("Destination slice cannot fit original request".into());
         }
@@ -1399,9 +1402,6 @@ impl Dns64Translator {
         }
         if flags.truncation() {
             return Err("Truncated responses are not supported".into());
-        }
-        if dest.len() < MAX_PACKET_SIZE {
-            return Err("Not enough data to translate DNS request into IPv4".into());
         }
         if dest.len() < request.data.len() {
             return Err("Destination slice cannot fit original request".into());

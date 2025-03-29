@@ -1060,7 +1060,7 @@ impl<'a> IpPacket<'a> {
         match self {
             IpPacket::V4(packet) => {
                 dest[0..packet.data.len()].copy_from_slice(packet.data);
-                // TODO DUALSTACK: decrease TTL.
+                // TODO 0.5.0: decrease TTL.
                 Ok(packet.data.len())
             }
             IpPacket::V6(packet) => packet.write_translated(dest, truncated),
@@ -1672,7 +1672,7 @@ impl Network {
             }
             IpPacket::V4(_) => {
                 if !is_dns_ip {
-                    // TODO DUALSTACK: decrease TTL.
+                    // TODO 0.5.0: decrease TTL.
                     Ok(RoutingActionEsp::Forward(packet.into_data()))
                 } else {
                     self.translate_dns_packet_from_esp(packet, header, out_buf)
@@ -1709,7 +1709,7 @@ impl Network {
         trace!("Decoded DNS packet from ESP: {}", dns_packet);
         // Reserve space for UDP header.
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
-            ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE];
+            ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE_IPV4];
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated_ipv4(out_buf, false)?;
             debug_print_packet(&out_buf[..length]);
@@ -1810,8 +1810,8 @@ impl Network {
             IpPacket::V4(packet) => packet,
             IpPacket::V6(_) => return Err("Cannot translate IPv6 packet in NAT64".into()),
         };
-        let is_dns_ip = self.dns_addrs.contains(&header.src_addr());
-        let is_ipv4_tunnel = self.tunnel_ips.contains(&header.src_addr());
+        let is_dns_ip = self.dns_addrs.contains(header.src_addr());
+        let is_ipv4_tunnel = self.tunnel_ips.contains(header.src_addr());
         // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
         // limit is 1 (would be reduced to 1)
         // https://datatracker.ietf.org/doc/html/rfc7915#section-4.1
@@ -1825,17 +1825,15 @@ impl Network {
             )
         } else if is_ipv4_tunnel {
             let data = packet.into_data();
-            // TODO DUALSTACK: decrease TTL.
+            // TODO 0.5.0: decrease TTL.
             out_buf[..data.len()].copy_from_slice(data);
             Ok(RoutingActionVpn::Forward(out_buf, data.len()))
+        } else if packet.transport_protocol() == TransportProtocolType::ICMP {
+            self.translate_icmp_packet_from_vpn(packet, out_buf, nat64_prefix)
         } else {
-            if packet.transport_protocol() == TransportProtocolType::ICMP {
-                self.translate_icmp_packet_from_vpn(packet, out_buf, nat64_prefix)
-            } else {
-                let length = packet.write_translated(out_buf, nat64_prefix, false)?;
-                debug_print_packet(&out_buf[..length]);
-                Ok(RoutingActionVpn::Forward(out_buf, length))
-            }
+            let length = packet.write_translated(out_buf, nat64_prefix, false)?;
+            debug_print_packet(&out_buf[..length]);
+            Ok(RoutingActionVpn::Forward(out_buf, length))
         }
     }
 
@@ -1881,7 +1879,7 @@ impl Network {
         }
 
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
-            ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE];
+            ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE_RESPONSE];
         let dns_translator = if let Some(dns_translator) = &mut self.dns_translator {
             dns_translator
         } else {
@@ -1991,10 +1989,6 @@ impl Checksum {
         sum = (sum >> 16) + (sum & 0x0000ffffu32);
         sum = (sum >> 16) + (sum & 0x0000ffffu32);
         self.0 = sum;
-    }
-
-    fn add_one(&mut self, add: u16) {
-        self.0 += add as u32
     }
 
     fn add_slice(&mut self, add: &[u8]) {
