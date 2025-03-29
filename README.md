@@ -115,7 +115,7 @@ For containers running in Podman Machine, use `host.containers.internal` instead
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --destination=<hostport> [--tunnel-domain=<domain>] [--nat64-prefix=<ip6prefix>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
+pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --destination=<hostport> [--tunnel-domain=<domain>] [--nat64-prefix=<ip6prefix>] [--dns64-tunnel-suffix=<domain>] [--nat64-ipv4-dns=<ip4addr>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
@@ -131,7 +131,7 @@ pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>]
 `--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. To specify multiple domains, add a `--tunnel-domain` argument for each one; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN.
 This is implemented using IKEv2 traffic selectors and works as expected on macOS; Windows seems to have [issues with split routing](https://docs.strongswan.org/docs/5.9/howtos/forwarding.html#_split_tunneling_with_ikev2).
 To ensure that dynamic IPs are handled correctly, pterodapter will send updated routes (IKEv2 Traffic Selectors) when the client rekeys the session.
-If `--nat64-prefix` is specified, subdomains will also be tunneled (e.g. `--tunnel-domain=example.com` will also route traffic to `subdomain.example.com`); otherwise (no `--nat64-prefix` is specified), only complete domain matches will be routed to the VPN.
+This option only affects IPv4 traffic. For NAT64 split tunnel routing, use the `--dns64-tunnel-suffix` argument.
 
 `--nat64-prefix=<ip6prefix>` specifies an optional argument indicating that [NAT64](https://en.wikipedia.org/wiki/NAT64) mode should be enabled, for example `--nat64-prefix=64:ff9b::` will remap IPv4 addresses to a /96 IPv6 subnet matching `64:ff9b::`-`64:ff9b::ffff:ffff`.
 In NAT64 mode, pterodapter will intercept DNS responses and remap external IPv4 addresses to IPv6 addresses in the specified subnet.
@@ -139,6 +139,15 @@ This is done only for domains matching a suffix listed in `--tunnel-domain`.
 The IKEv2 client will use IPv6 traffic, which is translated into IPv4 and sent to VPN, based on the SIIT alrorithm documented in [RFC 7915](https://datatracker.ietf.org/doc/html/rfc7915).
 This approach simplifies the routing table (IKEv2 Traffic Selector) to use only one network or traffic selector; it also allows to use domain suffixes and handle DNS updates without reconnecting the client.
 Inspired by ideas from [Microsoft DirectAccess](https://en.wikipedia.org/wiki/DirectAccess).
+
+`--dns64-tunnel-suffix=<domain>` specifies an optional argument indicating that `<domain>` and its subdomains should be sent through the VPN using NAT64 (DNS64).
+To specify multiple domains, add a `--dns64-tunnel-suffix` argument for each one.
+If no `--dns64-tunnel-suffix` arguments are specified, DNS64 won't be used, but will still remain available - for example, to be used with a custom DNS64 server.
+
+`--nat64-ipv4-dns=<ip4addr>` specifies an optional argument indicating that `<ip4addr>` should be added as an additional DNS address for clients who don't support IPv6.
+To specify multiple DNS servers, add a `--nat64-ipv4-dns` argument for each one.
+These addresses will be added to the VPN as additional destinations, and any responses from those DNS servers will always be sent as IPv4 responses.
+This option lets pterodapter decide if a DNS response should be sent as an IPv4 or IPv6 packet.
 
 `--destination=<hostport>` specifies the hostname to send to the client when performing a client handshake. If not specified, will use `pterodapter` as the hostname. Windows refuses to connect if the hostname doesn't match connection settings; macOS prints a warning in the Console.
 

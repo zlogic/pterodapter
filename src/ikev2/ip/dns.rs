@@ -284,7 +284,10 @@ impl DnsPacket<'_> {
                 }
             }
             Err(err) => {
-                warn!("Failed to parse DNS packet while checking if it matches suffix: {}", err);
+                warn!(
+                    "Failed to parse DNS packet while checking if it matches suffix: {}",
+                    err
+                );
                 false
             }
             _ => false,

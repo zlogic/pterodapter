@@ -1,6 +1,6 @@
 use std::{
     env, fmt, fs,
-    net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     process,
     str::FromStr,
     sync::Arc,
@@ -51,18 +51,20 @@ Options:\
 \n\n\
 > pterodapter [OPTIONS] ikev2\n\
 Options:\
-\n      --log-level=<LOG_LEVEL>   Log level [default: info]\
-\n      --listen-ip=<IP>          Listen IP address, multiple options can be provided [default: ::]\
-\n      --ike-port=<PORT>         IKEv2 port [default: 500]\
-\n      --nat-port=<PORT>         NAT port for IKEv2 and ESP [default: 4500]\
-\n      --listen-ip=<IP>          Listen IP address, multiple options can be provided [default: ::]\
-\n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
-\n      --tunnel-domain=<DOMAIN>  (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
-\n      --nat64-prefix=<IP6>      (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
-\n      --id-hostname=<FQDN>      Hostname for identification [default: pterodapter]\
-\n      --cacert=<FILENAME>       Path to root CA certificate (in PKCS 8 PEM format)\
-\n      --cert=<FILENAME>         Path to public certificate (in PKCS 8 PEM format)\
-\n      --key=<FILENAME>          Path to private key (in PKCS 8 PEM format)\
+\n      --log-level=<LOG_LEVEL>         Log level [default: info]\
+\n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
+\n      --ike-port=<PORT>               IKEv2 port [default: 500]\
+\n      --nat-port=<PORT>               NAT port for IKEv2 and ESP [default: 4500]\
+\n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
+\n      --destination=<HOSTPORT>        Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
+\n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
+\n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
+\n      --nat64-ipv4-dns=<IP4>          (Optional) Additional IPv4-only DNS address for NAT64 mode; can be specified multiple times\
+\n      --id-hostname=<FQDN>            Hostname for identification [default: pterodapter]\
+\n      --cacert=<FILENAME>             Path to root CA certificate (in PKCS 8 PEM format)\
+\n      --cert=<FILENAME>               Path to public certificate (in PKCS 8 PEM format)\
+\n      --key=<FILENAME>                Path to private key (in PKCS 8 PEM format)\
 \n\n\
 > pretodapter help";
 
@@ -120,6 +122,8 @@ impl Args {
         let mut private_key = None;
         let mut public_cert = None;
         let mut nat64_prefix = None;
+        let mut dns64_domains: Vec<String> = vec![];
+        let mut nat64_ipv4_dns: Vec<Ipv4Addr> = vec![];
 
         let tls_config =
             rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -184,6 +188,32 @@ impl Args {
                     );
                 }
                 tunnel_domains.push(value.into());
+            } else if name == "--dns64-tunnel-suffix" {
+                // Domains should be in DNS IDNA A-label format for Unicode strings.
+                // All further processing assumes the domain is an ASCII UTF-8 string.
+                if !value.is_ascii() {
+                    fail_with_error(
+                        name,
+                        value,
+                        format_args!("Domain is not a valid ASCII string"),
+                    );
+                }
+                dns64_domains.push(value.into());
+            } else if name == "--nat64-ipv4-dns" {
+                let dns_ipv4 = match IpAddr::from_str(value) {
+                    Ok(IpAddr::V4(ip)) => ip,
+                    Ok(IpAddr::V6(_)) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("NAT64 doesn't support IPv6 DNS addresses for IPv4 dns"),
+                    ),
+                    Err(err) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("Failed to parse NAT64 IPv4 DNS address: {}", err),
+                    ),
+                };
+                nat64_ipv4_dns.push(dns_ipv4);
             } else if action_type == ActionType::Proxy && name == "--pac-file" {
                 pac_path = Some(value.into());
             } else if action_type == ActionType::IkeV2 && name == "--listen-ip" {
@@ -275,6 +305,16 @@ impl Args {
                     process::exit(2);
                 }
             };
+        if nat64_prefix.is_none() && !dns64_domains.is_empty() {
+            eprintln!("--dns64-tunnel-suffix should only be used when --nat64-prefix is specified");
+            println!("{}", USAGE_INSTRUCTIONS);
+            process::exit(2);
+        }
+        if nat64_prefix.is_none() && !nat64_ipv4_dns.is_empty() {
+            eprintln!("--nat64-ipv4-dns should only be used when --nat64-prefix is specified");
+            println!("{}", USAGE_INSTRUCTIONS);
+            process::exit(2);
+        }
 
         let mtu = match action_type {
             ActionType::Proxy => fortivpn::PPP_MTU,
@@ -335,6 +375,8 @@ impl Args {
                         server_cert,
                         tunnel_domains,
                         nat64_prefix,
+                        dns64_domains,
+                        nat64_ipv4_dns,
                     };
                     let action = Action::IkeV2(Ikev2Config {
                         ikev2: ikev2_config,

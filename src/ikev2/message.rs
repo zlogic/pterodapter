@@ -610,15 +610,17 @@ impl MessageWriter<'_> {
 
     pub fn write_configuration_payload(
         &mut self,
-        ip_netmask: IpNetmask,
+        ip_netmasks: &[IpNetmask],
         dns: &[IpAddr],
         tunnel_domains: &[Vec<u8>],
     ) -> Result<(), NotEnoughSpaceError> {
-        let addr_length = match ip_netmask {
-            IpNetmask::Ipv4Mask(_, _) => (4 + 4) * 2,
-            IpNetmask::Ipv6Prefix(_, _) => 4 + 17,
-            IpNetmask::None => 0,
-        };
+        let addr_length = ip_netmasks
+            .iter()
+            .map(|ip_netmask| match ip_netmask {
+                IpNetmask::Ipv4Mask(_, _) => (4 + 4) * 2,
+                IpNetmask::Ipv6Prefix(_, _) => 4 + 17,
+            })
+            .sum::<usize>();
         let dns_length = dns
             .iter()
             .map(|dns| match dns {
@@ -639,37 +641,38 @@ impl MessageWriter<'_> {
 
         // Write IP address.
         let mut data = &mut next_payload_slice[4..];
-        match ip_netmask {
-            IpNetmask::Ipv4Mask(addr, netmask) => {
-                data[0..2].copy_from_slice(
-                    &ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
-                        .0
-                        .to_be_bytes(),
-                );
-                data[2..4].copy_from_slice(&4u16.to_be_bytes());
-                data[4..8].copy_from_slice(&addr.octets());
-                data[8..10].copy_from_slice(
-                    &ConfigurationAttributeType::INTERNAL_IP4_NETMASK
-                        .0
-                        .to_be_bytes(),
-                );
-                data[10..12].copy_from_slice(&4u16.to_be_bytes());
-                data[12..16].copy_from_slice(&netmask.octets());
-                data = &mut data[16..];
+        for ip_netmask in ip_netmasks {
+            match ip_netmask {
+                IpNetmask::Ipv4Mask(addr, netmask) => {
+                    data[0..2].copy_from_slice(
+                        &ConfigurationAttributeType::INTERNAL_IP4_ADDRESS
+                            .0
+                            .to_be_bytes(),
+                    );
+                    data[2..4].copy_from_slice(&4u16.to_be_bytes());
+                    data[4..8].copy_from_slice(&addr.octets());
+                    data[8..10].copy_from_slice(
+                        &ConfigurationAttributeType::INTERNAL_IP4_NETMASK
+                            .0
+                            .to_be_bytes(),
+                    );
+                    data[10..12].copy_from_slice(&4u16.to_be_bytes());
+                    data[12..16].copy_from_slice(&netmask.octets());
+                    data = &mut data[16..];
+                }
+                IpNetmask::Ipv6Prefix(addr, prefix) => {
+                    data[0..2].copy_from_slice(
+                        &ConfigurationAttributeType::INTERNAL_IP6_ADDRESS
+                            .0
+                            .to_be_bytes(),
+                    );
+                    data[2..4].copy_from_slice(&17u16.to_be_bytes());
+                    data[4..20].copy_from_slice(&addr.octets());
+                    data[20] = *prefix;
+                    data = &mut data[21..];
+                }
             }
-            IpNetmask::Ipv6Prefix(addr, prefix) => {
-                data[0..2].copy_from_slice(
-                    &ConfigurationAttributeType::INTERNAL_IP6_ADDRESS
-                        .0
-                        .to_be_bytes(),
-                );
-                data[2..4].copy_from_slice(&17u16.to_be_bytes());
-                data[4..20].copy_from_slice(&addr.octets());
-                data[20] = prefix;
-                data = &mut data[21..];
-            }
-            IpNetmask::None => {}
-        };
+        }
         // Write all DNS servers.
         for addr in dns {
             match addr {
@@ -2162,20 +2165,37 @@ pub struct TrafficSelector {
 }
 
 impl TrafficSelector {
-    pub fn from_ip_range(
-        addr_range: RangeInclusive<IpAddr>,
-    ) -> Result<TrafficSelector, FormatError> {
-        let ts_type = match (addr_range.start(), addr_range.end()) {
-            (IpAddr::V4(_), IpAddr::V4(_)) => TrafficSelectorType::TS_IPV4_ADDR_RANGE,
-            (IpAddr::V6(_), IpAddr::V6(_)) => TrafficSelectorType::TS_IPV6_ADDR_RANGE,
-            _ => return Err("Traffic selector has incompatible start/end address types".into()),
-        };
-        Ok(TrafficSelector {
-            ts_type,
+    pub fn from_ipv4_range(addr_range: RangeInclusive<Ipv4Addr>) -> TrafficSelector {
+        let addr_range = IpAddr::V4(*addr_range.start())..=IpAddr::V4(*addr_range.end());
+        TrafficSelector {
+            ts_type: TrafficSelectorType::TS_IPV4_ADDR_RANGE,
             ip_protocol: IPProtocolType::ANY,
             addr: addr_range,
             port: 0..=u16::MAX,
-        })
+        }
+    }
+
+    pub fn from_ipv6_range(addr_range: RangeInclusive<Ipv6Addr>) -> TrafficSelector {
+        let addr_range = IpAddr::V6(*addr_range.start())..=IpAddr::V6(*addr_range.end());
+        TrafficSelector {
+            ts_type: TrafficSelectorType::TS_IPV6_ADDR_RANGE,
+            ip_protocol: IPProtocolType::ANY,
+            addr: addr_range,
+            port: 0..=u16::MAX,
+        }
+    }
+
+    pub fn from_ip(addr: IpAddr) -> TrafficSelector {
+        let ts_type = match addr {
+            IpAddr::V4(_) => TrafficSelectorType::TS_IPV4_ADDR_RANGE,
+            IpAddr::V6(_) => TrafficSelectorType::TS_IPV6_ADDR_RANGE,
+        };
+        TrafficSelector {
+            ts_type,
+            ip_protocol: IPProtocolType::ANY,
+            addr: addr..=addr,
+            port: 0..=u16::MAX,
+        }
     }
 
     pub fn ts_type(&self) -> TrafficSelectorType {

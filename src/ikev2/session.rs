@@ -10,10 +10,7 @@ use std::{
     time::{self, Instant},
 };
 
-use super::{
-    MAX_DATAGRAM_SIZE, Sockets,
-    ip::{IpNetmask, Network},
-};
+use super::{MAX_DATAGRAM_SIZE, Sockets, ip::Network};
 use super::{SendError, crypto, esp, message, pki};
 
 use crypto::DHTransform;
@@ -932,9 +929,8 @@ impl IKEv2Session {
                             warn!("Failed to decode initiator traffic selectors: {}", err);
                             err
                         });
-                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
+                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
                         ts_remote = ts
                     }
                 }
@@ -946,9 +942,8 @@ impl IKEv2Session {
                             warn!("Failed to decode responder traffic selectors: {}", err);
                             err
                         });
-                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
+                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
                         ts_local = ts
                     }
                 }
@@ -1112,28 +1107,26 @@ impl IKEv2Session {
         };
 
         if ipv4_address_requested {
-            let ip_netmask = self.network.ip_netmask();
-            let tunnel_domains = if internal_domain_requested {
-                self.network.tunnel_domains()
+            let ip_netmasks = self.network.ip_netmasks();
+            let dns64_domains = if internal_domain_requested {
+                self.network.dns64_domains()
             } else {
                 &[]
             };
-            match ip_netmask {
-                IpNetmask::Ipv4Mask(_, _) | IpNetmask::Ipv6Prefix(_, _) => response
-                    .write_configuration_payload(
-                        ip_netmask,
-                        self.network.dns_addrs(),
-                        tunnel_domains,
-                    )?,
-                IpNetmask::None => {
-                    warn!("No IP address is available, notifying client");
-                    response.write_notify_payload(
-                        None,
-                        &[],
-                        message::NotifyMessageType::INTERNAL_ADDRESS_FAILURE,
-                        &[],
-                    )?;
-                }
+            if ip_netmasks.is_empty() {
+                warn!("No IP address is available, notifying client");
+                response.write_notify_payload(
+                    None,
+                    &[],
+                    message::NotifyMessageType::INTERNAL_ADDRESS_FAILURE,
+                    &[],
+                )?
+            } else {
+                response.write_configuration_payload(
+                    ip_netmasks,
+                    self.network.dns_addrs(),
+                    dns64_domains,
+                )?
             }
         }
 
@@ -1160,7 +1153,6 @@ impl IKEv2Session {
 
         response.write_security_association(&[(&transform_params, proposal_num)])?;
 
-        // TODO: will macOS or Windows accept more traffic selectors?
         response.write_traffic_selector_payload(true, &ts_remote)?;
         response.write_traffic_selector_payload(false, self.network.ts_local())?;
 
@@ -1365,9 +1357,8 @@ impl IKEv2Session {
                             warn!("Failed to decode initiator traffic selectors: {}", err);
                             err
                         });
-                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
+                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
                         ts_remote = ts
                     }
                 }
@@ -1379,9 +1370,8 @@ impl IKEv2Session {
                             warn!("Failed to decode responder traffic selectors: {}", err);
                             err
                         });
-                    let traffic_selector_type = self.network.traffic_selector_type();
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| ts.ts_type() == traffic_selector_type);
+                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
                         ts_local = ts
                     }
                 }

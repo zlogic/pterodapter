@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -50,6 +50,8 @@ pub struct Config {
     pub server_cert: Option<(String, String)>,
     pub tunnel_domains: Vec<String>,
     pub nat64_prefix: Option<Ipv6Addr>,
+    pub dns64_domains: Vec<String>,
+    pub nat64_ipv4_dns: Vec<Ipv4Addr>,
 }
 
 pub struct Server {
@@ -58,7 +60,9 @@ pub struct Server {
     nat_port: u16,
     pki_processing: Arc<pki::PkiProcessing>,
     tunnel_domains: Vec<String>,
+    dns64_domains: Vec<String>,
     nat64_prefix: Option<Nat64Prefix>,
+    nat64_ipv4_dns: Vec<Ipv4Addr>,
 }
 
 impl Server {
@@ -77,7 +81,9 @@ impl Server {
             nat_port: config.nat_port,
             pki_processing: Arc::new(pki_processing),
             tunnel_domains: config.tunnel_domains,
+            dns64_domains: config.dns64_domains,
             nat64_prefix: config.nat64_prefix.map(Nat64Prefix::new),
+            nat64_ipv4_dns: config.nat64_ipv4_dns,
         })
     }
 
@@ -110,25 +116,31 @@ impl Server {
             CLEANUP_INTERVAL,
             command_sender.clone(),
         ));
-        let mut network = ip::Network::new(self.nat64_prefix, self.tunnel_domains.clone())?;
-        if !network.is_nat64() {
-            network.refresh_addresses().await?;
+        let network = ip::Network::new(
+            self.nat64_prefix,
+            self.dns64_domains.clone(),
+            self.nat64_ipv4_dns.clone(),
+        )?;
+        if let Some(mut split_route_registry) =
+            network.split_route_registry(self.tunnel_domains.clone())
+        {
             let routes_sender = command_sender.clone();
-            let mut refresh_network = network.clone();
             rt.spawn(async move {
                 let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
                 delay.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
                 loop {
+                    match split_route_registry.refresh_addresses().await {
+                        Ok(ip_addresses) => {
+                            let _ = routes_sender
+                                .send(SessionMessage::UpdateSplitRoutes(ip_addresses))
+                                .await;
+                        }
+                        Err(err) => {
+                            warn!("Failed to refresh IP addresses for split routes: {}", err);
+                            continue;
+                        }
+                    }
                     delay.tick().await;
-                    if let Err(err) = refresh_network.refresh_addresses().await {
-                        warn!("Failed to refresh IP addresses for split routes: {}", err);
-                        continue;
-                    };
-                    let _ = routes_sender
-                        .send(SessionMessage::UpdateSplitRoutes(Box::new(
-                            refresh_network.clone(),
-                        )))
-                        .await;
                 }
             });
         };
@@ -543,7 +555,7 @@ enum SessionMessage {
     DeleteSecurityAssociation(u32),
     RetransmitRequest(session::SessionID, u32),
     CleanupTimer,
-    UpdateSplitRoutes(Box<Network>),
+    UpdateSplitRoutes(Vec<IpAddr>),
     Shutdown,
 }
 
@@ -749,6 +761,9 @@ impl Sessions {
             } else {
                 (None, &[])
             };
+        // TODO 0.5.0: remove this debug code.
+        //let internal_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10)));
+        //let dns_addrs = &[IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))];
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
     }
@@ -788,8 +803,8 @@ impl Sessions {
                 let rt = runtime::Handle::current();
                 self.cleanup(&rt);
             }
-            SessionMessage::UpdateSplitRoutes(network) => {
-                self.network = *network;
+            SessionMessage::UpdateSplitRoutes(ip_addresses) => {
+                self.network.set_split_routes(&ip_addresses);
                 self.update_all_split_routes();
             }
             SessionMessage::RetransmitRequest(session_id, message_id) => {

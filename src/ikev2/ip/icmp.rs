@@ -218,7 +218,7 @@ impl IcmpV4Message<'_> {
             _ => None,
         }?;
         original_packet
-            .write_icmp_forward(dest, length, nat64_prefix)
+            .write_icmp_translated(dest, length, nat64_prefix)
             .map_err(|err| warn!("Failed to translate Echo original header: {}", err))
             .ok()
     }
@@ -259,7 +259,7 @@ impl IcmpV4Message<'_> {
         } else {
             // RFC 7915, Section 4.5.
             original_packet
-                .write_converted(&mut dest[8..], nat64_prefix, true)
+                .write_translated(&mut dest[8..], nat64_prefix, true)
                 .map_err(|err| {
                     warn!(
                         "Failed to translate ICMPv4 original datagram to IPv6: {}",
@@ -472,7 +472,7 @@ impl IcmpV6Message<'_> {
             _ => None,
         }?;
         original_packet
-            .write_icmp_forward(dest, length)
+            .write_icmp_translated(dest, length)
             .map_err(|err| warn!("Failed to translate Echo original header: {}", err))
             .ok()
     }
@@ -512,7 +512,7 @@ impl IcmpV6Message<'_> {
         } else {
             // RFC 7915, Section 5.5.
             original_packet
-                .write_converted(&mut dest[8..], true)
+                .write_translated(&mut dest[8..], true)
                 .map_err(|err| {
                     warn!(
                         "Failed to translate ICMPv6 original datagram to IPv4: {}",
