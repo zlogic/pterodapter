@@ -1505,9 +1505,15 @@ impl Network {
         self.ip_netmasks = if let Some(nat64_prefix) = &self.nat64_prefix {
             self.dns_addrs = dns_addrs
                 .iter()
-                .map(|dns_addr| match dns_addr {
-                    IpAddr::V4(addr) => IpAddr::V6(nat64_prefix.map_ipv4(addr)),
-                    IpAddr::V6(_) => *dns_addr,
+                .flat_map(|dns_addr| match dns_addr {
+                    IpAddr::V4(addr) => {
+                        if !self.dns_addrs_ipv4.contains(addr) {
+                            Some(IpAddr::V6(nat64_prefix.map_ipv4(addr)))
+                        } else {
+                            None
+                        }
+                    }
+                    IpAddr::V6(_) => Some(*dns_addr),
                 })
                 .collect::<Vec<_>>();
             self.dns_addrs.extend(
