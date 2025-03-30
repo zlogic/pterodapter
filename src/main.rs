@@ -455,7 +455,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
             eprintln!("Failed to start runtime: {}", err);
             1
         })?;
-    let server = match ikev2::Server::new(config.ikev2) {
+    let mut server = match ikev2::Server::new(config.ikev2) {
         Ok(server) => server,
         Err(err) => {
             eprintln!("Failed to create server: {}", err);
@@ -479,8 +479,6 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
     if let Err(err) = server.run(rt, config.fortivpn, shutdown_receiver) {
         eprintln!("Failed to run server: {}", err);
     };
-
-    //rt.shutdown_timeout(Duration::from_secs(60));
 
     info!("Stopped server");
     Ok(())

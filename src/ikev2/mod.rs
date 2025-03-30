@@ -63,6 +63,10 @@ pub struct Server {
     dns64_domains: Vec<String>,
     nat64_prefix: Option<Nat64Prefix>,
     nat64_ipv4_dns: Vec<Ipv4Addr>,
+    udp_read_buffer: [u8; MAX_ESP_PACKET_SIZE],
+    udp_write_buffer: [u8; MAX_ESP_PACKET_SIZE],
+    vpn_read_buffer: [u8; MAX_ESP_PACKET_SIZE],
+    vpn_write_buffer: [u8; MAX_DATAGRAM_SIZE],
 }
 
 impl Server {
@@ -75,6 +79,10 @@ impl Server {
                 .as_ref()
                 .map(|(public_cert, private_key)| (public_cert.as_str(), private_key.as_str())),
         )?;
+        let udp_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
+        let udp_write_buffer = [0u8; MAX_ESP_PACKET_SIZE];
+        let vpn_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
+        let vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
         Ok(Server {
             listen_ips: config.listen_ips,
             port: config.port,
@@ -84,6 +92,10 @@ impl Server {
             dns64_domains: config.dns64_domains,
             nat64_prefix: config.nat64_prefix.map(Nat64Prefix::new),
             nat64_ipv4_dns: config.nat64_ipv4_dns,
+            udp_read_buffer,
+            udp_write_buffer,
+            vpn_read_buffer,
+            vpn_write_buffer,
         })
     }
 
@@ -102,7 +114,7 @@ impl Server {
     }
 
     pub fn run(
-        self,
+        &mut self,
         rt: runtime::Runtime,
         fortivpn_config: fortivpn::Config,
         shutdown_receiver: oneshot::Receiver<()>,
@@ -117,7 +129,7 @@ impl Server {
             command_sender.clone(),
         ));
         let network = ip::Network::new(
-            self.nat64_prefix,
+            self.nat64_prefix.clone(),
             self.dns64_domains.clone(),
             self.nat64_ipv4_dns.clone(),
         )?;
@@ -159,29 +171,16 @@ impl Server {
             }
         });
 
-        let mut udp_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
-        let mut udp_write_buffer = [0u8; MAX_ESP_PACKET_SIZE];
-        let mut vpn_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
-        let mut vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
-        rt.block_on(Self::run_process(
-            command_receiver,
-            sessions,
-            vpn_service,
-            &mut udp_read_buffer,
-            &mut udp_write_buffer,
-            &mut vpn_read_buffer,
-            &mut vpn_write_buffer,
-        ))
+        let result = rt.block_on(self.run_process(command_receiver, sessions, vpn_service));
+        rt.shutdown_timeout(Duration::from_secs(60));
+        result
     }
 
     async fn run_process(
+        &mut self,
         mut command_receiver: mpsc::Receiver<SessionMessage>,
         mut sessions: Sessions,
         mut vpn_service: FortiService,
-        mut udp_read_buffer: &mut [u8],
-        mut udp_write_buffer: &mut [u8],
-        mut vpn_read_buffer: &mut [u8],
-        mut vpn_write_buffer: &mut [u8],
     ) -> Result<(), IKEv2Error> {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
@@ -193,7 +192,7 @@ impl Server {
                 return Ok(());
             }
             // Wait until something is ready.
-            let mut udp_read_buf = ReadBuf::new(&mut udp_read_buffer);
+            let mut udp_read_buf = ReadBuf::new(&mut self.udp_read_buffer);
             poll_seed = poll_seed.wrapping_add(1);
             let (command_message, udp_source, vpn_event) = {
                 let mut vpn_event = None;
@@ -201,7 +200,7 @@ impl Server {
                 let mut command_message = None;
                 let ignore_vpn = shutdown && !vpn_is_connected;
                 let mut receive_command = pin!(command_receiver.recv());
-                let mut receive_vpn_event = pin!(vpn_service.wait_event(&mut vpn_read_buffer));
+                let mut receive_vpn_event = pin!(vpn_service.wait_event(&mut self.vpn_read_buffer));
                 let sockets = &sessions.sockets;
                 future::poll_fn(|cx| {
                     if vpn_event.is_none() {
@@ -254,14 +253,14 @@ impl Server {
                 sessions.process_message(message).await;
             }
             let vpn_action = match vpn_event {
-                Some(Ok(())) => match vpn_service.read_packet(&mut vpn_read_buffer).await {
+                Some(Ok(())) => match vpn_service.read_packet(&mut self.vpn_read_buffer).await {
                     Ok(data) => {
                         let read_bytes = data.len();
 
                         match sessions.process_vpn_packet(
-                            &mut vpn_read_buffer[fortivpn::PPP_HEADER_SIZE..],
+                            &mut self.vpn_read_buffer[fortivpn::PPP_HEADER_SIZE..],
                             read_bytes,
-                            &mut vpn_write_buffer,
+                            &mut self.vpn_write_buffer,
                         ) {
                             Ok(action) => action,
                             Err(err) => {
@@ -293,7 +292,7 @@ impl Server {
                     } else {
                         sessions.process_esp_packet(
                             udp_read_buf.filled_mut(),
-                            &mut udp_write_buffer,
+                            &mut self.udp_write_buffer,
                             udp_source,
                         )
                     };
