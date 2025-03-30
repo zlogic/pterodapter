@@ -21,6 +21,8 @@ const MAX_TRANSLATED_IP_HEADER_LENGTH: usize = 40 + 8;
 // Set to 0 to stop decreasing TTL or Hop Limit.
 const TTL_HOP_DECREMENT: u8 = 1;
 
+const DEFAULT_RESPONSE_TTL: u8 = 64;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TransportProtocolType(u8);
 
@@ -436,6 +438,33 @@ impl<'a> Ipv4Packet<'a> {
         Ok(40 + icmp_len)
     }
 
+    fn write_icmp_response_header(
+        &self,
+        dest: &mut [u8],
+        icmp_len: usize,
+    ) -> Result<usize, IpError> {
+        if dest.len() < 20 + icmp_len {
+            return Err("Not enough space to write ICMPv4 response header".into());
+        }
+        let ip_header = &mut dest[0..20];
+        ip_header[0] = (4 << 4) | 5;
+        ip_header[1] = self.data[1];
+        ip_header[2..4].copy_from_slice(&(icmp_len as u16 + 20u16).to_be_bytes());
+        ip_header[4..6].copy_from_slice(&self.data[4..6]);
+        ip_header[6..8].fill(0);
+        ip_header[8] = DEFAULT_RESPONSE_TTL;
+        ip_header[9] = TransportProtocolType::ICMP.to_u8();
+        ip_header[10..12].fill(0);
+        ip_header[12..16].copy_from_slice(&self.data[16..20]);
+        ip_header[16..20].copy_from_slice(&self.data[12..16]);
+
+        let mut checksum = Checksum::new();
+        checksum.add_slice(ip_header);
+        checksum.fold();
+        ip_header[10..12].copy_from_slice(&checksum.value().to_be_bytes());
+        Ok(20)
+    }
+
     fn write_udp_translated(
         &self,
         dest: &mut [u8],
@@ -484,23 +513,23 @@ impl<'a> Ipv4Packet<'a> {
         let start_offset = data_range.start - 20 - 8;
         let udp_length: u16 = 8 + data_range.len() as u16;
         let mut checksum = {
-            let dest = &mut dest[start_offset..start_offset + 20];
-            dest[0] = (4 << 4) | 5;
-            dest[1] = self.data[1];
-            dest[2..4].copy_from_slice(&(udp_length + 20u16).to_be_bytes());
-            dest[4..6].copy_from_slice(&self.data[4..6]);
-            dest[6..8].fill(0);
-            dest[8] = self.ttl().saturating_sub(TTL_HOP_DECREMENT);
-            dest[9] = self.data[9];
-            dest[10..12].fill(0);
-            dest[12..20].copy_from_slice(&self.data[12..20]);
+            let ip_header = &mut dest[start_offset..start_offset + 20];
+            ip_header[0] = (4 << 4) | 5;
+            ip_header[1] = self.data[1];
+            ip_header[2..4].copy_from_slice(&(udp_length + 20u16).to_be_bytes());
+            ip_header[4..6].copy_from_slice(&self.data[4..6]);
+            ip_header[6..8].fill(0);
+            ip_header[8] = self.ttl().saturating_sub(TTL_HOP_DECREMENT);
+            ip_header[9] = self.data[9];
+            ip_header[10..12].fill(0);
+            ip_header[12..20].copy_from_slice(&self.data[12..20]);
 
             let mut checksum = Checksum::new();
-            checksum.add_slice(dest);
+            checksum.add_slice(ip_header);
             checksum.fold();
-            dest[10..12].copy_from_slice(&checksum.value().to_be_bytes());
+            ip_header[10..12].copy_from_slice(&checksum.value().to_be_bytes());
 
-            Ipv4Packet::pseudo_checksum(dest, TransportProtocolType::UDP, udp_length as usize)
+            Ipv4Packet::pseudo_checksum(ip_header, TransportProtocolType::UDP, udp_length as usize)
         };
 
         checksum.add_slice(&dest[data_range.clone()]);
@@ -531,25 +560,25 @@ impl<'a> Ipv4Packet<'a> {
         let start_offset = data_range.start - 20 - 8;
         let udp_length: u16 = 8 + data_range.len() as u16;
         let mut checksum = {
-            let dest = &mut dest[start_offset..start_offset + 20];
-            dest[0] = (4 << 4) | 5;
-            dest[1] = self.data[1];
-            dest[2..4].copy_from_slice(&(udp_length + 20u16).to_be_bytes());
-            dest[4..6].copy_from_slice(&self.data[4..6]);
-            dest[6..8].fill(0);
+            let ip_header = &mut dest[start_offset..start_offset + 20];
+            ip_header[0] = (4 << 4) | 5;
+            ip_header[1] = self.data[1];
+            ip_header[2..4].copy_from_slice(&(udp_length + 20u16).to_be_bytes());
+            ip_header[4..6].copy_from_slice(&self.data[4..6]);
+            ip_header[6..8].fill(0);
 
-            dest[8] = self.ttl().saturating_sub(TTL_HOP_DECREMENT);
-            dest[9] = self.data[9];
-            dest[10..12].fill(0);
-            dest[12..16].copy_from_slice(&self.data[16..20]);
-            dest[16..20].copy_from_slice(&self.data[12..16]);
+            ip_header[8] = DEFAULT_RESPONSE_TTL;
+            ip_header[9] = self.data[9];
+            ip_header[10..12].fill(0);
+            ip_header[12..16].copy_from_slice(&self.data[16..20]);
+            ip_header[16..20].copy_from_slice(&self.data[12..16]);
 
             let mut checksum = Checksum::new();
-            checksum.add_slice(dest);
+            checksum.add_slice(ip_header);
             checksum.fold();
-            dest[10..12].copy_from_slice(&checksum.value().to_be_bytes());
+            ip_header[10..12].copy_from_slice(&checksum.value().to_be_bytes());
 
-            Ipv4Packet::pseudo_checksum(dest, TransportProtocolType::UDP, udp_length as usize)
+            Ipv4Packet::pseudo_checksum(ip_header, TransportProtocolType::UDP, udp_length as usize)
         };
 
         checksum.add_slice(&dest[data_range.clone()]);
@@ -829,6 +858,25 @@ impl<'a> Ipv6Packet<'a> {
         Ok(20 + icmp_len)
     }
 
+    fn write_icmp_response_header(
+        &self,
+        dest: &mut [u8],
+        icmp_len: usize,
+    ) -> Result<usize, IpError> {
+        if dest.len() < 40 + icmp_len {
+            return Err("Not enough space to write ICMPv6 response header".into());
+        }
+        let ip_header = &mut dest[0..40];
+        ip_header[0..4].copy_from_slice(&self.data[0..4]);
+        ip_header[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
+        ip_header[6] = TransportProtocolType::IPV6_ICMP.to_u8();
+        ip_header[7] = DEFAULT_RESPONSE_TTL;
+        ip_header[8..24].copy_from_slice(&self.data[24..40]);
+        ip_header[24..40].copy_from_slice(&self.data[8..24]);
+
+        Ok(40)
+    }
+
     fn write_udp_translated(
         &self,
         dest: &mut [u8],
@@ -885,7 +933,7 @@ impl<'a> Ipv6Packet<'a> {
             ip_header[2..4].fill(0);
             ip_header[4..6].copy_from_slice(&udp_length.to_be_bytes());
             ip_header[6] = TransportProtocolType::UDP.to_u8();
-            ip_header[7] = 1;
+            ip_header[7] = DEFAULT_RESPONSE_TTL;
             ip_header[8..24].copy_from_slice(&self.data[24..40]);
             ip_header[24..40].copy_from_slice(&self.data[8..24]);
 
@@ -1653,9 +1701,17 @@ impl Network {
         let is_dns_ip = self.dns_addrs.contains(header.dst_addr());
         match packet {
             IpPacket::V6(packet) => {
-                // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
-                // limit is 1 (would be reduced to 1)
-                // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1
+                if packet.hop_limit() <= TTL_HOP_DECREMENT {
+                    // RFC 7915, Section 5.1:
+                    // Hop limit will be reduced to 0 - will be dropped by the next hop.
+                    warn!(
+                        "Received packet with expired Hop limit from ESP: {}",
+                        header
+                    );
+                    let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
+                        .write_error_response(&IpPacket::V6(packet), out_buf)?;
+                    return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
+                }
                 if header.transport_protocol() == TransportProtocolType::IPV6_ICMP {
                     return self.translate_icmp_packet_from_esp(packet, out_buf);
                 }
@@ -1670,12 +1726,20 @@ impl Network {
                     self.translate_dns_packet_from_esp(IpPacket::V6(packet), header, out_buf)
                 }
             }
-            IpPacket::V4(_) => {
+            IpPacket::V4(packet) => {
+                if packet.ttl() <= TTL_HOP_DECREMENT {
+                    // RFC 7915, Section 4.1:
+                    // TTL limit will be reduced to 0 - will be dropped by the next hop.
+                    warn!("Received packet with expired TTL: {}", header);
+                    let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
+                        .write_error_response(&IpPacket::V4(packet), out_buf)?;
+                    return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
+                }
                 if !is_dns_ip {
                     // TODO 0.5.0: decrease TTL.
                     Ok(RoutingActionEsp::Forward(packet.into_data()))
                 } else {
-                    self.translate_dns_packet_from_esp(packet, header, out_buf)
+                    self.translate_dns_packet_from_esp(IpPacket::V4(packet), header, out_buf)
                 }
             }
         }
@@ -1698,11 +1762,11 @@ impl Network {
         }
         let is_dns_port = header.transport_protocol() == TransportProtocolType::UDP
             && header.dst_port() == Some(&53);
-        // TODO 0.5.0: To send back error responses, add ICMP handling from
-        // https://datatracker.ietf.org/doc/html/rfc7915#section-5.2
         if !is_dns_port {
             warn!("Dropping non-standard packet to DNS server {}", header);
-            return Ok(RoutingActionEsp::Drop);
+            let length =
+                icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(&packet, out_buf)?;
+            return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
         }
         let dns_packet =
             dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
@@ -1812,9 +1876,14 @@ impl Network {
         };
         let is_dns_ip = self.dns_addrs.contains(header.src_addr());
         let is_ipv4_tunnel = self.tunnel_ips.contains(header.src_addr());
-        // TODO 0.5.0: check for TTL/hop limits, and drop/send ICMP response if source hop
-        // limit is 1 (would be reduced to 1)
-        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.1
+        if packet.ttl() <= TTL_HOP_DECREMENT {
+            // RFC 7915, Section 4.1:
+            // TTL limit will be reduced to 0 - will be dropped by the next hop.
+            warn!("Received packet with expired TTL: {}", header);
+            let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
+                .write_error_response(&IpPacket::V4(packet), out_buf)?;
+            return Ok(RoutingActionVpn::ReturnToSender(&out_buf[..length]));
+        }
         if is_dns_ip {
             self.translate_dns_packet_from_vpn(
                 packet,
@@ -1856,10 +1925,11 @@ impl Network {
         }
         let is_dns_port = header.transport_protocol() == TransportProtocolType::UDP
             && header.src_port() == Some(&53);
-        // https://datatracker.ietf.org/doc/html/rfc7915#section-4.2
         if !is_dns_port {
             warn!("Dropping non-standard packet from DNS server {}", header);
-            return Ok(RoutingActionVpn::Drop);
+            let length = icmp::ICMP_ERROR_COMMUNICATION_PROHIBITED
+                .write_error_response(&IpPacket::V4(packet), out_buf)?;
+            return Ok(RoutingActionVpn::ReturnToSender(&out_buf[..length]));
         }
         let dns_packet =
             dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;

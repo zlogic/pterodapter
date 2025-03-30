@@ -4,7 +4,14 @@ use log::{debug, warn};
 
 use crate::logger::fmt_slice_hex;
 
-use super::{IpError, IpPacket, Ipv4Packet, Ipv6Packet, Nat64Prefix, TransportProtocolType};
+use super::{
+    Checksum, IpError, IpPacket, Ipv4Packet, Ipv6Packet, Nat64Prefix, TransportProtocolType,
+};
+
+const ICMPV4_ORIGINAL_MESSAGE_LIMIT: usize = 576 - 8 - 20;
+const ICMPV6_ORIGINAL_MESSAGE_LIMIT: usize = 1280 - 8 - 40;
+const ICMPV4_ORIGINAL_MESSAGE_LENGTH_STEP: usize = 32 / 8;
+const ICMPV6_ORIGINAL_MESSAGE_LENGTH_STEP: usize = 64 / 8;
 
 enum IcmpV4 {
     EchoReply,
@@ -13,6 +20,29 @@ enum IcmpV4 {
     TimeExceeded(IcmpV4TimeExceeded),
     ParameterProblem(IcmpV4ParameterProblem),
     Unknown(u8, u8),
+}
+
+impl IcmpV4 {
+    fn type_u8(&self) -> u8 {
+        match *self {
+            IcmpV4::EchoReply => 0,
+            IcmpV4::EchoRequest => 8,
+            IcmpV4::DestinationUnreachable(_) => 3,
+            IcmpV4::TimeExceeded(_) => 11,
+            IcmpV4::ParameterProblem(_) => 12,
+            IcmpV4::Unknown(code, _) => code,
+        }
+    }
+
+    fn code_u8(&self) -> u8 {
+        match *self {
+            IcmpV4::EchoReply | IcmpV4::EchoRequest => 0,
+            IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(code))
+            | IcmpV4::TimeExceeded(IcmpV4TimeExceeded(code))
+            | IcmpV4::ParameterProblem(IcmpV4ParameterProblem(code))
+            | IcmpV4::Unknown(_, code) => code,
+        }
+    }
 }
 
 struct IcmpV4DestinationUnreachable(u8);
@@ -89,6 +119,30 @@ enum IcmpV6 {
     Unknown(u8, u8),
 }
 
+impl IcmpV6 {
+    fn type_u8(&self) -> u8 {
+        match *self {
+            IcmpV6::EchoRequest => 128,
+            IcmpV6::EchoReply => 128,
+            IcmpV6::DestinationUnreachable(_) => 1,
+            IcmpV6::PacketTooBig => 2,
+            IcmpV6::TimeExceeded(_) => 3,
+            IcmpV6::ParameterProblem(_) => 4,
+            IcmpV6::Unknown(code, _) => code,
+        }
+    }
+
+    fn code_u8(&self) -> u8 {
+        match *self {
+            IcmpV6::EchoRequest | IcmpV6::EchoReply | IcmpV6::PacketTooBig => 0,
+            IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(code))
+            | IcmpV6::TimeExceeded(IcmpV6TimeExceeded(code))
+            | IcmpV6::ParameterProblem(IcmpV6ParameterProblem(code))
+            | IcmpV6::Unknown(_, code) => code,
+        }
+    }
+}
+
 struct IcmpV6DestinationUnreachable(u8);
 
 impl fmt::Display for IcmpV6DestinationUnreachable {
@@ -154,8 +208,6 @@ pub(super) enum IcmpTranslationAction {
 pub(super) struct IcmpV4Message<'a>(&'a [u8]);
 
 impl IcmpV4Message<'_> {
-    const ICMPV6_ORIGINAL_MESSAGE_LIMIT: usize = 1280 - 8 - 40;
-
     pub fn from_data(data: &[u8]) -> Result<IcmpV4Message, IpError> {
         if data.len() >= 8 {
             Ok(IcmpV4Message(data))
@@ -272,15 +324,14 @@ impl IcmpV4Message<'_> {
         // RFC 4884, Section 5.1 states that at least 128 bytes of the original message should be
         // provided; and in Section 5.3 that IP+ICMPv6 packets should be limited to 1280 bytes.
         let translated_length_padded = if translated_length < 128 {
-            128 / 8
-        } else if translated_length % 8 != 0 {
-            translated_length / 8 + 1
+            128 / ICMPV6_ORIGINAL_MESSAGE_LENGTH_STEP
+        } else if translated_length % ICMPV6_ORIGINAL_MESSAGE_LENGTH_STEP != 0 {
+            translated_length / ICMPV6_ORIGINAL_MESSAGE_LENGTH_STEP + 1
         } else {
-            translated_length / 8
+            translated_length / ICMPV6_ORIGINAL_MESSAGE_LENGTH_STEP
         };
         if !icmp_extensions.is_empty()
-            && translated_length_padded + icmp_extensions.len()
-                < Self::ICMPV6_ORIGINAL_MESSAGE_LIMIT
+            && translated_length_padded + icmp_extensions.len() < ICMPV6_ORIGINAL_MESSAGE_LIMIT
         {
             dest[4] = translated_length_padded as u8;
             let translated_length_padded = translated_length_padded * 8;
@@ -292,7 +343,7 @@ impl IcmpV4Message<'_> {
             ))
         } else {
             // Drop ICMP extensions if they won't fit into an ICMPv6 packet.
-            let translated_length = translated_length.min(Self::ICMPV6_ORIGINAL_MESSAGE_LIMIT);
+            let translated_length = translated_length.min(ICMPV6_ORIGINAL_MESSAGE_LIMIT);
             Ok(IcmpTranslationAction::Forward(8 + translated_length))
         }
     }
@@ -411,8 +462,6 @@ impl fmt::Display for IcmpV4Message<'_> {
 pub(super) struct IcmpV6Message<'a>(&'a [u8]);
 
 impl IcmpV6Message<'_> {
-    const ICMPV4_ORIGINAL_MESSAGE_LIMIT: usize = 576 - 8 - 20;
-
     pub fn from_data(data: &[u8]) -> Result<IcmpV6Message, IpError> {
         if data.len() >= 4 {
             Ok(IcmpV6Message(data))
@@ -526,15 +575,14 @@ impl IcmpV6Message<'_> {
         // RFC 4884, Section 5.1 states that at least 128 bytes of the original message should be
         // provided; and in Section 5.3 that IP+ICMPv4 packets should be limited to 576 bytes.
         let translated_length_padded = if translated_length < 128 {
-            128 / 8
-        } else if translated_length % 8 != 0 {
-            translated_length / 8 + 1
+            128 / ICMPV4_ORIGINAL_MESSAGE_LENGTH_STEP
+        } else if translated_length % ICMPV4_ORIGINAL_MESSAGE_LENGTH_STEP != 0 {
+            translated_length / ICMPV4_ORIGINAL_MESSAGE_LENGTH_STEP + 1
         } else {
-            translated_length / 8
+            translated_length / ICMPV4_ORIGINAL_MESSAGE_LENGTH_STEP
         };
         if !icmp_extensions.is_empty()
-            && translated_length_padded + icmp_extensions.len()
-                < Self::ICMPV4_ORIGINAL_MESSAGE_LIMIT
+            && translated_length_padded + icmp_extensions.len() < ICMPV4_ORIGINAL_MESSAGE_LIMIT
         {
             dest[4] = translated_length_padded as u8;
             let translated_length_padded = translated_length_padded * 8;
@@ -546,7 +594,7 @@ impl IcmpV6Message<'_> {
             ))
         } else {
             // Drop ICMP extensions if they won't fit into an ICMPv4 packet.
-            let translated_length = translated_length.min(Self::ICMPV4_ORIGINAL_MESSAGE_LIMIT);
+            let translated_length = translated_length.min(ICMPV4_ORIGINAL_MESSAGE_LIMIT);
             Ok(IcmpTranslationAction::Forward(8 + translated_length))
         }
     }
@@ -639,6 +687,85 @@ impl Deref for IcmpV6Message<'_> {
 
     fn deref(&self) -> &Self::Target {
         self.0
+    }
+}
+
+pub(crate) struct IcmpErrorResponse(IcmpV4, IcmpV6);
+pub(crate) const ICMP_ERROR_COMMUNICATION_PROHIBITED: IcmpErrorResponse = IcmpErrorResponse(
+    IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(13)),
+    IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(1)),
+);
+
+pub(crate) const ICMP_ERROR_HOST_UNREACHABLE: IcmpErrorResponse = IcmpErrorResponse(
+    IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(1)),
+    IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(0)),
+);
+
+pub(crate) const ICMP_ERROR_PORT_UNREACHABLE: IcmpErrorResponse = IcmpErrorResponse(
+    IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(3)),
+    IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(4)),
+);
+
+pub(crate) const ICMP_ERROR_TTL_HOP_LIMIT: IcmpErrorResponse = IcmpErrorResponse(
+    IcmpV4::TimeExceeded(IcmpV4TimeExceeded(0)),
+    IcmpV6::TimeExceeded(IcmpV6TimeExceeded(0)),
+);
+
+impl IcmpErrorResponse {
+    pub fn write_error_response(
+        &self,
+        packet: &IpPacket,
+        dest: &mut [u8],
+    ) -> Result<usize, IpError> {
+        // TODO 0.5.0: insert custom source IP address when responding "as a router"?
+        match packet {
+            IpPacket::V4(packet) => {
+                let available_bytes = packet
+                    .data
+                    .len()
+                    .min(dest.len() - 20 - 8)
+                    .min(ICMPV4_ORIGINAL_MESSAGE_LIMIT);
+                let start_offset = packet.write_icmp_response_header(dest, 8 + available_bytes)?;
+
+                let icmp_data = &mut dest[start_offset..start_offset + 8 + available_bytes];
+                icmp_data[0] = self.0.type_u8();
+                icmp_data[1] = self.0.code_u8();
+                icmp_data[2..8].fill(0);
+
+                icmp_data[8..].copy_from_slice(&packet.data[..available_bytes]);
+
+                let mut checksum = Checksum::new();
+                checksum.add_slice(icmp_data);
+                checksum.fold();
+                icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
+                Ok(start_offset + icmp_data.len())
+            }
+            IpPacket::V6(packet) => {
+                let available_bytes = packet
+                    .data
+                    .len()
+                    .min(dest.len() - 40 - 8)
+                    .min(ICMPV6_ORIGINAL_MESSAGE_LIMIT);
+                let start_offset = packet.write_icmp_response_header(dest, 8 + available_bytes)?;
+
+                let mut checksum = Ipv6Packet::pseudo_checksum(
+                    dest,
+                    TransportProtocolType::IPV6_ICMP,
+                    8 + available_bytes,
+                );
+                let icmp_data = &mut dest[start_offset..start_offset + 8 + available_bytes];
+                icmp_data[0] = self.1.type_u8();
+                icmp_data[1] = self.1.code_u8();
+                icmp_data[2..8].fill(0);
+
+                icmp_data[8..].copy_from_slice(&packet.data[..available_bytes]);
+
+                checksum.add_slice(icmp_data);
+                checksum.fold();
+                icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
+                Ok(start_offset + icmp_data.len())
+            }
+        }
     }
 }
 
