@@ -186,7 +186,7 @@ impl IcmpV4Message<'_> {
     fn check_translate_echo(
         original_packet: &Ipv4Packet,
         dest: &mut [u8],
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
     ) -> Option<usize> {
         if original_packet.transport_protocol() != TransportProtocolType::ICMP
             || dest.len() < 40 + 8
@@ -226,7 +226,7 @@ impl IcmpV4Message<'_> {
     fn translate_original_datagram_to_esp(
         &self,
         dest: &mut [u8],
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
     ) -> Result<IcmpTranslationAction, IpError> {
         // RFC 4884, Section 4 states that the sixth octet contains the datagram length.
         // All following octets (after the datagram) contain extensions.
@@ -251,7 +251,7 @@ impl IcmpV4Message<'_> {
         }?;
 
         let translated_length = if let Some(translated_echo_length) =
-            Self::check_translate_echo(&original_packet, &mut dest[8..], nat64_prefix.clone())
+            Self::check_translate_echo(&original_packet, &mut dest[8..], nat64_prefix)
         {
             // This is a deviation from RFC 7915 - allowing failed ping responses to be matched
             // with requests.
@@ -300,7 +300,7 @@ impl IcmpV4Message<'_> {
     pub fn translate_to_esp(
         &self,
         dest: &mut [u8],
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
     ) -> Result<IcmpTranslationAction, IpError> {
         let data_len = self[..].len();
         // RFC 7915, Section 4.2.

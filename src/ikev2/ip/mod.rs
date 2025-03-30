@@ -308,7 +308,7 @@ impl<'a> Ipv4Packet<'a> {
         dest: &mut [u8],
         fragmentation_extension: bool,
         transport_data_len: usize,
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
     ) -> Result<(), IpError> {
         // RFC 7915, Section 4.1.
         if fragmentation_extension && dest.len() != 48 {
@@ -341,9 +341,9 @@ impl<'a> Ipv4Packet<'a> {
         dest[6] = next_header.to_u8();
         dest[7] = self.ttl().saturating_sub(TTL_HOP_DECREMENT);
 
-        dest[8..20].copy_from_slice(&nat64_prefix);
+        dest[8..20].copy_from_slice(nat64_prefix);
         dest[20..24].copy_from_slice(&self.data[12..16]);
-        dest[24..36].copy_from_slice(&nat64_prefix);
+        dest[24..36].copy_from_slice(nat64_prefix);
         dest[36..40].copy_from_slice(&self.data[16..20]);
 
         if fragmentation_extension {
@@ -373,7 +373,7 @@ impl<'a> Ipv4Packet<'a> {
     fn write_translated(
         &self,
         dest: &mut [u8],
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
         truncated: bool,
     ) -> Result<usize, IpError> {
         let transport_data = self.transport_data.full_data();
@@ -422,7 +422,7 @@ impl<'a> Ipv4Packet<'a> {
         &self,
         dest: &mut [u8],
         icmp_len: usize,
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
     ) -> Result<usize, IpError> {
         let (ip_header, icmp_data) = dest[..40 + icmp_len].split_at_mut(40);
 
@@ -443,7 +443,7 @@ impl<'a> Ipv4Packet<'a> {
         &self,
         dest: &mut [u8],
         data_range: Range<usize>,
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
     ) -> Result<usize, IpError> {
         if data_range.start < 40 + 8 {
             return Err("Not enough space to add IPv6 header in UDP translation".into());
@@ -1820,7 +1820,7 @@ impl Network {
                 packet,
                 header,
                 is_ipv4_tunnel,
-                nat64_prefix,
+                &nat64_prefix,
                 out_buf,
             )
         } else if is_ipv4_tunnel {
@@ -1829,9 +1829,9 @@ impl Network {
             out_buf[..data.len()].copy_from_slice(data);
             Ok(RoutingActionVpn::Forward(out_buf, data.len()))
         } else if packet.transport_protocol() == TransportProtocolType::ICMP {
-            self.translate_icmp_packet_from_vpn(packet, out_buf, nat64_prefix)
+            self.translate_icmp_packet_from_vpn(packet, out_buf, &nat64_prefix)
         } else {
-            let length = packet.write_translated(out_buf, nat64_prefix, false)?;
+            let length = packet.write_translated(out_buf, &nat64_prefix, false)?;
             debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionVpn::Forward(out_buf, length))
         }
@@ -1842,7 +1842,7 @@ impl Network {
         packet: Ipv4Packet<'a>,
         header: IpHeader,
         is_ipv4_tunnel: bool,
-        nat_prefix: Nat64Prefix,
+        nat_prefix: &Nat64Prefix,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionVpn<'a>, IpError> {
         if !packet.validate_ip_checksum() {
@@ -1923,7 +1923,7 @@ impl Network {
         &mut self,
         packet: Ipv4Packet<'a>,
         out_buf: &'a mut [u8],
-        nat64_prefix: Nat64Prefix,
+        nat64_prefix: &Nat64Prefix,
     ) -> Result<RoutingActionVpn<'a>, IpError> {
         if !packet.validate_ip_checksum() {
             return Err("ICMPv4 packet has invalid IP checksum".into());
@@ -1940,7 +1940,7 @@ impl Network {
         // Reserve space for IPv6 header.
         let dest_buf = &mut out_buf[40..];
 
-        let translation = icmp_packet.translate_to_esp(dest_buf, nat64_prefix.clone())?;
+        let translation = icmp_packet.translate_to_esp(dest_buf, nat64_prefix)?;
         let action = match translation {
             icmp::IcmpTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {

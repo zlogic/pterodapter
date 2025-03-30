@@ -472,7 +472,6 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         info!("Started shutdown");
         if shutdown_sender.send(()).is_err() {
             eprintln!("Shutdown listener is closed");
-            return;
         }
     });
 
