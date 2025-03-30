@@ -401,9 +401,6 @@ impl<'a> Ipv4Packet<'a> {
             transport_data_len,
             nat64_prefix,
         )?;
-        // TODO 0.5.0: if data contains an ICMPv6 payload, translate it into ICMPv4.
-        // e.g. TTL exceeded responses for ICMPv6 pings need to contain original ICMPv6 headers.
-        // This can be done recursively.
         dest[header_len..header_len + transport_data.len()].copy_from_slice(transport_data);
         if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
@@ -806,9 +803,6 @@ impl<'a> Ipv6Packet<'a> {
             self.fragment_extension_data,
             transport_data_len,
         )?;
-        // TODO 0.5.0: if data contains an ICMPv6 payload, translate it into ICMPv4.
-        // e.g. TTL exceeded responses for ICMPv6 pings need to contain original ICMPv6 headers.
-        // This can be done recursively.
         dest[20..20 + transport_data.len()].copy_from_slice(transport_data);
         if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
