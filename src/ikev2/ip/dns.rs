@@ -1,6 +1,7 @@
 use std::{
     error, fmt,
     net::{Ipv4Addr, Ipv6Addr},
+    ops::RangeInclusive,
 };
 
 use log::{debug, warn};
@@ -26,6 +27,18 @@ const MAX_DOMAIN_LENGTH: usize = 255;
 // is at maximum, every subdomain will consume 2 bytes:
 // length + character, or 2-byte offset.
 const MAX_DOMAIN_LABELS: usize = MAX_DOMAIN_LENGTH / 2;
+
+// Contains a subset of RFC 5735.
+const UNROUTABLE_SUBNETS: [RangeInclusive<Ipv4Addr>; 4] = [
+    // "this" network that won't be used.
+    Ipv4Addr::new(0, 0, 0, 0)..=Ipv4Addr::new(0, 255, 255, 255),
+    // Loopback (shouldn't be routable).
+    Ipv4Addr::new(127, 0, 0, 0)..=Ipv4Addr::new(127, 255, 255, 255),
+    // Link-local (requires DHCP).
+    Ipv4Addr::new(169, 254, 0, 0)..=Ipv4Addr::new(169, 254, 255, 255),
+    // Multicast, reserved Class E and broadcast addresses.
+    Ipv4Addr::new(224, 0, 0, 0)..=Ipv4Addr::new(255, 255, 255, 255),
+];
 
 pub(super) struct DnsPacket<'a> {
     data: &'a [u8],
@@ -1312,6 +1325,16 @@ impl Dns64Translator {
         let rr_type = rr.rr_type();
         match rr.rdata()? {
             Rdata::Ipv4(addr) => {
+                if UNROUTABLE_SUBNETS
+                    .iter()
+                    .any(|reserved_range| reserved_range.contains(&addr))
+                {
+                    warn!(
+                        "Dropping untranslatable IPv4 address {} from response",
+                        addr
+                    );
+                    return Ok(None);
+                }
                 let rr_type = if rr_type == RrType::A {
                     RrType::AAAA
                 } else {
