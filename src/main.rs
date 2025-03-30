@@ -465,9 +465,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
 
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
 
-    let service_handle = rt.spawn(server.run(config.fortivpn, shutdown_receiver));
-
-    rt.block_on(async move {
+    rt.spawn(async move {
         if let Err(err) = signal::ctrl_c().await {
             eprintln!("Failed to wait for CTRL+C signal: {}", err);
         }
@@ -476,11 +474,13 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
             eprintln!("Shutdown listener is closed");
             return;
         }
-        if let Err(err) = service_handle.await {
-            eprintln!("Failed to run server: {}", err);
-        };
     });
-    rt.shutdown_timeout(Duration::from_secs(60));
+
+    if let Err(err) = server.run(rt, config.fortivpn, shutdown_receiver) {
+        eprintln!("Failed to run server: {}", err);
+    };
+
+    //rt.shutdown_timeout(Duration::from_secs(60));
 
     info!("Stopped server");
     Ok(())

@@ -101,15 +101,15 @@ impl Server {
         }
     }
 
-    pub async fn run(
+    pub fn run(
         self,
+        rt: runtime::Runtime,
         fortivpn_config: fortivpn::Config,
         shutdown_receiver: oneshot::Receiver<()>,
     ) -> Result<(), IKEv2Error> {
-        let sockets = Sockets::new(&self.listen_ips, self.port, self.nat_port).await?;
+        let sockets = rt.block_on(Sockets::new(&self.listen_ips, self.port, self.nat_port))?;
         let vpn_service = FortiService::new(fortivpn_config);
 
-        let rt = runtime::Handle::current();
         let (command_sender, command_receiver) = mpsc::channel(32);
         // Non-critical futures will be terminated by Tokio during the shutdown_timeout phase.
         rt.spawn(Server::send_cleanup_ticks(
@@ -159,15 +159,15 @@ impl Server {
             }
         });
 
-        Self::run_process(command_receiver, sessions, vpn_service).await
+        Self::run_process(rt, command_receiver, sessions, vpn_service)
     }
 
-    async fn run_process(
+    fn run_process(
+        rt: runtime::Runtime,
         mut command_receiver: mpsc::Receiver<SessionMessage>,
         mut sessions: Sessions,
         mut vpn_service: FortiService,
     ) -> Result<(), IKEv2Error> {
-        let rt = runtime::Handle::current();
         let mut shutdown = false;
         let mut udp_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
         let mut udp_write_buffer = [0u8; MAX_ESP_PACKET_SIZE];
@@ -191,7 +191,7 @@ impl Server {
                 let mut receive_command = pin!(command_receiver.recv());
                 let mut receive_vpn_event = pin!(vpn_service.wait_event(&mut vpn_read_buffer));
                 let sockets = &sessions.sockets;
-                future::poll_fn(|cx| {
+                rt.block_on(future::poll_fn(|cx| {
                     if vpn_event.is_none() {
                         vpn_event = if !ignore_vpn {
                             let vpn_event = receive_vpn_event.as_mut().poll(cx);
@@ -221,8 +221,7 @@ impl Server {
                     } else {
                         Poll::Pending
                     }
-                })
-                .await;
+                }));
                 (command_message, udp_source, vpn_event)
             };
             // Process all ready events.
@@ -230,8 +229,8 @@ impl Server {
                 match message {
                     SessionMessage::Shutdown => {
                         shutdown = true;
-                        sessions.cleanup(&rt);
-                        if let Err(err) = vpn_service.terminate().await {
+                        sessions.cleanup(rt.handle());
+                        if let Err(err) = rt.block_on(vpn_service.terminate()) {
                             warn!("Failed to terminate VPN client connection: {}", err);
                         }
                     }
@@ -239,10 +238,10 @@ impl Server {
                         // These messages are handled by Session.
                     }
                 }
-                sessions.process_message(message).await;
+                rt.block_on(sessions.process_message(message));
             }
             let vpn_action = match vpn_event {
-                Some(Ok(())) => match vpn_service.read_packet(&mut vpn_read_buffer).await {
+                Some(Ok(())) => match rt.block_on(vpn_service.read_packet(&mut vpn_read_buffer)) {
                     Ok(data) => {
                         let read_bytes = data.len();
 
@@ -275,9 +274,9 @@ impl Server {
                     let remote_addr = udp_source.remote_addr;
                     let result = if udp_source.is_ikev2() {
                         sessions.update_ip(vpn_service.ip_configuration());
-                        sessions
-                            .process_ikev2_message(udp_read_buf.filled(), udp_source)
-                            .await
+                        rt.block_on(
+                            sessions.process_ikev2_message(udp_read_buf.filled(), udp_source),
+                        )
                     } else {
                         sessions.process_esp_packet(
                             udp_read_buf.filled_mut(),
@@ -307,7 +306,7 @@ impl Server {
                 let mut forwarded_udp_packet = None;
                 let mut vpn_event = None;
                 let sockets = &mut sessions.sockets;
-                future::poll_fn(|cx| {
+                rt.block_on(future::poll_fn(|cx| {
                     if vpn_event.is_none() {
                         vpn_event = match process_vpn_events.as_mut().poll(cx) {
                             Poll::Ready(result) => Some(result),
@@ -353,8 +352,7 @@ impl Server {
                     } else {
                         Poll::Pending
                     }
-                })
-                .await;
+                }));
                 (vpn_event, sent_udp_response, forwarded_udp_packet)
             };
             if let Some(Err(err)) = sent_udp_response {
@@ -367,7 +365,7 @@ impl Server {
                 warn!("Failed to process VPN lifecycle events: {}", err);
             }
             if vpn_is_connected && !vpn_service.is_connected() {
-                sessions.delete_all_sessions(&rt);
+                sessions.delete_all_sessions(rt.handle());
             }
         }
     }
