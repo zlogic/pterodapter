@@ -1874,7 +1874,15 @@ impl Network {
             IpPacket::V4(packet) => packet,
             IpPacket::V6(_) => return Err("Cannot translate IPv6 packet in NAT64".into()),
         };
-        let is_dns_ip = self.dns_addrs.contains(header.src_addr());
+        let is_dns_ip = {
+            // DNS responses will arrive from an IPv4 address, need to check if it matches
+            // a NAT64 address or a dns_addrs_ipv4 address.
+            let packet_src_addr = packet.src_addr().octets();
+            self.dns_addrs.iter().any(|dns_addr| match dns_addr {
+                IpAddr::V4(addr) => addr.octets() == packet_src_addr,
+                IpAddr::V6(addr) => addr.octets()[12..16] == packet_src_addr,
+            })
+        };
         let is_ipv4_tunnel = self.tunnel_ips.contains(header.src_addr());
         if packet.ttl() <= TTL_HOP_DECREMENT {
             // RFC 7915, Section 4.1:
