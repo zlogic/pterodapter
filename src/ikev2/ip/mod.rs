@@ -1685,7 +1685,7 @@ impl Network {
         self.dns64_domains_dns
             .domains()
             .iter()
-            .any(|domain| dns_packet.matches_suffix(domain))
+            .any(|domain| dns_packet.matches_nat64(domain))
     }
 
     pub fn translate_packet_from_esp<'a>(
@@ -2106,13 +2106,8 @@ struct TunnelDomainsDns {
 
 impl TunnelDomainsDns {
     fn new(tunnel_domains: &[String]) -> TunnelDomainsDns {
-        // Ensure macOS to use DoH are filtered - DoH discovery queries _dns.resolver.arpa for
-        // SVCB and HTTPS records:
-        // https://www.ietf.org/archive/id/draft-ietf-add-ddr-10.html#name-discovery-using-resolver-ip
-        let doh_domain = ["_dns.resolver.arpa".to_string()];
         let tunnel_domains = tunnel_domains
             .iter()
-            .chain(doh_domain.iter())
             .map(|tunnel_domain| {
                 tunnel_domain
                     .split(".")

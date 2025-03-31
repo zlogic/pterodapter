@@ -275,13 +275,23 @@ impl DnsPacket<'_> {
         }
     }
 
-    pub fn matches_suffix(&self, suffix: &[Vec<u8>]) -> bool {
+    pub fn matches_nat64(&self, suffix: &[Vec<u8>]) -> bool {
         self.iter_sections().any(|section| match section {
             Ok(Section::Question(q)) => {
                 let qtype = q.qtype().to_rtype();
                 if qtype == Some(RrType::SVCB) || qtype == Some(RrType::HTTPS) {
-                    // Always match SVCB and HTTPS questions (DoH is not supported).
-                    true
+                    // Ensure macOS doesn't switdh to DoH (as documented in RFC 9461).
+                    match q.iter_qname().next() {
+                        Some(Ok((_, label))) => label == "_dns".as_bytes(),
+                        Some(Err(err)) => {
+                            warn!(
+                                "Failed to parse DNS packet while checking if it's a DoH chesk: {}",
+                                err
+                            );
+                            false
+                        }
+                        None => false,
+                    }
                 } else if qtype == Some(RrType::A) || qtype == Some(RrType::AAAA) {
                     let label = q.iter_qname();
                     let label_length = label.size_hint().0;
@@ -1403,10 +1413,19 @@ impl Dns64Translator {
             }
             Rdata::Unknown(_) => {
                 // SVCB and HTTPS responses must be dropped (DoH is not supported).
-                warn!(
-                    "Dropping unsupported {} resource record from response",
-                    rr_type
-                );
+                let is_doh_discovery =
+                    rr.rr_type() == RrType::SVCB || rr.rr_type() == RrType::HTTPS;
+                if is_doh_discovery {
+                    warn!(
+                        "Dropping DoH discovery {} resource record from response",
+                        rr_type
+                    );
+                } else {
+                    warn!(
+                        "Dropping unsupported {} resource record from response",
+                        rr_type
+                    );
+                }
                 Ok(None)
             }
         }
