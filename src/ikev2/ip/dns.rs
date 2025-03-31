@@ -1367,7 +1367,8 @@ impl Dns64Translator {
                 Ok(Some(length))
             }
             Rdata::Ipv6(_) => {
-                warn!("Dropping unsupported AAAA record from response");
+                // RFC 9461 requests to Google DNS may return AAAA records in Additional Records.
+                debug!("Dropping unsupported AAAA record from response");
                 Ok(None)
             }
             Rdata::Name(name_label) => {
@@ -1416,7 +1417,7 @@ impl Dns64Translator {
                 let is_doh_discovery =
                     rr.rr_type() == RrType::SVCB || rr.rr_type() == RrType::HTTPS;
                 if is_doh_discovery {
-                    warn!(
+                    debug!(
                         "Dropping DoH discovery {} resource record from response",
                         rr_type
                     );
