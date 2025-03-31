@@ -1243,9 +1243,8 @@ impl Dns64Translator {
                                 q.iter_qname(),
                             )?
                         }
-                        Some(RrType::A) | Some(RrType::SVCB) | Some(RrType::HTTPS) => {
-                            // Drop A questions (IPv4 is not supported).
-                            // Drop SVCB and HTTPS questions (DoH is not supported).
+                        Some(RrType::A) => {
+                            // Send empty response to A questions (IPv4 is not supported).
                             debug!(
                                 "Dropping unsupported {} record in DNS question: {}",
                                 q.qtype(),
@@ -1262,7 +1261,7 @@ impl Dns64Translator {
                             return Ok(Self::write_error_response(
                                 dest,
                                 request.data,
-                                ResponseCode::NameError,
+                                ResponseCode::NoError,
                                 qdcount,
                                 length,
                             ));
@@ -1403,6 +1402,7 @@ impl Dns64Translator {
                 Ok(Some(length))
             }
             Rdata::Unknown(_) => {
+                // SVCB and HTTPS responses must be dropped (DoH is not supported).
                 warn!(
                     "Dropping unsupported {} resource record from response",
                     rr_type

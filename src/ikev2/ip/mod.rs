@@ -1735,7 +1735,7 @@ impl Network {
                         .write_error_response(&IpPacket::V4(packet), out_buf)?;
                     return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
                 }
-                if !is_dns_ip {
+                if !is_dns_ip || packet.transport_protocol() == TransportProtocolType::ICMP {
                     // TODO 0.5.0: decrease TTL.
                     Ok(RoutingActionEsp::Forward(packet.into_data()))
                 } else {
@@ -2106,8 +2106,13 @@ struct TunnelDomainsDns {
 
 impl TunnelDomainsDns {
     fn new(tunnel_domains: &[String]) -> TunnelDomainsDns {
+        // Ensure macOS to use DoH are filtered - DoH discovery queries _dns.resolver.arpa for
+        // SVCB and HTTPS records:
+        // https://www.ietf.org/archive/id/draft-ietf-add-ddr-10.html#name-discovery-using-resolver-ip
+        let doh_domain = ["_dns.resolver.arpa".to_string()];
         let tunnel_domains = tunnel_domains
             .iter()
+            .chain(doh_domain.iter())
             .map(|tunnel_domain| {
                 tunnel_domain
                     .split(".")
