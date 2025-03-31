@@ -69,7 +69,7 @@ For more details on configuring Windows, check the [StrongSwan documentation](ht
 To be able to use ECDSA certs, run the following command (replace `<name>` with the VPN connection name):
 
 ```
-Set-VpnConnectionIPsecConfiguration -ConnectionName <name> -CipherTransformConstants GCMAES256 -EncryptionMethod GCMAES256 -IntegrityCheckMethod SHA256 -DHGroup ECP256 -AuthenticationTransformConstants GCMAES256 -PfsGroup None
+Set-VpnConnectionIPsecConfiguration -ConnectionName <name> -CipherTransformConstants GCMAES256 -EncryptionMethod GCMAES256 -IntegrityCheckMethod SHA256 -DHGroup ECP256 -AuthenticationTransformConstants GCMAES256 -PfsGroup ECP256
 ```
 
 ### macOS
