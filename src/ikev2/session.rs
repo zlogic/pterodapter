@@ -226,7 +226,6 @@ impl IKEv2Session {
         request: &message::InputMessage,
         new_ids: &mut ReservedSpi,
     ) -> Result<bool, SessionError> {
-        // TODO: return error if payload type is critical but not recognized
         self.last_update = Instant::now();
         let message_id = request.read_message_id();
         match message_id.cmp(&self.remote_message_id) {
@@ -557,9 +556,11 @@ impl IKEv2Session {
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(err) => {
-                    // TODO: return INVALID_SYNTAX notification.
-                    info!("Received invalid payload: {}", err);
-                    continue;
+                    warn!("Received invalid payload: {}", err);
+                    return self.write_failed_response(
+                        response,
+                        message::NotifyMessageType::INVALID_SYNTAX,
+                    );
                 }
             };
             // IKEv2 payloads need to be sent in a very specific order.
@@ -571,8 +572,10 @@ impl IKEv2Session {
                             transform
                         } else {
                             warn!("No compatible SA parameters found");
-                            // TODO: return NO_PROPOSAL_CHOSEN notification.
-                            continue;
+                            return self.write_failed_response(
+                                response,
+                                message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
+                            );
                         };
                     response.write_security_association(&[(&prop, proposal_num)])?;
                     match prop.create_dh() {
@@ -589,9 +592,11 @@ impl IKEv2Session {
                         shared_secret = match dh.compute_shared_secret(kex.read_value()) {
                             Ok(shared_secret) => Some(shared_secret),
                             Err(err) => {
-                                // TODO: return INVALID_KE_PAYLOAD notification.
                                 warn!("Failed to compute shared secret: {}", err);
-                                continue;
+                                return self.write_failed_response(
+                                    response,
+                                    message::NotifyMessageType::INVALID_KE_PAYLOAD,
+                                );
                             }
                         };
                         response
@@ -624,8 +629,10 @@ impl IKEv2Session {
                         params
                     } else {
                         warn!("Unspecified transform parameters");
-                        // TODO: return INVALID_SYNTAX notification.
-                        continue;
+                        return self.write_failed_response(
+                            response,
+                            message::NotifyMessageType::INVALID_SYNTAX,
+                        );
                     };
                     let prf_transform = match params
                         .create_prf(&prf_key[0..nonce_remote.len() + nonce_local.len()])
@@ -633,63 +640,74 @@ impl IKEv2Session {
                         Ok(prf) => prf,
                         Err(err) => {
                             warn!("Failed to init PRF transform for SKEYSEED: {}", err);
-                            // TODO: return NO_PROPOSAL_CHOSEN notification.
-                            continue;
+                            return self.write_failed_response(
+                                response,
+                                message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
+                            );
                         }
                     };
                     let shared_secret = if let Some(ref shared_secret) = shared_secret {
                         shared_secret
                     } else {
                         warn!("Unspecified shared secret");
-                        // TODO: return NO_PROPOSAL_CHOSEN notification.
-                        continue;
+                        return self.write_failed_response(
+                            response,
+                            message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
+                        );
                     };
                     let skeyseed = prf_transform.prf(shared_secret.as_slice());
                     let prf_transform = match params.create_prf_plus(skeyseed.as_slice()) {
                         Ok(prf) => prf,
                         Err(err) => {
                             warn!("Failed to init PRF transform for keying material: {}", err);
-                            // TODO: return NO_PROPOSAL_CHOSEN notification.
-                            continue;
+                            return self.write_failed_response(
+                                response,
+                                message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
+                            );
                         }
                     };
                     match prf_transform.create_crypto_stack(params, &prf_key) {
                         Ok(crypto_stack) => self.crypto_stack = Some(crypto_stack),
                         Err(err) => {
                             warn!("Failed to set up cryptography stack: {}", err);
-                            // TODO: return INVALID_SYNTAX notification.
-                            continue;
+                            return self.write_failed_response(
+                                response,
+                                message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
+                            );
                         }
                     };
                     let dest = response
                         .next_payload_slice(message::PayloadType::NONCE, nonce_local.len())?;
                     dest.copy_from_slice(nonce_local);
                 }
-                message::Payload::Notify(notify) => {
-                    match notify.message_type() {
-                        message::NotifyMessageType::SIGNATURE_HASH_ALGORITHMS => {
-                            let supports_sha256 = notify
-                                .to_signature_hash_algorithms()?
-                                .any(|alg| alg == message::SignatureHashAlgorithm::SHA2_256);
-                            if !supports_sha256 {
-                                // TODO: return NO_PROPOSAL_CHOSEN notification.
-                                return Err("No supported signature hash algorithms".into());
-                            }
+                message::Payload::Notify(notify) => match notify.message_type() {
+                    message::NotifyMessageType::SIGNATURE_HASH_ALGORITHMS => {
+                        let supports_sha256 = notify
+                            .to_signature_hash_algorithms()?
+                            .any(|alg| alg == message::SignatureHashAlgorithm::SHA2_256);
+                        if !supports_sha256 {
+                            warn!("No supported signature hash algorithms");
+                            return self.write_failed_response(
+                                response,
+                                message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
+                            );
                         }
-                        message::NotifyMessageType::IKEV2_FRAGMENTATION_SUPPORTED => {
-                            self.use_fragmentation = true;
-                        }
-                        _ => {}
                     }
-                }
+                    message::NotifyMessageType::IKEV2_FRAGMENTATION_SUPPORTED => {
+                        self.use_fragmentation = true;
+                    }
+                    _ => {}
+                },
                 _ => {
                     if payload.is_critical() {
                         warn!(
                             "Received critical, unsupported payload: {}",
                             payload.payload_type()
                         );
-                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
-                        return Err("Received critical, unsupported payload".into());
+                        return self.write_failed_response(
+                            response,
+                            message::NotifyMessageType::UNSUPPORTED_CRITICAL_PAYLOAD,
+                        );
                     }
                 }
             }
@@ -732,14 +750,16 @@ impl IKEv2Session {
         let nonce_initiator = if let Some(nonce) = nonce_initiator {
             nonce
         } else {
-            // TODO: return INVALID_SYNTAX notification.
-            return Err("Initiator didn't provide nonce".into());
+            warn!("Initiator didn't provide nonce");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::INVALID_SYNTAX);
         };
         let nonce_responder = if let Some(nonce) = nonce_responder {
             nonce
         } else {
-            // TODO: return INVALID_SYNTAX notification.
-            return Err("No nonce provided in response".into());
+            warn!("No nonce provided in response");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::INVALID_SYNTAX);
         };
 
         response.write_notify_payload(
@@ -802,10 +822,10 @@ impl IKEv2Session {
         let ctx = match self.state {
             SessionState::InitSA(ref ctx) => ctx.clone(),
             _ => {
+                warn!("Received IKE_AUTH request for session not in init state");
                 return self.write_failed_response(
                     response,
                     message::NotifyMessageType::AUTHENTICATION_FAILED,
-                    "Session is not in init state".into(),
                 );
             }
         };
@@ -836,8 +856,10 @@ impl IKEv2Session {
                 Ok(payload) => payload,
                 Err(err) => {
                     warn!("Failed to read decrypted payload data: {}", err);
-                    // TODO: return INVALID_SYNTAX notification.
-                    continue;
+                    return self.write_failed_response(
+                        response,
+                        message::NotifyMessageType::INVALID_SYNTAX,
+                    );
                 }
             };
             match payload {
@@ -850,7 +872,6 @@ impl IKEv2Session {
                         return self.write_failed_response(
                             response,
                             message::NotifyMessageType::AUTHENTICATION_FAILED,
-                            "Certificate encoding is unsupported".into(),
                         );
                     }
                     match self
@@ -879,7 +900,6 @@ impl IKEv2Session {
                         return self.write_failed_response(
                             response,
                             message::NotifyMessageType::AUTHENTICATION_FAILED,
-                            "Certificate request encoding is unsupported".into(),
                         );
                     }
                     match self.pki_processing.server_cert(certreq.read_value()) {
@@ -909,7 +929,6 @@ impl IKEv2Session {
                             return self.write_failed_response(
                                 response,
                                 message::NotifyMessageType::AUTHENTICATION_FAILED,
-                                "Authentication method is unsupported".into(),
                             );
                         }
                     }
@@ -971,8 +990,10 @@ impl IKEv2Session {
                             "Received critical, unsupported payload: {}",
                             payload.payload_type()
                         );
-                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
-                        return Err("Received critical, unsupported payload".into());
+                        return self.write_failed_response(
+                            response,
+                            message::NotifyMessageType::UNSUPPORTED_CRITICAL_PAYLOAD,
+                        );
                     }
                 }
             }
@@ -981,54 +1002,58 @@ impl IKEv2Session {
         let client_cert = if let Some(cert) = client_cert {
             cert
         } else {
+            warn!("Initiator provided no valid cert");
             return self.write_failed_response(
                 response,
                 message::NotifyMessageType::AUTHENTICATION_FAILED,
-                "Client provided no cert".into(),
             );
         };
         let (client_auth, signature_format) = if let Some(auth) = client_auth {
             auth
         } else {
+            warn!("Initiator provided no valid auth");
             return self.write_failed_response(
                 response,
                 message::NotifyMessageType::AUTHENTICATION_FAILED,
-                "Client provided no auth".into(),
             );
         };
         let id_initiator = if let Some(id) = id_initiator {
             id
         } else {
+            warn!("Initiator provided no ID");
             return self.write_failed_response(
                 response,
                 message::NotifyMessageType::AUTHENTICATION_FAILED,
-                "Client provided no ID".into(),
             );
         };
         let (mut transform_params, proposal_num) = if let Some(params) = transform_params {
             params
         } else {
-            // TODO: return NO_PROPOSAL_CHOSEN notification.
-            return Err("Unacceptable Security Association proposals".into());
+            warn!("Unacceptable Security Association proposals");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::NO_PROPOSAL_CHOSEN);
         };
         if ts_local.is_empty() || ts_remote.is_empty() {
-            // TODO: return TS_UNACCEPTABLE notification.
-            return Err("No traffic selectors offered by client".into());
+            warn!("No traffic selectors offered by client");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::TS_UNACCEPTABLE);
         }
         if !self.network.ts_local().iter().all(|local_ts| {
             ts_local
                 .iter()
                 .any(|client_ts| client_ts.contains(local_ts))
         }) {
-            // TODO: return TS_UNACCEPTABLE notification.
-            return Err("Failed to narrow traffic selector".into());
+            warn!("Failed to narrow traffic selector");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::TS_UNACCEPTABLE);
         }
 
         let local_spi = if let Some(local_spi) = new_ids.take_esp() {
             local_spi
         } else {
-            // TODO: return NO_PROPOSAL_CHOSEN notification.
-            return Err("No pre-generated SA ID available".into());
+            warn!("No pre-generated SA ID available");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::TEMPORARY_FAILURE);
         };
         transform_params.set_local_spi(message::Spi::U32(local_spi));
         let remote_spi = match transform_params.remote_spi() {
@@ -1058,7 +1083,10 @@ impl IKEv2Session {
             &client_auth,
         ) {
             warn!("Client authentication failed: {}", err);
-            return Err("Client authentication failed".into());
+            return self.write_failed_response(
+                response,
+                message::NotifyMessageType::AUTHENTICATION_FAILED,
+            );
         }
 
         // At this point the client identity has been successfully verified, proceed with sending a successful response.
@@ -1115,12 +1143,10 @@ impl IKEv2Session {
             };
             if ip_netmasks.is_empty() {
                 warn!("No IP address is available, notifying client");
-                response.write_notify_payload(
-                    None,
-                    &[],
+                return self.write_failed_response(
+                    response,
                     message::NotifyMessageType::INTERNAL_ADDRESS_FAILURE,
-                    &[],
-                )?
+                );
             } else {
                 response.write_configuration_payload(
                     ip_netmasks,
@@ -1139,8 +1165,8 @@ impl IKEv2Session {
             Ok(crypto_stack) => crypto_stack,
             Err(err) => {
                 warn!("Failed to set up child SA cryptography stack: {}", err);
-                // TODO: return INVALID_SYNTAX notification.
-                return Err("Failed to set up child SA cryptography stack".into());
+                return self
+                    .write_failed_response(response, message::NotifyMessageType::INVALID_SYNTAX);
             }
         };
 
@@ -1174,9 +1200,7 @@ impl IKEv2Session {
         &mut self,
         response: &mut message::MessageWriter,
         reason: message::NotifyMessageType,
-        err: SessionError,
     ) -> Result<(), SessionError> {
-        debug!("Request failed, sending error response: {}", err);
         Ok(response.write_notify_payload(None, &[], reason, &[])?)
     }
 
@@ -1193,8 +1217,10 @@ impl IKEv2Session {
                 Ok(payload) => payload,
                 Err(err) => {
                     warn!("Failed to read decrypted payload data: {}", err);
-                    // TODO: return INVALID_SYNTAX notification.
-                    continue;
+                    return self.write_failed_response(
+                        response,
+                        message::NotifyMessageType::INVALID_SYNTAX,
+                    );
                 }
             };
             match payload {
@@ -1208,8 +1234,10 @@ impl IKEv2Session {
                             "Received critical, unsupported payload: {}",
                             payload.payload_type()
                         );
-                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
-                        return Err("Received critical, unsupported payload".into());
+                        return self.write_failed_response(
+                            response,
+                            message::NotifyMessageType::UNSUPPORTED_CRITICAL_PAYLOAD,
+                        );
                     }
                 }
             }
@@ -1294,8 +1322,10 @@ impl IKEv2Session {
                 Ok(payload) => payload,
                 Err(err) => {
                     warn!("Failed to read decrypted payload data: {}", err);
-                    // TODO: return INVALID_SYNTAX notification.
-                    continue;
+                    return self.write_failed_response(
+                        response,
+                        message::NotifyMessageType::INVALID_SYNTAX,
+                    );
                 }
             };
             match payload {
@@ -1342,9 +1372,11 @@ impl IKEv2Session {
                         shared_secret = match dh.compute_shared_secret(kex.read_value()) {
                             Ok(shared_secret) => Some(shared_secret),
                             Err(err) => {
-                                // TODO: return INVALID_KE_PAYLOAD notification.
                                 warn!("Failed to compute shared secret: {}", err);
-                                continue;
+                                return self.write_failed_response(
+                                    response,
+                                    message::NotifyMessageType::INVALID_KE_PAYLOAD,
+                                );
                             }
                         };
                     }
@@ -1381,8 +1413,10 @@ impl IKEv2Session {
                             "Received critical, unsupported payload: {}",
                             payload.payload_type()
                         );
-                        // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
-                        return Err("Received critical, unsupported payload".into());
+                        return self.write_failed_response(
+                            response,
+                            message::NotifyMessageType::UNSUPPORTED_CRITICAL_PAYLOAD,
+                        );
                     }
                 }
             }
@@ -1391,25 +1425,23 @@ impl IKEv2Session {
         let nonce_initiator = if let Some(nonce_initiator) = nonce_initiator {
             nonce_initiator
         } else {
-            return self.write_failed_response(
-                response,
-                message::NotifyMessageType::INVALID_SYNTAX,
-                "Client provided no nonce".into(),
-            );
+            warn!("Initiator didn't provide nonce");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::INVALID_SYNTAX);
         };
         let nonce_responder = if let Some(nonce_responder) = nonce_responder {
             nonce_responder
         } else {
-            return Err("No nonce generated for client".into());
+            warn!("No nonce provided in response");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::INVALID_SYNTAX);
         };
         let (mut transform_params, proposal_num) = if let Some(params) = transform_params {
             params
         } else {
-            return self.write_failed_response(
-                response,
-                message::NotifyMessageType::NO_PROPOSAL_CHOSEN,
-                "Unacceptable Security Association proposals".into(),
-            );
+            warn!("Unacceptable Security Association proposals");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::NO_PROPOSAL_CHOSEN);
         };
         let key_exchange = match (dh_transform, public_key) {
             (Some(dh_transform), Some(public_key)) => {
@@ -1417,10 +1449,10 @@ impl IKEv2Session {
             }
             (None, None) => None,
             _ => {
+                warn!("DH transform or key exchange is not initialized");
                 return self.write_failed_response(
                     response,
                     message::NotifyMessageType::INVALID_KE_PAYLOAD,
-                    "DH transform or key exchange is not initialized".into(),
                 );
             }
         };
@@ -1438,7 +1470,11 @@ impl IKEv2Session {
                 let local_spi = if let Some(local_spi) = new_ids.take_esp() {
                     local_spi
                 } else {
-                    return Err("No pre-generated SA ID available".into());
+                    warn!("No pre-generated SA ID available");
+                    return self.write_failed_response(
+                        response,
+                        message::NotifyMessageType::TEMPORARY_FAILURE,
+                    );
                 };
                 transform_params.set_local_spi(message::Spi::U32(local_spi));
                 crypto_stack.create_child_stack(&transform_params, &prf_key)
@@ -1446,7 +1482,11 @@ impl IKEv2Session {
                 let local_spi = if let Some(local_spi) = new_ids.take_ike() {
                     message::Spi::U64(local_spi)
                 } else {
-                    return Err("No pre-generated IKE SA ID available".into());
+                    warn!("No pre-generated IKE SA ID available");
+                    return self.write_failed_response(
+                        response,
+                        message::NotifyMessageType::TEMPORARY_FAILURE,
+                    );
                 };
                 transform_params.set_local_spi(local_spi);
                 let skeyseed = crypto_stack.rekey_skeyseed(&prf_key);
@@ -1471,14 +1511,14 @@ impl IKEv2Session {
                     return self.write_failed_response(
                         response,
                         message::NotifyMessageType::INVALID_SYNTAX,
-                        "Failed to rekey crypto stack".into(),
                     );
                 }
             }
         };
         if rekey_child_sa.is_some() && (ts_local.is_empty() || ts_remote.is_empty()) {
-            // TODO: return TS_UNACCEPTABLE notification.
-            return Err("No traffic selectors offered by client".into());
+            warn!("No traffic selectors offered by client");
+            return self
+                .write_failed_response(response, message::NotifyMessageType::TS_UNACCEPTABLE);
         }
         if let Some(old_spi) = rekey_child_sa {
             debug!("Rekeying child SA");
@@ -1491,10 +1531,10 @@ impl IKEv2Session {
                 .iter()
                 .any(|sa_id| sa_id.remote_spi == old_spi)
             {
+                warn!("Cannot find child SA to rekey");
                 return self.write_failed_response(
                     response,
                     message::NotifyMessageType::CHILD_SA_NOT_FOUND,
-                    "Cannot find child SA to rekey".into(),
                 );
             };
             let (remote_spi, local_spi) =
@@ -1769,7 +1809,6 @@ impl IKEv2Session {
         local_addr: SocketAddr,
         response: &message::InputMessage,
     ) -> Result<(), SessionError> {
-        // TODO: return error if payload type is critical but not recognized
         self.last_update = Instant::now();
         let message_id = response.read_message_id();
         match message_id.cmp(&self.local_message_id) {
@@ -1818,7 +1857,6 @@ impl IKEv2Session {
                 Ok(payload) => payload,
                 Err(err) => {
                     warn!("Failed to read decrypted payload data: {}", err);
-                    // TODO: return INVALID_SYNTAX notification.
                     continue;
                 }
             };
@@ -1828,7 +1866,6 @@ impl IKEv2Session {
                     "Received critical, unsupported payload: {}",
                     payload.payload_type()
                 );
-                // TODO: return UNSUPPORTED_CRITICAL_PAYLOAD.
                 return Err("Received critical, unsupported payload".into());
             }
         }
