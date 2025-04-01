@@ -376,7 +376,8 @@ impl IcmpV4Message<'_> {
                     2 => {
                         dest[0] = 4;
                         dest[1] = 1;
-                        // TODO 0.5.0: set pointer value.
+                        // Set pointer to IPv6 Next Header field.
+                        dest[4..8].copy_from_slice(&6u32.to_be_bytes());
                     }
                     3 => dest[1] = 4,
                     4 => {
@@ -412,16 +413,44 @@ impl IcmpV4Message<'_> {
             }
             IcmpV4::ParameterProblem(IcmpV4ParameterProblem(code)) => {
                 dest[0] = 4;
+                let pointer_value = match self[4] {
+                    0 => Some(0),
+                    1 => Some(1),
+                    2 | 3 => Some(4),
+                    8 => Some(7),
+                    9 => Some(6),
+                    12..=15 => Some(8),
+                    16..=19 => Some(24),
+                    _ => None,
+                };
                 match code {
                     0 => {
                         dest[1] = 0;
-                        // TODO 0.5.0: set pointer value.
+                        let pointer_value = if let Some(pointer_value) = pointer_value {
+                            pointer_value as u32
+                        } else {
+                            debug!(
+                                "Failed to translate ICMPv4 parameter problem pointer {} to IPv6",
+                                &self[4]
+                            );
+                            return Ok(IcmpTranslationAction::Drop);
+                        };
+                        dest[4..8].copy_from_slice(&pointer_value.to_be_bytes());
 
                         self.translate_original_datagram_to_esp(dest, nat64_prefix)
                     }
                     2 => {
                         dest[1] = 0;
-                        // TODO 0.5.0: set pointer value.
+                        let pointer_value = if let Some(pointer_value) = pointer_value {
+                            pointer_value as u32
+                        } else {
+                            debug!(
+                                "Failed to translate ICMPv4 parameter problem pointer {} to IPv6",
+                                &self[4]
+                            );
+                            return Ok(IcmpTranslationAction::Drop);
+                        };
+                        dest[4..8].copy_from_slice(&pointer_value.to_be_bytes());
 
                         self.translate_original_datagram_to_esp(dest, nat64_prefix)
                     }
@@ -653,11 +682,31 @@ impl IcmpV6Message<'_> {
                 self.translate_original_datagram_to_vpn(dest)
             }
             IcmpV6::ParameterProblem(IcmpV6ParameterProblem(code)) => {
+                let pointer_value = match self[4] {
+                    0 => Some(0),
+                    1 => Some(1),
+                    4 | 5 => Some(2),
+                    6 => Some(9),
+                    7 => Some(8),
+                    8..=23 => Some(12),
+                    24..=39 => Some(16),
+                    _ => None,
+                };
                 match code {
                     0 => {
                         dest[0] = 12;
                         dest[1] = 0;
-                        // TODO 0.5.0: set pointer value.
+
+                        let pointer_value = if let Some(pointer_value) = pointer_value {
+                            pointer_value
+                        } else {
+                            debug!(
+                                "Failed to translate ICMPv6 parameter problem pointer {} to IPv4",
+                                &self[4]
+                            );
+                            return Ok(IcmpTranslationAction::Drop);
+                        };
+                        dest[4] = pointer_value;
 
                         self.translate_original_datagram_to_vpn(dest)
                     }
