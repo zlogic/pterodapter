@@ -417,6 +417,28 @@ impl<'a> Ipv4Packet<'a> {
         Ok(header_len + transport_data.len())
     }
 
+    fn write_ipv4_decrease_ttl(&self, dest: &mut [u8]) -> Result<usize, IpError> {
+        if dest.len() < self.data.len() {
+            return Err(
+                "Not enough data in destination buffer to write next hop IPv4 packet".into(),
+            );
+        }
+        dest[0..self.data.len()].copy_from_slice(self.data);
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&dest[10..12]);
+        let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+
+        let ttl = self.ttl();
+        let prev_checksum = Checksum::from_slice(&dest[8..10]);
+        dest[8] = ttl.saturating_sub(TTL_HOP_DECREMENT);
+        let new_checksum = Checksum::from_slice(&dest[8..10]);
+        checksum.incremental_update(prev_checksum, new_checksum);
+        checksum.fold();
+        dest[10..12].copy_from_slice(&checksum.value().to_be_bytes());
+
+        Ok(self.data.len())
+    }
+
     fn write_icmp_translated(
         &self,
         dest: &mut [u8],
@@ -1102,11 +1124,7 @@ impl<'a> IpPacket<'a> {
 
     fn write_translated_ipv4(&self, dest: &mut [u8], truncated: bool) -> Result<usize, IpError> {
         match self {
-            IpPacket::V4(packet) => {
-                dest[0..packet.data.len()].copy_from_slice(packet.data);
-                // TODO 0.5.0: decrease TTL.
-                Ok(packet.data.len())
-            }
+            IpPacket::V4(packet) => packet.write_ipv4_decrease_ttl(dest),
             IpPacket::V6(packet) => packet.write_translated(dest, truncated),
         }
     }
@@ -1738,8 +1756,9 @@ impl Network {
                     return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
                 }
                 if !is_dns_ip || packet.transport_protocol() == TransportProtocolType::ICMP {
-                    // TODO 0.5.0: decrease TTL.
-                    Ok(RoutingActionEsp::Forward(packet.into_data()))
+                    let length = packet.write_ipv4_decrease_ttl(out_buf)?;
+                    debug_print_packet(&out_buf[..length]);
+                    Ok(RoutingActionEsp::Forward(&out_buf[..length]))
                 } else {
                     self.translate_dns_packet_from_esp(IpPacket::V4(packet), header, out_buf)
                 }
@@ -1903,10 +1922,9 @@ impl Network {
                 out_buf,
             )
         } else if is_ipv4_tunnel {
-            let data = packet.into_data();
-            // TODO 0.5.0: decrease TTL.
-            out_buf[..data.len()].copy_from_slice(data);
-            Ok(RoutingActionVpn::Forward(out_buf, data.len()))
+            let length = packet.write_ipv4_decrease_ttl(out_buf)?;
+            debug_print_packet(&out_buf[..length]);
+            Ok(RoutingActionVpn::Forward(out_buf, length))
         } else if packet.transport_protocol() == TransportProtocolType::ICMP {
             self.translate_icmp_packet_from_vpn(packet, out_buf, &nat64_prefix)
         } else {
@@ -2059,6 +2077,12 @@ impl Checksum {
 
     fn from_inverted(inv: u16) -> Checksum {
         Checksum((!inv) as u32)
+    }
+
+    fn from_slice(data: &[u8]) -> Checksum {
+        let mut checksum = Checksum(0);
+        checksum.add_slice(data);
+        checksum
     }
 
     #[inline]
