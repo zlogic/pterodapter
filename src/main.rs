@@ -82,7 +82,7 @@ struct Ikev2Config {
 
 impl Args {
     fn parse() -> Args {
-        let action_type = match env::args().last().as_deref() {
+        let action_type = match env::args().next_back().as_deref() {
             Some("proxy") => ActionType::Proxy,
             Some("ikev2") => ActionType::IkeV2,
             Some("help") => {
