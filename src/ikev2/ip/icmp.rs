@@ -1,4 +1,8 @@
-use std::{fmt, ops::Deref};
+use std::{
+    fmt,
+    net::{Ipv4Addr, Ipv6Addr},
+    ops::Deref,
+};
 
 use log::{debug, warn};
 
@@ -13,6 +17,11 @@ const ICMPV6_ORIGINAL_MESSAGE_LIMIT: usize = 1280 - 8 - 40;
 const ICMPV4_ORIGINAL_MESSAGE_LENGTH_STEP: usize = 32 / 8;
 const ICMPV6_ORIGINAL_MESSAGE_LENGTH_STEP: usize = 64 / 8;
 
+// Source IPv4 address for ICMP routing error responses.
+// RFC 6890 Section 2.2.2 lists it as a source-only "this host on this network".
+const ICMP_OWN_ADDRESS: [u8; 4] = [0, 0, 0, 1];
+
+#[derive(Eq, PartialEq)]
 enum IcmpV4 {
     EchoReply,
     EchoRequest,
@@ -45,6 +54,7 @@ impl IcmpV4 {
     }
 }
 
+#[derive(Eq, PartialEq)]
 struct IcmpV4DestinationUnreachable(u8);
 
 impl fmt::Display for IcmpV4DestinationUnreachable {
@@ -71,6 +81,7 @@ impl fmt::Display for IcmpV4DestinationUnreachable {
     }
 }
 
+#[derive(Eq, PartialEq)]
 struct IcmpV4TimeExceeded(u8);
 
 impl fmt::Display for IcmpV4TimeExceeded {
@@ -83,6 +94,7 @@ impl fmt::Display for IcmpV4TimeExceeded {
     }
 }
 
+#[derive(Eq, PartialEq)]
 struct IcmpV4ParameterProblem(u8);
 
 impl fmt::Display for IcmpV4ParameterProblem {
@@ -109,6 +121,7 @@ impl fmt::Display for IcmpV4 {
     }
 }
 
+#[derive(Eq, PartialEq)]
 enum IcmpV6 {
     EchoRequest,
     EchoReply,
@@ -143,6 +156,7 @@ impl IcmpV6 {
     }
 }
 
+#[derive(Eq, PartialEq)]
 struct IcmpV6DestinationUnreachable(u8);
 
 impl fmt::Display for IcmpV6DestinationUnreachable {
@@ -161,6 +175,7 @@ impl fmt::Display for IcmpV6DestinationUnreachable {
     }
 }
 
+#[derive(Eq, PartialEq)]
 struct IcmpV6TimeExceeded(u8);
 
 impl fmt::Display for IcmpV6TimeExceeded {
@@ -173,6 +188,7 @@ impl fmt::Display for IcmpV6TimeExceeded {
     }
 }
 
+#[derive(Eq, PartialEq)]
 struct IcmpV6ParameterProblem(u8);
 
 impl fmt::Display for IcmpV6ParameterProblem {
@@ -739,7 +755,9 @@ impl Deref for IcmpV6Message<'_> {
     }
 }
 
+#[derive(Eq, PartialEq)]
 pub(crate) struct IcmpErrorResponse(IcmpV4, IcmpV6);
+
 pub(crate) const ICMP_ERROR_COMMUNICATION_PROHIBITED: IcmpErrorResponse = IcmpErrorResponse(
     IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(13)),
     IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(1)),
@@ -766,15 +784,21 @@ impl IcmpErrorResponse {
         packet: &IpPacket,
         dest: &mut [u8],
     ) -> Result<usize, IpError> {
-        // TODO 0.5.0: insert custom source IP address when responding "as a router"?
+        let src_own_ip = self == &ICMP_ERROR_HOST_UNREACHABLE || self == &ICMP_ERROR_TTL_HOP_LIMIT;
         match packet {
             IpPacket::V4(packet) => {
+                let src_addr = if src_own_ip {
+                    Ipv4Addr::from(ICMP_OWN_ADDRESS)
+                } else {
+                    packet.dst_addr()
+                };
                 let available_bytes = packet
                     .data
                     .len()
                     .min(dest.len() - 20 - 8)
                     .min(ICMPV4_ORIGINAL_MESSAGE_LIMIT);
-                let start_offset = packet.write_icmp_response_header(dest, 8 + available_bytes)?;
+                let start_offset =
+                    packet.write_icmp_response_header(src_addr, dest, 8 + available_bytes)?;
 
                 let icmp_data = &mut dest[start_offset..start_offset + 8 + available_bytes];
                 icmp_data[0] = self.0.type_u8();
@@ -790,12 +814,21 @@ impl IcmpErrorResponse {
                 Ok(start_offset + icmp_data.len())
             }
             IpPacket::V6(packet) => {
+                let src_addr = if src_own_ip {
+                    let mut src_addr = [0u8; 16];
+                    src_addr[0..12].copy_from_slice(&packet.dst_addr().octets()[0..12]);
+                    src_addr[12..16].copy_from_slice(&ICMP_OWN_ADDRESS);
+                    Ipv6Addr::from(src_addr)
+                } else {
+                    packet.dst_addr()
+                };
                 let available_bytes = packet
                     .data
                     .len()
                     .min(dest.len() - 40 - 8)
                     .min(ICMPV6_ORIGINAL_MESSAGE_LIMIT);
-                let start_offset = packet.write_icmp_response_header(dest, 8 + available_bytes)?;
+                let start_offset =
+                    packet.write_icmp_response_header(src_addr, dest, 8 + available_bytes)?;
 
                 let mut checksum = Ipv6Packet::pseudo_checksum(
                     dest,

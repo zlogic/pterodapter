@@ -440,6 +440,7 @@ impl<'a> Ipv4Packet<'a> {
 
     fn write_icmp_response_header(
         &self,
+        src_addr: Ipv4Addr,
         dest: &mut [u8],
         icmp_len: usize,
     ) -> Result<usize, IpError> {
@@ -455,7 +456,7 @@ impl<'a> Ipv4Packet<'a> {
         ip_header[8] = DEFAULT_RESPONSE_TTL;
         ip_header[9] = TransportProtocolType::ICMP.to_u8();
         ip_header[10..12].fill(0);
-        ip_header[12..16].copy_from_slice(&self.data[16..20]);
+        ip_header[12..16].copy_from_slice(&src_addr.octets());
         ip_header[16..20].copy_from_slice(&self.data[12..16]);
 
         let mut checksum = Checksum::new();
@@ -860,6 +861,7 @@ impl<'a> Ipv6Packet<'a> {
 
     fn write_icmp_response_header(
         &self,
+        src_addr: Ipv6Addr,
         dest: &mut [u8],
         icmp_len: usize,
     ) -> Result<usize, IpError> {
@@ -871,7 +873,7 @@ impl<'a> Ipv6Packet<'a> {
         ip_header[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
         ip_header[6] = TransportProtocolType::IPV6_ICMP.to_u8();
         ip_header[7] = DEFAULT_RESPONSE_TTL;
-        ip_header[8..24].copy_from_slice(&self.data[24..40]);
+        ip_header[8..24].copy_from_slice(&src_addr.octets());
         ip_header[24..40].copy_from_slice(&self.data[8..24]);
 
         Ok(40)
