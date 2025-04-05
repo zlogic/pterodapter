@@ -169,7 +169,7 @@ For example:
     --cacert=vpn-root.cert.pem \
     --cert=vpn-server.cert.pem \
     --key=vpn-server.key.pem \
-    proxy
+    ikev2
 ```
 
 For more information how to generate certs and configure clients, see the [certs.md](docs/certs.md) document.
