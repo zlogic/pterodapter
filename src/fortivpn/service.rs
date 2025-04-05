@@ -175,10 +175,6 @@ impl FortiService {
         }
     }
 
-    pub fn mtu(&self) -> u16 {
-        self.config.mtu
-    }
-
     pub fn ip_configuration(&self) -> Option<(IpAddr, &[IpAddr])> {
         match self.state {
             ConnectionState::Connected(ref state) => {

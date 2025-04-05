@@ -24,18 +24,13 @@ pub struct Config {
     pub tls_config: Arc<rustls::client::ClientConfig>,
     pub destination_addr: SocketAddr,
     pub destination_hostport: String,
-    pub mtu: u16,
 }
-
-// PPP_MTU specifies is the MTU excluding IP, TCP, TLS, FortiVPN and PPP encapsulation headers.
-// When running locally, using this MTU adjusts to the FortiVPN stream MTU.
-pub const PPP_MTU: u16 = 1500 - 20 - 20 - 5 - 6 - 4;
 
 // ESP_MTU specifies the MTU matching the ESP slice size.
 // It's set the the UDP buffer size, with reserved space for ESP headers [8] and
 // cryptography nonce [8] + padding [8] + tag [16] (for AES GCM),
 // or IV [16] + padding [32] + authentication hash [12] (for AES CBC).
-pub const ESP_MTU: u16 = 1500 - 8 - 8 - 8 - 16;
+const ESP_MTU: u16 = 1500 - 8 - 8 - 8 - 16;
 
 // PPP_HEADER_SIZE specifies the PPP header size, which is always prepended to the destination
 // buffer.
@@ -170,9 +165,8 @@ impl FortiVPNTunnel {
         let ip_config = Self::request_vpn_allocation(domain, &mut socket, &cookie).await?;
         Self::start_vpn_tunnel(domain, &mut socket, &cookie).await?;
 
-        let mtu = config.mtu;
         let mut ppp_state = PPPState::new();
-        let ppp_magic = Self::start_ppp(&mut socket, &mut ppp_state, mtu).await?;
+        let ppp_magic = Self::start_ppp(&mut socket, &mut ppp_state, ESP_MTU).await?;
         Self::start_ipcp(&mut socket, &mut ppp_state, ip_config.addr).await?;
         Ok(FortiVPNTunnel {
             socket,
