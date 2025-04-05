@@ -1,54 +1,27 @@
 use std::{
     env, fmt, fs,
-    net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv6Addr, ToSocketAddrs},
     process,
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
 use log::info;
-use tokio::{signal, sync::mpsc};
+use tokio::signal;
 use tokio_rustls::rustls;
 
 mod fortivpn;
 mod http;
+mod ikev2;
 mod logger;
 mod ppp;
 
-#[cfg(feature = "proxy")]
-mod proxy;
-
-#[cfg(feature = "ikev2")]
-mod ikev2;
-
-enum Action {
-    #[cfg(feature = "proxy")]
-    Proxy(ProxyConfig),
-    #[cfg(feature = "ikev2")]
-    IkeV2(Ikev2Config),
-}
-
-#[derive(Eq, PartialEq)]
-enum ActionType {
-    Proxy,
-    IkeV2,
-}
-
 struct Args {
     log_level: log::LevelFilter,
-    action: Action,
+    config: Ikev2Config,
 }
 
 const USAGE_INSTRUCTIONS: &str = "Usage:\n\n\
-> pterodapter [OPTIONS] proxy\n\
-Options:\
-\n      --log-level=<LOG_LEVEL>   Log level [default: info]\
-\n      --listen-address=<IP>     Listen IP address [default: :::5328]\
-\n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
-\n      --tunnel-domain=<SUFFIX>  (Optional) Forward only subdomains to VPN, other domains will use direct connection; can be specified multiple times\
-\n      --pac-file=<PATH>         (Optional) Path to pac file (available at /proxy.pac)\
-\n\n\
 > pterodapter [OPTIONS] ikev2\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>         Log level [default: info]\
@@ -67,13 +40,6 @@ Options:\
 \n\n\
 > pretodapter help";
 
-#[cfg(feature = "proxy")]
-struct ProxyConfig {
-    proxy: proxy::Config,
-    fortivpn: fortivpn::Config,
-}
-
-#[cfg(feature = "ikev2")]
 struct Ikev2Config {
     ikev2: ikev2::Config,
     fortivpn: fortivpn::Config,
@@ -81,9 +47,8 @@ struct Ikev2Config {
 
 impl Args {
     fn parse() -> Args {
-        let action_type = match env::args().next_back().as_deref() {
-            Some("proxy") => ActionType::Proxy,
-            Some("ikev2") => ActionType::IkeV2,
+        match env::args().next_back().as_deref() {
+            Some("ikev2") => {}
             Some("help") => {
                 println!("{}", USAGE_INSTRUCTIONS);
                 process::exit(0);
@@ -106,8 +71,6 @@ impl Args {
 
         let mut log_level = log::LevelFilter::Info;
 
-        let mut listen_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5328);
-        let mut pac_path: Option<String> = None;
         let mut tunnel_domains: Vec<String> = vec![];
 
         let mut destination_addr = None;
@@ -154,15 +117,6 @@ impl Args {
                     "OFF" => log::LevelFilter::Off,
                     _ => fail_with_error(name, value, format_args!("Unsupported log level")),
                 };
-            } else if action_type == ActionType::Proxy && name == "--listen-address" {
-                match SocketAddr::from_str(value) {
-                    Ok(addr) => listen_addr = addr,
-                    Err(err) => fail_with_error(
-                        name,
-                        value,
-                        format_args!("Failed to parse listen address: {}", err),
-                    ),
-                };
             } else if name == "--destination" {
                 match value.to_socket_addrs() {
                     Ok(mut addr) => {
@@ -197,9 +151,7 @@ impl Args {
                     );
                 }
                 dns64_domains.push(value.into());
-            } else if action_type == ActionType::Proxy && name == "--pac-file" {
-                pac_path = Some(value.into());
-            } else if action_type == ActionType::IkeV2 && name == "--listen-ip" {
+            } else if name == "--listen-ip" {
                 match IpAddr::from_str(value) {
                     Ok(ip) => {
                         listen_ips.push(ip);
@@ -210,7 +162,7 @@ impl Args {
                         format_args!("Failed to parse IP address: {}", err),
                     ),
                 };
-            } else if action_type == ActionType::IkeV2 && name == "--ike-port" {
+            } else if name == "--ike-port" {
                 match u16::from_str(value) {
                     Ok(port) => ike_port = port,
                     Err(err) => fail_with_error(
@@ -219,7 +171,7 @@ impl Args {
                         format_args!("Failed to parse IKEv2 port: {}", err),
                     ),
                 };
-            } else if action_type == ActionType::IkeV2 && name == "--nat-port" {
+            } else if name == "--nat-port" {
                 match u16::from_str(value) {
                     Ok(port) => nat_port = port,
                     Err(err) => fail_with_error(
@@ -228,7 +180,7 @@ impl Args {
                         format_args!("Failed to parse NAT port for IKEv2: {}", err),
                     ),
                 };
-            } else if action_type == ActionType::IkeV2 && name == "--nat64-prefix" {
+            } else if name == "--nat64-prefix" {
                 let ip = match IpAddr::from_str(value) {
                     Ok(IpAddr::V4(_)) => fail_with_error(
                         name,
@@ -243,9 +195,9 @@ impl Args {
                     ),
                 };
                 nat64_prefix = Some(ip);
-            } else if action_type == ActionType::IkeV2 && name == "--id-hostname" {
+            } else if name == "--id-hostname" {
                 id_hostname = Some(value.into());
-            } else if action_type == ActionType::IkeV2 && name == "--cacert" {
+            } else if name == "--cacert" {
                 match fs::read_to_string(value) {
                     Ok(cert) => root_ca = Some(cert),
                     Err(err) => fail_with_error(
@@ -254,7 +206,7 @@ impl Args {
                         format_args!("Failed to read root CA cert: {}", err),
                     ),
                 };
-            } else if action_type == ActionType::IkeV2 && name == "--cert" {
+            } else if name == "--cert" {
                 match fs::read_to_string(value) {
                     Ok(cert) => public_cert = Some(cert),
                     Err(err) => fail_with_error(
@@ -263,7 +215,7 @@ impl Args {
                         format_args!("Failed to read root CA cert: {}", err),
                     ),
                 };
-            } else if action_type == ActionType::IkeV2 && name == "--key" {
+            } else if name == "--key" {
                 match fs::read_to_string(value) {
                     Ok(cert) => private_key = Some(cert),
                     Err(err) => fail_with_error(
@@ -294,133 +246,39 @@ impl Args {
             process::exit(2);
         }
 
-        let mtu = match action_type {
-            ActionType::Proxy => fortivpn::PPP_MTU,
-            ActionType::IkeV2 => fortivpn::ESP_MTU,
-        };
         let fortivpn_config = fortivpn::Config {
             destination_addr,
             destination_hostport,
             tls_config,
-            mtu,
         };
 
-        match action_type {
-            ActionType::Proxy => {
-                #[cfg(not(feature = "proxy"))]
-                {
-                    eprintln!("Compiled without proxy support");
-                    println!("{}", USAGE_INSTRUCTIONS);
-                    process::exit(2);
-                }
-                #[cfg(feature = "proxy")]
-                {
-                    let proxy_config = proxy::Config {
-                        listen_addr,
-                        pac_path,
-                        tunnel_domains,
-                    };
-                    let action = Action::Proxy(ProxyConfig {
-                        proxy: proxy_config,
-                        fortivpn: fortivpn_config,
-                    });
-                    Args { log_level, action }
-                }
-            }
-            ActionType::IkeV2 => {
-                #[cfg(not(feature = "ikev2"))]
-                {
-                    eprintln!("Compiled without IKEv2 support");
-                    println!("{}", USAGE_INSTRUCTIONS);
-                    process::exit(2);
-                }
-                #[cfg(feature = "ikev2")]
-                {
-                    let server_cert = match (public_cert, private_key) {
-                        (Some(public_cert), Some(private_key)) => Some((public_cert, private_key)),
-                        _ => None,
-                    };
-                    if listen_ips.is_empty() {
-                        listen_ips = vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)];
-                    }
-
-                    let ikev2_config = ikev2::Config {
-                        hostname: id_hostname.clone(),
-                        listen_ips: listen_ips.clone(),
-                        port: ike_port,
-                        nat_port,
-                        root_ca,
-                        server_cert,
-                        tunnel_domains,
-                        nat64_prefix,
-                        dns64_domains,
-                    };
-                    let action = Action::IkeV2(Ikev2Config {
-                        ikev2: ikev2_config,
-                        fortivpn: fortivpn_config,
-                    });
-                    Args { log_level, action }
-                }
-            }
+        let server_cert = match (public_cert, private_key) {
+            (Some(public_cert), Some(private_key)) => Some((public_cert, private_key)),
+            _ => None,
+        };
+        if listen_ips.is_empty() {
+            listen_ips = vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)];
         }
+
+        let ikev2_config = ikev2::Config {
+            hostname: id_hostname.clone(),
+            listen_ips: listen_ips.clone(),
+            port: ike_port,
+            nat_port,
+            root_ca,
+            server_cert,
+            tunnel_domains,
+            nat64_prefix,
+            dns64_domains,
+        };
+        let config = Ikev2Config {
+            ikev2: ikev2_config,
+            fortivpn: fortivpn_config,
+        };
+        Args { log_level, config }
     }
 }
 
-#[cfg(feature = "proxy")]
-fn serve_proxy(config: ProxyConfig) -> Result<(), i32> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .map_err(|err| {
-            eprintln!("Failed to start runtime: {}", err);
-            1
-        })?;
-
-    let (command_sender, command_receiver) = mpsc::channel(64);
-    let server = proxy::Server::new(config.proxy, command_sender.clone()).map_err(|err| {
-        eprintln!("Failed to start proxy server: {}", err);
-        1
-    })?;
-    let server_handle = rt.spawn(async move {
-        if let Err(err) = server.run().await {
-            eprintln!("Server failed to run: {}", err);
-        }
-    });
-
-    let client = proxy::network::Network::new(config.fortivpn).map_err(|err| {
-        eprintln!("Failed to start virtual network interface: {}", err);
-        1
-    })?;
-
-    let client_handle = rt.spawn(client.run(command_receiver));
-
-    rt.block_on(async move {
-        if let Err(err) = signal::ctrl_c().await {
-            eprintln!("Failed to wait for CTRL+C signal: {}", err);
-        }
-        info!("Started shutdown");
-        if command_sender
-            .send(proxy::network::Command::Shutdown)
-            .await
-            .is_err()
-        {
-            eprintln!("Shutdown listener is closed");
-            return;
-        }
-        if let Err(err) = client_handle.await {
-            eprintln!("Network failed to run: {}", err);
-        }
-    });
-
-    server_handle.abort();
-    rt.shutdown_timeout(Duration::from_secs(60));
-
-    info!("Stopped server");
-    Ok(())
-}
-
-#[cfg(feature = "ikev2")]
 fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
     use tokio::sync::oneshot;
 
@@ -477,18 +335,7 @@ fn main() {
     if let Err(err) = logger::setup_logger(args.log_level) {
         eprintln!("Failed to set up logger, error is {}", err);
     }
-    match args.action {
-        #[cfg(feature = "proxy")]
-        Action::Proxy(config) => {
-            if let Err(exitcode) = serve_proxy(config) {
-                process::exit(exitcode);
-            }
-        }
-        #[cfg(feature = "ikev2")]
-        Action::IkeV2(config) => {
-            if let Err(exitcode) = serve_ikev2(config) {
-                process::exit(exitcode);
-            }
-        }
+    if let Err(exitcode) = serve_ikev2(args.config) {
+        process::exit(exitcode);
     }
 }
