@@ -729,6 +729,12 @@ impl<'a> Ipv6Packet<'a> {
         }
     }
 
+    fn fragment_next_header(&self) -> Option<TransportProtocolType> {
+        Some(TransportProtocolType::from_u8(
+            self.fragment_extension_data?[0],
+        ))
+    }
+
     fn is_fragment_shifted(&self) -> bool {
         match self.fragment_offset() {
             Some(0) | None => false,
@@ -1742,10 +1748,15 @@ impl Network {
                 if header.transport_protocol() == TransportProtocolType::IPV6_ICMP {
                     return self.translate_icmp_packet_from_esp(packet, out_buf);
                 }
-                // TODO 0.5.0: if fragment header is followed by an unsupported extension header, drop it.
-                // https://datatracker.ietf.org/doc/html/rfc7915#section-5.1.1
-
-                if !is_dns_ip {
+                if packet
+                    .fragment_next_header()
+                    .is_some_and(|protocol| protocol.is_ipv6_extension())
+                {
+                    // RFC 7915, Section 5.1.1
+                    // If fragment header is followed by an unsupported extension header, drop it.
+                    warn!("Dropping IPv6 packet with extension header after a Fragment header");
+                    Ok(RoutingActionEsp::Drop)
+                } else if !is_dns_ip {
                     let length = packet.write_translated(out_buf, false)?;
                     debug_print_packet(&out_buf[..length]);
                     Ok(RoutingActionEsp::Forward(&out_buf[..length]))
