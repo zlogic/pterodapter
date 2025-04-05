@@ -8,7 +8,7 @@ pterodapter is a userspace IKEv2-to-FortiVPN adapter that acts as an L3 IKEv2 VP
 
 ![Connection diagram](diagram.svg)
 
-Previous versions also supported a proxy mode, which was deprecated once IKEv2 improved support for DNS-based split routing.
+Previous versions also supported a proxy mode, which was deprecated once IKEv2 improved support for DNS-based split routing (NAT64 SIIT with split-horizon DNS64).
 
 The last version supporting proxy mode is [0.5.0](https://github.com/zlogic/pterodapter/tree/0.5.0).
 
@@ -22,6 +22,8 @@ To avoid granting root permissions, the following command grants permissions to 
 ```shell
 sudo setcap CAP_NET_BIND_SERVICE=+eip pterodapter
 ```
+
+To run pterodapter locally, use WSL on Windows, or [add firewall redirection](docs/macos-pf.md) on macOS.
 
 # How to use it
 
