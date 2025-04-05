@@ -772,9 +772,6 @@ impl Sessions {
             } else {
                 (None, &[])
             };
-        // TODO 0.5.0: remove this debug code.
-        //let internal_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10)));
-        //let dns_addrs = &[IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))];
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
     }
