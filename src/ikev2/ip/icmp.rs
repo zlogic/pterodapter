@@ -2,6 +2,7 @@ use std::{
     fmt,
     net::{Ipv4Addr, Ipv6Addr},
     ops::Deref,
+    time,
 };
 
 use log::{debug, warn};
@@ -755,6 +756,18 @@ impl Deref for IcmpV6Message<'_> {
     }
 }
 
+impl fmt::Display for IcmpV6Message<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ICMPv6 {} C={:#06X}: {}",
+            self.icmp_type(),
+            self.checksum(),
+            fmt_slice_hex(self)
+        )
+    }
+}
+
 #[derive(Eq, PartialEq)]
 pub(crate) struct IcmpErrorResponse(IcmpV4, IcmpV6);
 
@@ -851,14 +864,33 @@ impl IcmpErrorResponse {
     }
 }
 
-impl fmt::Display for IcmpV6Message<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ICMPv6 {} C={:#06X}: {}",
-            self.icmp_type(),
-            self.checksum(),
-            fmt_slice_hex(self)
-        )
+const ICMP_RATELIMITER_LIMIT: usize = 10;
+const ICMP_RATELIMITER_INTERVAL: time::Duration = time::Duration::from_secs(5);
+
+#[derive(Clone)]
+pub(super) struct RateLimiter {
+    count: usize,
+    next_reset: time::Instant,
+}
+
+impl RateLimiter {
+    pub fn new() -> RateLimiter {
+        RateLimiter {
+            count: 0,
+            next_reset: time::Instant::now() + ICMP_RATELIMITER_INTERVAL,
+        }
+    }
+
+    pub fn can_send(&mut self) -> bool {
+        if self.count < ICMP_RATELIMITER_LIMIT {
+            self.count += 1;
+            true
+        } else if time::Instant::now() >= self.next_reset {
+            self.count = 0;
+            self.next_reset = time::Instant::now() + ICMP_RATELIMITER_INTERVAL;
+            true
+        } else {
+            false
+        }
     }
 }

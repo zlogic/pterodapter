@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, Range},
 };
 
-use log::{trace, warn};
+use log::{info, trace, warn};
 
 use crate::logger::fmt_slice_hex;
 
@@ -1511,6 +1511,7 @@ pub struct Network {
     dns64_domains_dns: TunnelDomainsDns,
     local_ts: Vec<message::TrafficSelector>,
     dns_translator: Option<dns::Dns64Translator>,
+    icmp_rate_limiter: icmp::RateLimiter,
 }
 
 impl Network {
@@ -1532,6 +1533,7 @@ impl Network {
         let dns_translator = nat64_prefix
             .as_ref()
             .map(|nat64_prefix| dns::Dns64Translator::new(nat64_prefix.clone()));
+        let icmp_rate_limiter = icmp::RateLimiter::new();
         Ok(Network {
             nat64_prefix,
             real_ip: None,
@@ -1543,6 +1545,7 @@ impl Network {
             dns_addrs_ipv4,
             local_ts: vec![],
             dns_translator,
+            icmp_rate_limiter,
         })
     }
 
@@ -1728,6 +1731,10 @@ impl Network {
                         "Received packet with expired Hop limit from ESP: {}",
                         header
                     );
+                    if !self.icmp_rate_limiter.can_send() {
+                        info!("ICMP rate limit reached, dropping response");
+                        return Ok(RoutingActionEsp::Drop);
+                    }
                     let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
                         .write_error_response(&IpPacket::V6(packet), out_buf)?;
                     return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
@@ -1751,6 +1758,10 @@ impl Network {
                     // RFC 7915, Section 4.1:
                     // TTL limit will be reduced to 0 - will be dropped by the next hop.
                     warn!("Received packet with expired TTL: {}", header);
+                    if !self.icmp_rate_limiter.can_send() {
+                        info!("ICMP rate limit reached, dropping response");
+                        return Ok(RoutingActionEsp::Drop);
+                    }
                     let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
                         .write_error_response(&IpPacket::V4(packet), out_buf)?;
                     return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
@@ -1785,6 +1796,10 @@ impl Network {
             && header.dst_port() == Some(&53);
         if !is_dns_port {
             warn!("Dropping non-standard packet to DNS server {}", header);
+            if !self.icmp_rate_limiter.can_send() {
+                info!("ICMP rate limit reached, dropping response");
+                return Ok(RoutingActionEsp::Drop);
+            }
             let length =
                 icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(&packet, out_buf)?;
             return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
@@ -1909,6 +1924,10 @@ impl Network {
             // RFC 7915, Section 4.1:
             // TTL limit will be reduced to 0 - will be dropped by the next hop.
             warn!("Received packet with expired TTL: {}", header);
+            if !self.icmp_rate_limiter.can_send() {
+                info!("ICMP rate limit reached, dropping response");
+                return Ok(RoutingActionVpn::Drop);
+            }
             let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
                 .write_error_response(&IpPacket::V4(packet), out_buf)?;
             return Ok(RoutingActionVpn::ReturnToSender(&out_buf[..length]));
@@ -1955,6 +1974,10 @@ impl Network {
             && header.src_port() == Some(&53);
         if !is_dns_port {
             warn!("Dropping non-standard packet from DNS server {}", header);
+            if !self.icmp_rate_limiter.can_send() {
+                info!("ICMP rate limit reached, dropping response");
+                return Ok(RoutingActionVpn::Drop);
+            }
             let length = icmp::ICMP_ERROR_COMMUNICATION_PROHIBITED
                 .write_error_response(&IpPacket::V4(packet), out_buf)?;
             return Ok(RoutingActionVpn::ReturnToSender(&out_buf[..length]));
