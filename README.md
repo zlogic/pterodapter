@@ -160,6 +160,8 @@ For example:
     --destination=fortivpn.example.com:443 \
     --tunnel-domain=gitlab.example.com \
     --tunnel-domain=registry.example.com \
+    --nat64-prefix=64:ff9b:: \
+    --dns64-tunnel-suffix=example.com \
     --id-hostname=pterodapter.home \
     --cacert=vpn-root.cert.pem \
     --cert=vpn-server.cert.pem \
@@ -170,6 +172,8 @@ For example:
 For more information how to generate certs and configure clients, see the [certs.md](docs/certs.md) document.
 
 For information how to run pterodapter as a systemd unit, see the [systemd.md](docs/systemd.md) document.
+
+For information how to enable split routing in WIndows, see the [windows-split-routing.md](docs/windows-split-routing.md) document.
 
 # Reference
 

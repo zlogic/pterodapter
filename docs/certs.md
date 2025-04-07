@@ -37,6 +37,11 @@ basicConstraints = critical, CA:FALSE")
 rm vpn-server.csr.pem
 ```
 
+⚠️ Windows seems to fail TLS certificate validation if the VPN destination is an IP address and not a FQDN.
+StrongSwan suggests that this might work if the IP address is used as a `subjectAltName`, but these certificates will be rejected by rustls-webpki.
+
+If the VPN server doesn't have a hostname (e.g. is running on WSL), use a wildcard DNS service like `nip.io`, `sslip.io` or a static entry in `C:\Windows\System32\drivers\etc\hosts`.
+
 ## Client certificates
 
 Generate client key
@@ -68,7 +73,7 @@ For more details on configuring Windows, check the [StrongSwan documentation](ht
 
 To be able to use ECDSA certs, run the following command (replace `<name>` with the VPN connection name):
 
-```
+```powershell
 Set-VpnConnectionIPsecConfiguration -ConnectionName <name> -CipherTransformConstants GCMAES256 -EncryptionMethod GCMAES256 -IntegrityCheckMethod SHA256 -DHGroup ECP256 -AuthenticationTransformConstants GCMAES256 -PfsGroup ECP256
 ```
 
