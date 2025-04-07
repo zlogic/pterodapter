@@ -1734,7 +1734,6 @@ impl Network {
                     Ok(RoutingActionEsp::Drop)
                 } else if !is_dns_ip {
                     let length = packet.write_translated(out_buf, false)?;
-                    debug_print_packet(&out_buf[..length]);
                     Ok(RoutingActionEsp::Forward(&out_buf[..length]))
                 } else {
                     self.translate_dns_packet_from_esp(IpPacket::V6(packet), header, out_buf)
@@ -1755,7 +1754,6 @@ impl Network {
                 }
                 if !is_dns_ip || packet.transport_protocol() == TransportProtocolType::ICMP {
                     let length = packet.write_ipv4_decrease_ttl(out_buf)?;
-                    debug_print_packet(&out_buf[..length]);
                     Ok(RoutingActionEsp::Forward(&out_buf[..length]))
                 } else {
                     self.translate_dns_packet_from_esp(IpPacket::V4(packet), header, out_buf)
@@ -1799,7 +1797,6 @@ impl Network {
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE_IPV4];
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated_ipv4(out_buf, false)?;
-            debug_print_packet(&out_buf[..length]);
             return Ok(RoutingActionEsp::Forward(&out_buf[..length]));
         }
 
@@ -1822,7 +1819,6 @@ impl Network {
                     MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
                 )?;
                 let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-                debug_print_packet(&out_buf[start_offset..data_end]);
                 RoutingActionEsp::Forward(&out_buf[start_offset..data_end])
             }
             dns::DnsTranslationAction::ReplyToSender(length) => {
@@ -1835,7 +1831,6 @@ impl Network {
                     MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
                 )?;
                 let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-                debug_print_packet(&out_buf[start_offset..data_end]);
                 RoutingActionEsp::ReturnToSender(
                     &mut out_buf[start_offset..],
                     data_end - start_offset,
@@ -1872,7 +1867,6 @@ impl Network {
                 }
 
                 let length = packet.write_icmp_translated(out_buf, length)?;
-                debug_print_packet(&out_buf[..length]);
                 RoutingActionEsp::Forward(&out_buf[..length])
             }
             icmp::IcmpTranslationAction::Drop => RoutingActionEsp::Drop,
@@ -1925,11 +1919,9 @@ impl Network {
             self.translate_dns_packet_from_vpn(packet, header, &nat64_prefix, out_buf)
         } else if is_ipv4_tunnel {
             let length = packet.write_ipv4_decrease_ttl(out_buf)?;
-            debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionVpn::Forward(out_buf, length))
         } else {
             let length = packet.write_translated(out_buf, &nat64_prefix, false)?;
-            debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionVpn::Forward(out_buf, length))
         }
     }
@@ -1968,7 +1960,6 @@ impl Network {
         // Reserve space for UDP header.
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated(out_buf, nat_prefix, false)?;
-            debug_print_packet(&out_buf[..length]);
             return Ok(RoutingActionVpn::Forward(out_buf, length));
         }
 
@@ -1993,7 +1984,6 @@ impl Network {
             nat_prefix,
         )?;
         let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-        debug_print_packet(&out_buf[start_offset..data_end]);
         Ok(RoutingActionVpn::Forward(
             &mut out_buf[start_offset..],
             data_end - start_offset,
@@ -2030,7 +2020,6 @@ impl Network {
                 }
 
                 let length = packet.write_icmp_translated(out_buf, length, nat64_prefix)?;
-                debug_print_packet(&out_buf[..length]);
                 RoutingActionVpn::Forward(out_buf, length)
             }
             icmp::IcmpTranslationAction::Drop => RoutingActionVpn::Drop,
@@ -2191,42 +2180,5 @@ impl From<io::Error> for IpError {
 impl From<&'static str> for IpError {
     fn from(msg: &'static str) -> IpError {
         Self::Internal(msg)
-    }
-}
-
-fn debug_print_packet(data: &[u8]) {
-    // TODO 0.5.0: Remove this debug code once everything's ready.
-    let packet = match IpPacket::from_data(data) {
-        Ok(packet) => packet,
-        Err(err) => {
-            println!("Error validating packet: {}\n{}", err, fmt_slice_hex(data));
-            return;
-        }
-    };
-
-    if packet.fragment_offset().is_some() {
-        println!("> Packet is fragmented: {}", fmt_slice_hex(data));
-    }
-    match &packet {
-        IpPacket::V4(packet) => {
-            let valid_transport = packet.validate_transport_checksum();
-            let valid_ip = packet.validate_ip_checksum();
-            if !valid_transport || !valid_ip {
-                println!(
-                    "! Checksum validation failed: transport={} ip={} packet: {}",
-                    valid_transport,
-                    valid_ip,
-                    fmt_slice_hex(data)
-                );
-            }
-        }
-        IpPacket::V6(packet) => {
-            if !packet.validate_transport_checksum() {
-                println!(
-                    "! Checksum validation for transport failed, packet: {}",
-                    fmt_slice_hex(data)
-                )
-            }
-        }
     }
 }
