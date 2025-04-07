@@ -1943,7 +1943,9 @@ impl Network {
                 .write_error_response(&IpPacket::V4(packet), out_buf)?;
             return Ok(RoutingActionVpn::ReturnToSender(&out_buf[..length]));
         }
-        if is_dns_ip {
+        if packet.transport_protocol() == TransportProtocolType::ICMP {
+            self.translate_icmp_packet_from_vpn(packet, out_buf, &nat64_prefix)
+        } else if is_dns_ip {
             self.translate_dns_packet_from_vpn(
                 packet,
                 header,
@@ -1955,8 +1957,6 @@ impl Network {
             let length = packet.write_ipv4_decrease_ttl(out_buf)?;
             debug_print_packet(&out_buf[..length]);
             Ok(RoutingActionVpn::Forward(out_buf, length))
-        } else if packet.transport_protocol() == TransportProtocolType::ICMP {
-            self.translate_icmp_packet_from_vpn(packet, out_buf, &nat64_prefix)
         } else {
             let length = packet.write_translated(out_buf, &nat64_prefix, false)?;
             debug_print_packet(&out_buf[..length]);
