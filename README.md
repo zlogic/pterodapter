@@ -115,7 +115,7 @@ For containers running in Podman Machine, use `host.containers.internal` instead
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --destination=<hostport> [--tunnel-domain=<domain>] [--nat64-prefix=<ip6prefix>] [--dns64-tunnel-suffix=<domain>] [--nat64-ipv4-dns=<ip4addr>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
+pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --destination=<hostport> [--tunnel-domain=<domain>] [--nat64-prefix=<ip6prefix>] [--dns64-tunnel-suffix=<domain>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> ikev2
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
@@ -143,11 +143,6 @@ Inspired by ideas from [Microsoft DirectAccess](https://en.wikipedia.org/wiki/Di
 `--dns64-tunnel-suffix=<domain>` specifies an optional argument indicating that `<domain>` and its subdomains should be sent through the VPN using NAT64 (DNS64).
 To specify multiple domains, add a `--dns64-tunnel-suffix` argument for each one.
 If no `--dns64-tunnel-suffix` arguments are specified, DNS64 won't be used, but will still remain available - for example, to be used with a custom DNS64 server.
-
-`--nat64-ipv4-dns=<ip4addr>` specifies an optional argument indicating that `<ip4addr>` should be added as an additional DNS address for clients who don't support IPv6.
-To specify multiple DNS servers, add a `--nat64-ipv4-dns` argument for each one.
-These addresses will be added to the VPN as additional destinations, and any responses from those DNS servers will always be sent as IPv4 responses.
-This option lets pterodapter decide if a DNS response should be sent as an IPv4 or IPv6 packet.
 
 `--destination=<hostport>` specifies the hostname to send to the client when performing a client handshake. If not specified, will use `pterodapter` as the hostname. Windows refuses to connect if the hostname doesn't match connection settings; macOS prints a warning in the Console.
 

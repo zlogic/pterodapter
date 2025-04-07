@@ -1511,7 +1511,6 @@ pub struct Network {
     real_ip: Option<IpAddr>,
     ip_netmasks: Vec<IpNetmask>,
     dns_addrs: Vec<IpAddr>,
-    dns_addrs_ipv4: Vec<Ipv4Addr>,
     tunnel_ips: Vec<IpAddr>,
     dns64_domains_idna: Vec<Vec<u8>>,
     dns64_domains_dns: TunnelDomainsDns,
@@ -1524,17 +1523,12 @@ impl Network {
     pub fn new(
         nat64_prefix: Option<Nat64Prefix>,
         dns64_domains: Vec<String>,
-        dns_addrs_ipv4: Vec<Ipv4Addr>,
     ) -> Result<Network, IpError> {
         let dns64_domains_idna = dns64_domains
             .iter()
             .map(|domain| domain.as_bytes().to_vec())
             .collect::<Vec<_>>();
         let dns64_domains_dns = TunnelDomainsDns::new(&dns64_domains);
-        let tunnel_ips = dns_addrs_ipv4
-            .iter()
-            .map(|dns_addr| IpAddr::V4(*dns_addr))
-            .collect::<Vec<_>>();
 
         let dns_translator = nat64_prefix
             .as_ref()
@@ -1545,10 +1539,9 @@ impl Network {
             real_ip: None,
             ip_netmasks: vec![],
             dns_addrs: vec![],
-            tunnel_ips,
+            tunnel_ips: vec![],
             dns64_domains_idna,
             dns64_domains_dns,
-            dns_addrs_ipv4,
             local_ts: vec![],
             dns_translator,
             icmp_rate_limiter,
@@ -1576,22 +1569,11 @@ impl Network {
         self.ip_netmasks = if let Some(nat64_prefix) = &self.nat64_prefix {
             self.dns_addrs = dns_addrs
                 .iter()
-                .flat_map(|dns_addr| match dns_addr {
-                    IpAddr::V4(addr) => {
-                        if !self.dns_addrs_ipv4.contains(addr) {
-                            Some(IpAddr::V6(nat64_prefix.map_ipv4(addr)))
-                        } else {
-                            None
-                        }
-                    }
-                    IpAddr::V6(_) => Some(*dns_addr),
+                .map(|dns_addr| match dns_addr {
+                    IpAddr::V4(addr) => IpAddr::V6(nat64_prefix.map_ipv4(addr)),
+                    IpAddr::V6(_) => *dns_addr,
                 })
                 .collect::<Vec<_>>();
-            self.dns_addrs.extend(
-                self.dns_addrs_ipv4
-                    .iter()
-                    .map(|dns_addr| IpAddr::V4(*dns_addr)),
-            );
             if let (Some(IpAddr::V4(addr)), Some(ipv4_netmask)) = (&self.real_ip, ipv4_netmask) {
                 let ipv6_addr = nat64_prefix.map_ipv4(addr);
                 vec![ipv4_netmask, IpNetmask::Ipv6Prefix(ipv6_addr, 96)]
@@ -1611,11 +1593,6 @@ impl Network {
 
     pub fn set_split_routes(&mut self, ip_addresses: &[IpAddr]) {
         self.tunnel_ips = ip_addresses.to_vec();
-        self.tunnel_ips.extend(
-            self.dns_addrs_ipv4
-                .iter()
-                .map(|dns_addr| IpAddr::V4(*dns_addr)),
-        );
         self.update_local_ts();
     }
 
@@ -1746,9 +1723,8 @@ impl Network {
                     return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
                 }
                 if header.transport_protocol() == TransportProtocolType::IPV6_ICMP {
-                    return self.translate_icmp_packet_from_esp(packet, out_buf);
-                }
-                if packet
+                    self.translate_icmp_packet_from_esp(packet, out_buf)
+                } else if packet
                     .fragment_next_header()
                     .is_some_and(|protocol| protocol.is_ipv6_extension())
                 {
@@ -1946,13 +1922,7 @@ impl Network {
         if packet.transport_protocol() == TransportProtocolType::ICMP {
             self.translate_icmp_packet_from_vpn(packet, out_buf, &nat64_prefix)
         } else if is_dns_ip {
-            self.translate_dns_packet_from_vpn(
-                packet,
-                header,
-                is_ipv4_tunnel,
-                &nat64_prefix,
-                out_buf,
-            )
+            self.translate_dns_packet_from_vpn(packet, header, &nat64_prefix, out_buf)
         } else if is_ipv4_tunnel {
             let length = packet.write_ipv4_decrease_ttl(out_buf)?;
             debug_print_packet(&out_buf[..length]);
@@ -1968,7 +1938,6 @@ impl Network {
         &mut self,
         packet: Ipv4Packet<'a>,
         header: IpHeader,
-        is_ipv4_tunnel: bool,
         nat_prefix: &Nat64Prefix,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionVpn<'a>, IpError> {
@@ -1998,15 +1967,8 @@ impl Network {
         trace!("Decoded DNS packet from VPN: {}", dns_packet);
         // Reserve space for UDP header.
         if !self.dns_matches_nat64(&dns_packet) {
-            let length = if is_ipv4_tunnel {
-                let data = packet.into_data();
-                out_buf[..data.len()].copy_from_slice(data);
-                data.len()
-            } else {
-                let length = packet.write_translated(out_buf, nat_prefix, false)?;
-                debug_print_packet(&out_buf[..length]);
-                length
-            };
+            let length = packet.write_translated(out_buf, nat_prefix, false)?;
+            debug_print_packet(&out_buf[..length]);
             return Ok(RoutingActionVpn::Forward(out_buf, length));
         }
 
@@ -2025,30 +1987,17 @@ impl Network {
             trace!("Rewrote DNS response from VPN: {}", dns_packet);
         }
 
-        if is_ipv4_tunnel {
-            let start_offset = packet.write_udp_updated_payload(
-                out_buf,
-                MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
-            )?;
-            let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-            debug_print_packet(&out_buf[start_offset..data_end]);
-            Ok(RoutingActionVpn::Forward(
-                &mut out_buf[start_offset..],
-                data_end - start_offset,
-            ))
-        } else {
-            let start_offset = packet.write_udp_translated(
-                out_buf,
-                MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
-                nat_prefix,
-            )?;
-            let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-            debug_print_packet(&out_buf[start_offset..data_end]);
-            Ok(RoutingActionVpn::Forward(
-                &mut out_buf[start_offset..],
-                data_end - start_offset,
-            ))
-        }
+        let start_offset = packet.write_udp_translated(
+            out_buf,
+            MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
+            nat_prefix,
+        )?;
+        let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
+        debug_print_packet(&out_buf[start_offset..data_end]);
+        Ok(RoutingActionVpn::Forward(
+            &mut out_buf[start_offset..],
+            data_end - start_offset,
+        ))
     }
 
     fn translate_icmp_packet_from_vpn<'a>(

@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -51,7 +51,6 @@ pub struct Config {
     pub tunnel_domains: Vec<String>,
     pub nat64_prefix: Option<Ipv6Addr>,
     pub dns64_domains: Vec<String>,
-    pub nat64_ipv4_dns: Vec<Ipv4Addr>,
 }
 
 pub struct Server {
@@ -62,7 +61,6 @@ pub struct Server {
     tunnel_domains: Vec<String>,
     dns64_domains: Vec<String>,
     nat64_prefix: Option<Nat64Prefix>,
-    nat64_ipv4_dns: Vec<Ipv4Addr>,
     udp_read_buffer: [u8; MAX_ESP_PACKET_SIZE],
     udp_write_buffer: [u8; MAX_ESP_PACKET_SIZE],
     vpn_read_buffer: [u8; MAX_ESP_PACKET_SIZE],
@@ -91,7 +89,6 @@ impl Server {
             tunnel_domains: config.tunnel_domains,
             dns64_domains: config.dns64_domains,
             nat64_prefix: config.nat64_prefix.map(Nat64Prefix::new),
-            nat64_ipv4_dns: config.nat64_ipv4_dns,
             udp_read_buffer,
             udp_write_buffer,
             vpn_read_buffer,
@@ -128,11 +125,7 @@ impl Server {
             CLEANUP_INTERVAL,
             command_sender.clone(),
         ));
-        let network = ip::Network::new(
-            self.nat64_prefix.clone(),
-            self.dns64_domains.clone(),
-            self.nat64_ipv4_dns.clone(),
-        )?;
+        let network = ip::Network::new(self.nat64_prefix.clone(), self.dns64_domains.clone())?;
         if let Some(mut split_route_registry) =
             network.split_route_registry(self.tunnel_domains.clone())
         {
