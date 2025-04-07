@@ -136,7 +136,7 @@ This option only affects IPv4 traffic. For NAT64 split tunnel routing, use the `
 `--nat64-prefix=<ip6prefix>` specifies an optional argument indicating that [NAT64](https://en.wikipedia.org/wiki/NAT64) mode should be enabled, for example `--nat64-prefix=64:ff9b::` will remap IPv4 addresses to a /96 IPv6 subnet matching `64:ff9b::`-`64:ff9b::ffff:ffff`.
 In NAT64 mode, pterodapter will intercept DNS responses and remap external IPv4 addresses to IPv6 addresses in the specified subnet.
 This is done only for domains matching a suffix listed in `--tunnel-domain`.
-The IKEv2 client will use IPv6 traffic, which is translated into IPv4 and sent to VPN, based on the SIIT alrorithm documented in [RFC 7915](https://datatracker.ietf.org/doc/html/rfc7915).
+The IKEv2 client will use IPv6 traffic, which is translated into IPv4 and sent to VPN, based on the SIIT algorithm documented in [RFC 7915](https://datatracker.ietf.org/doc/html/rfc7915).
 This approach simplifies the routing table (IKEv2 Traffic Selector) to use only one network or traffic selector; it also allows to use domain suffixes and handle DNS updates without reconnecting the client.
 Inspired by ideas from [Microsoft DirectAccess](https://en.wikipedia.org/wiki/DirectAccess).
 
