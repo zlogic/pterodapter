@@ -129,7 +129,7 @@ pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>]
 `--destination=<hostport>` specifies the FortiVPN connection address, for example `--destination=fortivpn.example.com:443`.
 
 `--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. To specify multiple domains, add a `--tunnel-domain` argument for each one; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN.
-This is implemented using IKEv2 traffic selectors and works as expected on macOS; Windows seems to have [issues with split routing](https://docs.strongswan.org/docs/5.9/howtos/forwarding.html#_split_tunneling_with_ikev2).
+This is implemented using IKEv2 traffic selectors and works with no extra configuration on macOS; Windows needs routes [to be added manually](docs/windows-split-routing.md).
 To ensure that dynamic IPs are handled correctly, pterodapter will send updated routes (IKEv2 Traffic Selectors) when the client rekeys the session.
 This option only affects IPv4 traffic. For NAT64 split tunnel routing, use the `--dns64-tunnel-suffix` argument.
 
@@ -173,7 +173,17 @@ For more information how to generate certs and configure clients, see the [certs
 
 For information how to run pterodapter as a systemd unit, see the [systemd.md](docs/systemd.md) document.
 
-For information how to enable split routing in WIndows, see the [windows-split-routing.md](docs/windows-split-routing.md) document.
+For information how to enable split routing in Windows, see the [windows-split-routing.md](docs/windows-split-routing.md) document.
+
+## Running on the same host
+
+IKEv2 relies on fixed port numbers (500 and 4500) and most implementations (macOS and Windows built-in VPN clients) don't allow to specify a custom port number.
+Additionally, IKEv2 uses fixed ports on the client side as well.
+
+This means running pterodapter on the same host as the client could cause issues.
+
+* For Windows, run pterodapter in WSL with NAT networking mode (mirrored networking might work but is untested).
+* For macOS, [create a virtual IP](docs/macos-pf.md) in built-in packet filter .
 
 # Reference
 
