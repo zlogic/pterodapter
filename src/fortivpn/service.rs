@@ -17,7 +17,7 @@ struct ConnectedData {
 enum ConnectionState {
     Disconnected,
     Connecting(JoinHandle<Result<FortiVPNTunnel, VpnServiceError>>),
-    Connected(ConnectedData),
+    Connected(Box<ConnectedData>),
 }
 
 pub struct FortiService {
@@ -60,12 +60,12 @@ impl FortiService {
                     info!("VPN service is connected");
                     let mut echo_timer = tokio::time::interval(super::ECHO_SEND_INTERVAL);
                     echo_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    self.state = ConnectionState::Connected(ConnectedData {
+                    self.state = ConnectionState::Connected(Box::new(ConnectedData {
                         tunnel,
                         echo_timer,
                         need_echo: false,
                         unflushed_writes: 0,
-                    });
+                    }));
                     Ok(())
                 }
                 Err(err) => {
