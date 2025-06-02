@@ -7,6 +7,7 @@ use std::{
 };
 
 use log::info;
+use rustls_platform_verifier::BuilderVerifierExt as _;
 use tokio::signal;
 use tokio_rustls::rustls;
 
@@ -87,12 +88,15 @@ impl Args {
         let mut dns64_domains: Vec<String> = vec![];
 
         let tls_config =
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .dangerous() // rustls_platform_verifier is claims this is not dangerous
-                .with_custom_certificate_verifier(Arc::new(
-                    rustls_platform_verifier::Verifier::new(),
-                ))
-                .with_no_client_auth();
+            match rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_platform_verifier()
+            {
+                Ok(builder) => builder.with_no_client_auth(),
+                Err(err) => {
+                    eprintln!("Failed to init platform verifier: {}", err);
+                    process::exit(2);
+                }
+            };
         let tls_config = Arc::new(tls_config);
 
         for arg in env::args()

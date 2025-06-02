@@ -11,7 +11,7 @@ rust-version = "1.85"
 log = { version = "0.4", default-features = false }
 tokio = { version = "1.45", default-features = false, features = ["rt", "io-util", "signal", "net", "time", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
-rustls-platform-verifier = { version = "0.5", default-features = false }
+rustls-platform-verifier = { version = "0.6", default-features = false }
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
 aws-lc-rs = { version = "*", default-features = false }
 rustls-webpki = { version = "*", default-features = false, features = ["aws-lc-rs"] }
