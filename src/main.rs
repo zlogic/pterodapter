@@ -30,7 +30,8 @@ Options:\
 \n      --ike-port=<PORT>               IKEv2 port [default: 500]\
 \n      --nat-port=<PORT>               NAT port for IKEv2 and ESP [default: 4500]\
 \n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
-\n      --destination=<HOSTPORT>        Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --l4remote-ip=<IP4>             IPv4 address for L4 Remove mode, e.g. 10.10.10.10\
 \n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
 \n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
@@ -38,6 +39,7 @@ Options:\
 \n      --cacert=<FILENAME>             Path to root CA certificate (in PKCS 8 PEM format)\
 \n      --cert=<FILENAME>               Path to public certificate (in PKCS 8 PEM format)\
 \n      --key=<FILENAME>                Path to private key (in PKCS 8 PEM format)\
+\n      --pcap=<FILENAME>               (Optional) Enable packet capture into the specified tcpdump file\
 \n\n\
 > pretodapter help";
 
@@ -71,8 +73,9 @@ impl Args {
 
         let mut tunnel_domains: Vec<String> = vec![];
 
-        let mut destination_addr = None;
-        let mut destination_hostport = None;
+        let mut fortivpn_addr = None;
+        let mut fortivpn_hostport = None;
+        let mut l4remote_ip = None;
 
         let mut listen_ips = vec![];
         let mut ike_port = 500u16;
@@ -83,6 +86,8 @@ impl Args {
         let mut public_cert = None;
         let mut nat64_prefix = None;
         let mut dns64_domains: Vec<String> = vec![];
+
+        let mut pcap_file: Option<String> = None;
 
         let tls_config =
             match rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -118,11 +123,11 @@ impl Args {
                     "OFF" => log::LevelFilter::Off,
                     _ => fail_with_error(name, value, format_args!("Unsupported log level")),
                 };
-            } else if name == "--destination" {
+            } else if name == "--fortivpn" {
                 match value.to_socket_addrs() {
                     Ok(mut addr) => {
-                        destination_addr = addr.next();
-                        destination_hostport = Some(value.to_string());
+                        fortivpn_addr = addr.next();
+                        fortivpn_hostport = Some(value.to_string());
                     }
                     Err(err) => fail_with_error(
                         name,
@@ -130,6 +135,22 @@ impl Args {
                         format_args!("Failed to parse destination address: {err}"),
                     ),
                 };
+            } else if name == "--l4remote-ip" {
+                let ip = match IpAddr::from_str(value) {
+                    Ok(IpAddr::V4(ip)) => ip,
+                    Ok(IpAddr::V6(_)) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("L4 remote mode doesn't support IPv6 addresses"),
+                    ),
+
+                    Err(err) => fail_with_error(
+                        name,
+                        value,
+                        format_args!("Failed to parse L4 remote IP address: {err}"),
+                    ),
+                };
+                l4remote_ip = Some(ip);
             } else if name == "--tunnel-domain" {
                 // Domains should be in DNS IDNA A-label format for Unicode strings.
                 // All further processing assumes the domain is an ASCII UTF-8 string.
@@ -225,33 +246,30 @@ impl Args {
                         format_args!("Failed to read root CA cert: {err}"),
                     ),
                 };
+            } else if name == "--pcap" {
+                pcap_file = Some(value.into());
             } else {
                 eprintln!("Unsupported argument {arg}");
             }
         }
 
-        let (destination_addr, destination_hostport) =
-            match (destination_addr, destination_hostport) {
-                (Some(destination_addr), Some(destination_hostport)) => {
-                    (destination_addr, destination_hostport)
-                }
-                _ => {
-                    eprintln!("No destination specified");
-                    println!("{USAGE_INSTRUCTIONS}");
-                    process::exit(2);
-                }
-            };
+        let fortivpn_config = match (fortivpn_addr, fortivpn_hostport) {
+            (Some(fortivpn_addr), Some(fortivpn_hostport)) => fortivpn::Config {
+                destination_addr: fortivpn_addr,
+                destination_hostport: fortivpn_hostport,
+                tls_config,
+            },
+            _ => {
+                eprintln!("No destination specified");
+                println!("{USAGE_INSTRUCTIONS}");
+                process::exit(2);
+            }
+        };
         if nat64_prefix.is_none() && !dns64_domains.is_empty() {
             eprintln!("--dns64-tunnel-suffix should only be used when --nat64-prefix is specified");
             println!("{USAGE_INSTRUCTIONS}");
             process::exit(2);
         }
-
-        let fortivpn_config = fortivpn::Config {
-            destination_addr,
-            destination_hostport,
-            tls_config,
-        };
 
         let server_cert = match (public_cert, private_key) {
             (Some(public_cert), Some(private_key)) => Some((public_cert, private_key)),
