@@ -2,7 +2,7 @@ use std::{error, fmt, net::SocketAddr};
 
 use log::{debug, trace, warn};
 
-use crate::logger::fmt_slice_hex;
+use crate::{logger::fmt_slice_hex, pcap};
 
 use super::{crypto, ip, message};
 
@@ -142,9 +142,13 @@ impl SecurityAssociation {
         &mut self,
         in_data: &'a mut [u8],
         out_buf: &'a mut [u8],
+        pcap_sender: &mut Option<pcap::PcapSender>,
     ) -> Result<RoutingAction<'a>, EspError> {
         let decrypted_slice = self.decrypt_esp(in_data)?;
         trace!("Decrypted ESP packet\n{}", fmt_slice_hex(decrypted_slice));
+        if let Some(pcap_sender) = pcap_sender {
+            pcap_sender.send_packet(decrypted_slice);
+        }
         let ip_packet = match ip::IpPacket::from_data(decrypted_slice) {
             Ok(packet) => packet,
             Err(err) => {
@@ -230,6 +234,7 @@ impl SecurityAssociation {
         in_buf: &'a mut [u8],
         out_buf: &'a mut [u8],
         data_len: usize,
+        pcap_sender: &mut Option<pcap::PcapSender>,
     ) -> Result<RoutingAction<'a>, EspError> {
         match self
             .network
@@ -240,6 +245,9 @@ impl SecurityAssociation {
                     "Encrypting response to sender: {}",
                     fmt_slice_hex(&buf[..data_len])
                 );
+                if let Some(pcap_sender) = pcap_sender {
+                    pcap_sender.send_packet(&buf[..data_len]);
+                }
                 let encoded_length = self.encoded_length(data_len);
                 if encoded_length > buf.len() {
                     // This sometimes happens when FortiVPN returns a zero-padded packet.

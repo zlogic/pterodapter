@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -20,10 +20,7 @@ use tokio::{
     time,
 };
 
-use crate::{
-    fortivpn::{self, service::FortiService},
-    logger::fmt_slice_hex,
-};
+use crate::{fortivpn, logger::fmt_slice_hex, pcap};
 
 mod crypto;
 mod esp;
@@ -113,11 +110,11 @@ impl Server {
     pub fn run(
         &mut self,
         rt: runtime::Runtime,
-        fortivpn_config: fortivpn::Config,
+        vpn_service: fortivpn::service::FortiService,
         shutdown_receiver: oneshot::Receiver<()>,
+        pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), IKEv2Error> {
         let sockets = rt.block_on(Sockets::new(&self.listen_ips, self.port, self.nat_port))?;
-        let vpn_service = FortiService::new(fortivpn_config);
 
         let (command_sender, command_receiver) = mpsc::channel(32);
         // Non-critical futures will be terminated by Tokio during the shutdown_timeout phase.
@@ -154,6 +151,7 @@ impl Server {
             sockets,
             command_sender.clone(),
             network,
+            pcap_sender,
         );
         rt.spawn(async move {
             if shutdown_receiver.await.is_ok()
@@ -172,7 +170,7 @@ impl Server {
         &mut self,
         mut command_receiver: mpsc::Receiver<SessionMessage>,
         mut sessions: Sessions,
-        mut vpn_service: FortiService,
+        mut vpn_service: fortivpn::service::FortiService,
     ) -> Result<(), IKEv2Error> {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
@@ -559,6 +557,7 @@ struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Sockets,
     network: Network,
+    pcap_sender: Option<pcap::PcapSender>,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
     next_sa_index: usize,
@@ -574,11 +573,13 @@ impl Sessions {
         sockets: Sockets,
         command_sender: mpsc::Sender<SessionMessage>,
         network: Network,
+        pcap_sender: Option<pcap::PcapSender>,
     ) -> Sessions {
         Sessions {
             pki_processing,
             sockets,
             network,
+            pcap_sender,
             sessions: HashMap::new(),
             next_sa_index: 0,
             security_associations: HashMap::new(),
@@ -748,6 +749,14 @@ impl Sessions {
             } else {
                 (None, &[])
             };
+        // TODO FORTIVPN: remove this test code once L4 client stub is available.
+        let (internal_addr, dns_addrs) = (
+            Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10))),
+            &[
+                IpAddr::V4(Ipv4Addr::new(10, 10, 10, 11)),
+                IpAddr::V4(Ipv4Addr::new(10, 10, 10, 12)),
+            ],
+        );
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
     }
@@ -1046,7 +1055,7 @@ impl Sessions {
         local_spi.copy_from_slice(&in_buf[0..4]);
         let local_spi = u32::from_be_bytes(local_spi);
         if let Some(sa) = self.security_associations.get_mut(&local_spi) {
-            let action = sa.handle_esp(in_buf, out_buf)?;
+            let action = sa.handle_esp(in_buf, out_buf, &mut self.pcap_sender)?;
             Ok(EspRoutingAction::Process(action, udp_source))
         } else {
             warn!(
@@ -1096,7 +1105,8 @@ impl Sessions {
                 }
             })
         {
-            let routing_action = sa.handle_vpn(ip_header, in_buf, out_buf, data_len)?;
+            let routing_action =
+                sa.handle_vpn(ip_header, in_buf, out_buf, data_len, &mut self.pcap_sender)?;
             let destination = UdpDatagramDestination {
                 remote_addr: sa.remote_addr(),
                 local_addr: sa.local_addr(),
