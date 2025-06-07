@@ -15,6 +15,7 @@ mod fortivpn;
 mod http;
 mod ikev2;
 mod logger;
+mod pcap;
 mod ppp;
 
 struct Args {
@@ -46,6 +47,7 @@ Options:\
 struct Ikev2Config {
     ikev2: ikev2::Config,
     fortivpn: fortivpn::Config,
+    pcap: Option<String>,
 }
 
 impl Args {
@@ -293,6 +295,7 @@ impl Args {
         let config = Ikev2Config {
             ikev2: ikev2_config,
             fortivpn: fortivpn_config,
+            pcap: pcap_file,
         };
         Args { log_level, config }
     }
@@ -329,7 +332,25 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         }
     });
 
-    if let Err(err) = server.run(rt, config.fortivpn, shutdown_receiver) {
+    let pcap_sender = if let Some(pcap_file) = config.pcap {
+        match rt.block_on(pcap::PcapWriter::new(pcap_file)) {
+            Ok(pcap_writer) => {
+                let pcap_sender = pcap_writer.create_sender();
+                rt.spawn(pcap_writer.run());
+                Some(pcap_sender)
+            }
+            Err(err) => {
+                eprintln!("Failed to create PCAP writer: {err}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // TODO PCAP: log packets transferred through the VPN service (only if NAT64/DNS64 is enabled).
+    let vpn_service = fortivpn::service::FortiService::new(config.fortivpn);
+    if let Err(err) = server.run(rt, vpn_service, shutdown_receiver, pcap_sender) {
         eprintln!("Failed to run server: {err}");
     };
 
