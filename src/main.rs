@@ -32,7 +32,7 @@ Options:\
 \n      --nat-port=<PORT>               NAT port for IKEv2 and ESP [default: 4500]\
 \n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
-\n      --l4remote-ip=<IP4>             IPv4 address for L4 Remove mode, e.g. 10.10.10.10\
+\n      --masquerade-ip=<IP4>           IPv4 address for masquerade mode, e.g. 10.10.10.10\
 \n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
 \n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
@@ -77,7 +77,7 @@ impl Args {
 
         let mut fortivpn_addr = None;
         let mut fortivpn_hostport = None;
-        let mut l4remote_ip = None;
+        let mut masquerade_ip = None;
 
         let mut listen_ips = vec![];
         let mut ike_port = 500u16;
@@ -137,22 +137,22 @@ impl Args {
                         format_args!("Failed to parse destination address: {err}"),
                     ),
                 };
-            } else if name == "--l4remote-ip" {
+            } else if name == "--masquerade-ip" {
                 let ip = match IpAddr::from_str(value) {
                     Ok(IpAddr::V4(ip)) => ip,
                     Ok(IpAddr::V6(_)) => fail_with_error(
                         name,
                         value,
-                        format_args!("L4 remote mode doesn't support IPv6 addresses"),
+                        format_args!("Masquerade mode doesn't support IPv6 addresses"),
                     ),
 
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse L4 remote IP address: {err}"),
+                        format_args!("Failed to parse masquerade IP address: {err}"),
                     ),
                 };
-                l4remote_ip = Some(ip);
+                masquerade_ip = Some(ip);
             } else if name == "--tunnel-domain" {
                 // Domains should be in DNS IDNA A-label format for Unicode strings.
                 // All further processing assumes the domain is an ASCII UTF-8 string.
