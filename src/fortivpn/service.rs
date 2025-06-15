@@ -125,11 +125,13 @@ impl uplink::UplinkService for FortiService {
         buffer: &'a mut [u8],
     ) -> Result<&'a [u8], uplink::UplinkError> {
         if let ConnectionState::Connected(state) = &mut self.state {
-            if let Some(pcap_sender) = &mut self.pcap_sender {
-                pcap_sender.send_packet(buffer);
-            }
             match state.tunnel.try_read_packet(buffer).await {
-                Ok(data) => Ok(data),
+                Ok(data) => {
+                    if let Some(pcap_sender) = &mut self.pcap_sender {
+                        pcap_sender.send_packet(data);
+                    }
+                    Ok(data)
+                }
                 Err(err) => {
                     self.state = ConnectionState::Disconnected;
                     Err(err.into())

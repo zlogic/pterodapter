@@ -38,9 +38,6 @@ const MAX_DATAGRAM_SIZE: usize = 1500 + fortivpn::PPP_HEADER_SIZE;
 // Use 1500 as max MTU, real value is likely lower.
 const MAX_ESP_PACKET_SIZE: usize = 1500 + fortivpn::PPP_HEADER_SIZE + esp::MAX_EXTRA_HEADERS_SIZE;
 
-// For FortiVPN, a packet might contain a header that needs to be discarded.
-const UPLINK_RESERVED_HEADER: usize = fortivpn::PPP_HEADER_SIZE;
-
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
 
@@ -183,6 +180,7 @@ impl Server {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
         let mut poll_seed = 0usize;
+        let uplink_reserved_header_size = uplink.reserved_header_bytes();
         loop {
             let uplink_is_connected = uplink.is_connected();
             if shutdown && sessions.is_empty() && !uplink_is_connected {
@@ -257,7 +255,7 @@ impl Server {
                         let read_bytes = data.len();
 
                         match sessions.process_uplink_packet(
-                            &mut self.uplink_read_buffer[UPLINK_RESERVED_HEADER..],
+                            &mut self.uplink_read_buffer[uplink_reserved_header_size..],
                             read_bytes,
                             &mut self.uplink_write_buffer,
                         ) {
