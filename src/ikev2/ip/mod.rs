@@ -1806,7 +1806,7 @@ impl Network {
             return Err("DNS translator is not available".into());
         };
 
-        let translation = dns_translator.translate_to_vpn(&dns_packet, dest_buf)?;
+        let translation = dns_translator.translate_to_uplink(&dns_packet, dest_buf)?;
         let action = match translation {
             dns::DnsTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
@@ -1858,7 +1858,7 @@ impl Network {
         // Reserve space for IPv4 header.
         let dest_buf = &mut out_buf[20..];
 
-        let translation = icmp_packet.translate_to_vpn(dest_buf)?;
+        let translation = icmp_packet.translate_to_uplink(dest_buf)?;
         let action = match translation {
             icmp::IcmpTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
@@ -1874,17 +1874,17 @@ impl Network {
         Ok(action)
     }
 
-    pub fn translate_packet_from_vpn<'a>(
+    pub fn translate_packet_from_uplink<'a>(
         &mut self,
         header: IpHeader,
         in_buf: &'a mut [u8],
         data_len: usize,
         out_buf: &'a mut [u8],
-    ) -> Result<RoutingActionVpn<'a>, IpError> {
+    ) -> Result<RoutingActionUplink<'a>, IpError> {
         let nat64_prefix = if let Some(nat64_prefix) = self.nat64_prefix.as_ref() {
             nat64_prefix.clone()
         } else {
-            return Ok(RoutingActionVpn::Forward(in_buf, data_len));
+            return Ok(RoutingActionUplink::Forward(in_buf, data_len));
         };
         let packet = IpPacket::from_data(&in_buf[..data_len])?;
         let packet = match packet {
@@ -1907,32 +1907,32 @@ impl Network {
             warn!("Received packet with expired TTL: {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
-                return Ok(RoutingActionVpn::Drop);
+                return Ok(RoutingActionUplink::Drop);
             }
             let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
                 .write_error_response(&IpPacket::V4(packet), out_buf)?;
-            return Ok(RoutingActionVpn::ReturnToSender(&out_buf[..length]));
+            return Ok(RoutingActionUplink::ReturnToSender(&out_buf[..length]));
         }
         if packet.transport_protocol() == TransportProtocolType::ICMP {
-            self.translate_icmp_packet_from_vpn(packet, out_buf, &nat64_prefix)
+            self.translate_icmp_packet_from_uplink(packet, out_buf, &nat64_prefix)
         } else if is_dns_ip {
-            self.translate_dns_packet_from_vpn(packet, header, &nat64_prefix, out_buf)
+            self.translate_dns_packet_from_uplink(packet, header, &nat64_prefix, out_buf)
         } else if is_ipv4_tunnel {
             let length = packet.write_ipv4_decrease_ttl(out_buf)?;
-            Ok(RoutingActionVpn::Forward(out_buf, length))
+            Ok(RoutingActionUplink::Forward(out_buf, length))
         } else {
             let length = packet.write_translated(out_buf, &nat64_prefix, false)?;
-            Ok(RoutingActionVpn::Forward(out_buf, length))
+            Ok(RoutingActionUplink::Forward(out_buf, length))
         }
     }
 
-    fn translate_dns_packet_from_vpn<'a>(
+    fn translate_dns_packet_from_uplink<'a>(
         &mut self,
         packet: Ipv4Packet<'a>,
         header: IpHeader,
         nat_prefix: &Nat64Prefix,
         out_buf: &'a mut [u8],
-    ) -> Result<RoutingActionVpn<'a>, IpError> {
+    ) -> Result<RoutingActionUplink<'a>, IpError> {
         if !packet.validate_ip_checksum() {
             return Err("DNS packet has invalid IP checksum".into());
         }
@@ -1948,19 +1948,19 @@ impl Network {
             warn!("Dropping non-standard packet from DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
-                return Ok(RoutingActionVpn::Drop);
+                return Ok(RoutingActionUplink::Drop);
             }
             let length = icmp::ICMP_ERROR_COMMUNICATION_PROHIBITED
                 .write_error_response(&IpPacket::V4(packet), out_buf)?;
-            return Ok(RoutingActionVpn::ReturnToSender(&out_buf[..length]));
+            return Ok(RoutingActionUplink::ReturnToSender(&out_buf[..length]));
         }
         let dns_packet =
             dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
-        trace!("Decoded DNS packet from VPN: {dns_packet}");
+        trace!("Decoded DNS packet from uplink/VPN: {dns_packet}");
         // Reserve space for UDP header.
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated(out_buf, nat_prefix, false)?;
-            return Ok(RoutingActionVpn::Forward(out_buf, length));
+            return Ok(RoutingActionUplink::Forward(out_buf, length));
         }
 
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
@@ -1975,7 +1975,7 @@ impl Network {
         let length = dns_translator.translate_to_esp(&dns_packet, dest_buf)?;
         if log::log_enabled!(log::Level::Trace) {
             let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
-            trace!("Rewrote DNS response from VPN: {dns_packet}");
+            trace!("Rewrote DNS response from uplink/VPN: {dns_packet}");
         }
 
         let start_offset = packet.write_udp_translated(
@@ -1984,18 +1984,18 @@ impl Network {
             nat_prefix,
         )?;
         let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-        Ok(RoutingActionVpn::Forward(
+        Ok(RoutingActionUplink::Forward(
             &mut out_buf[start_offset..],
             data_end - start_offset,
         ))
     }
 
-    fn translate_icmp_packet_from_vpn<'a>(
+    fn translate_icmp_packet_from_uplink<'a>(
         &mut self,
         packet: Ipv4Packet<'a>,
         out_buf: &'a mut [u8],
         nat64_prefix: &Nat64Prefix,
-    ) -> Result<RoutingActionVpn<'a>, IpError> {
+    ) -> Result<RoutingActionUplink<'a>, IpError> {
         if !packet.validate_ip_checksum() {
             return Err("ICMPv4 packet has invalid IP checksum".into());
         }
@@ -2016,13 +2016,13 @@ impl Network {
             icmp::IcmpTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let icmp_packet = icmp::IcmpV6Message::from_data(&dest_buf[..length])?;
-                    trace!("Rewrote ICMPv4 packet from VPN: {icmp_packet}");
+                    trace!("Rewrote ICMPv4 packet from uplink/VPN: {icmp_packet}");
                 }
 
                 let length = packet.write_icmp_translated(out_buf, length, nat64_prefix)?;
-                RoutingActionVpn::Forward(out_buf, length)
+                RoutingActionUplink::Forward(out_buf, length)
             }
-            icmp::IcmpTranslationAction::Drop => RoutingActionVpn::Drop,
+            icmp::IcmpTranslationAction::Drop => RoutingActionUplink::Drop,
         };
         Ok(action)
     }
@@ -2034,7 +2034,7 @@ pub enum RoutingActionEsp<'a> {
     Drop,
 }
 
-pub enum RoutingActionVpn<'a> {
+pub enum RoutingActionUplink<'a> {
     Forward(&'a mut [u8], usize),
     ReturnToSender(&'a [u8]),
     Drop,
