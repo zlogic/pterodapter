@@ -22,13 +22,23 @@ pub enum UplinkServiceType {
     Masquerade(masquerade::MasqueradeClient),
 }
 
-pub fn new_service(config: Config, pcap_sender: Option<pcap::PcapSender>) -> UplinkServiceType {
-    match config {
-        Config::FortiVPN(config) => {
-            UplinkServiceType::FortiVPN(fortivpn::service::FortiService::new(config, pcap_sender))
+impl UplinkServiceType {
+    pub fn new(config: Config, pcap_sender: Option<pcap::PcapSender>) -> UplinkServiceType {
+        match config {
+            Config::FortiVPN(config) => UplinkServiceType::FortiVPN(
+                fortivpn::service::FortiService::new(config, pcap_sender),
+            ),
+            Config::Masquerade(config) => {
+                UplinkServiceType::Masquerade(masquerade::MasqueradeClient::new(config))
+            }
         }
-        Config::Masquerade(config) => {
-            UplinkServiceType::Masquerade(masquerade::MasqueradeClient::new(config))
+    }
+
+    pub fn reserved_header_bytes(&self) -> usize {
+        // For FortiVPN, a packet might contain a PPP header that needs to be discarded.
+        match self {
+            UplinkServiceType::FortiVPN(_) => fortivpn::PPP_HEADER_SIZE,
+            UplinkServiceType::Masquerade(_) => 0,
         }
     }
 }
