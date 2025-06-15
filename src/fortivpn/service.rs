@@ -3,6 +3,8 @@ use std::{error, fmt, net::IpAddr};
 use log::{debug, info, warn};
 use tokio::{runtime, task::JoinHandle, time::Interval};
 
+use crate::pcap;
+
 use super::{Config, FortiVPNTunnel};
 
 const FLUSH_INTERVAL: usize = 5;
@@ -23,13 +25,15 @@ enum ConnectionState {
 pub struct FortiService {
     config: Config,
     state: ConnectionState,
+    pcap_sender: Option<pcap::PcapSender>,
 }
 
 impl FortiService {
-    pub fn new(config: Config) -> FortiService {
+    pub fn new(config: Config, pcap_sender: Option<pcap::PcapSender>) -> FortiService {
         FortiService {
             config,
             state: ConnectionState::Disconnected,
+            pcap_sender,
         }
     }
 
@@ -110,6 +114,9 @@ impl FortiService {
         buffer: &'a mut [u8],
     ) -> Result<&'a [u8], VpnServiceError> {
         if let ConnectionState::Connected(state) = &mut self.state {
+            if let Some(pcap_sender) = &mut self.pcap_sender {
+                pcap_sender.send_packet(buffer);
+            }
             match state.tunnel.try_read_packet(buffer).await {
                 Ok(data) => Ok(data),
                 Err(err) => {
@@ -128,6 +135,9 @@ impl FortiService {
             for send_data in send_slices {
                 if send_data.is_empty() {
                     continue;
+                }
+                if let Some(pcap_sender) = &mut self.pcap_sender {
+                    pcap_sender.send_packet(send_data);
                 }
                 sent_data = true;
                 match state.tunnel.write_data(send_data).await {
