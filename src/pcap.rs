@@ -61,6 +61,9 @@ pub struct PcapSender {
 
 impl PcapSender {
     pub fn send_packet(&mut self, packet: &[u8]) {
+        if packet.is_empty() {
+            return;
+        }
         // TODO PCAP: try to reuse/recycle buffers?
         let time = SystemTime::now();
 
