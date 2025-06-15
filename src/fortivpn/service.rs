@@ -1,9 +1,9 @@
-use std::{error, fmt, net::IpAddr};
+use std::net::IpAddr;
 
 use log::{debug, info, warn};
 use tokio::{runtime, task::JoinHandle, time::Interval};
 
-use crate::pcap;
+use crate::{pcap, uplink};
 
 use super::{Config, FortiVPNTunnel};
 
@@ -18,7 +18,7 @@ struct ConnectedData {
 
 enum ConnectionState {
     Disconnected,
-    Connecting(JoinHandle<Result<FortiVPNTunnel, VpnServiceError>>),
+    Connecting(JoinHandle<Result<FortiVPNTunnel, uplink::UplinkError>>),
     Connected(Box<ConnectedData>),
 }
 
@@ -37,17 +37,28 @@ impl FortiService {
         }
     }
 
-    pub fn is_connected(&self) -> bool {
-        matches!(self.state, ConnectionState::Connected(_))
-    }
-
-    async fn connect(config: Config) -> Result<FortiVPNTunnel, VpnServiceError> {
+    async fn connect(config: Config) -> Result<FortiVPNTunnel, uplink::UplinkError> {
         let sslvpn_cookie = super::get_oauth_cookie(&config).await?;
         debug!("VPN cookie received");
         Ok(FortiVPNTunnel::new(&config, sslvpn_cookie).await?)
     }
+}
 
-    pub async fn wait_event(&mut self, buf: &mut [u8]) -> Result<(), VpnServiceError> {
+impl uplink::UplinkService for FortiService {
+    fn is_connected(&self) -> bool {
+        matches!(self.state, ConnectionState::Connected(_))
+    }
+
+    fn ip_configuration(&self) -> Option<(IpAddr, &[IpAddr])> {
+        match self.state {
+            ConnectionState::Connected(ref state) => {
+                Some((state.tunnel.ip_addr(), state.tunnel.dns()))
+            }
+            _ => None,
+        }
+    }
+
+    async fn wait_event(&mut self, buf: &mut [u8]) -> Result<(), uplink::UplinkError> {
         use std::future::{self, Future};
         use std::pin::pin;
         use std::task::Poll;
@@ -109,10 +120,10 @@ impl FortiService {
         }
     }
 
-    pub async fn read_packet<'a>(
+    async fn read_packet<'a>(
         &mut self,
         buffer: &'a mut [u8],
-    ) -> Result<&'a [u8], VpnServiceError> {
+    ) -> Result<&'a [u8], uplink::UplinkError> {
         if let ConnectionState::Connected(state) = &mut self.state {
             if let Some(pcap_sender) = &mut self.pcap_sender {
                 pcap_sender.send_packet(buffer);
@@ -129,7 +140,7 @@ impl FortiService {
         }
     }
 
-    pub async fn process_events(&mut self, send_slices: &[&[u8]]) -> Result<(), VpnServiceError> {
+    async fn process_events(&mut self, send_slices: &[&[u8]]) -> Result<(), uplink::UplinkError> {
         if let ConnectionState::Connected(state) = &mut self.state {
             let mut sent_data = false;
             for send_data in send_slices {
@@ -171,7 +182,7 @@ impl FortiService {
         Ok(())
     }
 
-    pub async fn terminate(&mut self) -> Result<(), VpnServiceError> {
+    async fn terminate(&mut self) -> Result<(), uplink::UplinkError> {
         match &mut self.state {
             ConnectionState::Connected(state) => {
                 let result = state.tunnel.terminate().await;
@@ -180,59 +191,5 @@ impl FortiService {
             }
             _ => Ok(()),
         }
-    }
-
-    pub fn ip_configuration(&self) -> Option<(IpAddr, &[IpAddr])> {
-        match self.state {
-            ConnectionState::Connected(ref state) => {
-                Some((state.tunnel.ip_addr(), state.tunnel.dns()))
-            }
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum VpnServiceError {
-    Internal(&'static str),
-    FortiVpn(super::FortiError),
-    Join(tokio::task::JoinError),
-}
-
-impl fmt::Display for VpnServiceError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Internal(msg) => f.write_str(msg),
-            Self::FortiVpn(e) => write!(f, "VPN client error: {e}"),
-            Self::Join(e) => write!(f, "Tokio join error: {e}"),
-        }
-    }
-}
-
-impl error::Error for VpnServiceError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Self::Internal(_msg) => None,
-            Self::FortiVpn(err) => Some(err),
-            Self::Join(err) => Some(err),
-        }
-    }
-}
-
-impl From<&'static str> for VpnServiceError {
-    fn from(msg: &'static str) -> VpnServiceError {
-        Self::Internal(msg)
-    }
-}
-
-impl From<super::FortiError> for VpnServiceError {
-    fn from(err: super::FortiError) -> VpnServiceError {
-        Self::FortiVpn(err)
-    }
-}
-
-impl From<tokio::task::JoinError> for VpnServiceError {
-    fn from(err: tokio::task::JoinError) -> VpnServiceError {
-        Self::Join(err)
     }
 }

@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -20,7 +20,12 @@ use tokio::{
     time,
 };
 
-use crate::{fortivpn, logger::fmt_slice_hex, pcap};
+use crate::{
+    fortivpn,
+    logger::fmt_slice_hex,
+    pcap,
+    uplink::{self, UplinkService as _},
+};
 
 mod crypto;
 mod esp;
@@ -32,6 +37,9 @@ mod session;
 const MAX_DATAGRAM_SIZE: usize = 1500 + fortivpn::PPP_HEADER_SIZE;
 // Use 1500 as max MTU, real value is likely lower.
 const MAX_ESP_PACKET_SIZE: usize = 1500 + fortivpn::PPP_HEADER_SIZE + esp::MAX_EXTRA_HEADERS_SIZE;
+
+// For FortiVPN, a packet might contain a header that needs to be discarded.
+const UPLINK_RESERVED_HEADER: usize = fortivpn::PPP_HEADER_SIZE;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 const IKE_INIT_SA_EXPIRATION: Duration = Duration::from_secs(15);
@@ -60,8 +68,8 @@ pub struct Server {
     nat64_prefix: Option<Nat64Prefix>,
     udp_read_buffer: [u8; MAX_ESP_PACKET_SIZE],
     udp_write_buffer: [u8; MAX_ESP_PACKET_SIZE],
-    vpn_read_buffer: [u8; MAX_ESP_PACKET_SIZE],
-    vpn_write_buffer: [u8; MAX_DATAGRAM_SIZE],
+    uplink_read_buffer: [u8; MAX_ESP_PACKET_SIZE],
+    uplink_write_buffer: [u8; MAX_DATAGRAM_SIZE],
 }
 
 impl Server {
@@ -76,8 +84,8 @@ impl Server {
         )?;
         let udp_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
         let udp_write_buffer = [0u8; MAX_ESP_PACKET_SIZE];
-        let vpn_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
-        let vpn_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
+        let uplink_read_buffer = [0u8; MAX_ESP_PACKET_SIZE];
+        let uplink_write_buffer = [0u8; MAX_DATAGRAM_SIZE];
         Ok(Server {
             listen_ips: config.listen_ips,
             port: config.port,
@@ -88,8 +96,8 @@ impl Server {
             nat64_prefix: config.nat64_prefix.map(Nat64Prefix::new),
             udp_read_buffer,
             udp_write_buffer,
-            vpn_read_buffer,
-            vpn_write_buffer,
+            uplink_read_buffer,
+            uplink_write_buffer,
         })
     }
 
@@ -110,7 +118,7 @@ impl Server {
     pub fn run(
         &mut self,
         rt: runtime::Runtime,
-        vpn_service: fortivpn::service::FortiService,
+        uplink: uplink::UplinkServiceType,
         shutdown_receiver: oneshot::Receiver<()>,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), IKEv2Error> {
@@ -161,7 +169,7 @@ impl Server {
             }
         });
 
-        let result = rt.block_on(self.run_process(command_receiver, sessions, vpn_service));
+        let result = rt.block_on(self.run_process(command_receiver, sessions, uplink));
         rt.shutdown_timeout(Duration::from_secs(60));
         result
     }
@@ -170,38 +178,39 @@ impl Server {
         &mut self,
         mut command_receiver: mpsc::Receiver<SessionMessage>,
         mut sessions: Sessions,
-        mut vpn_service: fortivpn::service::FortiService,
+        mut uplink: uplink::UplinkServiceType,
     ) -> Result<(), IKEv2Error> {
         let rt = runtime::Handle::current();
         let mut shutdown = false;
         let mut poll_seed = 0usize;
         loop {
-            let vpn_is_connected = vpn_service.is_connected();
-            if shutdown && sessions.is_empty() && !vpn_is_connected {
+            let uplink_is_connected = uplink.is_connected();
+            if shutdown && sessions.is_empty() && !uplink_is_connected {
                 debug!("Shutdown completed");
                 return Ok(());
             }
             // Wait until something is ready.
             let mut udp_read_buf = ReadBuf::new(&mut self.udp_read_buffer);
             poll_seed = poll_seed.wrapping_add(1);
-            let (command_message, udp_source, vpn_event) = {
-                let mut vpn_event = None;
+            let (command_message, udp_source, uplink_event) = {
+                let mut uplink_event = None;
                 let mut udp_source = None;
                 let mut command_message = None;
-                let ignore_vpn = shutdown && !vpn_is_connected;
+                let ignore_uplink = shutdown && !uplink_is_connected;
                 let mut receive_command = pin!(command_receiver.recv());
-                let mut receive_vpn_event = pin!(vpn_service.wait_event(&mut self.vpn_read_buffer));
+                let mut receive_uplink_event =
+                    pin!(uplink.wait_event(&mut self.uplink_read_buffer));
                 let sockets = &sessions.sockets;
                 future::poll_fn(|cx| {
-                    if vpn_event.is_none() {
-                        vpn_event = if !ignore_vpn {
-                            let vpn_event = receive_vpn_event.as_mut().poll(cx);
-                            match vpn_event {
+                    if uplink_event.is_none() {
+                        uplink_event = if !ignore_uplink {
+                            let uplink_event = receive_uplink_event.as_mut().poll(cx);
+                            match uplink_event {
                                 Poll::Ready(cmd) => Some(cmd),
                                 Poll::Pending => None,
                             }
                         } else {
-                            // Avoid waking if VPN is already shut down.
+                            // Avoid waking if uplink/VPN is already shut down.
                             None
                         };
                     }
@@ -217,14 +226,14 @@ impl Server {
                             Poll::Pending => None,
                         }
                     }
-                    if vpn_event.is_some() || udp_source.is_some() || command_message.is_some() {
+                    if uplink_event.is_some() || udp_source.is_some() || command_message.is_some() {
                         Poll::Ready(())
                     } else {
                         Poll::Pending
                     }
                 })
                 .await;
-                (command_message, udp_source, vpn_event)
+                (command_message, udp_source, uplink_event)
             };
             // Process all ready events.
             if let Some(message) = command_message {
@@ -232,8 +241,8 @@ impl Server {
                     SessionMessage::Shutdown => {
                         shutdown = true;
                         sessions.cleanup(&rt);
-                        if let Err(err) = vpn_service.terminate().await {
-                            warn!("Failed to terminate VPN client connection: {err}");
+                        if let Err(err) = uplink.terminate().await {
+                            warn!("Failed to terminate uplink/VPN client connection: {err}");
                         }
                     }
                     _ => {
@@ -242,40 +251,40 @@ impl Server {
                 }
                 sessions.process_message(message).await;
             }
-            let vpn_action = match vpn_event {
-                Some(Ok(())) => match vpn_service.read_packet(&mut self.vpn_read_buffer).await {
+            let uplink_action = match uplink_event {
+                Some(Ok(())) => match uplink.read_packet(&mut self.uplink_read_buffer).await {
                     Ok(data) => {
                         let read_bytes = data.len();
 
-                        match sessions.process_vpn_packet(
-                            &mut self.vpn_read_buffer[fortivpn::PPP_HEADER_SIZE..],
+                        match sessions.process_uplink_packet(
+                            &mut self.uplink_read_buffer[UPLINK_RESERVED_HEADER..],
                             read_bytes,
-                            &mut self.vpn_write_buffer,
+                            &mut self.uplink_write_buffer,
                         ) {
                             Ok(action) => action,
                             Err(err) => {
-                                warn!("Failed to forward VPN packet to IKEv2: {err}");
-                                VpnRoutingAction::Drop
+                                warn!("Failed to forward uplink/VPN packet to IKEv2: {err}");
+                                UplinkRoutingAction::Drop
                             }
                         }
                     }
                     Err(err) => {
-                        warn!("Failed to read packet from VPN: {err}");
-                        VpnRoutingAction::Drop
+                        warn!("Failed to read packet from uplink/VPN: {err}");
+                        UplinkRoutingAction::Drop
                     }
                 },
                 Some(Err(err)) => {
-                    warn!("VPN reported an error status: {err}");
-                    VpnRoutingAction::Drop
+                    warn!("Uplink/VPN reported an error status: {err}");
+                    UplinkRoutingAction::Drop
                 }
-                None => VpnRoutingAction::Drop,
+                None => UplinkRoutingAction::Drop,
             };
-            let (vpn_reply, vpn_send_to_udp) = vpn_action.into_packets();
+            let (uplink_reply, uplink_send_to_udp) = uplink_action.into_packets();
             let udp_action = match udp_source {
                 Some(Ok(udp_source)) => {
                     let remote_addr = udp_source.remote_addr;
                     let result = if udp_source.is_ikev2() {
-                        sessions.update_ip(vpn_service.ip_configuration());
+                        sessions.update_ip(uplink.ip_configuration());
                         sessions
                             .process_ikev2_message(udp_read_buf.filled(), udp_source)
                             .await
@@ -300,17 +309,17 @@ impl Server {
                 }
                 None => EspRoutingAction::Drop,
             };
-            let (udp_reply, udp_send_to_vpn) = udp_action.into_packets();
-            let (vpn_event, sent_udp_response, forwarded_udp_packet) = {
-                let send_slices_to_vpn = [vpn_reply, udp_send_to_vpn];
-                let mut process_vpn_events = pin!(vpn_service.process_events(&send_slices_to_vpn));
+            let (udp_reply, udp_send_to_uplink) = udp_action.into_packets();
+            let (uplink_event, sent_udp_response, forwarded_udp_packet) = {
+                let send_slices_to_uplink = [uplink_reply, udp_send_to_uplink];
+                let mut process_uplink_events = pin!(uplink.process_events(&send_slices_to_uplink));
                 let mut sent_udp_response = None;
                 let mut forwarded_udp_packet = None;
-                let mut vpn_event = None;
+                let mut uplink_event = None;
                 let sockets = &mut sessions.sockets;
                 future::poll_fn(|cx| {
-                    if vpn_event.is_none() {
-                        vpn_event = match process_vpn_events.as_mut().poll(cx) {
+                    if uplink_event.is_none() {
+                        uplink_event = match process_uplink_events.as_mut().poll(cx) {
                             Poll::Ready(result) => Some(result),
                             Poll::Pending => None,
                         };
@@ -332,12 +341,12 @@ impl Server {
                     }
                     if forwarded_udp_packet.is_none() {
                         forwarded_udp_packet =
-                            if let Some((destination, vpn_packet)) = &vpn_send_to_udp {
+                            if let Some((destination, uplink_packet)) = &uplink_send_to_udp {
                                 match sockets.poll_send(
                                     cx,
                                     destination.local_addr,
                                     destination.remote_addr,
-                                    vpn_packet,
+                                    uplink_packet,
                                 ) {
                                     Poll::Ready(result) => Some(result),
                                     Poll::Pending => None,
@@ -346,7 +355,7 @@ impl Server {
                                 Some(Ok(()))
                             }
                     }
-                    if vpn_event.is_some()
+                    if uplink_event.is_some()
                         && sent_udp_response.is_some()
                         && forwarded_udp_packet.is_some()
                     {
@@ -356,7 +365,7 @@ impl Server {
                     }
                 })
                 .await;
-                (vpn_event, sent_udp_response, forwarded_udp_packet)
+                (uplink_event, sent_udp_response, forwarded_udp_packet)
             };
             if let Some(Err(err)) = sent_udp_response {
                 warn!("Failed to send UDP ESP response: {err}");
@@ -364,10 +373,10 @@ impl Server {
             if let Some(Err(err)) = forwarded_udp_packet {
                 warn!("Failed to forward message to UDP ESP: {err}");
             }
-            if let Some(Err(err)) = vpn_event {
-                warn!("Failed to process VPN lifecycle events: {err}");
+            if let Some(Err(err)) = uplink_event {
+                warn!("Failed to process uplink/VPN lifecycle events: {err}");
             }
-            if vpn_is_connected && !vpn_service.is_connected() {
+            if uplink_is_connected && !uplink.is_connected() {
                 sessions.delete_all_sessions(&rt);
             }
         }
@@ -524,22 +533,23 @@ struct UdpDatagramDestination {
     local_addr: SocketAddr,
 }
 
-enum VpnRoutingAction<'a> {
+enum UplinkRoutingAction<'a> {
     Process(esp::RoutingAction<'a>, UdpDatagramDestination),
     Drop,
 }
 
-impl<'a> VpnRoutingAction<'a> {
+impl<'a> UplinkRoutingAction<'a> {
     fn into_packets(self) -> (&'a [u8], Option<(UdpDatagramDestination, &'a [u8])>) {
         match self {
-            VpnRoutingAction::Process(
+            UplinkRoutingAction::Process(
                 esp::RoutingAction::Forward(data),
                 udp_datagram_destination,
             ) => (&[], Some((udp_datagram_destination, data))),
-            VpnRoutingAction::Process(esp::RoutingAction::ReturnToSender(data), _) => (data, None),
-            VpnRoutingAction::Process(esp::RoutingAction::Drop, _) | VpnRoutingAction::Drop => {
-                (&[], None)
+            UplinkRoutingAction::Process(esp::RoutingAction::ReturnToSender(data), _) => {
+                (data, None)
             }
+            UplinkRoutingAction::Process(esp::RoutingAction::Drop, _)
+            | UplinkRoutingAction::Drop => (&[], None),
         }
     }
 }
@@ -749,14 +759,6 @@ impl Sessions {
             } else {
                 (None, &[])
             };
-        // TODO FORTIVPN: remove this test code once L4 client stub is available.
-        let (internal_addr, dns_addrs) = (
-            Some(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10))),
-            &[
-                IpAddr::V4(Ipv4Addr::new(10, 10, 10, 11)),
-                IpAddr::V4(Ipv4Addr::new(10, 10, 10, 12)),
-            ],
-        );
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
     }
@@ -1066,37 +1068,37 @@ impl Sessions {
         }
     }
 
-    fn process_vpn_packet<'a>(
+    fn process_uplink_packet<'a>(
         &mut self,
         in_buf: &'a mut [u8],
         data_len: usize,
         out_buf: &'a mut [u8],
-    ) -> Result<VpnRoutingAction<'a>, IKEv2Error> {
+    ) -> Result<UplinkRoutingAction<'a>, IKEv2Error> {
         if data_len == 0 {
-            return Ok(VpnRoutingAction::Drop);
+            return Ok(UplinkRoutingAction::Drop);
         }
         trace!(
-            "Received packet from VPN\n{}",
+            "Received packet from uplink/VPN\n{}",
             fmt_slice_hex(&in_buf[..data_len])
         );
         let ip_packet = match ip::IpPacket::from_data(&in_buf[..data_len]) {
             Ok(packet) => packet,
             Err(err) => {
                 warn!(
-                    "Failed to decode IP packet from VPN: {}\n{}",
+                    "Failed to decode IP packet from uplink/VPN: {}\n{}",
                     err,
                     fmt_slice_hex(&in_buf[..data_len]),
                 );
-                return Err("Failed to decode IP packet from VPN".into());
+                return Err("Failed to decode IP packet from uplink/VPN".into());
             }
         };
-        trace!("Decoded IP packet from VPN {ip_packet}");
+        trace!("Decoded IP packet from uplink/VPN {ip_packet}");
         let ip_header = ip_packet.to_header();
         // Prefer an active, most recent SA.
         if let Some(sa) = self
             .security_associations
             .values_mut()
-            .filter(|sa| sa.accepts_vpn_to_esp(&ip_header))
+            .filter(|sa| sa.accepts_uplink_to_esp(&ip_header))
             .reduce(|a, b| {
                 if a.is_active() && a.index() > b.index() {
                     a
@@ -1106,15 +1108,15 @@ impl Sessions {
             })
         {
             let routing_action =
-                sa.handle_vpn(ip_header, in_buf, out_buf, data_len, &mut self.pcap_sender)?;
+                sa.handle_uplink(ip_header, in_buf, out_buf, data_len, &mut self.pcap_sender)?;
             let destination = UdpDatagramDestination {
                 remote_addr: sa.remote_addr(),
                 local_addr: sa.local_addr(),
             };
-            Ok(VpnRoutingAction::Process(routing_action, destination))
+            Ok(UplinkRoutingAction::Process(routing_action, destination))
         } else {
-            debug!("No matching Security Associations found for VPN packet {ip_header}");
-            Err("No matching Security Associations found for VPN packet".into())
+            debug!("No matching Security Associations found for uplink/VPN packet {ip_header}");
+            Err("No matching Security Associations found for uplink/VPN packet".into())
         }
     }
 }
@@ -1164,7 +1166,7 @@ pub enum IKEv2Error {
     Session(session::SessionError),
     Esp(esp::EspError),
     Ip(ip::IpError),
-    Forti(fortivpn::service::VpnServiceError),
+    Uplink(uplink::UplinkError),
     SendError(SendError),
     Join(tokio::task::JoinError),
     Io(io::Error),
@@ -1180,7 +1182,7 @@ impl fmt::Display for IKEv2Error {
             Self::Session(e) => write!(f, "IKEv2 session error: {e}"),
             Self::Esp(e) => write!(f, "ESP error: {e}"),
             Self::Ip(e) => write!(f, "IP error: {e}"),
-            Self::Forti(e) => write!(f, "VPN error: {e}"),
+            Self::Uplink(e) => write!(f, "Uplink/VPN error: {e}"),
             Self::SendError(e) => write!(f, "Send error: {e}"),
             Self::Join(e) => write!(f, "Tokio join error: {e}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
@@ -1198,7 +1200,7 @@ impl error::Error for IKEv2Error {
             Self::Session(err) => Some(err),
             Self::Esp(err) => Some(err),
             Self::Ip(err) => Some(err),
-            Self::Forti(err) => Some(err),
+            Self::Uplink(err) => Some(err),
             Self::SendError(err) => Some(err),
             Self::Join(err) => Some(err),
             Self::Io(err) => Some(err),
@@ -1248,9 +1250,9 @@ impl From<ip::IpError> for IKEv2Error {
     }
 }
 
-impl From<fortivpn::service::VpnServiceError> for IKEv2Error {
-    fn from(err: fortivpn::service::VpnServiceError) -> IKEv2Error {
-        Self::Forti(err)
+impl From<uplink::UplinkError> for IKEv2Error {
+    fn from(err: uplink::UplinkError) -> IKEv2Error {
+        Self::Uplink(err)
     }
 }
 

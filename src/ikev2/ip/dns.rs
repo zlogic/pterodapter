@@ -1208,7 +1208,7 @@ impl Dns64Translator {
         Ok(length + 4)
     }
 
-    pub fn translate_to_vpn(
+    pub fn translate_to_uplink(
         &mut self,
         request: &DnsPacket,
         dest: &mut [u8],
