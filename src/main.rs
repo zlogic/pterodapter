@@ -354,7 +354,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         None
     };
 
-    let uplink = uplink::new_service(config.uplink, pcap_sender.clone());
+    let uplink = uplink::UplinkServiceType::new(config.uplink, pcap_sender.clone());
     if let Err(err) = server.run(rt, uplink, shutdown_receiver, pcap_sender) {
         eprintln!("Failed to run server: {err}");
     };
