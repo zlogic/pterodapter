@@ -32,7 +32,7 @@ Options:\
 \n      --nat-port=<PORT>               NAT port for IKEv2 and ESP [default: 4500]\
 \n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
-\n      --masquerade-ip=<IP4>           IPv4 address for masquerade mode, e.g. 10.10.10.10\
+\n      --masquerade-ip=<IP4>           Virtual IP address for masquerade mode, e.g. 10.10.10.10\
 \n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
 \n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
@@ -139,13 +139,7 @@ impl Args {
                 };
             } else if name == "--masquerade-ip" {
                 let ip = match IpAddr::from_str(value) {
-                    Ok(IpAddr::V4(ip)) => ip,
-                    Ok(IpAddr::V6(_)) => fail_with_error(
-                        name,
-                        value,
-                        format_args!("Masquerade mode doesn't support IPv6 addresses"),
-                    ),
-
+                    Ok(ip) => ip,
                     Err(err) => fail_with_error(
                         name,
                         value,
@@ -215,7 +209,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse RNAT CIDR IP address: {err}"),
+                        format_args!("Failed to parse NAT64 prefix: {err}"),
                     ),
                 };
                 nat64_prefix = Some(ip);
@@ -349,7 +343,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
     };
 
     // TODO PCAP: log packets transferred through the VPN service (only if NAT64/DNS64 is enabled).
-    let vpn_service = fortivpn::service::FortiService::new(config.fortivpn);
+    let vpn_service = fortivpn::service::FortiService::new(config.fortivpn, pcap_sender.clone());
     if let Err(err) = server.run(rt, vpn_service, shutdown_receiver, pcap_sender) {
         eprintln!("Failed to run server: {err}");
     };
