@@ -15,8 +15,10 @@ mod fortivpn;
 mod http;
 mod ikev2;
 mod logger;
+mod masquerade;
 mod pcap;
 mod ppp;
+mod uplink;
 
 struct Args {
     log_level: log::LevelFilter,
@@ -46,7 +48,7 @@ Options:\
 
 struct Ikev2Config {
     ikev2: ikev2::Config,
-    fortivpn: fortivpn::Config,
+    uplink: uplink::Config,
     pcap: Option<String>,
 }
 
@@ -249,12 +251,22 @@ impl Args {
             }
         }
 
-        let fortivpn_config = match (fortivpn_addr, fortivpn_hostport) {
-            (Some(fortivpn_addr), Some(fortivpn_hostport)) => fortivpn::Config {
-                destination_addr: fortivpn_addr,
-                destination_hostport: fortivpn_hostport,
-                tls_config,
-            },
+        let uplink_config = match (fortivpn_addr, fortivpn_hostport, masquerade_ip) {
+            (Some(fortivpn_addr), Some(fortivpn_hostport), None) => {
+                uplink::Config::FortiVPN(fortivpn::Config {
+                    destination_addr: fortivpn_addr,
+                    destination_hostport: fortivpn_hostport,
+                    tls_config,
+                })
+            }
+            (None, None, Some(masquerade_ip)) => {
+                uplink::Config::Masquerade(masquerade::Config { masquerade_ip })
+            }
+            (Some(_), Some(_), Some(_)) => {
+                eprintln!("Cannot use both FortiVPN and masquerade at the same time");
+                println!("{USAGE_INSTRUCTIONS}");
+                process::exit(2);
+            }
             _ => {
                 eprintln!("No destination specified");
                 println!("{USAGE_INSTRUCTIONS}");
@@ -288,7 +300,7 @@ impl Args {
         };
         let config = Ikev2Config {
             ikev2: ikev2_config,
-            fortivpn: fortivpn_config,
+            uplink: uplink_config,
             pcap: pcap_file,
         };
         Args { log_level, config }
@@ -342,9 +354,8 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         None
     };
 
-    // TODO PCAP: log packets transferred through the VPN service (only if NAT64/DNS64 is enabled).
-    let vpn_service = fortivpn::service::FortiService::new(config.fortivpn, pcap_sender.clone());
-    if let Err(err) = server.run(rt, vpn_service, shutdown_receiver, pcap_sender) {
+    let uplink = uplink::new_service(config.uplink, pcap_sender.clone());
+    if let Err(err) = server.run(rt, uplink, shutdown_receiver, pcap_sender) {
         eprintln!("Failed to run server: {err}");
     };
 

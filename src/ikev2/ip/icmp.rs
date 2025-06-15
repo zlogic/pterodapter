@@ -566,7 +566,7 @@ impl IcmpV6Message<'_> {
             .ok()
     }
 
-    fn translate_original_datagram_to_vpn(
+    fn translate_original_datagram_to_uplink(
         &self,
         dest: &mut [u8],
     ) -> Result<IcmpTranslationAction, IpError> {
@@ -633,7 +633,7 @@ impl IcmpV6Message<'_> {
         }
     }
 
-    pub fn translate_to_vpn(&self, dest: &mut [u8]) -> Result<IcmpTranslationAction, IpError> {
+    pub fn translate_to_uplink(&self, dest: &mut [u8]) -> Result<IcmpTranslationAction, IpError> {
         let data_len = self[..].len();
         // RFC 7915, Section 5.2.
         match self.icmp_type() {
@@ -664,7 +664,7 @@ impl IcmpV6Message<'_> {
                 }
                 dest[2..8].fill(0);
 
-                self.translate_original_datagram_to_vpn(dest)
+                self.translate_original_datagram_to_uplink(dest)
             }
             IcmpV6::PacketTooBig => {
                 dest[0] = 3;
@@ -677,14 +677,14 @@ impl IcmpV6Message<'_> {
                 let mtu = mtu.min(u16::MAX as u32).saturating_sub(20) as u16;
                 dest[6..8].copy_from_slice(&mtu.to_be_bytes());
 
-                self.translate_original_datagram_to_vpn(dest)
+                self.translate_original_datagram_to_uplink(dest)
             }
             IcmpV6::TimeExceeded(IcmpV6TimeExceeded(code)) => {
                 dest[0] = 11;
                 dest[1] = code;
                 dest[2..8].fill(0);
 
-                self.translate_original_datagram_to_vpn(dest)
+                self.translate_original_datagram_to_uplink(dest)
             }
             IcmpV6::ParameterProblem(IcmpV6ParameterProblem(code)) => {
                 let pointer_value = match self[4] {
@@ -713,14 +713,14 @@ impl IcmpV6Message<'_> {
                         };
                         dest[4] = pointer_value;
 
-                        self.translate_original_datagram_to_vpn(dest)
+                        self.translate_original_datagram_to_uplink(dest)
                     }
                     1 => {
                         dest[0] = 3;
                         dest[1] = 2;
                         dest[2..8].fill(0);
 
-                        self.translate_original_datagram_to_vpn(dest)
+                        self.translate_original_datagram_to_uplink(dest)
                     }
                     _ => {
                         debug!("Dropping unsupported ICMPv6 request {self}");

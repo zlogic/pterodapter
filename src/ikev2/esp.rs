@@ -80,12 +80,12 @@ impl SecurityAssociation {
         8 + self.crypto_stack.encrypted_payload_length(msg_len)
     }
 
-    pub fn accepts_esp_to_vpn(&self, hdr: &ip::IpHeader) -> bool {
+    fn accepts_esp_to_uplink(&self, hdr: &ip::IpHeader) -> bool {
         ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Destination)
             && ts_accepts_header(&self.ts_remote, hdr, TsCheck::Source)
     }
 
-    pub fn accepts_vpn_to_esp(&self, hdr: &ip::IpHeader) -> bool {
+    pub fn accepts_uplink_to_esp(&self, hdr: &ip::IpHeader) -> bool {
         let translated_hdr = self.network.translate_ipv4_header(hdr);
         let hdr = if let Some(hdr) = translated_hdr.as_ref() {
             hdr
@@ -162,7 +162,7 @@ impl SecurityAssociation {
         };
         trace!("Decoded IP packet from ESP {ip_packet}");
         let ip_header = ip_packet.to_header();
-        if !self.accepts_esp_to_vpn(&ip_header) {
+        if !self.accepts_esp_to_uplink(&ip_header) {
             debug!("ESP packet {ip_header} dropped by traffic selector");
             // Microsoft Teams can spam the network with a lot of stray packets.
             // Don't log an error if the packet is dropped to keep the logs clean on the info
@@ -228,7 +228,7 @@ impl SecurityAssociation {
         }
     }
 
-    pub fn handle_vpn<'a>(
+    pub fn handle_uplink<'a>(
         &mut self,
         ip_header: ip::IpHeader,
         in_buf: &'a mut [u8],
@@ -238,9 +238,9 @@ impl SecurityAssociation {
     ) -> Result<RoutingAction<'a>, EspError> {
         match self
             .network
-            .translate_packet_from_vpn(ip_header, in_buf, data_len, out_buf)
+            .translate_packet_from_uplink(ip_header, in_buf, data_len, out_buf)
         {
-            Ok(ip::RoutingActionVpn::Forward(buf, data_len)) => {
+            Ok(ip::RoutingActionUplink::Forward(buf, data_len)) => {
                 trace!(
                     "Encrypting response to sender: {}",
                     fmt_slice_hex(&buf[..data_len])
@@ -261,18 +261,20 @@ impl SecurityAssociation {
                 buf[data_len..encoded_length].fill(0);
                 let encrypted_data = self.encrypt_esp(&mut buf[..encoded_length], data_len)?;
                 trace!(
-                    "Encrypted VPN packet to {}\n{}",
+                    "Encrypted uplink/VPN packet to {}\n{}",
                     self.remote_addr,
                     fmt_slice_hex(encrypted_data)
                 );
 
                 Ok(RoutingAction::Forward(encrypted_data))
             }
-            Ok(ip::RoutingActionVpn::ReturnToSender(buf)) => Ok(RoutingAction::ReturnToSender(buf)),
-            Ok(ip::RoutingActionVpn::Drop) => Ok(RoutingAction::Drop),
+            Ok(ip::RoutingActionUplink::ReturnToSender(buf)) => {
+                Ok(RoutingAction::ReturnToSender(buf))
+            }
+            Ok(ip::RoutingActionUplink::Drop) => Ok(RoutingAction::Drop),
             Err(err) => {
-                warn!("Failed to NAT packet from VPN: {err}");
-                Err("Failed to NAT packet from VPN".into())
+                warn!("Failed to NAT packet from uplink/VPN: {err}");
+                Err("Failed to NAT packet from uplink/VPN".into())
             }
         }
     }
