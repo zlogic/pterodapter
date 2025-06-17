@@ -6,7 +6,7 @@ use std::{
     error, fmt,
     future::{self, Future},
     io,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::pin,
     sync::Arc,
     task::Poll,
@@ -21,7 +21,7 @@ use tokio::{
 };
 
 use crate::{
-    fortivpn,
+    fortivpn, ip,
     logger::fmt_slice_hex,
     pcap,
     uplink::{self, UplinkService as _},
@@ -29,7 +29,6 @@ use crate::{
 
 mod crypto;
 mod esp;
-mod ip;
 mod message;
 mod pki;
 mod session;
@@ -128,27 +127,14 @@ impl Server {
             command_sender.clone(),
         ));
         let network = ip::Network::new(self.nat64_prefix.clone(), self.dns64_domains.clone())?;
-        if let Some(mut split_route_registry) =
-            network.split_route_registry(self.tunnel_domains.clone())
-        {
-            let routes_sender = command_sender.clone();
-            rt.spawn(async move {
-                let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
-                delay.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-                loop {
-                    match split_route_registry.refresh_addresses().await {
-                        Ok(ip_addresses) => {
-                            let _ = routes_sender
-                                .send(SessionMessage::UpdateSplitRoutes(ip_addresses))
-                                .await;
-                        }
-                        Err(err) => {
-                            warn!("Failed to refresh IP addresses for split routes: {err}");
-                        }
-                    }
-                    delay.tick().await;
-                }
-            });
+        let split_route_registry = if !self.tunnel_domains.is_empty() {
+            rt.spawn(SplitRouteRegistry::monitor_addresses(
+                self.tunnel_domains.clone(),
+                command_sender.clone(),
+            ));
+            Some(SplitRouteRegistry::new(self.nat64_prefix.clone()))
+        } else {
+            None
         };
 
         let sessions = Sessions::new(
@@ -156,6 +142,7 @@ impl Server {
             sockets,
             command_sender.clone(),
             network,
+            split_route_registry,
             pcap_sender,
         );
         rt.spawn(async move {
@@ -565,6 +552,7 @@ struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Sockets,
     network: Network,
+    split_route_registry: Option<SplitRouteRegistry>,
     pcap_sender: Option<pcap::PcapSender>,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
@@ -581,12 +569,14 @@ impl Sessions {
         sockets: Sockets,
         command_sender: mpsc::Sender<SessionMessage>,
         network: Network,
+        split_route_registry: Option<SplitRouteRegistry>,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Sessions {
         Sessions {
             pki_processing,
             sockets,
             network,
+            split_route_registry,
             pcap_sender,
             sessions: HashMap::new(),
             next_sa_index: 0,
@@ -744,9 +734,12 @@ impl Sessions {
         }
     }
 
-    fn update_all_split_routes(&mut self) {
-        for (_, session) in self.sessions.iter_mut() {
-            session.update_split_routes(self.network.ts_local())
+    fn update_all_split_routes(&mut self, ip_addresses: &[IpAddr]) {
+        if let Some(split_route_registry) = &mut self.split_route_registry {
+            split_route_registry.update_local_ts(ip_addresses);
+            for (_, session) in self.sessions.iter_mut() {
+                session.expand_local_ts(&split_route_registry.local_ts)
+            }
         }
     }
 
@@ -798,7 +791,7 @@ impl Sessions {
             }
             SessionMessage::UpdateSplitRoutes(ip_addresses) => {
                 self.network.set_split_routes(&ip_addresses);
-                self.update_all_split_routes();
+                self.update_all_split_routes(&ip_addresses);
             }
             SessionMessage::RetransmitRequest(session_id, message_id) => {
                 self.retransmit_request(session_id, message_id).await;
@@ -1115,6 +1108,95 @@ impl Sessions {
         } else {
             debug!("No matching Security Associations found for uplink/VPN packet {ip_header}");
             Err("No matching Security Associations found for uplink/VPN packet".into())
+        }
+    }
+}
+
+struct SplitRouteRegistry {
+    local_ts: Vec<message::TrafficSelector>,
+    nat64_prefix: Option<Nat64Prefix>,
+}
+
+impl SplitRouteRegistry {
+    fn new(nat64_prefix: Option<Nat64Prefix>) -> SplitRouteRegistry {
+        SplitRouteRegistry {
+            local_ts: vec![],
+            nat64_prefix,
+        }
+    }
+
+    async fn monitor_addresses(
+        tunnel_domains: Vec<String>,
+        routes_sender: mpsc::Sender<SessionMessage>,
+    ) -> Result<Vec<IpAddr>, IKEv2Error> {
+        let mut delay = tokio::time::interval(SPLIT_TUNNEL_REFRESH_INTERVAL);
+        delay.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            // Use a predefined port just in case.
+            let addresses = tunnel_domains
+                .iter()
+                .map(|domain| tokio::net::lookup_host((domain.clone(), 80)))
+                .collect::<Vec<_>>();
+
+            let mut ip_addresses = vec![];
+            for addrs in addresses.into_iter() {
+                match addrs.await {
+                    Ok(address_ips) => ip_addresses.extend(address_ips.map(|addr| addr.ip())),
+                    Err(err) => {
+                        warn!("Failed to refresh IP addresses for split routes: {err}");
+                    }
+                }
+            }
+            if ip_addresses.is_empty() {
+                let _ = routes_sender
+                    .send(SessionMessage::UpdateSplitRoutes(ip_addresses))
+                    .await;
+            }
+            delay.tick().await;
+        }
+    }
+
+    fn update_local_ts(&mut self, tunnel_ips: &[IpAddr]) {
+        self.local_ts.clear();
+        if let Some(nat64_ts) = self.nat64_traffic_selector() {
+            self.local_ts.push(nat64_ts);
+            self.local_ts
+                .extend(tunnel_ips.iter().flat_map(|ip_address| {
+                    if ip_address.is_ipv4() {
+                        Some(message::TrafficSelector::from_ip(*ip_address))
+                    } else {
+                        None
+                    }
+                }));
+        } else if tunnel_ips.is_empty() {
+            let full_ts = message::TrafficSelector::from_ipv4_range(
+                Ipv4Addr::new(0, 0, 0, 0)..=Ipv4Addr::new(255, 255, 255, 255),
+            );
+            self.local_ts.push(full_ts);
+        } else {
+            self.local_ts
+                .extend(tunnel_ips.iter().filter_map(|ip_address| {
+                    if ip_address.is_ipv4() {
+                        Some(message::TrafficSelector::from_ip(*ip_address))
+                    } else {
+                        None
+                    }
+                }))
+        }
+    }
+
+    fn nat64_traffic_selector(&self) -> Option<message::TrafficSelector> {
+        if let Some(nat64_prefix) = &self.nat64_prefix {
+            let mut start_addr = [0u8; 16];
+            start_addr[0..12].copy_from_slice(nat64_prefix);
+            let mut end_addr = start_addr;
+            start_addr[12..16].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            end_addr[12..16].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+            Some(message::TrafficSelector::from_ipv6_range(
+                Ipv6Addr::from(start_addr)..=Ipv6Addr::from(end_addr),
+            ))
+        } else {
+            None
         }
     }
 }

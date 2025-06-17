@@ -8,8 +8,6 @@ use log::{info, trace, warn};
 
 use crate::logger::fmt_slice_hex;
 
-use super::message;
-
 mod dns;
 mod icmp;
 
@@ -76,7 +74,7 @@ impl TransportProtocolType {
         }
     }
 
-    fn to_u8(self) -> u8 {
+    pub fn to_u8(self) -> u8 {
         self.0
     }
 
@@ -99,13 +97,6 @@ impl TransportProtocolType {
 
     fn supports_checksum(&self) -> bool {
         matches!(*self, Self::TCP | Self::UDP | Self::ICMP | Self::IPV6_ICMP)
-    }
-}
-
-impl PartialEq<message::IPProtocolType> for TransportProtocolType {
-    fn eq(&self, other: &message::IPProtocolType) -> bool {
-        let protocol_id = other.protocol_id();
-        protocol_id != 0 && self.0 == protocol_id
     }
 }
 
@@ -1460,17 +1451,6 @@ impl Nat64Prefix {
         segments[12..16].copy_from_slice(&addr.octets());
         segments.into()
     }
-
-    fn traffic_selector(&self) -> message::TrafficSelector {
-        let mut start_addr = [0u8; 16];
-        start_addr[0..12].copy_from_slice(&self.0);
-        let mut end_addr = start_addr;
-        start_addr[12..16].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        end_addr[12..16].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
-        message::TrafficSelector::from_ipv6_range(
-            Ipv6Addr::from(start_addr)..=Ipv6Addr::from(end_addr),
-        )
-    }
 }
 
 impl Deref for Nat64Prefix {
@@ -1487,27 +1467,6 @@ pub enum IpNetmask {
     Ipv6Prefix(Ipv6Addr, u8),
 }
 
-pub struct SplitRouteRegistry {
-    tunnel_domains: Vec<String>,
-}
-
-impl SplitRouteRegistry {
-    pub async fn refresh_addresses(&mut self) -> Result<Vec<IpAddr>, IpError> {
-        // Use a predefined port just in case.
-        let addresses = self
-            .tunnel_domains
-            .iter()
-            .map(|domain| tokio::net::lookup_host((domain.clone(), 80)))
-            .collect::<Vec<_>>();
-
-        let mut ip_addresses = vec![];
-        for addrs in addresses.into_iter() {
-            addrs.await?.for_each(|addr| ip_addresses.push(addr.ip()));
-        }
-        Ok(ip_addresses)
-    }
-}
-
 #[derive(Clone)]
 pub struct Network {
     nat64_prefix: Option<Nat64Prefix>,
@@ -1517,7 +1476,6 @@ pub struct Network {
     tunnel_ips: Vec<IpAddr>,
     dns64_domains_idna: Vec<Vec<u8>>,
     dns64_domains_dns: TunnelDomainsDns,
-    local_ts: Vec<message::TrafficSelector>,
     dns_translator: Option<dns::Dns64Translator>,
     icmp_rate_limiter: icmp::RateLimiter,
 }
@@ -1545,18 +1503,9 @@ impl Network {
             tunnel_ips: vec![],
             dns64_domains_idna,
             dns64_domains_dns,
-            local_ts: vec![],
             dns_translator,
             icmp_rate_limiter,
         })
-    }
-
-    pub fn split_route_registry(&self, tunnel_domains: Vec<String>) -> Option<SplitRouteRegistry> {
-        if tunnel_domains.is_empty() {
-            None
-        } else {
-            Some(SplitRouteRegistry { tunnel_domains })
-        }
     }
 
     pub fn is_nat64(&self) -> bool {
@@ -1591,43 +1540,10 @@ impl Network {
                 vec![]
             }
         };
-        self.update_local_ts();
     }
 
     pub fn set_split_routes(&mut self, ip_addresses: &[IpAddr]) {
         self.tunnel_ips = ip_addresses.to_vec();
-        self.update_local_ts();
-    }
-
-    fn update_local_ts(&mut self) {
-        self.local_ts.clear();
-        if let Some(nat64_prefix) = &self.nat64_prefix {
-            self.local_ts.push(nat64_prefix.traffic_selector());
-            if !self.tunnel_ips.is_empty() {
-                self.local_ts
-                    .extend(self.tunnel_ips.iter().flat_map(|ip_address| {
-                        if ip_address.is_ipv4() {
-                            Some(message::TrafficSelector::from_ip(*ip_address))
-                        } else {
-                            None
-                        }
-                    }));
-            }
-        } else if self.tunnel_ips.is_empty() {
-            let full_ts = message::TrafficSelector::from_ipv4_range(
-                Ipv4Addr::new(0, 0, 0, 0)..=Ipv4Addr::new(255, 255, 255, 255),
-            );
-            self.local_ts.push(full_ts);
-        } else {
-            self.local_ts
-                .extend(self.tunnel_ips.iter().filter_map(|ip_address| {
-                    if ip_address.is_ipv4() {
-                        Some(message::TrafficSelector::from_ip(*ip_address))
-                    } else {
-                        None
-                    }
-                }))
-        }
     }
 
     pub fn ip_netmasks(&self) -> &[IpNetmask] {
@@ -1638,37 +1554,16 @@ impl Network {
         &self.dns_addrs
     }
 
-    pub fn ts_local(&self) -> &[message::TrafficSelector] {
-        &self.local_ts
-    }
-
     pub fn dns64_domains(&self) -> &[Vec<u8>] {
         &self.dns64_domains_idna
     }
 
-    pub fn traffic_selector_compatible(&self, ts_type: message::TrafficSelectorType) -> bool {
-        if self.nat64_prefix.is_some() {
-            ts_type == message::TrafficSelectorType::TS_IPV6_ADDR_RANGE
-                || ts_type == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE
-        } else {
-            match &self.real_ip {
-                Some(IpAddr::V6(_)) => ts_type == message::TrafficSelectorType::TS_IPV6_ADDR_RANGE,
-                Some(IpAddr::V4(_)) => ts_type == message::TrafficSelectorType::TS_IPV4_ADDR_RANGE,
-                None => false,
-            }
-        }
+    pub fn supports_ipv4(&self) -> bool {
+        self.is_nat64() || self.real_ip.is_some_and(|ip| ip.is_ipv4())
     }
 
-    pub fn expand_local_ts(&mut self, new_local_ts: &[message::TrafficSelector]) {
-        for check_ts in new_local_ts {
-            if !self
-                .local_ts
-                .iter()
-                .any(|existing_ts| existing_ts.contains(check_ts))
-            {
-                self.local_ts.push(check_ts.clone());
-            }
-        }
+    pub fn supports_ipv6(&self) -> bool {
+        self.is_nat64() || self.real_ip.is_some_and(|ip| ip.is_ipv6())
     }
 
     pub fn translate_ipv4_header(&self, hdr: &IpHeader) -> Option<IpHeader> {
@@ -2133,7 +2028,6 @@ impl TunnelDomainsDns {
 pub enum IpError {
     Internal(&'static str),
     Dns(dns::DnsError),
-    Format(message::FormatError),
     Io(io::Error),
 }
 
@@ -2142,7 +2036,6 @@ impl fmt::Display for IpError {
         match self {
             Self::Internal(msg) => f.write_str(msg),
             Self::Dns(e) => write!(f, "DNS error: {e}"),
-            Self::Format(e) => write!(f, "Format error: {e}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
         }
     }
@@ -2153,7 +2046,6 @@ impl error::Error for IpError {
         match self {
             Self::Internal(_msg) => None,
             Self::Dns(err) => Some(err),
-            Self::Format(err) => Some(err),
             Self::Io(err) => Some(err),
         }
     }
@@ -2162,12 +2054,6 @@ impl error::Error for IpError {
 impl From<dns::DnsError> for IpError {
     fn from(err: dns::DnsError) -> IpError {
         Self::Dns(err)
-    }
-}
-
-impl From<message::FormatError> for IpError {
-    fn from(err: message::FormatError) -> IpError {
-        Self::Format(err)
     }
 }
 

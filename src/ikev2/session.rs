@@ -124,6 +124,7 @@ pub struct IKEv2Session {
     local_addr: SocketAddr,
     state: SessionState,
     network: Network,
+    ts_local: Vec<message::TrafficSelector>,
     child_sas: HashSet<ChildSessionID>,
     pki_processing: Arc<pki::PkiProcessing>,
     use_fragmentation: bool,
@@ -156,6 +157,7 @@ impl IKEv2Session {
             local_addr,
             state: SessionState::Empty,
             network: network.clone(),
+            ts_local: vec![],
             child_sas: HashSet::new(),
             pki_processing,
             use_fragmentation: false,
@@ -949,7 +951,7 @@ impl IKEv2Session {
                             err
                         });
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
+                        ts.retain(|ts| self.traffic_selector_compatible(ts));
                         ts_remote = ts
                     }
                 }
@@ -962,7 +964,7 @@ impl IKEv2Session {
                             err
                         });
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
+                        ts.retain(|ts| self.traffic_selector_compatible(ts));
                         ts_local = ts
                     }
                 }
@@ -1038,7 +1040,7 @@ impl IKEv2Session {
             return self
                 .write_failed_response(response, message::NotifyMessageType::TS_UNACCEPTABLE);
         }
-        if !self.network.ts_local().iter().all(|local_ts| {
+        if !self.ts_local.iter().all(|local_ts| {
             ts_local
                 .iter()
                 .any(|client_ts| client_ts.contains(local_ts))
@@ -1180,10 +1182,11 @@ impl IKEv2Session {
         response.write_security_association(&[(&transform_params, proposal_num)])?;
 
         response.write_traffic_selector_payload(true, &ts_remote)?;
-        response.write_traffic_selector_payload(false, self.network.ts_local())?;
+        response.write_traffic_selector_payload(false, &self.ts_local)?;
 
         let child_sa = esp::SecurityAssociation::new(
-            (self.network.clone(), local_addr, local_spi),
+            self.network.clone(),
+            (self.ts_local.clone(), local_addr, local_spi),
             (ts_remote, remote_addr, remote_spi),
             child_crypto_stack,
             &transform_params,
@@ -1386,7 +1389,7 @@ impl IKEv2Session {
                             err
                         });
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
+                        ts.retain(|ts| self.traffic_selector_compatible(ts));
                         ts_remote = ts
                     }
                 }
@@ -1399,7 +1402,7 @@ impl IKEv2Session {
                             err
                         });
                     if let Ok(mut ts) = ts {
-                        ts.retain(|ts| self.network.traffic_selector_compatible(ts.ts_type()));
+                        ts.retain(|ts| self.traffic_selector_compatible(ts));
                         ts_local = ts
                     }
                 }
@@ -1545,7 +1548,8 @@ impl IKEv2Session {
                 local_spi,
             });
             let child_sa = esp::SecurityAssociation::new(
-                (self.network.clone(), self.local_addr, local_spi),
+                self.network.clone(),
+                (self.ts_local.clone(), self.local_addr, local_spi),
                 (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
@@ -1569,7 +1573,8 @@ impl IKEv2Session {
                 local_spi,
             });
             let child_sa = esp::SecurityAssociation::new(
-                (self.network.clone(), self.local_addr, local_spi),
+                self.network.clone(),
+                (self.ts_local.clone(), self.local_addr, local_spi),
                 (ts_remote.clone(), self.remote_addr, remote_spi),
                 new_crypto_stack,
                 &transform_params,
@@ -1596,6 +1601,7 @@ impl IKEv2Session {
                 local_addr: self.local_addr,
                 state: SessionState::Established,
                 network: self.network.clone(),
+                ts_local: self.ts_local.clone(),
                 child_sas,
                 pki_processing: self.pki_processing.clone(),
                 use_fragmentation: self.use_fragmentation,
@@ -1630,7 +1636,7 @@ impl IKEv2Session {
 
         if rekey_child_sa.is_some() || create_child_sa {
             response.write_traffic_selector_payload(true, &ts_remote)?;
-            response.write_traffic_selector_payload(false, self.network.ts_local())?;
+            response.write_traffic_selector_payload(false, &self.ts_local)?;
         }
         Ok(())
     }
@@ -1693,8 +1699,24 @@ impl IKEv2Session {
         Ok(message_id)
     }
 
-    pub fn update_split_routes(&mut self, updated_ts_local: &[message::TrafficSelector]) {
-        self.network.expand_local_ts(updated_ts_local)
+    pub fn expand_local_ts(&mut self, updated_local_ts: &[message::TrafficSelector]) {
+        for check_ts in updated_local_ts {
+            if !self
+                .ts_local
+                .iter()
+                .any(|existing_ts| existing_ts.contains(check_ts))
+            {
+                self.ts_local.push(check_ts.clone());
+            }
+        }
+    }
+
+    fn traffic_selector_compatible(&self, ts: &message::TrafficSelector) -> bool {
+        match ts.ts_type() {
+            message::TrafficSelectorType::TS_IPV4_ADDR_RANGE => self.network.supports_ipv4(),
+            message::TrafficSelectorType::TS_IPV6_ADDR_RANGE => self.network.supports_ipv6(),
+            _ => false,
+        }
     }
 
     fn log_fragment_contents(
