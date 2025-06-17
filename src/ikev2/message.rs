@@ -6,7 +6,7 @@ use std::{
 
 use log::{debug, warn};
 
-use crate::logger::fmt_slice_hex;
+use crate::{ip, logger::fmt_slice_hex};
 
 use super::{crypto, ip::IpNetmask};
 
@@ -2531,6 +2531,13 @@ impl<'a> EncryptedMessage<'a> {
 
     pub fn encrypted_data(&self) -> &[u8] {
         self.data
+    }
+}
+
+impl PartialEq<IPProtocolType> for ip::TransportProtocolType {
+    fn eq(&self, other: &IPProtocolType) -> bool {
+        let protocol_id = other.protocol_id();
+        protocol_id != 0 && self.to_u8() == protocol_id
     }
 }
 

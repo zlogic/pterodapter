@@ -12,6 +12,7 @@ pub type SecurityAssociationID = u32;
 
 pub struct SecurityAssociation {
     network: ip::Network,
+    ts_local: Vec<message::TrafficSelector>,
     ts_remote: Vec<message::TrafficSelector>,
     local_spi: u32,
     remote_spi: u32,
@@ -32,7 +33,8 @@ pub enum RoutingAction<'a> {
 
 impl SecurityAssociation {
     pub fn new(
-        local_config: (ip::Network, SocketAddr, u32),
+        network: ip::Network,
+        local_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
         remote_config: (Vec<message::TrafficSelector>, SocketAddr, u32),
         crypto_stack: crypto::CryptoStack,
         params: &crypto::TransformParameters,
@@ -43,10 +45,11 @@ impl SecurityAssociation {
         } else {
             0
         };
-        let (network, local_addr, local_spi) = local_config;
+        let (ts_local, local_addr, local_spi) = local_config;
         let (ts_remote, remote_addr, remote_spi) = remote_config;
         SecurityAssociation {
             network,
+            ts_local,
             ts_remote,
             local_spi,
             remote_spi,
@@ -81,7 +84,7 @@ impl SecurityAssociation {
     }
 
     fn accepts_esp_to_uplink(&self, hdr: &ip::IpHeader) -> bool {
-        ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Destination)
+        ts_accepts_header(&self.ts_local, hdr, TsCheck::Destination)
             && ts_accepts_header(&self.ts_remote, hdr, TsCheck::Source)
     }
 
@@ -93,7 +96,7 @@ impl SecurityAssociation {
             hdr
         };
         ts_accepts_header(&self.ts_remote, hdr, TsCheck::Destination)
-            && ts_accepts_header(self.network.ts_local(), hdr, TsCheck::Source)
+            && ts_accepts_header(&self.ts_local, hdr, TsCheck::Source)
     }
 
     fn decrypt_esp<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a [u8], EspError> {
