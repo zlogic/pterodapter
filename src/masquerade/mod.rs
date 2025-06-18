@@ -32,9 +32,24 @@ impl MasqueradeClient {
     pub fn new(config: Config) -> MasqueradeClient {
         let nat64_prefix = config.nat64_prefix.map(ip::Nat64Prefix::new);
         let dns_translator = nat64_prefix.clone().map(ip::Dns64Translator::new);
+        let dns_addrs = if let Some(nat64_prefix) = &nat64_prefix {
+            config
+                .dns_addrs
+                .iter()
+                .filter_map(|dns_addr| {
+                    if nat64_prefix.matches(dns_addr) {
+                        None
+                    } else {
+                        Some(*dns_addr)
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            config.dns_addrs
+        };
         MasqueradeClient {
             masquerade_ip: config.masquerade_ip,
-            dns_addrs: config.dns_addrs,
+            dns_addrs,
             nat64_prefix,
             dns64_domains: ip::TunnelDomainsDns::new(&config.dns64_domains),
             dns_translator,
@@ -95,7 +110,6 @@ pub async fn read_systen_dns_servers() -> Result<Vec<IpAddr>, MasqueradeError> {
             }
         }
     }
-    // TODO: exclude NAT64 DNS addresses to prevent loops.
     Ok(dns_servers)
 }
 

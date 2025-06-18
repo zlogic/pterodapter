@@ -1451,6 +1451,13 @@ impl Nat64Prefix {
         segments[12..16].copy_from_slice(&addr.octets());
         segments.into()
     }
+
+    pub fn matches(&self, addr: &IpAddr) -> bool {
+        match addr {
+            IpAddr::V6(addr) => self.0 == addr.octets()[0..12],
+            IpAddr::V4(_) => false,
+        }
+    }
 }
 
 impl Deref for Nat64Prefix {
