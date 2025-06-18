@@ -260,9 +260,12 @@ impl Args {
                     tls_config,
                 })
             }
-            (None, None, Some(masquerade_ip)) => {
-                uplink::Config::Masquerade(masquerade::Config { masquerade_ip })
-            }
+            (None, None, Some(masquerade_ip)) => uplink::Config::Masquerade(masquerade::Config {
+                masquerade_ip,
+                dns_addrs: vec![],
+                nat64_prefix,
+                dns64_domains: dns64_domains.clone(),
+            }),
             (Some(_), Some(_), Some(_)) => {
                 eprintln!("Cannot use both FortiVPN and masquerade at the same time");
                 println!("{USAGE_INSTRUCTIONS}");
@@ -355,7 +358,23 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         None
     };
 
-    let uplink = uplink::UplinkServiceType::new(config.uplink, pcap_sender.clone());
+    let uplink_config = if let uplink::Config::Masquerade(masquerade_config) = config.uplink {
+        match rt.block_on(masquerade::read_systen_dns_servers()) {
+            Ok(dns_servers) => uplink::Config::Masquerade(masquerade::Config {
+                masquerade_ip: masquerade_config.masquerade_ip,
+                dns_addrs: dns_servers,
+                dns64_domains: masquerade_config.dns64_domains,
+                nat64_prefix: masquerade_config.nat64_prefix,
+            }),
+            Err(err) => {
+                eprintln!("Failed to parse DNS server configuration: {err}");
+                process::exit(2);
+            }
+        }
+    } else {
+        config.uplink
+    };
+    let uplink = uplink::UplinkServiceType::new(uplink_config, pcap_sender.clone());
     if let Err(err) = server.run(rt, uplink, shutdown_receiver, pcap_sender) {
         eprintln!("Failed to run server: {err}");
     };
