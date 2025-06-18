@@ -40,7 +40,7 @@ const UNROUTABLE_SUBNETS: [RangeInclusive<Ipv4Addr>; 4] = [
     Ipv4Addr::new(224, 0, 0, 0)..=Ipv4Addr::new(255, 255, 255, 255),
 ];
 
-pub(super) struct DnsPacket<'a> {
+pub struct DnsPacket<'a> {
     data: &'a [u8],
 }
 
@@ -1094,12 +1094,12 @@ impl CompressionMap {
     }
 }
 
-pub(super) struct Dns64Translator {
+pub struct Dns64Translator {
     compression_map: CompressionMap,
     nat64_prefix: Nat64Prefix,
 }
 
-pub(super) enum DnsTranslationAction {
+pub enum DnsTranslationAction {
     Forward(usize),
     ReplyToSender(usize),
 }
