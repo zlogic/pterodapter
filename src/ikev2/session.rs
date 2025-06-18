@@ -150,6 +150,7 @@ impl IKEv2Session {
         local_addr: SocketAddr,
         pki_processing: Arc<pki::PkiProcessing>,
         network: &Network,
+        ts_local: Vec<message::TrafficSelector>,
     ) -> IKEv2Session {
         IKEv2Session {
             session_id,
@@ -157,7 +158,7 @@ impl IKEv2Session {
             local_addr,
             state: SessionState::Empty,
             network: network.clone(),
-            ts_local: vec![],
+            ts_local,
             child_sas: HashSet::new(),
             pki_processing,
             use_fragmentation: false,
