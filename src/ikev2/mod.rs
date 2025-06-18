@@ -127,15 +127,13 @@ impl Server {
             command_sender.clone(),
         ));
         let network = ip::Network::new(self.nat64_prefix.clone(), self.dns64_domains.clone())?;
-        let split_route_registry = if !self.tunnel_domains.is_empty() {
+        if !self.tunnel_domains.is_empty() {
             rt.spawn(SplitRouteRegistry::monitor_addresses(
                 self.tunnel_domains.clone(),
                 command_sender.clone(),
             ));
-            Some(SplitRouteRegistry::new(self.nat64_prefix.clone()))
-        } else {
-            None
-        };
+        }
+        let split_route_registry = SplitRouteRegistry::new(self.nat64_prefix.clone());
 
         let sessions = Sessions::new(
             self.pki_processing.clone(),
@@ -552,7 +550,7 @@ struct Sessions {
     pki_processing: Arc<pki::PkiProcessing>,
     sockets: Sockets,
     network: Network,
-    split_route_registry: Option<SplitRouteRegistry>,
+    split_route_registry: SplitRouteRegistry,
     pcap_sender: Option<pcap::PcapSender>,
     sessions: HashMap<session::SessionID, session::IKEv2Session>,
     security_associations: HashMap<esp::SecurityAssociationID, esp::SecurityAssociation>,
@@ -569,7 +567,7 @@ impl Sessions {
         sockets: Sockets,
         command_sender: mpsc::Sender<SessionMessage>,
         network: Network,
-        split_route_registry: Option<SplitRouteRegistry>,
+        split_route_registry: SplitRouteRegistry,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Sessions {
         Sessions {
@@ -616,6 +614,7 @@ impl Sessions {
                 local_addr,
                 self.pki_processing.clone(),
                 &self.network,
+                self.split_route_registry.local_ts.clone(),
             )
         });
         session_id
@@ -735,11 +734,9 @@ impl Sessions {
     }
 
     fn update_all_split_routes(&mut self, ip_addresses: &[IpAddr]) {
-        if let Some(split_route_registry) = &mut self.split_route_registry {
-            split_route_registry.update_local_ts(ip_addresses);
-            for (_, session) in self.sessions.iter_mut() {
-                session.expand_local_ts(&split_route_registry.local_ts)
-            }
+        self.split_route_registry.update_local_ts(ip_addresses);
+        for (_, session) in self.sessions.iter_mut() {
+            session.expand_local_ts(&self.split_route_registry.local_ts)
         }
     }
 
@@ -1119,10 +1116,12 @@ struct SplitRouteRegistry {
 
 impl SplitRouteRegistry {
     fn new(nat64_prefix: Option<Nat64Prefix>) -> SplitRouteRegistry {
-        SplitRouteRegistry {
+        let mut split_route_registry = SplitRouteRegistry {
             local_ts: vec![],
             nat64_prefix,
-        }
+        };
+        split_route_registry.update_local_ts(&[]);
+        split_route_registry
     }
 
     async fn monitor_addresses(
@@ -1147,7 +1146,7 @@ impl SplitRouteRegistry {
                     }
                 }
             }
-            if ip_addresses.is_empty() {
+            if !ip_addresses.is_empty() {
                 let _ = routes_sender
                     .send(SessionMessage::UpdateSplitRoutes(ip_addresses))
                     .await;
@@ -1169,10 +1168,19 @@ impl SplitRouteRegistry {
                     }
                 }));
         } else if tunnel_ips.is_empty() {
-            let full_ts = message::TrafficSelector::from_ipv4_range(
+            let ts_ipv4 = message::TrafficSelector::from_ipv4_range(
                 Ipv4Addr::new(0, 0, 0, 0)..=Ipv4Addr::new(255, 255, 255, 255),
             );
-            self.local_ts.push(full_ts);
+            self.local_ts.push(ts_ipv4);
+            let ts_ipv6 = message::TrafficSelector::from_ipv6_range(
+                Ipv6Addr::new(
+                    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                )
+                    ..=Ipv6Addr::new(
+                        0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                    ),
+            );
+            self.local_ts.push(ts_ipv6);
         } else {
             self.local_ts
                 .extend(tunnel_ips.iter().filter_map(|ip_address| {
