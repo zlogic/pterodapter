@@ -2001,12 +2001,12 @@ impl Checksum {
 type DomainLabels = Vec<Vec<u8>>;
 
 #[derive(Clone)]
-struct TunnelDomainsDns {
+pub struct TunnelDomainsDns {
     tunnel_domains: Vec<DomainLabels>,
 }
 
 impl TunnelDomainsDns {
-    fn new(tunnel_domains: &[String]) -> TunnelDomainsDns {
+    pub fn new(tunnel_domains: &[String]) -> TunnelDomainsDns {
         let tunnel_domains = tunnel_domains
             .iter()
             .map(|tunnel_domain| {
@@ -2023,6 +2023,8 @@ impl TunnelDomainsDns {
         &self.tunnel_domains
     }
 }
+
+pub type Dns64Translator = dns::Dns64Translator;
 
 #[derive(Debug)]
 pub enum IpError {
