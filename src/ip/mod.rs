@@ -1051,6 +1051,13 @@ impl<'a> IpPacket<'a> {
         }
     }
 
+    pub fn transport_protocol(&self) -> TransportProtocolType {
+        match self {
+            IpPacket::V4(packet) => packet.transport_protocol(),
+            IpPacket::V6(packet) => packet.transport_protocol(),
+        }
+    }
+
     pub fn transport_protocol_data(&self) -> &TransportData<'_> {
         match self {
             IpPacket::V4(packet) => packet.transport_protocol_data(),
@@ -1084,14 +1091,14 @@ impl<'a> IpPacket<'a> {
         }
     }
 
-    fn into_data(self) -> &'a [u8] {
+    pub fn into_data(self) -> &'a [u8] {
         match self {
             IpPacket::V4(packet) => packet.into_data(),
             IpPacket::V6(packet) => packet.into_data(),
         }
     }
 
-    fn validate_ip_checksum(&self) -> bool {
+    pub fn validate_ip_checksum(&self) -> bool {
         match self {
             IpPacket::V4(packet) => packet.validate_ip_checksum(),
             IpPacket::V6(_) => true,
