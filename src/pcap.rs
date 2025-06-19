@@ -64,8 +64,17 @@ impl PcapSender {
         if packet.is_empty() {
             return;
         }
-        // TODO PCAP: try to reuse/recycle buffers?
         let time = SystemTime::now();
+        let permit = match self.tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(err) => {
+                if !self.data_lost {
+                    self.data_lost = true;
+                    log::error!("PCAP send buffer is full, some data will be lost: {err}");
+                }
+                return;
+            }
+        };
 
         let time = match time.duration_since(UNIX_EPOCH) {
             Ok(time) => time,
@@ -82,11 +91,6 @@ impl PcapSender {
         data[12..16].copy_from_slice(&(packet.len() as u32).to_be_bytes());
         data[16..16 + captured_length].copy_from_slice(&packet[0..captured_length]);
 
-        if let Err(err) = self.tx.try_send((data, 16 + captured_length)) {
-            if !self.data_lost {
-                self.data_lost = true;
-                log::error!("PCAP send buffer is full, some data will be lost: {err}");
-            }
-        }
+        permit.send((data, 16 + captured_length))
     }
 }
