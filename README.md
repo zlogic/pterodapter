@@ -59,7 +59,7 @@ Inspired by ideas from [Microsoft DirectAccess](https://en.wikipedia.org/wiki/Di
 To specify multiple domains, add a `--dns64-tunnel-suffix` argument for each one.
 If no `--dns64-tunnel-suffix` arguments are specified, DNS64 won't be used, but will still remain available - for example, to be used with a custom DNS64 server.
 
-`--destination=<hostport>` specifies the hostname to send to the client when performing a client handshake. If not specified, will use `pterodapter` as the hostname. Windows refuses to connect if the hostname doesn't match connection settings; macOS prints a warning in the Console.
+`--id-hostname=<hostname>` specifies the hostname to send to the client when performing a client handshake. If not specified, will use `pterodapter` as the hostname. Windows refuses to connect if the hostname doesn't match connection settings; macOS prints a warning in the Console.
 
 `--cacert=<filename>` specifies the path to a root CA PEM file, required for two-way authentication.
 

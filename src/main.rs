@@ -2,7 +2,7 @@ use std::{
     env, fmt, fs,
     net::{IpAddr, Ipv6Addr, ToSocketAddrs},
     process,
-    str::FromStr,
+    str::FromStr as _,
     sync::Arc,
 };
 
