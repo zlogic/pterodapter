@@ -170,7 +170,7 @@ impl LcpCode {
         if (Self::CONFIGURE_REQUEST.0..=Self::DISCARD_REQUEST.0).contains(&value) {
             Ok(LcpCode(value))
         } else {
-            debug!("Unsupported LCP Code: {}", value);
+            debug!("Unsupported LCP Code: {value}");
             Err("Unsupported LCP Code".into())
         }
     }
@@ -339,14 +339,14 @@ impl fmt::Display for LcpOptionData<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::Reserved() => write!(f, "Reserved"),
-            Self::MaximumReceiveUnit(mru) => write!(f, "Maximum-Receive-Unit {}", mru),
+            Self::MaximumReceiveUnit(mru) => write!(f, "Maximum-Receive-Unit {mru}"),
             Self::AuthenticationProtocol(data) => {
                 write!(f, "Authentication-Protocol {}", fmt_slice_hex(data))
             }
             Self::QualityProtocol(data) => {
                 write!(f, "Quality-Protocol {}", fmt_slice_hex(data))
             }
-            Self::MagicNumber(magic) => write!(f, "Magic-Number {:08x}", magic),
+            Self::MagicNumber(magic) => write!(f, "Magic-Number {magic:08x}"),
             Self::ProtocolFieldCompression() => write!(f, "Protocol-Field-Compression"),
             Self::AddressControlFieldCompression() => {
                 write!(f, "Address-and-Control-Field-Compression")
@@ -565,11 +565,11 @@ impl fmt::Display for IpcpOptionData<'_> {
             Self::IpCompressionProtocol(data) => {
                 write!(f, "IP-Compression-Protocol {}", fmt_slice_hex(data))
             }
-            Self::IpAddress(ip) => write!(f, "IP-Address {}", ip),
-            Self::PrimaryDns(ip) => write!(f, "Primary DNS Server Address {}", ip),
-            Self::PrimaryNbns(ip) => write!(f, "Primary NBNS Server Address {}", ip),
-            Self::SecondaryDns(ip) => write!(f, "Secondary DNS Server Address {}", ip),
-            Self::SecondaryNbns(ip) => write!(f, "Secondary NBNS Server Address {}", ip),
+            Self::IpAddress(ip) => write!(f, "IP-Address {ip}"),
+            Self::PrimaryDns(ip) => write!(f, "Primary DNS Server Address {ip}"),
+            Self::PrimaryNbns(ip) => write!(f, "Primary NBNS Server Address {ip}"),
+            Self::SecondaryDns(ip) => write!(f, "Secondary DNS Server Address {ip}"),
+            Self::SecondaryNbns(ip) => write!(f, "Secondary NBNS Server Address {ip}"),
         }
     }
 }
@@ -642,12 +642,12 @@ impl fmt::Display for Packet<'_> {
                 write!(f, "LCP code: {} id: {}", lcp.code(), lcp.identifier())?;
                 for opt in lcp.iter_options() {
                     match opt {
-                        Ok(opt) => write!(f, " {}", opt)?,
-                        Err(err) => write!(f, " invalid option: {}", err)?,
+                        Ok(opt) => write!(f, " {opt}")?,
+                        Err(err) => write!(f, " invalid option: {err}")?,
                     }
                 }
                 if let Some(magic) = lcp.read_magic() {
-                    write!(f, ", magic: {:08x}", magic)?;
+                    write!(f, ", magic: {magic:08x}")?;
                 }
                 Ok(())
             }
@@ -655,8 +655,8 @@ impl fmt::Display for Packet<'_> {
                 write!(f, "IPCP code: {} id: {}", ipcp.code(), ipcp.identifier())?;
                 for opt in ipcp.iter_options() {
                     match opt {
-                        Ok(opt) => write!(f, " {}", opt)?,
-                        Err(err) => write!(f, " invalid option: {}", err)?,
+                        Ok(opt) => write!(f, " {opt}")?,
+                        Err(err) => write!(f, " invalid option: {err}")?,
                     }
                 }
                 Ok(())

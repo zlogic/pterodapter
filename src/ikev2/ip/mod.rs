@@ -1184,7 +1184,7 @@ impl fmt::Display for IpPacket<'_> {
             None => write!(f, "{}", self.dst_addr())?,
         }
         if let Some(offset) = self.fragment_offset() {
-            write!(f, " F={}", offset)?;
+            write!(f, " F={offset}")?;
         }
         match self {
             IpPacket::V4(packet) => write!(
@@ -1429,11 +1429,11 @@ impl fmt::Display for TransportData<'_> {
             TransportData::Generic(protocol, data) => match *protocol {
                 TransportProtocolType::ICMP => match icmp::IcmpV4Message::from_data(data) {
                     Ok(icmp) => icmp.fmt(f),
-                    Err(err) => write!(f, "ICMPv4 error: {}", err),
+                    Err(err) => write!(f, "ICMPv4 error: {err}"),
                 },
                 TransportProtocolType::IPV6_ICMP => match icmp::IcmpV6Message::from_data(data) {
                     Ok(icmp) => icmp.fmt(f),
-                    Err(err) => write!(f, "ICMPv6 error: {}", err),
+                    Err(err) => write!(f, "ICMPv6 error: {err}"),
                 },
                 protocol => write!(f, "{} {}", protocol, fmt_slice_hex(data)),
             },
@@ -1710,10 +1710,7 @@ impl Network {
                 if packet.hop_limit() <= TTL_HOP_DECREMENT {
                     // RFC 7915, Section 5.1:
                     // Hop limit will be reduced to 0 - will be dropped by the next hop.
-                    warn!(
-                        "Received packet with expired Hop limit from ESP: {}",
-                        header
-                    );
+                    warn!("Received packet with expired Hop limit from ESP: {header}");
                     if !self.icmp_rate_limiter.can_send() {
                         info!("ICMP rate limit reached, dropping response");
                         return Ok(RoutingActionEsp::Drop);
@@ -1743,7 +1740,7 @@ impl Network {
                 if packet.ttl() <= TTL_HOP_DECREMENT {
                     // RFC 7915, Section 4.1:
                     // TTL limit will be reduced to 0 - will be dropped by the next hop.
-                    warn!("Received packet with expired TTL: {}", header);
+                    warn!("Received packet with expired TTL: {header}");
                     if !self.icmp_rate_limiter.can_send() {
                         info!("ICMP rate limit reached, dropping response");
                         return Ok(RoutingActionEsp::Drop);
@@ -1780,7 +1777,7 @@ impl Network {
         let is_dns_port = header.transport_protocol() == TransportProtocolType::UDP
             && header.dst_port() == Some(&53);
         if !is_dns_port {
-            warn!("Dropping non-standard packet to DNS server {}", header);
+            warn!("Dropping non-standard packet to DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
                 return Ok(RoutingActionEsp::Drop);
@@ -1791,7 +1788,7 @@ impl Network {
         }
         let dns_packet =
             dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
-        trace!("Decoded DNS packet from ESP: {}", dns_packet);
+        trace!("Decoded DNS packet from ESP: {dns_packet}");
         // Reserve space for UDP header.
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE_IPV4];
@@ -1811,7 +1808,7 @@ impl Network {
             dns::DnsTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
-                    trace!("Rewrote DNS request from ESP: {}", dns_packet);
+                    trace!("Rewrote DNS request from ESP: {dns_packet}");
                 }
 
                 let start_offset = packet.write_updated_udp_ipv4(
@@ -1824,7 +1821,7 @@ impl Network {
             dns::DnsTranslationAction::ReplyToSender(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
-                    trace!("Sending immediate DNS reply to ESP: {}", dns_packet);
+                    trace!("Sending immediate DNS reply to ESP: {dns_packet}");
                 }
                 let start_offset = packet.write_udp_response(
                     out_buf,
@@ -1854,7 +1851,7 @@ impl Network {
 
         let icmp_packet =
             icmp::IcmpV6Message::from_data(packet.transport_protocol_data().full_data())?;
-        trace!("Decoded ICMPv6 packet {}", icmp_packet);
+        trace!("Decoded ICMPv6 packet {icmp_packet}");
         // Reserve space for IPv4 header.
         let dest_buf = &mut out_buf[20..];
 
@@ -1863,7 +1860,7 @@ impl Network {
             icmp::IcmpTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let icmp_packet = icmp::IcmpV4Message::from_data(&dest_buf[..length])?;
-                    trace!("Rewrote ICMPv6 packet from ESP: {}", icmp_packet);
+                    trace!("Rewrote ICMPv6 packet from ESP: {icmp_packet}");
                 }
 
                 let length = packet.write_icmp_translated(out_buf, length)?;
@@ -1904,7 +1901,7 @@ impl Network {
         if packet.ttl() <= TTL_HOP_DECREMENT {
             // RFC 7915, Section 4.1:
             // TTL limit will be reduced to 0 - will be dropped by the next hop.
-            warn!("Received packet with expired TTL: {}", header);
+            warn!("Received packet with expired TTL: {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
                 return Ok(RoutingActionVpn::Drop);
@@ -1945,7 +1942,7 @@ impl Network {
         let is_dns_port = header.transport_protocol() == TransportProtocolType::UDP
             && header.src_port() == Some(&53);
         if !is_dns_port {
-            warn!("Dropping non-standard packet from DNS server {}", header);
+            warn!("Dropping non-standard packet from DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
                 return Ok(RoutingActionVpn::Drop);
@@ -1956,7 +1953,7 @@ impl Network {
         }
         let dns_packet =
             dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
-        trace!("Decoded DNS packet from VPN: {}", dns_packet);
+        trace!("Decoded DNS packet from VPN: {dns_packet}");
         // Reserve space for UDP header.
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated(out_buf, nat_prefix, false)?;
@@ -1975,7 +1972,7 @@ impl Network {
         let length = dns_translator.translate_to_esp(&dns_packet, dest_buf)?;
         if log::log_enabled!(log::Level::Trace) {
             let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
-            trace!("Rewrote DNS response from VPN: {}", dns_packet);
+            trace!("Rewrote DNS response from VPN: {dns_packet}");
         }
 
         let start_offset = packet.write_udp_translated(
@@ -2007,7 +2004,7 @@ impl Network {
         }
         let icmp_packet =
             icmp::IcmpV4Message::from_data(packet.transport_protocol_data().full_data())?;
-        trace!("Decoded ICMPv4 packet {}", icmp_packet);
+        trace!("Decoded ICMPv4 packet {icmp_packet}");
         // Reserve space for IPv6 header.
         let dest_buf = &mut out_buf[40..];
 
@@ -2016,7 +2013,7 @@ impl Network {
             icmp::IcmpTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let icmp_packet = icmp::IcmpV6Message::from_data(&dest_buf[..length])?;
-                    trace!("Rewrote ICMPv4 packet from VPN: {}", icmp_packet);
+                    trace!("Rewrote ICMPv4 packet from VPN: {icmp_packet}");
                 }
 
                 let length = packet.write_icmp_translated(out_buf, length, nat64_prefix)?;
@@ -2141,9 +2138,9 @@ impl fmt::Display for IpError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Dns(e) => write!(f, "DNS error: {}", e),
-            Self::Format(e) => write!(f, "Format error: {}", e),
-            Self::Io(e) => write!(f, "IO error: {}", e),
+            Self::Dns(e) => write!(f, "DNS error: {e}"),
+            Self::Format(e) => write!(f, "Format error: {e}"),
+            Self::Io(e) => write!(f, "IO error: {e}"),
         }
     }
 }

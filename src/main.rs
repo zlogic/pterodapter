@@ -51,22 +51,19 @@ impl Args {
         match env::args().next_back().as_deref() {
             Some("ikev2") => {}
             Some("help") => {
-                println!("{}", USAGE_INSTRUCTIONS);
+                println!("{USAGE_INSTRUCTIONS}");
                 process::exit(0);
             }
             _ => {
                 eprintln!("No action specified");
-                println!("{}", USAGE_INSTRUCTIONS);
+                println!("{USAGE_INSTRUCTIONS}");
                 process::exit(2);
             }
         };
 
         let fail_with_error = |name: &str, value: &str, err: fmt::Arguments| -> ! {
-            eprintln!(
-                "Argument {} has an unsupported value {}: {}",
-                name, value, err
-            );
-            println!("{}", USAGE_INSTRUCTIONS);
+            eprintln!("Argument {name} has an unsupported value {value}: {err}");
+            println!("{USAGE_INSTRUCTIONS}");
             process::exit(2);
         };
 
@@ -93,7 +90,7 @@ impl Args {
             {
                 Ok(builder) => builder.with_no_client_auth(),
                 Err(err) => {
-                    eprintln!("Failed to init platform verifier: {}", err);
+                    eprintln!("Failed to init platform verifier: {err}");
                     process::exit(2);
                 }
             };
@@ -106,8 +103,8 @@ impl Args {
             let (name, value) = if let Some(arg) = arg.split_once('=') {
                 arg
             } else {
-                eprintln!("Option flag {} has no value", arg);
-                println!("{}", USAGE_INSTRUCTIONS);
+                eprintln!("Option flag {arg} has no value");
+                println!("{USAGE_INSTRUCTIONS}");
                 process::exit(2);
             };
 
@@ -130,7 +127,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse destination address: {}", err),
+                        format_args!("Failed to parse destination address: {err}"),
                     ),
                 };
             } else if name == "--tunnel-domain" {
@@ -163,7 +160,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse IP address: {}", err),
+                        format_args!("Failed to parse IP address: {err}"),
                     ),
                 };
             } else if name == "--ike-port" {
@@ -172,7 +169,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse IKEv2 port: {}", err),
+                        format_args!("Failed to parse IKEv2 port: {err}"),
                     ),
                 };
             } else if name == "--nat-port" {
@@ -181,7 +178,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse NAT port for IKEv2: {}", err),
+                        format_args!("Failed to parse NAT port for IKEv2: {err}"),
                     ),
                 };
             } else if name == "--nat64-prefix" {
@@ -195,7 +192,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse RNAT CIDR IP address: {}", err),
+                        format_args!("Failed to parse RNAT CIDR IP address: {err}"),
                     ),
                 };
                 nat64_prefix = Some(ip);
@@ -207,7 +204,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to read root CA cert: {}", err),
+                        format_args!("Failed to read root CA cert: {err}"),
                     ),
                 };
             } else if name == "--cert" {
@@ -216,7 +213,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to read root CA cert: {}", err),
+                        format_args!("Failed to read root CA cert: {err}"),
                     ),
                 };
             } else if name == "--key" {
@@ -225,11 +222,11 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to read root CA cert: {}", err),
+                        format_args!("Failed to read root CA cert: {err}"),
                     ),
                 };
             } else {
-                eprintln!("Unsupported argument {}", arg);
+                eprintln!("Unsupported argument {arg}");
             }
         }
 
@@ -240,13 +237,13 @@ impl Args {
                 }
                 _ => {
                     eprintln!("No destination specified");
-                    println!("{}", USAGE_INSTRUCTIONS);
+                    println!("{USAGE_INSTRUCTIONS}");
                     process::exit(2);
                 }
             };
         if nat64_prefix.is_none() && !dns64_domains.is_empty() {
             eprintln!("--dns64-tunnel-suffix should only be used when --nat64-prefix is specified");
-            println!("{}", USAGE_INSTRUCTIONS);
+            println!("{USAGE_INSTRUCTIONS}");
             process::exit(2);
         }
 
@@ -291,13 +288,13 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         .enable_time()
         .build()
         .map_err(|err| {
-            eprintln!("Failed to start runtime: {}", err);
+            eprintln!("Failed to start runtime: {err}");
             1
         })?;
     let mut server = match ikev2::Server::new(config.ikev2) {
         Ok(server) => server,
         Err(err) => {
-            eprintln!("Failed to create server: {}", err);
+            eprintln!("Failed to create server: {err}");
             std::process::exit(1)
         }
     };
@@ -306,7 +303,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
 
     rt.spawn(async move {
         if let Err(err) = signal::ctrl_c().await {
-            eprintln!("Failed to wait for CTRL+C signal: {}", err);
+            eprintln!("Failed to wait for CTRL+C signal: {err}");
         }
         info!("Started shutdown");
         if shutdown_sender.send(()).is_err() {
@@ -315,7 +312,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
     });
 
     if let Err(err) = server.run(rt, config.fortivpn, shutdown_receiver) {
-        eprintln!("Failed to run server: {}", err);
+        eprintln!("Failed to run server: {err}");
     };
 
     info!("Stopped server");
@@ -337,7 +334,7 @@ fn main() {
     let args = Args::parse();
 
     if let Err(err) = logger::setup_logger(args.log_level) {
-        eprintln!("Failed to set up logger, error is {}", err);
+        eprintln!("Failed to set up logger, error is {err}");
     }
     if let Err(exitcode) = serve_ikev2(args.config) {
         process::exit(exitcode);

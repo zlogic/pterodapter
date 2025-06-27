@@ -42,7 +42,7 @@ where
         let chunk_length = match <usize>::from_str_radix(chunk_length, 16) {
             Ok(chunk_length) => chunk_length,
             Err(err) => {
-                debug!("Failed to parse chunk length {}: {}", chunk_length, err);
+                debug!("Failed to parse chunk length {chunk_length}: {err}");
                 return Err("Failed to parse chunk length".into());
             }
         };
@@ -63,7 +63,7 @@ where
     }
 
     Ok(String::from_utf8(result).map_err(|err| {
-        debug!("Failed to decode content as UTF-8: {}", err);
+        debug!("Failed to decode content as UTF-8: {err}");
         "Failed to decode content as UTF-8"
     })?)
 }
@@ -85,7 +85,7 @@ where
     socket.read_exact(&mut buf).await?;
 
     Ok(String::from_utf8(buf).map_err(|err| {
-        warn!("Failed to decode headers as UTF-8: {}", err);
+        warn!("Failed to decode headers as UTF-8: {err}");
         "Failed to decode headers as UTF-8"
     })?)
 }
@@ -97,7 +97,7 @@ pub fn find_content_length(headers: &str) -> Option<usize> {
             match content_length.parse::<usize>() {
                 Ok(content_length) => return Some(content_length),
                 Err(err) => {
-                    warn!("Failed to parse content-length: {}", err);
+                    warn!("Failed to parse content-length: {err}");
                     continue;
                 }
             }
@@ -124,7 +124,7 @@ pub fn validate_response_code(headers: &str) -> Result<(), HttpError> {
     match extract_response_code(headers) {
         Some(200) => Ok(()),
         Some(code) => {
-            debug!("Received unexpected HTTP response code: {}", code);
+            debug!("Received unexpected HTTP response code: {code}");
             Err("Received unexpected HTTP response code".into())
         }
         None => Err("Unable to read HTTP response code".into()),
@@ -160,22 +160,21 @@ pub fn build_request(
     content_length: usize,
 ) -> String {
     let cookie = if let Some(cookie) = cookie {
-        format!("Cookie: {}\r\n", cookie)
+        format!("Cookie: {cookie}\r\n")
     } else {
         "".to_string()
     };
     let content_length = if content_length > 0 {
-        format!("Content-Length: {}\r\n", content_length)
+        format!("Content-Length: {content_length}\r\n")
     } else {
         "".to_string()
     };
     format!(
-        "{} HTTP/1.1\r\n\
-            Host: {}\r\n\
+        "{verb} HTTP/1.1\r\n\
+            Host: {host}\r\n\
             User-Agent: Mozilla/5.0 SV1\r\n\
             Accept: */*\r\n\
-            {}{}\r\n",
-        verb, host, cookie, content_length
+            {cookie}{content_length}\r\n"
     )
 }
 
@@ -190,8 +189,8 @@ impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(e) => write!(f, "IO error: {}", e),
-            Self::Tls(e) => write!(f, "TLS error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::Tls(e) => write!(f, "TLS error: {e}"),
         }
     }
 }

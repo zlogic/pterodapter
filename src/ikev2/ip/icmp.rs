@@ -77,7 +77,7 @@ impl fmt::Display for IcmpV4DestinationUnreachable {
             13 => f.write_str("Communication administratively prohibited"),
             14 => f.write_str("Host Precedence Violation"),
             15 => f.write_str("Precedence cutoff in effect"),
-            other => write!(f, "{}", other),
+            other => write!(f, "{other}"),
         }
     }
 }
@@ -90,7 +90,7 @@ impl fmt::Display for IcmpV4TimeExceeded {
         match self.0 {
             0 => f.write_str("Time to live (TTL) expired in transit"),
             1 => f.write_str("Fragment reassembly time exceeded"),
-            other => write!(f, "{}", other),
+            other => write!(f, "{other}"),
         }
     }
 }
@@ -104,7 +104,7 @@ impl fmt::Display for IcmpV4ParameterProblem {
             0 => f.write_str("Pointer indicates the error"),
             1 => f.write_str("Missing a required option"),
             2 => f.write_str("Bad length"),
-            other => write!(f, "{}", other),
+            other => write!(f, "{other}"),
         }
     }
 }
@@ -114,10 +114,10 @@ impl fmt::Display for IcmpV4 {
         match self {
             IcmpV4::EchoReply => write!(f, "Echo Reply"),
             IcmpV4::EchoRequest => write!(f, "Echo Request"),
-            IcmpV4::DestinationUnreachable(code) => write!(f, "Destination Unreachable ({})", code),
-            IcmpV4::TimeExceeded(code) => write!(f, "Time Exceeded ({})", code),
-            IcmpV4::ParameterProblem(code) => write!(f, "Parameter Problem ({})", code),
-            IcmpV4::Unknown(t, code) => write!(f, "{} ({})", t, code),
+            IcmpV4::DestinationUnreachable(code) => write!(f, "Destination Unreachable ({code})"),
+            IcmpV4::TimeExceeded(code) => write!(f, "Time Exceeded ({code})"),
+            IcmpV4::ParameterProblem(code) => write!(f, "Parameter Problem ({code})"),
+            IcmpV4::Unknown(t, code) => write!(f, "{t} ({code})"),
         }
     }
 }
@@ -171,7 +171,7 @@ impl fmt::Display for IcmpV6DestinationUnreachable {
             5 => f.write_str("Source address failed ingress/egress policy"),
             6 => f.write_str("Reject route to destination"),
             7 => f.write_str("Error in Source Routing Header"),
-            other => write!(f, "{}", other),
+            other => write!(f, "{other}"),
         }
     }
 }
@@ -184,7 +184,7 @@ impl fmt::Display for IcmpV6TimeExceeded {
         match self.0 {
             0 => f.write_str("Hop limit exceeded in transit"),
             1 => f.write_str("Fragment reassembly time exceeded"),
-            other => write!(f, "{}", other),
+            other => write!(f, "{other}"),
         }
     }
 }
@@ -198,7 +198,7 @@ impl fmt::Display for IcmpV6ParameterProblem {
             0 => f.write_str("Erroneous header field encountered"),
             1 => f.write_str("Unrecognized Next Header type encountered"),
             2 => f.write_str("Unrecognized IPv6 option encountered"),
-            other => write!(f, "{}", other),
+            other => write!(f, "{other}"),
         }
     }
 }
@@ -208,11 +208,11 @@ impl fmt::Display for IcmpV6 {
         match self {
             IcmpV6::EchoRequest => write!(f, "Echo Request"),
             IcmpV6::EchoReply => write!(f, "Echo Reply"),
-            IcmpV6::DestinationUnreachable(code) => write!(f, "Destination Unreachable ({})", code),
+            IcmpV6::DestinationUnreachable(code) => write!(f, "Destination Unreachable ({code})"),
             IcmpV6::PacketTooBig => write!(f, "Packet Too Big"),
-            IcmpV6::TimeExceeded(code) => write!(f, "Time Exceeded ({})", code),
-            IcmpV6::ParameterProblem(code) => write!(f, "Parameter Problem ({})", code),
-            IcmpV6::Unknown(t, code) => write!(f, "{} ({})", t, code),
+            IcmpV6::TimeExceeded(code) => write!(f, "Time Exceeded ({code})"),
+            IcmpV6::ParameterProblem(code) => write!(f, "Parameter Problem ({code})"),
+            IcmpV6::Unknown(t, code) => write!(f, "{t} ({code})"),
         }
     }
 }
@@ -288,7 +288,7 @@ impl IcmpV4Message<'_> {
         }?;
         original_packet
             .write_icmp_translated(dest, length, nat64_prefix)
-            .map_err(|err| warn!("Failed to translate Echo original header: {}", err))
+            .map_err(|err| warn!("Failed to translate Echo original header: {err}"))
             .ok()
     }
 
@@ -311,10 +311,7 @@ impl IcmpV4Message<'_> {
             Ok(IpPacket::V4(packet)) => Ok(packet),
             Ok(IpPacket::V6(_)) => Err("ICMPv4 header contains IPv6 original data".into()),
             Err(err) => {
-                warn!(
-                    "Failed to parse original datagram in ICMPv4 packet: {}",
-                    err
-                );
+                warn!("Failed to parse original datagram in ICMPv4 packet: {err}");
                 Err(err)
             }
         }?;
@@ -330,10 +327,7 @@ impl IcmpV4Message<'_> {
             original_packet
                 .write_translated(&mut dest[8..], nat64_prefix, true)
                 .map_err(|err| {
-                    warn!(
-                        "Failed to translate ICMPv4 original datagram to IPv6: {}",
-                        err
-                    );
+                    warn!("Failed to translate ICMPv4 original datagram to IPv6: {err}");
                     err
                 })?
         };
@@ -414,7 +408,7 @@ impl IcmpV4Message<'_> {
                     13 => dest[1] = 1,
                     14 => dest[1] = 1,
                     _ => {
-                        debug!("Dropping unsupported ICMPv6 request {}", self);
+                        debug!("Dropping unsupported ICMPv6 request {self}");
                         return Ok(IcmpTranslationAction::Drop);
                     }
                 }
@@ -472,13 +466,13 @@ impl IcmpV4Message<'_> {
                         self.translate_original_datagram_to_esp(dest, nat64_prefix)
                     }
                     _ => {
-                        debug!("Dropping unsupported ICMPv4 request {}", self);
+                        debug!("Dropping unsupported ICMPv4 request {self}");
                         Ok(IcmpTranslationAction::Drop)
                     }
                 }
             }
             IcmpV4::Unknown(_, _) => {
-                debug!("Dropping unsupported ICMPv6 request {}", self);
+                debug!("Dropping unsupported ICMPv6 request {self}");
                 Ok(IcmpTranslationAction::Drop)
             }
         }
@@ -568,7 +562,7 @@ impl IcmpV6Message<'_> {
         }?;
         original_packet
             .write_icmp_translated(dest, length)
-            .map_err(|err| warn!("Failed to translate Echo original header: {}", err))
+            .map_err(|err| warn!("Failed to translate Echo original header: {err}"))
             .ok()
     }
 
@@ -590,10 +584,7 @@ impl IcmpV6Message<'_> {
             Ok(IpPacket::V4(_)) => Err("ICMPv6 header contains IPv4 original data".into()),
             Ok(IpPacket::V6(packet)) => Ok(packet),
             Err(err) => {
-                warn!(
-                    "Failed to parse original datagram in ICMPv6 packet: {}",
-                    err
-                );
+                warn!("Failed to parse original datagram in ICMPv6 packet: {err}");
                 Err(err)
             }
         }?;
@@ -609,10 +600,7 @@ impl IcmpV6Message<'_> {
             original_packet
                 .write_translated(&mut dest[8..], true)
                 .map_err(|err| {
-                    warn!(
-                        "Failed to translate ICMPv6 original datagram to IPv4: {}",
-                        err
-                    );
+                    warn!("Failed to translate ICMPv6 original datagram to IPv4: {err}");
                     err
                 })?
         };
@@ -670,7 +658,7 @@ impl IcmpV6Message<'_> {
                     3 => dest[1] = 1,
                     4 => dest[1] = 3,
                     _ => {
-                        debug!("Dropping unsupported ICMPv6 request {}", self);
+                        debug!("Dropping unsupported ICMPv6 request {self}");
                         return Ok(IcmpTranslationAction::Drop);
                     }
                 }
@@ -735,13 +723,13 @@ impl IcmpV6Message<'_> {
                         self.translate_original_datagram_to_vpn(dest)
                     }
                     _ => {
-                        debug!("Dropping unsupported ICMPv6 request {}", self);
+                        debug!("Dropping unsupported ICMPv6 request {self}");
                         Ok(IcmpTranslationAction::Drop)
                     }
                 }
             }
             IcmpV6::Unknown(_, _) => {
-                debug!("Dropping unsupported ICMPv6 request {}", self);
+                debug!("Dropping unsupported ICMPv6 request {self}");
                 Ok(IcmpTranslationAction::Drop)
             }
         }

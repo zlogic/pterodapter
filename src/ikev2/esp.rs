@@ -132,7 +132,7 @@ impl SecurityAssociation {
                 Ok(data)
             }
             Err(err) => {
-                warn!("Failed to decrypt ESP packet: {}", err);
+                warn!("Failed to decrypt ESP packet: {err}");
                 Err("Failed to decrypt ESP packet".into())
             }
         }
@@ -156,10 +156,10 @@ impl SecurityAssociation {
                 return Err("Failed to parse IP packet from ESP".into());
             }
         };
-        trace!("Decoded IP packet from ESP {}", ip_packet);
+        trace!("Decoded IP packet from ESP {ip_packet}");
         let ip_header = ip_packet.to_header();
         if !self.accepts_esp_to_vpn(&ip_header) {
-            debug!("ESP packet {} dropped by traffic selector", ip_header);
+            debug!("ESP packet {ip_header} dropped by traffic selector");
             // Microsoft Teams can spam the network with a lot of stray packets.
             // Don't log an error if the packet is dropped to keep the logs clean on the info
             // level.
@@ -181,7 +181,7 @@ impl SecurityAssociation {
             }
             Ok(ip::RoutingActionEsp::Drop) => Ok(RoutingAction::Drop),
             Err(err) => {
-                warn!("Failed to NAT packet from ESP: {}", err);
+                warn!("Failed to NAT packet from ESP: {err}");
                 Err("Failed to NAT packet from ESP".into())
             }
         }
@@ -218,7 +218,7 @@ impl SecurityAssociation {
                 Ok(&data[..8 + encrypted_data_len])
             }
             Err(err) => {
-                warn!("Failed to encrypt ESP packet: {}", err);
+                warn!("Failed to encrypt ESP packet: {err}");
                 Err("Failed to encrypt ESP packet".into())
             }
         }
@@ -263,7 +263,7 @@ impl SecurityAssociation {
             Ok(ip::RoutingActionVpn::ReturnToSender(buf)) => Ok(RoutingAction::ReturnToSender(buf)),
             Ok(ip::RoutingActionVpn::Drop) => Ok(RoutingAction::Drop),
             Err(err) => {
-                warn!("Failed to NAT packet from VPN: {}", err);
+                warn!("Failed to NAT packet from VPN: {err}");
                 Err("Failed to NAT packet from VPN".into())
             }
         }
@@ -387,7 +387,7 @@ impl fmt::Display for EspError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Ip(err) => write!(f, "IP error {}", err),
+            Self::Ip(err) => write!(f, "IP error {err}"),
         }
     }
 }

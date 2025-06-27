@@ -83,7 +83,7 @@ impl fmt::Display for Opcode {
             Opcode::StandardQuery => write!(f, "Standard query"),
             Opcode::InverseQuery => write!(f, "Inverse query"),
             Opcode::Status => write!(f, "Status"),
-            Opcode::Reserved(code) => write!(f, "Reserved({})", code),
+            Opcode::Reserved(code) => write!(f, "Reserved({code})"),
         }
     }
 }
@@ -133,7 +133,7 @@ impl fmt::Display for ResponseCode {
             ResponseCode::NameError => write!(f, "Name error"),
             ResponseCode::NotImplemented => write!(f, "Not implemented"),
             ResponseCode::Refused => write!(f, "Refused"),
-            ResponseCode::Reserved(code) => write!(f, "Reserved({})", code),
+            ResponseCode::Reserved(code) => write!(f, "Reserved({code})"),
         }
     }
 }
@@ -285,8 +285,7 @@ impl DnsPacket<'_> {
                         Some(Ok((_, label))) => label == "_dns".as_bytes(),
                         Some(Err(err)) => {
                             warn!(
-                                "Failed to parse DNS packet while checking if it's a DoH chesk: {}",
-                                err
+                                "Failed to parse DNS packet while checking if it's a DoH chesk: {err}"
                             );
                             false
                         }
@@ -302,7 +301,7 @@ impl DnsPacket<'_> {
                             |(label, check_label)| match label {
                                 Ok((_, label)) => label.eq_ignore_ascii_case(check_label),
                                 Err(err) => {
-                                    warn!("Failed to parse DNS packet while checking if it matches suffix: {}", err);
+                                    warn!("Failed to parse DNS packet while checking if it matches suffix: {err}");
                                     false
                                 }
                             },
@@ -314,8 +313,7 @@ impl DnsPacket<'_> {
             }
             Err(err) => {
                 warn!(
-                    "Failed to parse DNS packet while checking if it matches suffix: {}",
-                    err
+                    "Failed to parse DNS packet while checking if it matches suffix: {err}"
                 );
                 false
             }
@@ -352,11 +350,11 @@ impl fmt::Display for DnsPacket<'_> {
                 write!(f, "; ")?;
             }
             match &section {
-                Ok(Section::Question(q)) => write!(f, "Q: {}", q)?,
-                Ok(Section::Answer(a)) => write!(f, "A: {}", a)?,
-                Ok(Section::Nameserver(ns)) => write!(f, "NS: {}", ns)?,
-                Ok(Section::AdditionalRecord(ar)) => write!(f, "AR: {}", ar)?,
-                Err(err) => write!(f, "Error: {}", err)?,
+                Ok(Section::Question(q)) => write!(f, "Q: {q}")?,
+                Ok(Section::Answer(a)) => write!(f, "A: {a}")?,
+                Ok(Section::Nameserver(ns)) => write!(f, "NS: {ns}")?,
+                Ok(Section::AdditionalRecord(ar)) => write!(f, "AR: {ar}")?,
+                Err(err) => write!(f, "Error: {err}")?,
             }
         }
         Ok(())
@@ -542,16 +540,16 @@ impl LabelIter<'_> {
         self.enumerate().try_for_each(|(i, segment)| {
             let (_, segment) = match segment {
                 Ok(segment) => segment,
-                Err(err) => return write!(f, "[err: {}]", err),
+                Err(err) => return write!(f, "[err: {err}]"),
             };
             let segment = match std::str::from_utf8(segment) {
                 Ok(segment) => segment,
-                Err(err) => return write!(f, "[utf8 err: {}]", err),
+                Err(err) => return write!(f, "[utf8 err: {err}]"),
             };
             if i == 0 {
-                write!(f, "{}", segment)
+                write!(f, "{segment}")
             } else {
-                write!(f, ".{}", segment)
+                write!(f, ".{segment}")
             }
         })
     }
@@ -619,7 +617,7 @@ impl fmt::Display for RrType {
             Self::OPT => write!(f, "OPT"),
             Self::SVCB => write!(f, "SVCB"),
             Self::HTTPS => write!(f, "HTTPS"),
-            RrType(code) => write!(f, "Unknown({})", code),
+            RrType(code) => write!(f, "Unknown({code})"),
         }
     }
 }
@@ -683,7 +681,7 @@ impl fmt::Display for RrClass {
             Self::CS => write!(f, "CS(Obsolete)"),
             Self::CH => write!(f, "CH"),
             Self::HS => write!(f, "HS"),
-            RrClass(code) => write!(f, "Unknown({})", code),
+            RrClass(code) => write!(f, "Unknown({code})"),
         }
     }
 }
@@ -1033,8 +1031,8 @@ impl fmt::Display for ResourceRecord<'_> {
             self.ttl(),
         )?;
         match self.rdata() {
-            Ok(data) => write!(f, " {}", data),
-            Err(err) => write!(f, " [err: {}]", err),
+            Ok(data) => write!(f, " {data}"),
+            Err(err) => write!(f, " [err: {err}]"),
         }
     }
 }
@@ -1289,16 +1287,16 @@ impl Dns64Translator {
                     };
                 }
                 Ok(Section::Answer(a)) => {
-                    debug!("Dropping unsupported A section from request: {}", a)
+                    debug!("Dropping unsupported A section from request: {a}")
                 }
                 Ok(Section::Nameserver(ns)) => {
-                    debug!("Dropping unsupported NS section from request: {}", ns)
+                    debug!("Dropping unsupported NS section from request: {ns}")
                 }
                 Ok(Section::AdditionalRecord(ar)) => {
-                    debug!("Dropping unsupported AR section from request: {}", ar)
+                    debug!("Dropping unsupported AR section from request: {ar}")
                 }
                 Err(err) => {
-                    warn!("Failed to parse DNS section: {}", err);
+                    warn!("Failed to parse DNS section: {err}");
                     return Ok(Self::write_error_response(
                         dest,
                         request.data,
@@ -1338,10 +1336,7 @@ impl Dns64Translator {
                     .iter()
                     .any(|reserved_range| reserved_range.contains(&addr))
                 {
-                    warn!(
-                        "Dropping untranslatable IPv4 address {} from response",
-                        addr
-                    );
+                    warn!("Dropping untranslatable IPv4 address {addr} from response");
                     return Ok(None);
                 }
                 let rr_type = if rr_type == RrType::A {
@@ -1417,15 +1412,9 @@ impl Dns64Translator {
                 let is_doh_discovery =
                     rr.rr_type() == RrType::SVCB || rr.rr_type() == RrType::HTTPS;
                 if is_doh_discovery {
-                    debug!(
-                        "Dropping DoH discovery {} resource record from response",
-                        rr_type
-                    );
+                    debug!("Dropping DoH discovery {rr_type} resource record from response");
                 } else {
-                    warn!(
-                        "Dropping unsupported {} resource record from response",
-                        rr_type
-                    );
+                    warn!("Dropping unsupported {rr_type} resource record from response");
                 }
                 Ok(None)
             }

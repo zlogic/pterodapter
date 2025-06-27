@@ -95,10 +95,7 @@ impl FortiService {
                 };
                 connected_data.need_echo = send_echo;
                 if let Some(Err(err)) = packet_available {
-                    warn!(
-                        "Failed to check if next packet from VPN is available: {}",
-                        err
-                    );
+                    warn!("Failed to check if next packet from VPN is available: {err}");
                     self.state = ConnectionState::Disconnected;
                     Err(err.into())
                 } else {
@@ -138,7 +135,7 @@ impl FortiService {
                         state.unflushed_writes += 1;
                     }
                     Err(err) => {
-                        warn!("Failed to send packet to VPN: {}", err);
+                        warn!("Failed to send packet to VPN: {err}");
                         self.state = ConnectionState::Disconnected;
                         return Err(err.into());
                     }
@@ -147,7 +144,7 @@ impl FortiService {
             if state.need_echo {
                 state.need_echo = false;
                 if let Err(err) = state.tunnel.process_echo().await {
-                    warn!("Echo request timed out: {}", err);
+                    warn!("Echo request timed out: {err}");
                     self.state = ConnectionState::Disconnected;
                     return Err(err.into());
                 }
@@ -155,7 +152,7 @@ impl FortiService {
             if state.unflushed_writes > FLUSH_INTERVAL || (state.unflushed_writes > 0 && !sent_data)
             {
                 if let Err(err) = state.tunnel.flush().await {
-                    warn!("Failed to flush data to VPN: {}", err);
+                    warn!("Failed to flush data to VPN: {err}");
                     self.state = ConnectionState::Disconnected;
                     return Err(err.into());
                 }
@@ -196,8 +193,8 @@ impl fmt::Display for VpnServiceError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::FortiVpn(e) => write!(f, "VPN client error: {}", e),
-            Self::Join(e) => write!(f, "Tokio join error: {}", e),
+            Self::FortiVpn(e) => write!(f, "VPN client error: {e}"),
+            Self::Join(e) => write!(f, "Tokio join error: {e}"),
         }
     }
 }

@@ -41,7 +41,7 @@ impl PkiProcessing {
             client_validation
                 .verify_server_cert(&server_cert_der)
                 .map_err(|err| {
-                    warn!("Failed to validate server certificate: {}", err);
+                    warn!("Failed to validate server certificate: {err}");
                     err
                 })?;
         };
@@ -123,10 +123,7 @@ impl PkiProcessing {
                     })
                     .next(),
                 Err(err) => {
-                    warn!(
-                        "Failed to parse client cert Subject Alternative Names: {}",
-                        err
-                    );
+                    warn!("Failed to parse client cert Subject Alternative Names: {err}");
                     None
                 }
             })
@@ -136,7 +133,7 @@ impl PkiProcessing {
             .subject
             .0
             .iter()
-            .filter_map(|entry| format!("{}", entry).into())
+            .filter_map(|entry| format!("{entry}").into())
             .next();
         let subject = if let Some(san) = san {
             san
@@ -410,11 +407,11 @@ impl fmt::Display for CertError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Rustls(e) => write!(f, "Rustls error: {}", e),
-            Self::Webpki(e) => write!(f, "WebPKI error: {}", e),
-            Self::VerifierBuilder(e) => write!(f, "Verifier Builder error: {}", e),
-            Self::X509(e) => write!(f, "X509 error: {}", e),
-            Self::Base64(e) => write!(f, "Base64 decode error: {}", e),
+            Self::Rustls(e) => write!(f, "Rustls error: {e}"),
+            Self::Webpki(e) => write!(f, "WebPKI error: {e}"),
+            Self::VerifierBuilder(e) => write!(f, "Verifier Builder error: {e}"),
+            Self::X509(e) => write!(f, "X509 error: {e}"),
+            Self::Base64(e) => write!(f, "Base64 decode error: {e}"),
         }
     }
 }

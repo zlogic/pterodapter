@@ -23,7 +23,7 @@ impl ExchangeType {
         if (Self::IKE_SA_INIT.0..=Self::INFORMATIONAL.0).contains(&value) {
             Ok(ExchangeType(value))
         } else {
-            warn!("Unsupported IKEv2 Exchange Type {}", value);
+            warn!("Unsupported IKEv2 Exchange Type {value}");
             Err("Unsupported IKEv2 Exchange Type".into())
         }
     }
@@ -129,8 +129,8 @@ impl fmt::Display for Spi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::None => Ok(()),
-            Self::U32(val) => write!(f, "{:x}", val),
-            Self::U64(val) => write!(f, "{:x}", val),
+            Self::U32(val) => write!(f, "{val:x}"),
+            Self::U64(val) => write!(f, "{val:x}"),
         }
     }
 }
@@ -220,14 +220,14 @@ impl InputMessage<'_> {
         let is_sa_init = match self.read_exchange_type() {
             Ok(exchange_type) => exchange_type == ExchangeType::IKE_SA_INIT,
             Err(err) => {
-                warn!("Error parsing exchange type {}", err);
+                warn!("Error parsing exchange type {err}");
                 valid = false;
                 false
             }
         };
         let message_id = self.read_message_id();
         if is_sa_init && message_id != 0 {
-            warn!("Message ID for IKE_SA_INIT is not 0: {}", message_id);
+            warn!("Message ID for IKE_SA_INIT is not 0: {message_id}");
             valid = false;
         }
         if self.read_initiator_spi() == 0 {
@@ -244,15 +244,12 @@ impl InputMessage<'_> {
         {
             let (major_version, minor_version) = self.read_version();
             if major_version != 2 {
-                warn!(
-                    "Unsupported major version {}.{}",
-                    major_version, minor_version
-                );
+                warn!("Unsupported major version {major_version}.{minor_version}");
                 valid = false;
             }
         }
         if let Err(err) = self.read_flags() {
-            warn!("Error parsing flags {}", err);
+            warn!("Error parsing flags {err}");
             valid = false;
         }
         {
@@ -1105,7 +1102,7 @@ impl IPSecProtocolID {
         if (Self::IKE.0..=Self::ESP.0).contains(&value) {
             Ok(IPSecProtocolID(value))
         } else {
-            warn!("Unsupported IKEv2 IPSec Protocol ID {}", value);
+            warn!("Unsupported IKEv2 IPSec Protocol ID {value}");
             Err("Unsupported IKEv2 IPSec Protocol ID".into())
         }
     }
@@ -1147,7 +1144,7 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
             return None;
         }
         if last_substruct == 2 && proposal_length >= self.data.len() {
-            warn!("Unexpected proposal last substruct {}", last_substruct);
+            warn!("Unexpected proposal last substruct {last_substruct}");
             return None;
         }
         if self.data.len() < proposal_length {
@@ -1168,7 +1165,7 @@ impl<'a> Iterator for SecurityAssociationIter<'a> {
         let protocol_id = match IPSecProtocolID::from_u8(data[5]) {
             Ok(protocol_id) => protocol_id,
             Err(err) => {
-                warn!("Unsupported protocol ID: {}", err);
+                warn!("Unsupported protocol ID: {err}");
                 return Some(Err("Unsupported protocol ID".into()));
             }
         };
@@ -1291,10 +1288,7 @@ impl TransformType {
             4 => Ok(Self::DiffieHellman(transform_id)),
             5 => Ok(Self::ExtendedSequenceNumbers(transform_id)),
             _ => {
-                warn!(
-                    "Unsupported IKEv2 Transform Type {} ID {}",
-                    transform_type, transform_id
-                );
+                warn!("Unsupported IKEv2 Transform Type {transform_type} ID {transform_id}");
                 Err("Unsupported IKEv2 Transform Type".into())
             }
         }
@@ -1352,16 +1346,16 @@ impl fmt::Display for TransformType {
             Self::DH_256_ECP => write!(f, "DH_256_ECP"),
             Self::NO_ESN => write!(f, "NO_ESN"),
             Self::ESN => write!(f, "ESN"),
-            TransformType::Encryption(id) => write!(f, "Unknown Encryption Algorithm {}", id),
+            TransformType::Encryption(id) => write!(f, "Unknown Encryption Algorithm {id}"),
             TransformType::PseudorandomFunction(id) => {
-                write!(f, "Unknown Pseudorandom Function {}", id)
+                write!(f, "Unknown Pseudorandom Function {id}")
             }
             TransformType::IntegrityAlgorithm(id) => {
-                write!(f, "Unknown Integrity Algorithm {}", id)
+                write!(f, "Unknown Integrity Algorithm {id}")
             }
-            TransformType::DiffieHellman(id) => write!(f, "Unknown Diffie-Hellman Group {}", id),
+            TransformType::DiffieHellman(id) => write!(f, "Unknown Diffie-Hellman Group {id}"),
             TransformType::ExtendedSequenceNumbers(id) => {
-                write!(f, "Unknown Extended Sequence Numbers {}", id)
+                write!(f, "Unknown Extended Sequence Numbers {id}")
             }
         }
     }
@@ -1395,7 +1389,7 @@ impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
             return None;
         }
         if last_substruct == 3 && transform_length >= self.data.len() {
-            debug!("Unexpected transform last substruc {}", last_substruct);
+            debug!("Unexpected transform last substruc {last_substruct}");
             return None;
         }
         if self.data.len() < transform_length {
@@ -1415,7 +1409,7 @@ impl<'a> Iterator for SecurityAssociationTransformIter<'a> {
         let transform_type = match TransformType::from_raw(transform_type, transform_id) {
             Ok(transform_type) => transform_type,
             Err(err) => {
-                debug!("Unsupported transform type: {}", err);
+                debug!("Unsupported transform type: {err}");
                 return Some(Err("Unsupported transform type".into()));
             }
         };
@@ -1452,7 +1446,7 @@ impl TransformAttributeType {
         if value == Self::KEY_LENGTH.0 {
             Ok(TransformAttributeType(value))
         } else {
-            debug!("Unsupported IKEv2 Transform Attribute Type {}", value);
+            debug!("Unsupported IKEv2 Transform Attribute Type {value}");
             Err("Unsupported IKEv2 Transform Attribute Type".into())
         }
     }
@@ -1508,7 +1502,7 @@ impl<'a> Iterator for SecurityAssociationTransformAttributesIter<'a> {
             match TransformAttributeType::from_u16(attribute_type & ATTRIBUTE_TYPE_MASK) {
                 Ok(attribute_type) => attribute_type,
                 Err(err) => {
-                    debug!("Unsupported attribute type: {}", err);
+                    debug!("Unsupported attribute type: {err}");
                     return Some(Err("Unsupported attribute type".into()));
                 }
             };
@@ -2102,7 +2096,7 @@ impl TrafficSelectorType {
         if (Self::TS_IPV4_ADDR_RANGE.0..=Self::TS_IPV6_ADDR_RANGE.0).contains(&value) {
             Ok(TrafficSelectorType(value))
         } else {
-            debug!("Unsupported IKEv2 Traffic Selector type {}", value);
+            debug!("Unsupported IKEv2 Traffic Selector type {value}");
             Err("Unsupported IKEv2 Traffic Selector type".into())
         }
     }
@@ -2345,7 +2339,7 @@ impl ConfigurationType {
         if (Self::CFG_REQUEST.0..=Self::CFG_ACK.0).contains(&value) {
             Ok(ConfigurationType(value))
         } else {
-            debug!("Unsupported IKEv2 Configuration Type {}", value);
+            debug!("Unsupported IKEv2 Configuration Type {value}");
             Err("Unsupported IKEv2 Configuration Type".into())
         }
     }
@@ -2454,7 +2448,7 @@ impl<'a> Iterator for ConfigurationAttributesIter<'a> {
         attribute_type.copy_from_slice(&data[0..2]);
         let attribute_type = u16::from_be_bytes(attribute_type);
         if attribute_type & ATTRIBUTE_TYPE_RESERVED != 0x0000 {
-            debug!("Attribute type reserved flag is set {:x}", attribute_type);
+            debug!("Attribute type reserved flag is set {attribute_type:x}");
             return Some(Err("Attribute type reserved flag is set".into()));
         }
         let attribute_type =
@@ -2552,7 +2546,7 @@ impl fmt::Debug for Payload<'_> {
                     let prop = match prop {
                         Ok(prop) => prop,
                         Err(err) => {
-                            writeln!(f, "    Proposal invalid {}", err)?;
+                            writeln!(f, "    Proposal invalid {err}")?;
                             continue;
                         }
                     };
@@ -2565,7 +2559,7 @@ impl fmt::Debug for Payload<'_> {
                         let tf = match tf {
                             Ok(tf) => tf,
                             Err(err) => {
-                                writeln!(f, "      Transform invalid {}", err)?;
+                                writeln!(f, "      Transform invalid {err}")?;
                                 continue;
                             }
                         };
@@ -2574,7 +2568,7 @@ impl fmt::Debug for Payload<'_> {
                             let attr = match attr {
                                 Ok(attr) => attr,
                                 Err(err) => {
-                                    writeln!(f, "        Attribute type invalid {}", err)?;
+                                    writeln!(f, "        Attribute type invalid {err}")?;
                                     continue;
                                 }
                             };
@@ -2635,7 +2629,7 @@ impl fmt::Debug for Payload<'_> {
             Payload::Notify(pl_notify) => {
                 write!(f, "    Notify protocol ID ")?;
                 match pl_notify.protocol_id {
-                    Some(protocol) => write!(f, "{}", protocol)?,
+                    Some(protocol) => write!(f, "{protocol}")?,
                     None => write!(f, "None")?,
                 }
                 write!(f, " SPI {} type {}", pl_notify.spi, pl_notify.message_type,)?;
@@ -2643,7 +2637,7 @@ impl fmt::Debug for Payload<'_> {
                     write!(f, " list",)?;
                     if let Ok(hash_algorithms) = pl_notify.to_signature_hash_algorithms() {
                         for alg in hash_algorithms {
-                            write!(f, " {}", alg)?;
+                            write!(f, " {alg}")?;
                         }
                     } else {
                         write!(f, " error")?;
@@ -2656,7 +2650,7 @@ impl fmt::Debug for Payload<'_> {
             Payload::Delete(pl_delete) => {
                 write!(f, "    Delete protocol ID {} SPI", pl_delete.protocol_id)?;
                 for delete_spi in pl_delete.iter_spi() {
-                    write!(f, " {}", delete_spi)?;
+                    write!(f, " {delete_spi}")?;
                 }
                 writeln!(f)?;
             }
@@ -2665,7 +2659,7 @@ impl fmt::Debug for Payload<'_> {
                     let ts = match ts {
                         Ok(ts) => ts,
                         Err(err) => {
-                            writeln!(f, "    Traffic selector invalid {}", err)?;
+                            writeln!(f, "    Traffic selector invalid {err}")?;
                             continue;
                         }
                     };
@@ -2687,7 +2681,7 @@ impl fmt::Debug for Payload<'_> {
                     let attr = match attr {
                         Ok(attr) => attr,
                         Err(err) => {
-                            writeln!(f, "      Configuration attribute invalid {}", err)?;
+                            writeln!(f, "      Configuration attribute invalid {err}")?;
                             continue;
                         }
                     };
@@ -2728,12 +2722,12 @@ impl fmt::Debug for InputMessage<'_> {
             writeln!(f, "  Version {}.{}", version.0, version.1)?;
         }
         match self.read_exchange_type() {
-            Ok(t) => writeln!(f, "  Exchange type {}", t),
-            Err(err) => writeln!(f, "  Exchange type {}", err),
+            Ok(t) => writeln!(f, "  Exchange type {t}"),
+            Err(err) => writeln!(f, "  Exchange type {err}"),
         }?;
         match self.read_flags() {
-            Ok(t) => writeln!(f, "  Flags {}", t),
-            Err(err) => writeln!(f, "  Flags {}", err),
+            Ok(t) => writeln!(f, "  Flags {t}"),
+            Err(err) => writeln!(f, "  Flags {err}"),
         }?;
         writeln!(f, "  Message ID {}", self.read_message_id())?;
         writeln!(f, "  Length {}", self.read_length())?;
@@ -2741,7 +2735,7 @@ impl fmt::Debug for InputMessage<'_> {
             let pl = match pl {
                 Ok(pl) => pl,
                 Err(err) => {
-                    writeln!(f, "  Payload data invalid {}", err)?;
+                    writeln!(f, "  Payload data invalid {err}")?;
                     continue;
                 }
             };
@@ -2760,7 +2754,7 @@ impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.msg)?;
         if let Some(error_code) = &self.error_code {
-            write!(f, " ({})", error_code)?;
+            write!(f, " ({error_code})")?;
         }
         Ok(())
     }

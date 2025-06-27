@@ -53,17 +53,17 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     let listener = match TcpListener::bind(REDIRECT_ADDRESS).await {
         Ok(listener) => listener,
         Err(err) => {
-            warn!("Failed to bind listener on {}: {}", REDIRECT_ADDRESS, err);
+            warn!("Failed to bind listener on {REDIRECT_ADDRESS}: {err}");
             return Err("Failed to bind listener".into());
         }
     };
     let socket = match listener.accept().await {
         Ok((socket, addr)) => {
-            debug!("New connection on SAML redirect port from {}", addr);
+            debug!("New connection on SAML redirect port from {addr}");
             socket
         }
         Err(err) => {
-            warn!("Failed to accept incoming connection: {}", err);
+            warn!("Failed to accept incoming connection: {err}");
             return Err("Failed to accept incoming connection".into());
         }
     };
@@ -99,7 +99,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         socket
             .write_all(
                 http::build_request(
-                    format!("GET /remote/saml/auth_id?id={}", token_id).as_str(),
+                    format!("GET /remote/saml/auth_id?id={token_id}").as_str(),
                     domain,
                     None,
                     0,
@@ -218,18 +218,18 @@ impl FortiVPNTunnel {
             let ipv4_addr_start = if let Some(start) = content.find(IPV4_ADDRESS_PREFIX) {
                 start
             } else {
-                debug!("Unsupported config format: {}", content);
+                debug!("Unsupported config format: {content}");
                 return Err("Cannot find IPv4 address in config".into());
             };
             let content = &content[ipv4_addr_start + IPV4_ADDRESS_PREFIX.len()..];
             let ipv4_addr_end = if let Some(start) = content.find("'") {
                 start
             } else {
-                debug!("Unsupported config format: {}", content);
+                debug!("Unsupported config format: {content}");
                 return Err("Cannot find IPv4 address in config".into());
             };
             IpAddr::from_str(&content[..ipv4_addr_end]).map_err(|err| {
-                debug!("Failed to parse IPv4 address: {}", err);
+                debug!("Failed to parse IPv4 address: {err}");
                 "Failed to parse IPv4 address"
             })?
         };
@@ -242,11 +242,11 @@ impl FortiVPNTunnel {
             let dns_end = if let Some(start) = content.find("'") {
                 start
             } else {
-                debug!("Unsupported config format: {}", content);
+                debug!("Unsupported config format: {content}");
                 return Err("Cannot find DNS address in config".into());
             };
             let dns_addr = IpAddr::from_str(&content[..dns_end]).map_err(|err| {
-                debug!("Failed to parse DNS address: {}", err);
+                debug!("Failed to parse DNS address: {err}");
                 "Failed to parse DNS address"
             })?;
             dns.push(dns_addr);
@@ -282,7 +282,7 @@ impl FortiVPNTunnel {
         let length =
             ppp::encode_lcp_config(&mut req, ppp::LcpCode::CONFIGURE_REQUEST, identifier, &opts)
                 .map_err(|err| {
-                    debug!("Failed to encode LCP Configure-Request: {}", err);
+                    debug!("Failed to encode LCP Configure-Request: {err}");
                     "Failed to encode LCP Configure-Request"
                 })?;
         Self::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
@@ -295,7 +295,7 @@ impl FortiVPNTunnel {
                 .read_header(socket, &mut resp)
                 .await
                 .map_err(|err| {
-                    debug!("Failed to read PPP header: {}", err);
+                    debug!("Failed to read PPP header: {err}");
                     "Failed to read PPP header"
                 })?;
             let protocol = if let Some(protocol) = ppp_state.read_protocol(&resp) {
@@ -305,17 +305,14 @@ impl FortiVPNTunnel {
             };
             let resp = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
             let response = ppp::Packet::from_bytes(protocol, resp).map_err(|err| {
-                debug!("Failed to decode PPP packet: {}", err);
+                debug!("Failed to decode PPP packet: {err}");
                 "Failed to decode PPP packet"
             })?;
-            debug!("Received PPP packet: {}", response);
+            debug!("Received PPP packet: {response}");
             let lcp_packet = match &response {
                 ppp::Packet::Lcp(lcp) => lcp,
                 ppp::Packet::Unknown(_) | ppp::Packet::Ipcp(_) => {
-                    debug!(
-                        "Received unexpected PPP packet during LCP handshake: {}",
-                        response
-                    );
+                    debug!("Received unexpected PPP packet during LCP handshake: {response}");
                     continue;
                 }
             };
@@ -327,7 +324,7 @@ impl FortiVPNTunnel {
                     let options_match = match received_opts {
                         Ok(received_opts) => opts == received_opts.as_slice(),
                         Err(err) => {
-                            debug!("Failed to decode LCP Ack options: {}", err);
+                            debug!("Failed to decode LCP Ack options: {err}");
                             return Err("Failed to decode LCP Ack options".into());
                         }
                     };
@@ -344,8 +341,7 @@ impl FortiVPNTunnel {
                                 Ok(opt) => opt,
                                 Err(err) => {
                                     debug!(
-                                        "Remote side sent invalid LCP configuration option: {}",
-                                        err
+                                        "Remote side sent invalid LCP configuration option: {err}"
                                     );
                                     return Err(
                                         "Remote side sent invalid LCP configuration option".into(),
@@ -357,15 +353,14 @@ impl FortiVPNTunnel {
                                     if offered_mtu <= mtu {
                                         Ok(opt)
                                     } else {
-                                        debug!("Remote side sent unacceptable MTU: {}", mtu);
+                                        debug!("Remote side sent unacceptable MTU: {mtu}");
                                         Err("Remote side sent unacceptable MTU".into())
                                     }
                                 }
                                 ppp::LcpOptionData::MagicNumber(_) => Ok(opt),
                                 _ => {
                                     debug!(
-                                        "Remote side sent unsupported LCP configuration option: {}",
-                                        opt
+                                        "Remote side sent unsupported LCP configuration option: {opt}"
                                     );
                                     Err("Remote side sent unsupported LCP configuration option"
                                         .into())
@@ -380,7 +375,7 @@ impl FortiVPNTunnel {
                         lcp_packet.read_options(),
                     )
                     .map_err(|err| {
-                        debug!("Failed to encode LCP Configure-Ack: {}", err);
+                        debug!("Failed to encode LCP Configure-Ack: {err}");
                         "Failed to encode LCP Configure-Ack"
                     })?;
                     Self::send_ppp_packet(socket, ppp::Protocol::LCP, &req[..length]).await?;
@@ -388,15 +383,15 @@ impl FortiVPNTunnel {
                     remote_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_NAK => {
-                    debug!("Remote side Nak'd LCP configuration: {}", response);
+                    debug!("Remote side Nak'd LCP configuration: {response}");
                     return Err("Remote side Nak'd LCP configuration".into());
                 }
                 ppp::LcpCode::CONFIGURE_REJECT => {
-                    debug!("Remote side rejected LCP configuration: {}", response);
+                    debug!("Remote side rejected LCP configuration: {response}");
                     return Err("Remote side rejected LCP configuration".into());
                 }
                 _ => {
-                    debug!("Received unexpected PPP packet: {}", response);
+                    debug!("Received unexpected PPP packet: {response}");
                     return Err("Unexpected PPP packet received".into());
                 }
             }
@@ -423,7 +418,7 @@ impl FortiVPNTunnel {
         let length =
             ppp::encode_ipcp_config(&mut req, ppp::LcpCode::CONFIGURE_REQUEST, identifier, &opts)
                 .map_err(|err| {
-                debug!("Failed to encode IPCP Configure-Request: {}", err);
+                debug!("Failed to encode IPCP Configure-Request: {err}");
                 "Failed to encode IPCP Configure-Request"
             })?;
         let mut opts = [0u8; 100];
@@ -439,7 +434,7 @@ impl FortiVPNTunnel {
                 .read_header(socket, &mut resp)
                 .await
                 .map_err(|err| {
-                    debug!("Failed to read PPP header: {}", err);
+                    debug!("Failed to read PPP header: {err}");
                     "Failed to read PPP header"
                 })?;
             let protocol = if let Some(protocol) = ppp_state.read_protocol(&resp) {
@@ -449,17 +444,14 @@ impl FortiVPNTunnel {
             };
             let resp = Self::read_ppp_packet(socket, ppp_state, &mut resp).await?;
             let response = ppp::Packet::from_bytes(protocol, resp).map_err(|err| {
-                debug!("Failed to decode PPP packet: {}", err);
+                debug!("Failed to decode PPP packet: {err}");
                 "Failed to decode PPP packet"
             })?;
-            debug!("Received PPP packet: {}", response);
+            debug!("Received PPP packet: {response}");
             let ipcp_packet = match &response {
                 ppp::Packet::Ipcp(ipcp_packet) => ipcp_packet,
                 ppp::Packet::Unknown(_) | ppp::Packet::Lcp(_) => {
-                    debug!(
-                        "Received unexpected PPP packet during handshake: {}",
-                        response
-                    );
+                    debug!("Received unexpected PPP packet during handshake: {response}");
                     continue;
                 }
             };
@@ -478,8 +470,7 @@ impl FortiVPNTunnel {
                                 Ok(opt) => opt,
                                 Err(err) => {
                                     debug!(
-                                        "Remote side sent invalid IPCP configuration option: {}",
-                                        err
+                                        "Remote side sent invalid IPCP configuration option: {err}"
                                     );
                                     return Err(
                                         "Remote side sent invalid IPCP configuration option".into(),
@@ -492,8 +483,7 @@ impl FortiVPNTunnel {
                                 ppp::IpcpOptionData::SecondaryDns(_) => Ok(opt),
                                 _ => {
                                     debug!(
-                                        "Remote side sent unsupported IPCP configuration option: {}",
-                                        opt
+                                        "Remote side sent unsupported IPCP configuration option: {opt}"
                                     );
                                     Err("Remote side sent unsupported IPCP configuration option".into())
                                 }
@@ -507,7 +497,7 @@ impl FortiVPNTunnel {
                         ipcp_packet.read_options(),
                     )
                     .map_err(|err| {
-                        debug!("Failed to encode IPCP Configure-Ack: {}", err);
+                        debug!("Failed to encode IPCP Configure-Ack: {err}");
                         "Failed to encode IPCP Configure-Ack"
                     })?;
                     Self::send_ppp_packet(socket, ppp::Protocol::IPV4CP, &req[..length]).await?;
@@ -515,15 +505,15 @@ impl FortiVPNTunnel {
                     remote_acked = true;
                 }
                 ppp::LcpCode::CONFIGURE_NAK => {
-                    debug!("Remote side Nak'd IPCP configuration: {}", response);
+                    debug!("Remote side Nak'd IPCP configuration: {response}");
                     return Err("Remote side Nak'd IPCP configuration".into());
                 }
                 ppp::LcpCode::CONFIGURE_REJECT => {
-                    debug!("Remote side rejected IPCP configuration: {}", response);
+                    debug!("Remote side rejected IPCP configuration: {response}");
                     return Err("Remote side rejected IPCP configuration".into());
                 }
                 _ => {
-                    debug!("Received unexpected PPP packet: {}", response);
+                    debug!("Received unexpected PPP packet: {response}");
                     return Err("Unexpected PPP packet received".into());
                 }
             }
@@ -561,7 +551,7 @@ impl FortiVPNTunnel {
         dest: &'a mut [u8],
     ) -> Result<&'a [u8], FortiError> {
         state.read_header(socket, dest).await.map_err(|err| {
-            debug!("Failed to read PPP header: {}", err);
+            debug!("Failed to read PPP header: {err}");
             "Failed to read PPP header"
         })?;
         // Read all data to the end.
@@ -575,7 +565,7 @@ impl FortiVPNTunnel {
         let mut req = [0u8; 8];
         let data = self.ppp_magic.to_be_bytes();
         let length = ppp::encode_lcp_data(&mut req, code, identifier, &data).map_err(|err| {
-            debug!("Failed to encode {}: {}", code, err);
+            debug!("Failed to encode {code}: {err}");
             "Failed to encode Echo message"
         })?;
         Self::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await?;
@@ -620,7 +610,7 @@ impl FortiVPNTunnel {
         let packet = match ppp::Packet::from_bytes(ppp::Protocol::LCP, dest) {
             Ok(packet) => packet,
             Err(err) => {
-                info!("Failed to decode PPP packet: {}", err);
+                info!("Failed to decode PPP packet: {err}");
                 return Err("Failed to decode PPP packet".into());
             }
         };
@@ -638,7 +628,7 @@ impl FortiVPNTunnel {
                 self.send_echo(ppp::LcpCode::ECHO_REPLY, packet.identifier())
                     .await
                     .map_err(|err| {
-                        debug!("Failed to reply to echo {}", err);
+                        debug!("Failed to reply to echo {err}");
                         err
                     })?;
             }
@@ -668,7 +658,7 @@ impl FortiVPNTunnel {
             }
             ppp::Protocol::IPV4 | ppp::Protocol::IPV6 => Ok(self.ppp_state.consume_packet(dest)),
             _ => {
-                info!("Received unexpected PPP packet {}, ignoring", protocol);
+                info!("Received unexpected PPP packet {protocol}, ignoring");
                 Ok(&[])
             }
         }
@@ -685,7 +675,7 @@ impl FortiVPNTunnel {
             &[],
         )
         .map_err(|err| {
-            debug!("Failed to encode Terminate-Request: {}", err);
+            debug!("Failed to encode Terminate-Request: {err}");
             "Failed to encode Terminate-Request message"
         })?;
         Self::send_ppp_packet(&mut self.socket, ppp::Protocol::LCP, &req[..length]).await?;
@@ -696,7 +686,7 @@ impl FortiVPNTunnel {
                 .read_header(&mut self.socket, &mut resp)
                 .await
                 .map_err(|err| {
-                    debug!("Failed to read PPP header: {}", err);
+                    debug!("Failed to read PPP header: {err}");
                     "Failed to read PPP header"
                 })?;
             let protocol = if let Some(protocol) = self.ppp_state.read_protocol(&resp) {
@@ -707,21 +697,18 @@ impl FortiVPNTunnel {
             let resp =
                 Self::read_ppp_packet(&mut self.socket, &mut self.ppp_state, &mut resp).await?;
             let response = ppp::Packet::from_bytes(protocol, resp).map_err(|err| {
-                debug!("Failed to decode PPP packet: {}", err);
+                debug!("Failed to decode PPP packet: {err}");
                 "Failed to decode PPP packet"
             })?;
-            debug!("Received PPP packet: {}", response);
+            debug!("Received PPP packet: {response}");
             let lcp_packet = match &response {
                 ppp::Packet::Lcp(lcp) => lcp,
                 ppp::Packet::Unknown(_) | ppp::Packet::Ipcp(_) => {
-                    debug!(
-                        "Received unexpected PPP packet during termination: {}",
-                        response
-                    );
+                    debug!("Received unexpected PPP packet during termination: {response}");
                     continue;
                 }
             };
-            debug!("Received LCP packet: {:?}", response);
+            debug!("Received LCP packet: {response:?}");
             if lcp_packet.code() == ppp::LcpCode::TERMINATE_ACK {
                 break;
             }
@@ -774,7 +761,7 @@ impl PPPState {
                     }
                 }
                 Err(err) => {
-                    debug!("Failed to read PPP data: {}", err);
+                    debug!("Failed to read PPP data: {err}");
                     return Err("Failed to read PPP data".into());
                 }
             }
@@ -801,8 +788,7 @@ impl PPPState {
         let magic = &buf[2..4];
         if ppp_size != data_size + 6 {
             debug!(
-                "Conflicting packet size data: PPP packet size is {}, data size is {}",
-                ppp_size, data_size
+                "Conflicting packet size data: PPP packet size is {ppp_size}, data size is {data_size}"
             );
             return Err("Header has conflicting length data".into());
         }
@@ -863,9 +849,9 @@ impl PPPState {
         if &buf[..FALL_BACK_TO_HTTP.len()] == FALL_BACK_TO_HTTP {
             // FortiVPN will return an HTTP response if something goes wrong on setup.
             let headers = http::read_headers(socket).await?;
-            debug!("Tunnel not active, error response: {}", headers);
+            debug!("Tunnel not active, error response: {headers}");
             let content = http::read_content(socket, headers.as_str()).await?;
-            debug!("Error contents: {}", content);
+            debug!("Error contents: {content}");
             Err("Tunnel refused to establish link".into())
         } else {
             Ok(())
@@ -888,10 +874,10 @@ impl fmt::Display for FortiError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(e) => write!(f, "IO error: {}", e),
-            Self::Tls(e) => write!(f, "TLS error: {}", e),
-            Self::Dns(e) => write!(f, "DNS error: {}", e),
-            Self::Http(e) => write!(f, "HTTP error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::Tls(e) => write!(f, "TLS error: {e}"),
+            Self::Dns(e) => write!(f, "DNS error: {e}"),
+            Self::Http(e) => write!(f, "HTTP error: {e}"),
         }
     }
 }

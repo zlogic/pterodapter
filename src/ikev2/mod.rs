@@ -141,7 +141,7 @@ impl Server {
                                 .await;
                         }
                         Err(err) => {
-                            warn!("Failed to refresh IP addresses for split routes: {}", err);
+                            warn!("Failed to refresh IP addresses for split routes: {err}");
                             continue;
                         }
                     }
@@ -236,7 +236,7 @@ impl Server {
                         shutdown = true;
                         sessions.cleanup(&rt);
                         if let Err(err) = vpn_service.terminate().await {
-                            warn!("Failed to terminate VPN client connection: {}", err);
+                            warn!("Failed to terminate VPN client connection: {err}");
                         }
                     }
                     _ => {
@@ -257,18 +257,18 @@ impl Server {
                         ) {
                             Ok(action) => action,
                             Err(err) => {
-                                warn!("Failed to forward VPN packet to IKEv2: {}", err);
+                                warn!("Failed to forward VPN packet to IKEv2: {err}");
                                 VpnRoutingAction::Drop
                             }
                         }
                     }
                     Err(err) => {
-                        warn!("Failed to read packet from VPN: {}", err);
+                        warn!("Failed to read packet from VPN: {err}");
                         VpnRoutingAction::Drop
                     }
                 },
                 Some(Err(err)) => {
-                    warn!("VPN reported an error status: {}", err);
+                    warn!("VPN reported an error status: {err}");
                     VpnRoutingAction::Drop
                 }
                 None => VpnRoutingAction::Drop,
@@ -292,13 +292,13 @@ impl Server {
                     match result {
                         Ok(action) => action,
                         Err(err) => {
-                            warn!("Failed to process message from {}: {}", remote_addr, err);
+                            warn!("Failed to process message from {remote_addr}: {err}");
                             EspRoutingAction::Drop
                         }
                     }
                 }
                 Some(Err(err)) => {
-                    warn!("Failed to read data from UDP socket: {}", err);
+                    warn!("Failed to read data from UDP socket: {err}");
                     EspRoutingAction::Drop
                 }
                 None => EspRoutingAction::Drop,
@@ -362,13 +362,13 @@ impl Server {
                 (vpn_event, sent_udp_response, forwarded_udp_packet)
             };
             if let Some(Err(err)) = sent_udp_response {
-                warn!("Failed to send UDP ESP response: {}", err);
+                warn!("Failed to send UDP ESP response: {err}");
             }
             if let Some(Err(err)) = forwarded_udp_packet {
-                warn!("Failed to forward message to UDP ESP: {}", err);
+                warn!("Failed to forward message to UDP ESP: {err}");
             }
             if let Some(Err(err)) = vpn_event {
-                warn!("Failed to process VPN lifecycle events: {}", err);
+                warn!("Failed to process VPN lifecycle events: {err}");
             }
             if vpn_is_connected && !vpn_service.is_connected() {
                 sessions.delete_all_sessions(&rt);
@@ -392,13 +392,13 @@ impl Sockets {
                 let socket = match UdpSocket::bind((*listen_ip, listen_port)).await {
                     Ok(socket) => socket,
                     Err(err) => {
-                        log::error!("Failed to open listener on {}: {}", listen_ip, err);
+                        log::error!("Failed to open listener on {listen_ip}: {err}");
                         return Err(err.into());
                     }
                 };
                 let socket = Arc::new(socket);
                 let listen_addr = socket.local_addr()?;
-                info!("Started server on {}", listen_addr);
+                info!("Started server on {listen_addr}");
                 sockets.insert(listen_addr, socket.clone());
                 socket_list.push((listen_addr, socket));
             }
@@ -426,8 +426,7 @@ impl Sockets {
                 }
             } else {
                 warn!(
-                    "No open sockets for source address {} (destination {})",
-                    local_addr, remote_addr
+                    "No open sockets for source address {local_addr} (destination {remote_addr})"
                 );
                 Poll::Ready(Err("No open sockets for source address".into()))
             }
@@ -462,7 +461,7 @@ impl Sockets {
                     }));
                 }
                 Poll::Ready(Err(err)) => {
-                    warn!("Failed to receive from socket {}: {}", listen_addr, err);
+                    warn!("Failed to receive from socket {listen_addr}: {err}");
                     return Poll::Ready(Err(err.into()));
                 }
                 Poll::Pending => {}
@@ -479,18 +478,12 @@ impl Sockets {
     ) -> Result<(), SendError> {
         if let Some(socket) = self.sockets.get(local_addr) {
             socket.send_to(data, remote_addr).await.map_err(|err| {
-                warn!(
-                    "Failed to send UDP message from {} to {}: {}",
-                    local_addr, remote_addr, err
-                );
+                warn!("Failed to send UDP message from {local_addr} to {remote_addr}: {err}");
                 err
             })?;
             Ok(())
         } else {
-            warn!(
-                "No open sockets for source address {} (destination {})",
-                local_addr, remote_addr
-            );
+            warn!("No open sockets for source address {local_addr} (destination {remote_addr})");
             Err("No open sockets for source address".into())
         }
     }
@@ -639,10 +632,7 @@ impl Sessions {
         self.half_sessions
             .retain(|(remote_addr, remote_spi), (local_spi, expires_at)| {
                 if *expires_at + IKE_INIT_SA_EXPIRATION < now {
-                    info!(
-                        "Deleting expired init session {} (SPI {:x})",
-                        remote_addr, remote_spi
-                    );
+                    info!("Deleting expired init session {remote_addr} (SPI {remote_spi:x})");
                     self.sessions
                         .remove(&session::SessionID::new(*remote_spi, *local_spi));
                     false
@@ -663,8 +653,7 @@ impl Sessions {
                     .for_each(|local_spi| {
                         if self.security_associations.remove(&local_spi).is_some() {
                             info!(
-                                "Deleted Security Association {:x} from expired session {}",
-                                local_spi, session_id
+                                "Deleted Security Association {local_spi:x} from expired session {session_id}"
                             );
                         }
                     });
@@ -689,10 +678,7 @@ impl Sessions {
             let message_id = match session.start_request_delete_ike() {
                 Ok(message_id) => message_id,
                 Err(err) => {
-                    warn!(
-                        "Failed to prepare Delete request to session {}: {}",
-                        session_id, err
-                    );
+                    warn!("Failed to prepare Delete request to session {session_id}: {err}");
                     continue;
                 }
             };
@@ -717,8 +703,7 @@ impl Sessions {
                     .for_each(|local_spi| {
                         if self.security_associations.remove(&local_spi).is_some() {
                             info!(
-                                "Deleted Security Association {:x} from non-established session {}",
-                                local_spi, session_id
+                                "Deleted Security Association {local_spi:x} from non-established session {session_id}"
                             );
                         }
                     });
@@ -731,15 +716,14 @@ impl Sessions {
 
     fn delete_session(&mut self, session_id: session::SessionID) {
         if let Some(session) = self.sessions.remove(&session_id) {
-            debug!("Deleted IKEv2 session {}", session_id);
+            debug!("Deleted IKEv2 session {session_id}");
             session
                 .get_local_sa_spis()
                 .into_iter()
                 .for_each(|local_spi| {
                     if self.security_associations.remove(&local_spi).is_some() {
                         debug!(
-                            "Deleted Security Association {:x} from session {}",
-                            local_spi, session_id
+                            "Deleted Security Association {local_spi:x} from session {session_id}"
                         );
                     }
                 });
@@ -748,7 +732,7 @@ impl Sessions {
 
     fn delete_security_association(&mut self, session_id: u32) {
         if self.security_associations.remove(&session_id).is_some() {
-            debug!("Deleted Security Association {:x}", session_id)
+            debug!("Deleted Security Association {session_id:x}")
         }
     }
 
@@ -890,10 +874,7 @@ impl Sessions {
                     .send_last_response(&self.sockets, ikev2_request.read_message_id(), is_nat)
                     .await
                 {
-                    warn!(
-                        "Failed to transmit response to session {}: {}",
-                        session_id, err
-                    );
+                    warn!("Failed to transmit response to session {session_id}: {err}");
                 }
             }
         }
@@ -909,10 +890,7 @@ impl Sessions {
         let session = if let Some(session_id) = self.sessions.get_mut(&session_id) {
             session_id
         } else {
-            warn!(
-                "Failed to find IKEv2 session {} to process pending actions",
-                session_id
-            );
+            warn!("Failed to find IKEv2 session {session_id} to process pending actions");
             return;
         };
 
@@ -928,8 +906,7 @@ impl Sessions {
                         .is_some()
                     {
                         debug!(
-                            "Cleaned up completed init session {} (SPI {:x})",
-                            remote_addr, remote_spi
+                            "Cleaned up completed init session {remote_addr} (SPI {remote_spi:x})"
                         );
                     }
                 }
@@ -942,7 +919,7 @@ impl Sessions {
                     let tx = self.command_sender.clone();
                     let cmd = SessionMessage::DeleteSession(session_id);
                     rt.spawn(async move {
-                        debug!("Scheduling to delete IKEv2 session {}", session_id);
+                        debug!("Scheduling to delete IKEv2 session {session_id}");
                         if !delay.is_zero() {
                             time::sleep(delay).await;
                         }
@@ -968,10 +945,7 @@ impl Sessions {
                     let tx = self.command_sender.clone();
                     let cmd = SessionMessage::DeleteSecurityAssociation(session_id);
                     rt.spawn(async move {
-                        debug!(
-                            "Scheduling to delete Security Association session {:x}",
-                            session_id
-                        );
+                        debug!("Scheduling to delete Security Association session {session_id:x}");
                         if !delay.is_zero() {
                             time::sleep(delay).await;
                         }
@@ -992,8 +966,7 @@ impl Sessions {
                     .for_each(|local_spi| {
                         if self.security_associations.remove(&local_spi).is_some() {
                             info!(
-                                "Deleted Security Association {:x} from session {} deleted on INITIAL_CONTACT",
-                                local_spi, session_id
+                                "Deleted Security Association {local_spi:x} from session {session_id} deleted on INITIAL_CONTACT"
                             );
                         }
                     });
@@ -1013,21 +986,15 @@ impl Sessions {
         let session = if let Some(session) = self.sessions.get_mut(&session_id) {
             session
         } else {
-            debug!(
-                "Failed to retransmit request: missing session {}",
-                session_id
-            );
+            debug!("Failed to retransmit request: missing session {session_id}");
             return;
         };
         if let Err(err) = session.send_last_request(&self.sockets, message_id).await {
-            warn!(
-                "Failed to retransmit last request to session {}: {}",
-                session_id, err
-            );
+            warn!("Failed to retransmit last request to session {session_id}: {err}");
         }
         match session.next_retransmission() {
             session::NextRetransmission::Timeout => {
-                warn!("Session {} reached retrasmission limit", session_id);
+                warn!("Session {session_id} reached retrasmission limit");
             }
             session::NextRetransmission::Delay(delay) => {
                 Self::schedule_retransmission(
@@ -1116,7 +1083,7 @@ impl Sessions {
                 return Err("Failed to decode IP packet from VPN".into());
             }
         };
-        trace!("Decoded IP packet from VPN {}", ip_packet);
+        trace!("Decoded IP packet from VPN {ip_packet}");
         let ip_header = ip_packet.to_header();
         // Prefer an active, most recent SA.
         if let Some(sa) = self
@@ -1138,10 +1105,7 @@ impl Sessions {
             };
             Ok(VpnRoutingAction::Process(routing_action, destination))
         } else {
-            debug!(
-                "No matching Security Associations found for VPN packet {}",
-                ip_header
-            );
+            debug!("No matching Security Associations found for VPN packet {ip_header}");
             Err("No matching Security Associations found for VPN packet".into())
         }
     }
@@ -1157,7 +1121,7 @@ impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Io(e) => write!(f, "IO error: {}", e),
+            Self::Io(e) => write!(f, "IO error: {e}"),
         }
     }
 }
@@ -1202,16 +1166,16 @@ impl fmt::Display for IKEv2Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Format(e) => write!(f, "Format error: {}", e),
+            Self::Format(e) => write!(f, "Format error: {e}"),
             Self::NotEnoughSpace(_) => write!(f, "Not enough space error"),
-            Self::CertError(e) => write!(f, "PKI cert error: {}", e),
-            Self::Session(e) => write!(f, "IKEv2 session error: {}", e),
-            Self::Esp(e) => write!(f, "ESP error: {}", e),
-            Self::Ip(e) => write!(f, "IP error: {}", e),
-            Self::Forti(e) => write!(f, "VPN error: {}", e),
-            Self::SendError(e) => write!(f, "Send error: {}", e),
-            Self::Join(e) => write!(f, "Tokio join error: {}", e),
-            Self::Io(e) => write!(f, "IO error: {}", e),
+            Self::CertError(e) => write!(f, "PKI cert error: {e}"),
+            Self::Session(e) => write!(f, "IKEv2 session error: {e}"),
+            Self::Esp(e) => write!(f, "ESP error: {e}"),
+            Self::Ip(e) => write!(f, "IP error: {e}"),
+            Self::Forti(e) => write!(f, "VPN error: {e}"),
+            Self::SendError(e) => write!(f, "Send error: {e}"),
+            Self::Join(e) => write!(f, "Tokio join error: {e}"),
+            Self::Io(e) => write!(f, "IO error: {e}"),
         }
     }
 }
