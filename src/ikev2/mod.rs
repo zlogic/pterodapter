@@ -142,7 +142,6 @@ impl Server {
                         }
                         Err(err) => {
                             warn!("Failed to refresh IP addresses for split routes: {err}");
-                            continue;
                         }
                     }
                     delay.tick().await;
