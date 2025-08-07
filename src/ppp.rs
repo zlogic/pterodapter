@@ -15,7 +15,7 @@ pub enum Packet<'a> {
 }
 
 impl Packet<'_> {
-    pub fn from_bytes(protocol: Protocol, data: &[u8]) -> Result<Packet, FormatError> {
+    pub fn from_bytes(protocol: Protocol, data: &[u8]) -> Result<Packet<'_>, FormatError> {
         protocol.validate()?;
         let packet = match protocol {
             Protocol::LCP => Packet::Lcp(LcpPacket::from_bytes(data)?),
@@ -78,7 +78,7 @@ pub struct GenericPacket<'a> {
 }
 
 impl GenericPacket<'_> {
-    fn from_bytes(protocol: Protocol, data: &[u8]) -> GenericPacket {
+    fn from_bytes(protocol: Protocol, data: &[u8]) -> GenericPacket<'_> {
         GenericPacket { protocol, data }
     }
 }
@@ -90,7 +90,7 @@ pub struct LcpPacket<'a> {
 }
 
 impl LcpPacket<'_> {
-    fn from_bytes(data: &[u8]) -> Result<LcpPacket, FormatError> {
+    fn from_bytes(data: &[u8]) -> Result<LcpPacket<'_>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in LCP packet");
             Err("Not enough in LCP packet".into())
@@ -143,7 +143,7 @@ impl LcpPacket<'_> {
         }
     }
 
-    pub fn iter_options(&self) -> LcpOptionsIter {
+    pub fn iter_options(&self) -> LcpOptionsIter<'_> {
         LcpOptionsIter {
             data: self.read_options(),
         }
@@ -370,7 +370,7 @@ pub struct IpcpPacket<'a> {
 }
 
 impl IpcpPacket<'_> {
-    fn from_bytes(data: &[u8]) -> Result<IpcpPacket, FormatError> {
+    fn from_bytes(data: &[u8]) -> Result<IpcpPacket<'_>, FormatError> {
         if data.len() < 4 {
             debug!("Not enough data in IPCP packet");
             Err("Not enough in IPCP packet".into())

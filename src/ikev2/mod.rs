@@ -868,13 +868,12 @@ impl Sessions {
             )?;
             self.reserved_spi = Some(reserved_spi);
             // Response retransmissions are initiated by client.
-            if transmit_response {
-                if let Err(err) = session
+            if transmit_response
+                && let Err(err) = session
                     .send_last_response(&self.sockets, ikev2_request.read_message_id(), is_nat)
                     .await
-                {
-                    warn!("Failed to transmit response to session {session_id}: {err}");
-                }
+            {
+                warn!("Failed to transmit response to session {session_id}: {err}");
             }
         }
 

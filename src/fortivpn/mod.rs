@@ -113,12 +113,13 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         let headers = http::read_headers(&mut socket).await?;
         http::validate_response_code(&headers)?;
         for line in headers.lines() {
-            if cookie.is_none() && line.starts_with("Set-Cookie: SVPNCOOKIE=") {
-                if let Some(start_index) = line.find(":") {
-                    let line = &line[start_index + 2..];
-                    if let Some(end_index) = line.find("; ") {
-                        cookie = Some(line[..end_index].to_string());
-                    }
+            if cookie.is_none()
+                && line.starts_with("Set-Cookie: SVPNCOOKIE=")
+                && let Some(start_index) = line.find(":")
+            {
+                let line = &line[start_index + 2..];
+                if let Some(end_index) = line.find("; ") {
+                    cookie = Some(line[..end_index].to_string());
                 }
             }
         }

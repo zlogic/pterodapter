@@ -129,7 +129,7 @@ impl TransformParameters {
         }
     }
 
-    pub fn iter_parameters(&self) -> TransformParametersIter {
+    pub fn iter_parameters(&self) -> TransformParametersIter<'_> {
         TransformParametersIter {
             params: self,
             curr: 1,

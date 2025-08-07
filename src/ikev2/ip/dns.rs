@@ -228,7 +228,7 @@ impl DnsPacketFlags {
 impl DnsPacket<'_> {
     const DNS_HEADER_SIZE: usize = 12;
 
-    pub fn from_udp_payload(data: &[u8]) -> Result<DnsPacket, DnsError> {
+    pub fn from_udp_payload(data: &[u8]) -> Result<DnsPacket<'_>, DnsError> {
         // First 8 bytes are the UDP header.
         if data.len() < Self::DNS_HEADER_SIZE {
             Err("DNS packet size is smaller than header size".into())
@@ -248,7 +248,7 @@ impl DnsPacket<'_> {
         DnsPacketFlags::from_data(self.data)
     }
 
-    fn iter_sections(&self) -> SectionIter {
+    fn iter_sections(&self) -> SectionIter<'_> {
         let mut qdcount = [0u8; 2];
         qdcount.copy_from_slice(&self.data[4..6]);
         let qdcount = u16::from_be_bytes(qdcount);
@@ -717,7 +717,11 @@ struct SoaRecord<'a> {
 }
 
 impl SoaRecord<'_> {
-    fn from_data(data: &[u8], start_offset: usize, length: usize) -> Result<SoaRecord, DnsError> {
+    fn from_data(
+        data: &[u8],
+        start_offset: usize,
+        length: usize,
+    ) -> Result<SoaRecord<'_>, DnsError> {
         if length < 22 {
             return Err("Not enough data in SOA rdata length".into());
         }
@@ -746,7 +750,7 @@ impl SoaRecord<'_> {
         })
     }
 
-    fn iter_mname(&self) -> LabelIter {
+    fn iter_mname(&self) -> LabelIter<'_> {
         LabelIter {
             start_offset: self.mname_start_offset,
             data: self.data,
@@ -754,7 +758,7 @@ impl SoaRecord<'_> {
         }
     }
 
-    fn iter_rname(&self) -> LabelIter {
+    fn iter_rname(&self) -> LabelIter<'_> {
         LabelIter {
             start_offset: self.rname_start_offset,
             data: self.data,
@@ -837,7 +841,7 @@ fn name_end_offset(data: &[u8], start_offset: usize) -> Option<usize> {
 }
 
 impl Question<'_> {
-    fn from_data(data: &[u8], start_offset: usize) -> Result<Question, DnsError> {
+    fn from_data(data: &[u8], start_offset: usize) -> Result<Question<'_>, DnsError> {
         let qname_end_offset = if let Some(qname_end_offset) = name_end_offset(data, start_offset) {
             qname_end_offset
         } else {
@@ -856,7 +860,7 @@ impl Question<'_> {
         }
     }
 
-    fn iter_qname(&self) -> LabelIter {
+    fn iter_qname(&self) -> LabelIter<'_> {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
@@ -911,7 +915,7 @@ struct ResourceRecord<'a> {
 }
 
 impl ResourceRecord<'_> {
-    fn from_data(data: &[u8], start_offset: usize) -> Result<ResourceRecord, DnsError> {
+    fn from_data(data: &[u8], start_offset: usize) -> Result<ResourceRecord<'_>, DnsError> {
         let name_end_offset = if let Some(name_end_offset) = name_end_offset(data, start_offset) {
             name_end_offset
         } else {
@@ -936,7 +940,7 @@ impl ResourceRecord<'_> {
         }
     }
 
-    fn iter_name(&self) -> LabelIter {
+    fn iter_name(&self) -> LabelIter<'_> {
         LabelIter {
             start_offset: self.start_offset,
             data: self.data,
@@ -968,7 +972,7 @@ impl ResourceRecord<'_> {
         u16::from_be_bytes(rdlength)
     }
 
-    fn rdata(&self) -> Result<Rdata, DnsError> {
+    fn rdata(&self) -> Result<Rdata<'_>, DnsError> {
         // This is validated in the constructor.
         let start_offset = self.name_end_offset + 10;
         let rd_length = self.rd_length() as usize;

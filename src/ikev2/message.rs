@@ -148,7 +148,7 @@ pub struct InputMessage<'a> {
 
 // Parse and validate using spec from RFC 7296, Section 3.
 impl InputMessage<'_> {
-    pub fn from_datagram(p: &[u8], is_nat: bool) -> Result<InputMessage, FormatError> {
+    pub fn from_datagram(p: &[u8], is_nat: bool) -> Result<InputMessage<'_>, FormatError> {
         let data = if is_nat { &p[4..] } else { p };
         if p.len() < 28 {
             warn!("Not enough data in message");
@@ -266,7 +266,7 @@ impl InputMessage<'_> {
         valid
     }
 
-    pub fn iter_payloads(&self) -> PayloadIter {
+    pub fn iter_payloads(&self) -> PayloadIter<'_> {
         PayloadIter {
             start_offset: 28,
             next_payload: self.read_next_payload(),
@@ -304,7 +304,7 @@ pub struct MessageWriter<'a> {
 }
 
 impl MessageWriter<'_> {
-    pub fn new(dest: &mut [u8]) -> Result<MessageWriter, NotEnoughSpaceError> {
+    pub fn new(dest: &mut [u8]) -> Result<MessageWriter<'_>, NotEnoughSpaceError> {
         if dest.len() < 28 {
             return Err(NotEnoughSpaceError {});
         }
@@ -812,7 +812,7 @@ impl Payload<'_> {
         payload_type: PayloadType,
         critical: bool,
         data: &[u8],
-    ) -> Result<Payload, FormatError> {
+    ) -> Result<Payload<'_>, FormatError> {
         let payload = match payload_type {
             PayloadType::SECURITY_ASSOCIATION => {
                 Payload::SecurityAssociation(PayloadSecurityAssociation { critical, data })
@@ -862,7 +862,7 @@ impl Payload<'_> {
         encrypted_next_payload: PayloadType,
         data: &[u8],
         start_offset: usize,
-    ) -> Result<Payload, FormatError> {
+    ) -> Result<Payload<'_>, FormatError> {
         match payload_type {
             PayloadType::ENCRYPTED_AND_AUTHENTICATED => {
                 Ok(Payload::Encrypted(EncryptedMessage::from_encrypted_data(
@@ -1082,7 +1082,7 @@ pub struct PayloadSecurityAssociation<'a> {
 }
 
 impl PayloadSecurityAssociation<'_> {
-    pub fn iter_proposals(&self) -> SecurityAssociationIter {
+    pub fn iter_proposals(&self) -> SecurityAssociationIter<'_> {
         SecurityAssociationIter {
             data: self.data,
             next_proposal_num: 1,
@@ -1202,7 +1202,7 @@ pub struct SecurityAssociationProposal<'a> {
 }
 
 impl SecurityAssociationProposal<'_> {
-    pub fn iter_transforms(&self) -> SecurityAssociationTransformIter {
+    pub fn iter_transforms(&self) -> SecurityAssociationTransformIter<'_> {
         SecurityAssociationTransformIter {
             num_transforms: self.num_transforms,
             data: self.data,
@@ -1431,7 +1431,7 @@ impl SecurityAssociationTransform<'_> {
         self.transform_type
     }
 
-    pub fn iter_attributes(&self) -> SecurityAssociationTransformAttributesIter {
+    pub fn iter_attributes(&self) -> SecurityAssociationTransformAttributesIter<'_> {
         SecurityAssociationTransformAttributesIter { data: self.data }
     }
 }
@@ -1925,7 +1925,9 @@ impl<'a> PayloadNotify<'a> {
         self.data
     }
 
-    pub fn to_signature_hash_algorithms(&self) -> Result<SignatureHashAlgorithmIter, FormatError> {
+    pub fn to_signature_hash_algorithms(
+        &self,
+    ) -> Result<SignatureHashAlgorithmIter<'_>, FormatError> {
         if self.message_type != NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
             Err("Notify type is not SIGNATURE_HASH_ALGORITHMS".into())
         } else if self.data.len() % 2 != 0 {
@@ -2032,7 +2034,7 @@ impl<'a> PayloadDelete<'a> {
         })
     }
 
-    pub fn iter_spi(&self) -> DeleteSpiIter {
+    pub fn iter_spi(&self) -> DeleteSpiIter<'_> {
         DeleteSpiIter { data: self.data }
     }
 }
@@ -2077,7 +2079,7 @@ impl<'a> PayloadTrafficSelector<'a> {
         }
     }
 
-    pub fn iter_traffic_selectors(&self) -> TrafficSelectorIter {
+    pub fn iter_traffic_selectors(&self) -> TrafficSelectorIter<'_> {
         TrafficSelectorIter {
             num_selectors: self.data[0] as usize,
             data: &self.data[4..],
@@ -2321,7 +2323,7 @@ impl<'a> PayloadConfiguration<'a> {
         self.configuration_type
     }
 
-    pub fn iter_attributes(&self) -> ConfigurationAttributesIter {
+    pub fn iter_attributes(&self) -> ConfigurationAttributesIter<'_> {
         ConfigurationAttributesIter { data: self.data }
     }
 }

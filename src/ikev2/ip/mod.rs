@@ -164,7 +164,7 @@ impl<'a> Ipv4Packet<'a> {
     const FRAGMENT_DF_MASK: u16 = 1 << 14;
     const FRAGMENT_USED_MASK: u16 = Self::FRAGMENT_OFFSET_MASK | Self::FRAGMENT_MF_MASK;
 
-    fn from_data(data: &[u8]) -> Result<Ipv4Packet, IpError> {
+    fn from_data(data: &[u8]) -> Result<Ipv4Packet<'_>, IpError> {
         if data.len() < 20 {
             return Err("Not enough bytes in IPv4 header".into());
         }
@@ -216,7 +216,7 @@ impl<'a> Ipv4Packet<'a> {
         TransportProtocolType::from_u8(self.data[9])
     }
 
-    fn transport_protocol_data(&self) -> &TransportData {
+    fn transport_protocol_data(&self) -> &TransportData<'_> {
         &self.transport_data
     }
 
@@ -633,7 +633,7 @@ impl<'a> Ipv6Packet<'a> {
     const FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
     const FRAGMENT_MF_MASK: u16 = 1;
 
-    fn from_data(data: &[u8]) -> Result<Ipv6Packet, IpError> {
+    fn from_data(data: &[u8]) -> Result<Ipv6Packet<'_>, IpError> {
         if data.len() < 40 {
             return Err("Not enough bytes in IPv6 header".into());
         }
@@ -666,7 +666,7 @@ impl<'a> Ipv6Packet<'a> {
         self.data
     }
 
-    fn iter_payloads(data: &[u8]) -> Ipv6PacketIter {
+    fn iter_payloads(data: &[u8]) -> Ipv6PacketIter<'_> {
         Ipv6PacketIter {
             next_payload: TransportProtocolType(data[6]),
             data: &data[40..],
@@ -689,7 +689,7 @@ impl<'a> Ipv6Packet<'a> {
         self.transport_data.protocol()
     }
 
-    fn transport_protocol_data(&self) -> &TransportData {
+    fn transport_protocol_data(&self) -> &TransportData<'_> {
         &self.transport_data
     }
 
@@ -1032,7 +1032,7 @@ pub enum IpPacket<'a> {
 }
 
 impl<'a> IpPacket<'a> {
-    pub fn from_data(data: &[u8]) -> Result<IpPacket, IpError> {
+    pub fn from_data(data: &[u8]) -> Result<IpPacket<'_>, IpError> {
         if data.is_empty() {
             return Err("IP packet is empty, cannot extract header data".into());
         }
@@ -1060,7 +1060,7 @@ impl<'a> IpPacket<'a> {
         }
     }
 
-    pub fn transport_protocol_data(&self) -> &TransportData {
+    pub fn transport_protocol_data(&self) -> &TransportData<'_> {
         match self {
             IpPacket::V4(packet) => packet.transport_protocol_data(),
             IpPacket::V6(packet) => packet.transport_protocol_data(),
@@ -1264,7 +1264,10 @@ pub enum TransportData<'a> {
 }
 
 impl TransportData<'_> {
-    fn from_data(protocol: TransportProtocolType, data: &[u8]) -> Result<TransportData, IpError> {
+    fn from_data(
+        protocol: TransportProtocolType,
+        data: &[u8],
+    ) -> Result<TransportData<'_>, IpError> {
         match protocol {
             TransportProtocolType::UDP => {
                 if data.len() >= 4 {

@@ -79,13 +79,12 @@ impl PkiProcessing {
     }
 
     pub fn server_cert(&self, certificate_request: &[u8]) -> Option<&[u8]> {
-        if let Some(client_validation) = &self.client_validation {
-            if !certificate_request
+        if let Some(client_validation) = &self.client_validation
+            && !certificate_request
                 .chunks(20)
                 .any(|ca| client_validation.root_ca_request == ca)
-            {
-                return None;
-            }
+        {
+            return None;
         }
 
         self.default_server_cert()

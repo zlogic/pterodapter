@@ -149,13 +149,13 @@ impl FortiService {
                     return Err(err.into());
                 }
             }
-            if state.unflushed_writes > FLUSH_INTERVAL || (state.unflushed_writes > 0 && !sent_data)
+            if (state.unflushed_writes > FLUSH_INTERVAL
+                || (state.unflushed_writes > 0 && !sent_data))
+                && let Err(err) = state.tunnel.flush().await
             {
-                if let Err(err) = state.tunnel.flush().await {
-                    warn!("Failed to flush data to VPN: {err}");
-                    self.state = ConnectionState::Disconnected;
-                    return Err(err.into());
-                }
+                warn!("Failed to flush data to VPN: {err}");
+                self.state = ConnectionState::Disconnected;
+                return Err(err.into());
             }
         }
         Ok(())

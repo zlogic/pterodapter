@@ -225,7 +225,7 @@ pub(super) enum IcmpTranslationAction {
 pub(super) struct IcmpV4Message<'a>(&'a [u8]);
 
 impl IcmpV4Message<'_> {
-    pub fn from_data(data: &[u8]) -> Result<IcmpV4Message, IpError> {
+    pub fn from_data(data: &[u8]) -> Result<IcmpV4Message<'_>, IpError> {
         if data.len() >= 8 {
             Ok(IcmpV4Message(data))
         } else {
@@ -502,7 +502,7 @@ impl fmt::Display for IcmpV4Message<'_> {
 pub(super) struct IcmpV6Message<'a>(&'a [u8]);
 
 impl IcmpV6Message<'_> {
-    pub fn from_data(data: &[u8]) -> Result<IcmpV6Message, IpError> {
+    pub fn from_data(data: &[u8]) -> Result<IcmpV6Message<'_>, IpError> {
         if data.len() >= 4 {
             Ok(IcmpV6Message(data))
         } else {
