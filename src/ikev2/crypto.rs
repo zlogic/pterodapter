@@ -402,7 +402,7 @@ impl DHTransform for DHTransformECP256 {
         };
         match agreement::agree_ephemeral(
             private_key,
-            &other_public_key,
+            other_public_key,
             InitError::new("Failed to read ECDH key"),
             |secret_point| {
                 res.as_mut_slice().copy_from_slice(secret_point);
