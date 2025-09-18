@@ -1930,7 +1930,7 @@ impl<'a> PayloadNotify<'a> {
     ) -> Result<SignatureHashAlgorithmIter<'_>, FormatError> {
         if self.message_type != NotifyMessageType::SIGNATURE_HASH_ALGORITHMS {
             Err("Notify type is not SIGNATURE_HASH_ALGORITHMS".into())
-        } else if self.data.len() % 2 != 0 {
+        } else if !self.data.len().is_multiple_of(2) {
             Err("SIGNATURE_HASH_ALGORITHMS has an unsupported format".into())
         } else {
             Ok(SignatureHashAlgorithmIter { data: self.data })
