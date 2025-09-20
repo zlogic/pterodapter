@@ -18,8 +18,8 @@ Run pterodapter on ports 9500 + 9501 - and specify 192.0.2.40 as the destination
 
 ```shell
 cat << EOF | sudo pfctl -e -f -
-rdr pass proto udp from any to 192.0.2.40 port 500 tag MAC_TO_VPN -> 127.0.0.1 port 9500
-rdr pass proto udp from any to 192.0.2.40 port 4500 tag MAC_TO_VPN -> 127.0.0.1 port 9501
+rdr pass proto udp from any to 192.0.2.40 port 500 -> 127.0.0.1 port 9500
+rdr pass proto udp from any to 192.0.2.40 port 4500 -> 127.0.0.1 port 9501
 pass out quick route-to (lo0 127.0.0.1) proto udp from any to 192.0.2.40 port {500, 4500}
 EOF
 ```
@@ -44,8 +44,8 @@ and add an achor:
 
 ```shell
 cat << EOF | sudo pfctl -a com.apple/pterodapter -f -
-rdr pass proto udp from any to 192.0.2.40 port 500 tag MAC_TO_VPN -> 127.0.0.1 port 9500
-rdr pass proto udp from any to 192.0.2.40 port 4500 tag MAC_TO_VPN -> 127.0.0.1 port 9501
+rdr pass proto udp from any to 192.0.2.40 port 500 -> 127.0.0.1 port 9500
+rdr pass proto udp from any to 192.0.2.40 port 4500 -> 127.0.0.1 port 9501
 pass out quick route-to (lo0 127.0.0.1) proto udp from any to 192.0.2.40 port {500, 4500}
 EOF
 ```
