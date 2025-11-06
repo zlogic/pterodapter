@@ -20,7 +20,7 @@ This document explains how to set up a rule so that `192.168.64.240:500` is redi
 Run pterodapter on ports 9500 + 9501 - and specify 192.168.64.240 as the destination host.
 
 ```shell
-CONTAINER_SUBNET=192.168.64.0/24
+CONTAINER_SUBNET=192.168.64.240
 cat << EOF | sudo pfctl -Ef -
 rdr pass proto udp from port 500 to $CONTAINER_SUBNET port 500 -> 127.0.0.1 port 9500
 rdr pass proto udp from port 4500 to $CONTAINER_SUBNET port 4500 -> 127.0.0.1 port 9501
