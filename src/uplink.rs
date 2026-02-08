@@ -91,6 +91,7 @@ impl UplinkService for UplinkServiceType {
 pub enum UplinkError {
     Internal(&'static str),
     FortiVpn(fortivpn::FortiError),
+    Masquerade(masquerade::MasqueradeError),
     Join(tokio::task::JoinError),
 }
 
@@ -99,6 +100,7 @@ impl fmt::Display for UplinkError {
         match self {
             Self::Internal(msg) => f.write_str(msg),
             Self::FortiVpn(e) => write!(f, "FortiVPN client error: {e}"),
+            Self::Masquerade(e) => write!(f, "Masquerade client error: {e}"),
             Self::Join(e) => write!(f, "Tokio join error: {e}"),
         }
     }
@@ -109,6 +111,7 @@ impl error::Error for UplinkError {
         match self {
             Self::Internal(_msg) => None,
             Self::FortiVpn(err) => Some(err),
+            Self::Masquerade(err) => Some(err),
             Self::Join(err) => Some(err),
         }
     }
@@ -123,6 +126,12 @@ impl From<&'static str> for UplinkError {
 impl From<fortivpn::FortiError> for UplinkError {
     fn from(err: fortivpn::FortiError) -> UplinkError {
         Self::FortiVpn(err)
+    }
+}
+
+impl From<masquerade::MasqueradeError> for UplinkError {
+    fn from(err: masquerade::MasqueradeError) -> UplinkError {
+        Self::Masquerade(err)
     }
 }
 
