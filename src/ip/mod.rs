@@ -1,6 +1,6 @@
 use std::{
     error, fmt, io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::{Deref, Range},
 };
 
@@ -612,55 +612,6 @@ impl<'a> Ipv4Packet<'a> {
         udp_header[6..8].copy_from_slice(&checksum.to_be_bytes());
         Ok(start_offset)
     }
-
-    fn write_ip_udp_header(
-        src_addr: SocketAddrV4,
-        dst_addr: SocketAddrV4,
-        dest: &mut [u8],
-        data_range: Range<usize>,
-    ) -> Result<usize, IpError> {
-        if data_range.start < 20 + 8 {
-            return Err("Not enough space to add IPv4 header in IPv4 message".into());
-        }
-        let start_offset = data_range.start - 20 - 8;
-        let udp_length: u16 = 8 + data_range.len() as u16;
-        let mut checksum = {
-            let ip_header = &mut dest[start_offset..start_offset + 20];
-            ip_header[0] = (4 << 4) | 5;
-            ip_header[1] = 0;
-            ip_header[2..4].copy_from_slice(&(udp_length + 20u16).to_be_bytes());
-            ip_header[4..8].fill(0);
-
-            ip_header[8] = DEFAULT_RESPONSE_TTL;
-            ip_header[9] = TransportProtocolType::UDP.to_u8();
-            ip_header[10..12].fill(0);
-            ip_header[12..16].copy_from_slice(&src_addr.ip().octets());
-            ip_header[16..20].copy_from_slice(&dst_addr.ip().octets());
-
-            let mut checksum = Checksum::new();
-            checksum.add_slice(ip_header);
-            checksum.fold();
-            ip_header[10..12].copy_from_slice(&checksum.value().to_be_bytes());
-
-            Ipv4Packet::pseudo_checksum(ip_header, TransportProtocolType::UDP, udp_length as usize)
-        };
-
-        checksum.add_slice(&dest[data_range.clone()]);
-
-        let udp_header = &mut dest[start_offset + 20..start_offset + 28];
-        udp_header[0..2].copy_from_slice(&src_addr.port().to_be_bytes());
-        udp_header[2..4].copy_from_slice(&dst_addr.port().to_be_bytes());
-        udp_header[4..6].copy_from_slice(&udp_length.to_be_bytes());
-        udp_header[6..8].fill(0);
-
-        checksum.add_slice(udp_header);
-        checksum.fold();
-
-        let checksum = checksum.value();
-        let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
-        udp_header[6..8].copy_from_slice(&checksum.to_be_bytes());
-        Ok(start_offset)
-    }
 }
 
 pub struct Ipv6Packet<'a> {
@@ -1086,35 +1037,28 @@ impl<'a> IpPacket<'a> {
         }
     }
 
-    pub fn src_addr(&self) -> IpAddr {
+    fn src_addr(&self) -> IpAddr {
         match self {
             IpPacket::V4(packet) => IpAddr::V4(packet.src_addr()),
             IpPacket::V6(packet) => IpAddr::V6(packet.src_addr()),
         }
     }
 
-    pub fn dst_addr(&self) -> IpAddr {
+    fn dst_addr(&self) -> IpAddr {
         match self {
             IpPacket::V4(packet) => IpAddr::V4(packet.dst_addr()),
             IpPacket::V6(packet) => IpAddr::V6(packet.dst_addr()),
         }
     }
 
-    pub fn transport_protocol(&self) -> TransportProtocolType {
-        match self {
-            IpPacket::V4(packet) => packet.transport_protocol(),
-            IpPacket::V6(packet) => packet.transport_protocol(),
-        }
-    }
-
-    pub fn transport_protocol_data(&self) -> &TransportData<'_> {
+    fn transport_protocol_data(&self) -> &TransportData<'_> {
         match self {
             IpPacket::V4(packet) => packet.transport_protocol_data(),
             IpPacket::V6(packet) => packet.transport_protocol_data(),
         }
     }
 
-    pub fn src_port(&self) -> Option<u16> {
+    fn src_port(&self) -> Option<u16> {
         if self.is_fragment_shifted() {
             None
         } else {
@@ -1122,7 +1066,7 @@ impl<'a> IpPacket<'a> {
         }
     }
 
-    pub fn dst_port(&self) -> Option<u16> {
+    fn dst_port(&self) -> Option<u16> {
         if self.is_fragment_shifted() {
             None
         } else {
@@ -1140,14 +1084,14 @@ impl<'a> IpPacket<'a> {
         }
     }
 
-    pub fn into_data(self) -> &'a [u8] {
+    fn into_data(self) -> &'a [u8] {
         match self {
             IpPacket::V4(packet) => packet.into_data(),
             IpPacket::V6(packet) => packet.into_data(),
         }
     }
 
-    pub fn validate_ip_checksum(&self) -> bool {
+    fn validate_ip_checksum(&self) -> bool {
         match self {
             IpPacket::V4(packet) => packet.validate_ip_checksum(),
             IpPacket::V6(_) => true,
@@ -1201,25 +1145,6 @@ impl<'a> IpPacket<'a> {
         match self {
             IpPacket::V4(packet) => packet.write_udp_response(dest, data_range),
             IpPacket::V6(packet) => packet.write_udp_response(dest, data_range),
-        }
-    }
-
-    pub fn write_ip_udp_header(
-        src_addr: SocketAddr,
-        dst_addr: SocketAddr,
-        dest: &mut [u8],
-        data_range: Range<usize>,
-    ) -> Result<usize, IpError> {
-        match (src_addr, dst_addr) {
-            (SocketAddr::V4(src_addr), SocketAddr::V4(dst_addr)) => {
-                Ipv4Packet::write_ip_udp_header(src_addr, dst_addr, dest, data_range)
-            }
-            (SocketAddr::V6(_), SocketAddr::V6(_)) => {
-                Err("Support for writing UDP IPv6 headers is not yet implemented".into())
-            }
-            (SocketAddr::V4(_), SocketAddr::V6(_)) | (SocketAddr::V6(_), SocketAddr::V4(_)) => {
-                Err("Mismatching IP address types between source and destination".into())
-            }
         }
     }
 }
@@ -1368,7 +1293,7 @@ impl TransportData<'_> {
         }
     }
 
-    pub fn payload_data(&self) -> &[u8] {
+    fn payload_data(&self) -> &[u8] {
         match self {
             TransportData::Udp(data) => &data[8..],
             TransportData::Tcp(data, data_offset) => &data[*data_offset..],
@@ -1526,13 +1451,6 @@ impl Nat64Prefix {
         segments[12..16].copy_from_slice(&addr.octets());
         segments.into()
     }
-
-    pub fn matches(&self, addr: &IpAddr) -> bool {
-        match addr {
-            IpAddr::V6(addr) => self.0 == addr.octets()[0..12],
-            IpAddr::V4(_) => false,
-        }
-    }
 }
 
 impl Deref for Nat64Prefix {
@@ -1590,7 +1508,7 @@ impl Network {
         })
     }
 
-    pub fn is_nat64(&self) -> bool {
+    fn is_nat64(&self) -> bool {
         self.nat64_prefix.is_some()
     }
 
@@ -2083,12 +2001,12 @@ impl Checksum {
 type DomainLabels = Vec<Vec<u8>>;
 
 #[derive(Clone)]
-pub struct TunnelDomainsDns {
+struct TunnelDomainsDns {
     tunnel_domains: Vec<DomainLabels>,
 }
 
 impl TunnelDomainsDns {
-    pub fn new(tunnel_domains: &[String]) -> TunnelDomainsDns {
+    fn new(tunnel_domains: &[String]) -> TunnelDomainsDns {
         let tunnel_domains = tunnel_domains
             .iter()
             .map(|tunnel_domain| {

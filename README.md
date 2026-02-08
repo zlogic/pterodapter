@@ -30,7 +30,7 @@ To run pterodapter locally, use WSL on Windows, or [add firewall redirection](do
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --fortivpn=<hostport> | --masquerade-ip=<ip4addr> [--tunnel-domain=<domain>] [--nat64-prefix=<ip6prefix>] [--dns64-tunnel-suffix=<domain>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> [--pcap=<filename>] ikev2
+pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>] [--nat-port=<port>] --fortivpn=<hostport> [--tunnel-domain=<domain>] [--nat64-prefix=<ip6prefix>] [--dns64-tunnel-suffix=<domain>] [--id-hostname=<hostname>] --cacert=<filename> --cert=<filename> --key=<filename> [--pcap=<filename>] ikev2
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
@@ -42,8 +42,6 @@ pterotapter [--log-level=<level>] [--listen-ip=<ip-address>] [--ike-port=<port>]
 `--nat-port=<port>` is an optional argument to specify the NAT port for IKEv2 and ESP, for example `--nat-port=9501`. If not specified, will use port 4500 (the default IKEv2 and ESP NAT port).
 
 `--fortivpn=<hostport>` specifies the FortiVPN connection address, for example `--fortivpn=fortivpn.example.com:443`.
-
-`--masquerade-ip=<hostport>` specifies the internal IP address in masquerade mode, for example `--masquerade-ip=10.10.10.10`.
 
 `--tunnel-domain=<domain>` specifies an optional argument indicating that only `<domain>` should be sent through the VPN, and all other domains should use a direct connection. To specify multiple domains, add a `--tunnel-domain` argument for each one; if no `--tunnel-domain` arguments are specified, all traffic will be sent through the VPN.
 This is implemented using IKEv2 traffic selectors and works with no extra configuration on macOS; Windows needs routes [to be added manually](docs/windows-split-routing.md).
@@ -87,8 +85,6 @@ For example:
     --key=vpn-server.key.pem \
     ikev2
 ```
-
-`--fortivpn` enables the FortiVPN client mode, while `--masquerade-ip` will act as a TCP/UDP client (like a proxy, similar to [wgslirpy](https://github.com/vi/wgslirpy)).
 
 For more information how to generate certs and configure clients, see the [certs.md](docs/certs.md) document.
 

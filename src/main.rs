@@ -16,7 +16,6 @@ mod http;
 mod ikev2;
 mod ip;
 mod logger;
-mod masquerade;
 mod pcap;
 mod ppp;
 mod uplink;
@@ -35,7 +34,6 @@ Options:\
 \n      --nat-port=<PORT>               NAT port for IKEv2 and ESP [default: 4500]\
 \n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
-\n      --masquerade-ip=<IP4>           Virtual IP address for masquerade mode, e.g. 10.10.10.10\
 \n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
 \n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
@@ -80,7 +78,6 @@ impl Args {
 
         let mut fortivpn_addr = None;
         let mut fortivpn_hostport = None;
-        let mut masquerade_ip = None;
 
         let mut listen_ips = vec![];
         let mut ike_port = 500u16;
@@ -140,16 +137,6 @@ impl Args {
                         format_args!("Failed to parse destination address: {err}"),
                     ),
                 };
-            } else if name == "--masquerade-ip" {
-                let ip = match IpAddr::from_str(value) {
-                    Ok(ip) => ip,
-                    Err(err) => fail_with_error(
-                        name,
-                        value,
-                        format_args!("Failed to parse masquerade IP address: {err}"),
-                    ),
-                };
-                masquerade_ip = Some(ip);
             } else if name == "--tunnel-domain" {
                 // Domains should be in DNS IDNA A-label format for Unicode strings.
                 // All further processing assumes the domain is an ASCII UTF-8 string.
@@ -252,24 +239,13 @@ impl Args {
             }
         }
 
-        let uplink_config = match (fortivpn_addr, fortivpn_hostport, masquerade_ip) {
-            (Some(fortivpn_addr), Some(fortivpn_hostport), None) => {
+        let uplink_config = match (fortivpn_addr, fortivpn_hostport) {
+            (Some(fortivpn_addr), Some(fortivpn_hostport)) => {
                 uplink::Config::FortiVPN(fortivpn::Config {
                     destination_addr: fortivpn_addr,
                     destination_hostport: fortivpn_hostport,
                     tls_config,
                 })
-            }
-            (None, None, Some(masquerade_ip)) => uplink::Config::Masquerade(masquerade::Config {
-                masquerade_ip,
-                dns_addrs: vec![],
-                nat64_prefix,
-                dns64_domains: dns64_domains.clone(),
-            }),
-            (Some(_), Some(_), Some(_)) => {
-                eprintln!("Cannot use both FortiVPN and masquerade at the same time");
-                println!("{USAGE_INSTRUCTIONS}");
-                process::exit(2);
             }
             _ => {
                 eprintln!("No destination specified");
@@ -358,23 +334,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         None
     };
 
-    let uplink_config = if let uplink::Config::Masquerade(masquerade_config) = config.uplink {
-        match rt.block_on(masquerade::read_systen_dns_servers()) {
-            Ok(dns_servers) => uplink::Config::Masquerade(masquerade::Config {
-                masquerade_ip: masquerade_config.masquerade_ip,
-                dns_addrs: dns_servers,
-                dns64_domains: masquerade_config.dns64_domains,
-                nat64_prefix: masquerade_config.nat64_prefix,
-            }),
-            Err(err) => {
-                eprintln!("Failed to parse DNS server configuration: {err}");
-                process::exit(2);
-            }
-        }
-    } else {
-        config.uplink
-    };
-    let uplink = uplink::UplinkServiceType::new(uplink_config, pcap_sender.clone());
+    let uplink = uplink::UplinkServiceType::new(config.uplink, pcap_sender.clone());
     if let Err(err) = server.run(rt, uplink, shutdown_receiver, pcap_sender) {
         eprintln!("Failed to run server: {err}");
     };
