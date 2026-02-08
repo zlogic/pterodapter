@@ -74,7 +74,7 @@ For example:
 ```shell
 ./pterodapter --log-level=trace \
     --listen-ip=127.0.0.1 \
-    --destination=fortivpn.example.com:443 \
+    --fortivpn=fortivpn.example.com:443 \
     --tunnel-domain=gitlab.example.com \
     --tunnel-domain=registry.example.com \
     --nat64-prefix=64:ff9b:: \

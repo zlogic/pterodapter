@@ -11,7 +11,7 @@ Description=Pterodapter
 Type=exec
 WorkingDirectory=/var/home/core/pterodapter
 ExecStart=/var/home/core/pterodapter/pterodapter --log-level=trace --listen-ip=:: --id-hostname=schmetterling.home\\
-    --destination=fortivpn.example.com:443\\
+    --fortivpn=fortivpn.example.com:443\\
     --cacert=vpn-root.cert.pem --cert=vpn-server.cert.pem --key=vpn-server.key.pem\\
     --tunnel-domain=gitlab.example.com --tunnel-domain=jenkins.example.com\\
     ikev2
