@@ -6,7 +6,7 @@ use std::{
 };
 
 use log::{debug, info, warn};
-use rand::Rng;
+use rand::Rng as _;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufStream},
     net::{TcpListener, TcpStream},
@@ -275,7 +275,7 @@ impl FortiVPNTunnel {
         let mut req = [0u8; 20];
         let mut resp = [0u8; 200];
         let identifier = 1;
-        let magic = rand::rng().random::<u32>();
+        let magic = rand::rng().next_u32();
         let opts = [
             ppp::LcpOptionData::MaximumReceiveUnit(mtu),
             ppp::LcpOptionData::MagicNumber(magic),

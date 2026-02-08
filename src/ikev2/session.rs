@@ -1,5 +1,5 @@
 use log::{debug, info, trace, warn};
-use rand::Rng;
+use rand::RngExt as _;
 use std::{
     cmp::Ordering,
     collections::HashSet,
