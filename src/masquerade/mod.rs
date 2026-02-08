@@ -5,6 +5,7 @@ use std::{
     ops::Range,
     str::FromStr as _,
     task::Poll,
+    time::{Duration, Instant},
 };
 
 use log::{debug, warn};
@@ -12,11 +13,14 @@ use tokio::{
     fs,
     io::{AsyncBufReadExt as _, BufReader, ReadBuf},
     net::UdpSocket,
+    time::timeout_at,
 };
 
 use crate::{ip, logger::fmt_slice_hex, uplink};
 
 const MAX_IP_HEADER_LENGTH: usize = 40;
+
+const NAT_TTL_UDP: Duration = Duration::from_secs(60);
 
 pub struct Config {
     pub masquerade_ip: IpAddr,
@@ -143,8 +147,7 @@ impl uplink::UplinkService for MasqueradeClient {
         buffer: &'a mut [u8],
     ) -> Result<&'a [u8], uplink::UplinkError> {
         if self.running {
-            let res = self.nat_table.read_packet(buffer).await;
-            res
+            self.nat_table.read_packet(buffer).await
         } else {
             Ok(&[])
         }
@@ -193,6 +196,7 @@ impl fmt::Display for UdpSocketId {
 struct NatTable {
     udp_table: HashMap<NatFlowId, UdpSocketId>,
     udp_r_table: HashMap<UdpSocketId, Vec<NatFlowId>>,
+    udp_ttl: HashMap<NatFlowId, Instant>,
 
     udp_sockets: UdpSocketPool,
     poll_seed: usize,
@@ -203,6 +207,7 @@ impl NatTable {
         NatTable {
             udp_table: HashMap::new(),
             udp_r_table: HashMap::new(),
+            udp_ttl: HashMap::new(),
             udp_sockets: UdpSocketPool::new(),
             poll_seed: 0,
         }
@@ -250,20 +255,42 @@ impl NatTable {
 
     async fn wait_event(&mut self) -> Result<(), MasqueradeError> {
         self.poll_seed = self.poll_seed.wrapping_add(1);
-        future::poll_fn(|cx| self.udp_sockets.poll_ready(cx, self.poll_seed)).await
+        let ready = future::poll_fn(|cx| self.udp_sockets.poll_ready(cx, self.poll_seed));
+        if let Some(timeout) = self.next_timeout() {
+            match timeout_at(timeout.into(), ready).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(err),
+                Err(_) => {
+                    // Timeout.
+                    self.cleanup();
+                    Ok(())
+                }
+            }
+        } else {
+            ready.await
+        }
     }
 
     async fn read_packet<'a>(
         &mut self,
         buffer: &'a mut [u8],
     ) -> Result<&'a [u8], uplink::UplinkError> {
-        let read_bytes = future::poll_fn(|cx| {
+        match future::poll_fn(|cx| {
             self.udp_sockets
                 .poll_recv(cx, self.poll_seed, &self.udp_r_table, buffer)
         })
-        .await?;
-        let packet_data = &buffer[..read_bytes];
-        Ok(packet_data)
+        .await
+        {
+            Ok(Some((read_bytes, flow_id))) => {
+                self.udp_ttl
+                    .entry(flow_id)
+                    .and_modify(|ttl| *ttl = Instant::now() + NAT_TTL_UDP);
+                let packet_data = &buffer[..read_bytes];
+                Ok(packet_data)
+            }
+            Ok(None) => Ok(&[]),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn insert_flow(&mut self, flow: NatFlowId, socket: UdpSocketId) {
@@ -276,11 +303,49 @@ impl NatTable {
                 }
             })
             .or_insert_with(|| vec![flow]);
+        self.udp_ttl.insert(flow, Instant::now() + NAT_TTL_UDP);
     }
 
-    fn cleanup() {
-        // TODO: clean up unused sockets from UDP table, based on TTL
-        // Plus, clean up NAT table itself
+    fn next_timeout(&self) -> Option<Instant> {
+        self.udp_ttl.values().min().copied()
+    }
+
+    fn cleanup(&mut self) {
+        let now = Instant::now();
+        println!(
+            "!!! Cleanup before {} {} {} {}",
+            self.udp_ttl.len(),
+            self.udp_table.len(),
+            self.udp_r_table.len(),
+            self.udp_sockets.sockets.len()
+        );
+        self.udp_ttl.retain(|flow_id, expires| {
+            if *expires < now {
+                if let Some((_, socket_id)) = self.udp_table.remove_entry(flow_id)
+                    && let Some(flows) = self.udp_r_table.get_mut(&socket_id)
+                {
+                    flows.retain(|nat_flow| nat_flow != flow_id)
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.udp_r_table.retain(|socket_id, flows| {
+            if flows.is_empty() {
+                self.udp_sockets.remove_socket(socket_id);
+                false
+            } else {
+                true
+            }
+        });
+        println!(
+            "!!! Cleanup after {} {} {} {}",
+            self.udp_ttl.len(),
+            self.udp_table.len(),
+            self.udp_r_table.len(),
+            self.udp_sockets.sockets.len()
+        );
     }
 }
 
@@ -313,6 +378,10 @@ impl UdpSocketPool {
         self.sockets.get(id)
     }
 
+    fn remove_socket(&mut self, id: &UdpSocketId) -> Option<UdpSocket> {
+        self.sockets.remove(id)
+    }
+
     fn poll_ready(
         &self,
         cx: &mut std::task::Context<'_>,
@@ -341,15 +410,15 @@ impl UdpSocketPool {
         Poll::Pending
     }
 
-    fn poll_recv<'a>(
+    fn poll_recv(
         &self,
         cx: &mut std::task::Context<'_>,
         seed: usize,
         udp_r_table: &HashMap<UdpSocketId, Vec<NatFlowId>>,
-        buf: &'a mut [u8],
-    ) -> Poll<Result<usize, MasqueradeError>> {
+        buf: &mut [u8],
+    ) -> Poll<Result<Option<(usize, NatFlowId)>, MasqueradeError>> {
         if self.sockets.is_empty() {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         }
         // Split socket list into two parts, then combine the second half with the first one.
         let seed = seed % self.sockets.len();
@@ -365,27 +434,18 @@ impl UdpSocketPool {
                 Poll::Ready(Ok(remote_addr)) => {
                     let data_range =
                         MAX_IP_HEADER_LENGTH..MAX_IP_HEADER_LENGTH + read_buf.filled().len();
-                    let local_addr = if let Some(local_addr) = udp_r_table
+                    let flow_id = if let Some(flow_id) = udp_r_table
                         .get(socket_id)
-                        .map(|flows| {
-                            flows
-                                .iter()
-                                .find(|flow| flow.dst_addr == remote_addr)
-                                .map(|flow| flow.src_addr)
-                        })
-                        .flatten()
+                        .and_then(|flows| flows.iter().find(|flow| flow.dst_addr == remote_addr))
                     {
-                        local_addr
+                        flow_id
                     } else {
                         warn!("Failed to find flow in NAT table for packet from {remote_addr}");
                         return Poll::Ready(Err("Failed to find flow in NAT table".into()));
                     };
-                    return Poll::Ready(Self::write_ip_packet(
-                        remote_addr,
-                        local_addr,
-                        buf,
-                        data_range,
-                    ));
+                    let bytes_read =
+                        Self::write_ip_packet(remote_addr, flow_id.src_addr, buf, data_range)?;
+                    return Poll::Ready(Ok(Some((bytes_read, *flow_id))));
                 }
                 Poll::Ready(Err(err)) => {
                     warn!("Failed to receive from socket {socket_id}: {err}");
@@ -394,13 +454,13 @@ impl UdpSocketPool {
                 Poll::Pending => {}
             };
         }
-        Poll::Ready(Ok(0))
+        Poll::Ready(Ok(None))
     }
 
-    fn write_ip_packet<'a>(
+    fn write_ip_packet(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
-        dest: &'a mut [u8],
+        dest: &mut [u8],
         data_range: Range<usize>,
     ) -> Result<usize, MasqueradeError> {
         let start_offset =
