@@ -312,13 +312,6 @@ impl NatTable {
 
     fn cleanup(&mut self) {
         let now = Instant::now();
-        println!(
-            "!!! Cleanup before {} {} {} {}",
-            self.udp_ttl.len(),
-            self.udp_table.len(),
-            self.udp_r_table.len(),
-            self.udp_sockets.sockets.len()
-        );
         self.udp_ttl.retain(|flow_id, expires| {
             if *expires < now {
                 if let Some((_, socket_id)) = self.udp_table.remove_entry(flow_id)
@@ -339,13 +332,6 @@ impl NatTable {
                 true
             }
         });
-        println!(
-            "!!! Cleanup after {} {} {} {}",
-            self.udp_ttl.len(),
-            self.udp_table.len(),
-            self.udp_r_table.len(),
-            self.udp_sockets.sockets.len()
-        );
     }
 }
 
