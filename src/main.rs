@@ -15,23 +15,23 @@ mod fortivpn;
 mod http;
 mod ikev2;
 mod ip;
+#[cfg(target_os = "linux")]
+mod l2gateway;
 mod logger;
 mod pcap;
 mod ppp;
-#[cfg(target_os = "linux")]
-mod tproxy;
 mod uplink;
 
 enum Action {
     IkeV2(Ikev2Config),
     #[cfg(target_os = "linux")]
-    Tproxy(TproxyConfig),
+    L2Gateway(L2GatewayConfig),
 }
 
 #[derive(Eq, PartialEq)]
 enum ActionType {
     IkeV2,
-    Tproxy,
+    L2Gateway,
 }
 
 struct Args {
@@ -57,7 +57,7 @@ Options:\
 \n      --key=<FILENAME>                Path to private key (in PKCS 8 PEM format)\
 \n      --pcap=<FILENAME>               (Optional) Enable packet capture into the specified tcpdump file\
 \n\n\
-> pterodapter [OPTIONS] tproxy\n\
+> pterodapter [OPTIONS] l2gateway\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>         Log level [default: info]\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
@@ -75,8 +75,8 @@ struct Ikev2Config {
 }
 
 #[cfg(target_os = "linux")]
-struct TproxyConfig {
-    tproxy: tproxy::Config,
+struct L2GatewayConfig {
+    l2gateway: l2gateway::Config,
     uplink: uplink::Config,
     pcap: Option<String>,
 }
@@ -85,7 +85,7 @@ impl Args {
     fn parse() -> Args {
         let action_type = match env::args().next_back().as_deref() {
             Some("ikev2") => ActionType::IkeV2,
-            Some("tproxy") => ActionType::Tproxy,
+            Some("l2gateway") => ActionType::L2Gateway,
             Some("help") => {
                 println!("{USAGE_INSTRUCTIONS}");
                 process::exit(0);
@@ -318,16 +318,16 @@ impl Args {
                 });
                 Args { log_level, action }
             }
-            ActionType::Tproxy => {
+            ActionType::L2Gateway => {
                 #[cfg(target_os = "linux")]
                 {
-                    let tproxy_config = tproxy::Config {
+                    let l2gateway_config = l2gateway::Config {
                         tunnel_domains,
                         nat64_prefix,
                         dns64_domains,
                     };
-                    let action = Action::Tproxy(TproxyConfig {
-                        tproxy: tproxy_config,
+                    let action = Action::L2Gateway(L2GatewayConfig {
+                        l2gateway: l2gateway_config,
                         uplink: uplink_config,
                         pcap: pcap_file,
                     });
@@ -335,7 +335,7 @@ impl Args {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    eprintln!("TPROXY is only supported in Linux");
+                    eprintln!("L2 Gateway is only supported in Linux");
                     println!("{}", USAGE_INSTRUCTIONS);
                     process::exit(2);
                 }
@@ -401,7 +401,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
 }
 
 #[cfg(target_os = "linux")]
-fn serve_tproxy(config: TproxyConfig) -> Result<(), i32> {
+fn serve_l2gateway(config: L2GatewayConfig) -> Result<(), i32> {
     use tokio::sync::oneshot;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -412,7 +412,7 @@ fn serve_tproxy(config: TproxyConfig) -> Result<(), i32> {
             eprintln!("Failed to start runtime: {err}");
             1
         })?;
-    let mut server = tproxy::Server::new(config.tproxy);
+    let mut server = l2gateway::Server::new(config.l2gateway);
 
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
 
@@ -475,8 +475,8 @@ fn main() {
             }
         }
         #[cfg(target_os = "linux")]
-        Action::Tproxy(config) => {
-            if let Err(exitcode) = serve_tproxy(config) {
+        Action::L2Gateway(config) => {
+            if let Err(exitcode) = serve_l2gateway(config) {
                 process::exit(exitcode)
             }
         }
