@@ -18,11 +18,25 @@ mod ip;
 mod logger;
 mod pcap;
 mod ppp;
+#[cfg(target_os = "linux")]
+mod tproxy;
 mod uplink;
+
+enum Action {
+    IkeV2(Ikev2Config),
+    #[cfg(target_os = "linux")]
+    Tproxy(TproxyConfig),
+}
+
+#[derive(Eq, PartialEq)]
+enum ActionType {
+    IkeV2,
+    Tproxy,
+}
 
 struct Args {
     log_level: log::LevelFilter,
-    config: Ikev2Config,
+    action: Action,
 }
 
 const USAGE_INSTRUCTIONS: &str = "Usage:\n\n\
@@ -43,6 +57,15 @@ Options:\
 \n      --key=<FILENAME>                Path to private key (in PKCS 8 PEM format)\
 \n      --pcap=<FILENAME>               (Optional) Enable packet capture into the specified tcpdump file\
 \n\n\
+> pterodapter [OPTIONS] tproxy\n\
+Options:\
+\n      --log-level=<LOG_LEVEL>         Log level [default: info]\
+\n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
+\n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
+\n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
+\n      --pcap=<FILENAME>               (Optional) Enable packet capture into the specified tcpdump file\
+\n\n\
 > pretodapter help";
 
 struct Ikev2Config {
@@ -51,10 +74,18 @@ struct Ikev2Config {
     pcap: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
+struct TproxyConfig {
+    tproxy: tproxy::Config,
+    uplink: uplink::Config,
+    pcap: Option<String>,
+}
+
 impl Args {
     fn parse() -> Args {
-        match env::args().next_back().as_deref() {
-            Some("ikev2") => {}
+        let action_type = match env::args().next_back().as_deref() {
+            Some("ikev2") => ActionType::IkeV2,
+            Some("tproxy") => ActionType::Tproxy,
             Some("help") => {
                 println!("{USAGE_INSTRUCTIONS}");
                 process::exit(0);
@@ -134,7 +165,7 @@ impl Args {
                     Err(err) => fail_with_error(
                         name,
                         value,
-                        format_args!("Failed to parse destination address: {err}"),
+                        format_args!("Failed to parse destination fortivpn address: {err}"),
                     ),
                 };
             } else if name == "--tunnel-domain" {
@@ -159,7 +190,7 @@ impl Args {
                     );
                 }
                 dns64_domains.push(value.into());
-            } else if name == "--listen-ip" {
+            } else if action_type == ActionType::IkeV2 && name == "--listen-ip" {
                 match IpAddr::from_str(value) {
                     Ok(ip) => {
                         listen_ips.push(ip);
@@ -170,7 +201,7 @@ impl Args {
                         format_args!("Failed to parse IP address: {err}"),
                     ),
                 };
-            } else if name == "--ike-port" {
+            } else if action_type == ActionType::IkeV2 && name == "--ike-port" {
                 match u16::from_str(value) {
                     Ok(port) => ike_port = port,
                     Err(err) => fail_with_error(
@@ -179,7 +210,7 @@ impl Args {
                         format_args!("Failed to parse IKEv2 port: {err}"),
                     ),
                 };
-            } else if name == "--nat-port" {
+            } else if action_type == ActionType::IkeV2 && name == "--nat-port" {
                 match u16::from_str(value) {
                     Ok(port) => nat_port = port,
                     Err(err) => fail_with_error(
@@ -203,9 +234,9 @@ impl Args {
                     ),
                 };
                 nat64_prefix = Some(ip);
-            } else if name == "--id-hostname" {
+            } else if action_type == ActionType::IkeV2 && name == "--id-hostname" {
                 id_hostname = Some(value.into());
-            } else if name == "--cacert" {
+            } else if action_type == ActionType::IkeV2 && name == "--cacert" {
                 match fs::read_to_string(value) {
                     Ok(cert) => root_ca = Some(cert),
                     Err(err) => fail_with_error(
@@ -214,7 +245,7 @@ impl Args {
                         format_args!("Failed to read root CA cert: {err}"),
                     ),
                 };
-            } else if name == "--cert" {
+            } else if action_type == ActionType::IkeV2 && name == "--cert" {
                 match fs::read_to_string(value) {
                     Ok(cert) => public_cert = Some(cert),
                     Err(err) => fail_with_error(
@@ -223,7 +254,7 @@ impl Args {
                         format_args!("Failed to read root CA cert: {err}"),
                     ),
                 };
-            } else if name == "--key" {
+            } else if action_type == ActionType::IkeV2 && name == "--key" {
                 match fs::read_to_string(value) {
                     Ok(cert) => private_key = Some(cert),
                     Err(err) => fail_with_error(
@@ -248,7 +279,7 @@ impl Args {
                 })
             }
             _ => {
-                eprintln!("No destination specified");
+                eprintln!("No destination fortivpn specified");
                 println!("{USAGE_INSTRUCTIONS}");
                 process::exit(2);
             }
@@ -259,31 +290,57 @@ impl Args {
             process::exit(2);
         }
 
-        let server_cert = match (public_cert, private_key) {
-            (Some(public_cert), Some(private_key)) => Some((public_cert, private_key)),
-            _ => None,
-        };
-        if listen_ips.is_empty() {
-            listen_ips = vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)];
-        }
+        match action_type {
+            ActionType::IkeV2 => {
+                let server_cert = match (public_cert, private_key) {
+                    (Some(public_cert), Some(private_key)) => Some((public_cert, private_key)),
+                    _ => None,
+                };
+                if listen_ips.is_empty() {
+                    listen_ips = vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)];
+                }
 
-        let ikev2_config = ikev2::Config {
-            hostname: id_hostname.clone(),
-            listen_ips: listen_ips.clone(),
-            port: ike_port,
-            nat_port,
-            root_ca,
-            server_cert,
-            tunnel_domains,
-            nat64_prefix,
-            dns64_domains,
-        };
-        let config = Ikev2Config {
-            ikev2: ikev2_config,
-            uplink: uplink_config,
-            pcap: pcap_file,
-        };
-        Args { log_level, config }
+                let ikev2_config = ikev2::Config {
+                    hostname: id_hostname.clone(),
+                    listen_ips: listen_ips.clone(),
+                    port: ike_port,
+                    nat_port,
+                    root_ca,
+                    server_cert,
+                    tunnel_domains,
+                    nat64_prefix,
+                    dns64_domains,
+                };
+                let action = Action::IkeV2(Ikev2Config {
+                    ikev2: ikev2_config,
+                    uplink: uplink_config,
+                    pcap: pcap_file,
+                });
+                Args { log_level, action }
+            }
+            ActionType::Tproxy => {
+                #[cfg(target_os = "linux")]
+                {
+                    let tproxy_config = tproxy::Config {
+                        tunnel_domains,
+                        nat64_prefix,
+                        dns64_domains,
+                    };
+                    let action = Action::Tproxy(TproxyConfig {
+                        tproxy: tproxy_config,
+                        uplink: uplink_config,
+                        pcap: pcap_file,
+                    });
+                    Args { log_level, action }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    eprintln!("TPROXY is only supported in Linux");
+                    println!("{}", USAGE_INSTRUCTIONS);
+                    process::exit(2);
+                }
+            }
+        }
     }
 }
 
@@ -343,6 +400,57 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn serve_tproxy(config: TproxyConfig) -> Result<(), i32> {
+    use tokio::sync::oneshot;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|err| {
+            eprintln!("Failed to start runtime: {err}");
+            1
+        })?;
+    let mut server = tproxy::Server::new(config.tproxy);
+
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+
+    rt.spawn(async move {
+        if let Err(err) = signal::ctrl_c().await {
+            eprintln!("Failed to wait for CTRL+C signal: {err}");
+        }
+        info!("Started shutdown");
+        if shutdown_sender.send(()).is_err() {
+            eprintln!("Shutdown listener is closed");
+        }
+    });
+
+    let pcap_sender = if let Some(pcap_file) = config.pcap {
+        match rt.block_on(pcap::PcapWriter::new(pcap_file)) {
+            Ok(pcap_writer) => {
+                let pcap_sender = pcap_writer.create_sender();
+                rt.spawn(pcap_writer.run());
+                Some(pcap_sender)
+            }
+            Err(err) => {
+                eprintln!("Failed to create PCAP writer: {err}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let uplink = uplink::UplinkServiceType::new(config.uplink, pcap_sender.clone());
+    if let Err(err) = server.run(rt, uplink, shutdown_receiver, pcap_sender) {
+        eprintln!("Failed to run server: {err}");
+    };
+
+    info!("Stopped server");
+    Ok(())
+}
+
 fn main() {
     println!(
         "Pterodapter version {}",
@@ -360,7 +468,17 @@ fn main() {
     if let Err(err) = logger::setup_logger(args.log_level) {
         eprintln!("Failed to set up logger, error is {err}");
     }
-    if let Err(exitcode) = serve_ikev2(args.config) {
-        process::exit(exitcode);
+    match args.action {
+        Action::IkeV2(config) => {
+            if let Err(exitcode) = serve_ikev2(config) {
+                process::exit(exitcode);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Action::Tproxy(config) => {
+            if let Err(exitcode) = serve_tproxy(config) {
+                process::exit(exitcode)
+            }
+        }
     }
 }
