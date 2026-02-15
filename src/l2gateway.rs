@@ -1,9 +1,13 @@
-use std::io::Read;
-use std::io::{self};
 use std::os::fd::AsRawFd;
+use std::pin::pin;
+use std::task::Poll;
+use std::time::Duration;
 use std::{error, fmt, net::Ipv6Addr};
+use std::{future, io};
 
-use log::warn;
+use log::{debug, info, warn};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::{runtime, sync::oneshot};
 
 use crate::logger::fmt_slice_hex;
@@ -35,23 +39,81 @@ impl Server {
         shutdown_receiver: oneshot::Receiver<()>,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
-        let mut socket = match RawSocket::new(RawSocketProtocol::IPv6) {
+        let result = rt.block_on(self.run_process(shutdown_receiver, uplink));
+        rt.shutdown_timeout(Duration::from_secs(60));
+        result
+    }
+
+    async fn run_process(
+        &mut self,
+        shutdown_receiver: oneshot::Receiver<()>,
+        uplink: uplink::UplinkServiceType,
+    ) -> Result<(), L2GatewayError> {
+        // TODO GATEWAY: use a fixed limit matching the Ethernet limit (1500), FortiVPN can reuse
+        // space from Ethernet frames.
+        let mut buf = [0u8; 2000];
+        let socket = match RawSocket::new(RawSocketProtocol::IPv6).await {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
                 return Err(err.into());
             }
         };
-
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
             warn!("Failed to enable BPF filter, will rely on a less efficient packet filter: {err}")
         }
 
-        let mut buf = [0u8; 2000];
+        info!("Started server");
+
+        let mut shutdown_command = pin!(shutdown_receiver);
+        let mut shutdown = false;
         loop {
-            let bytes_read = socket.read(&mut buf).expect("read data");
-            let data = &buf[..bytes_read];
-            println!("! Got data {}", fmt_slice_hex(data));
+            let uplink_is_connected = uplink.is_connected();
+            if shutdown && !uplink_is_connected {
+                debug!("Shutdown completed");
+                return Ok(());
+            }
+            let (shutdown_requested, raw_packet) = {
+                let mut raw_packet = None;
+                let mut shutdown_requested = shutdown;
+                future::poll_fn(|cx| {
+                    if !shutdown_requested {
+                        shutdown_requested = match shutdown_command.as_mut().poll(cx) {
+                            Poll::Ready(_) => true,
+                            Poll::Pending => false,
+                        }
+                    }
+                    // shutdown_command.poll(cx)
+                    if raw_packet.is_none() {
+                        raw_packet = match socket.poll_recv(cx, &mut buf) {
+                            Poll::Ready(result) => Some(result),
+                            Poll::Pending => None,
+                        };
+                    }
+                    if raw_packet.is_some() || shutdown_requested {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                (shutdown_requested, raw_packet)
+            };
+            //let bytes_read = socket.read(&mut buf).await.expect("read data");
+            if shutdown_requested {
+                shutdown = true;
+            }
+            if let Some(raw_packet) = raw_packet {
+                match raw_packet {
+                    Ok(bytes_read) => {
+                        let data = &buf[..bytes_read];
+                        println!("! Got data {}", fmt_slice_hex(data));
+                    }
+                    Err(err) => {
+                        warn!("Failed to read raw packet: {err}");
+                    }
+                }
+            }
         }
     }
 }
@@ -61,23 +123,25 @@ enum RawSocketProtocol {
 }
 
 struct RawSocket {
-    socket: socket2::Socket,
+    socket: AsyncFd<std::os::unix::io::RawFd>,
 }
 
 impl RawSocket {
-    fn new(protocol: RawSocketProtocol) -> Result<RawSocket, io::Error> {
+    async fn new(protocol: RawSocketProtocol) -> Result<RawSocket, io::Error> {
         let protocol = match protocol {
             RawSocketProtocol::IPv6 => libc::ETH_P_IPV6,
         };
-        // TODO GATEWAY: switch to just libc, as socket2 doesn't work well with buffers,
-        // and doesn't support async.
-        let protocol = socket2::Protocol::from(u16::from_be(protocol as u16) as libc::c_int);
-        let socket = socket2::Socket::new(
-            socket2::Domain::PACKET,
-            socket2::Type::RAW,
-            Some(socket2::Protocol::from(protocol)),
-        )?;
-
+        let protocol = u16::from_be(protocol as u16) as libc::c_int;
+        let socket = match unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) } {
+            0 => return Err(io::Error::last_os_error()),
+            fd => fd as std::os::unix::io::RawFd,
+        };
+        if unsafe { libc::fcntl(socket, libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
+            let err = io::Error::last_os_error();
+            warn!("Failed to enable nonblocking operations: {err}");
+            return Err(err);
+        };
+        let socket = AsyncFd::new(socket)?;
         let socket = RawSocket { socket };
         if let Err(err) =
             socket.setsockopt_bool(libc::SOL_PACKET, libc::PACKET_IGNORE_OUTGOING, true)
@@ -90,8 +154,39 @@ impl RawSocket {
         Ok(socket)
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        self.socket.read(buf)
+    async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket
+            .async_io(Interest::READABLE, |fd| {
+                let result = unsafe { libc::recv(*fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            })
+            .await
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        loop {
+            let mut guard = std::task::ready!(self.socket.poll_read_ready(cx))?;
+            match guard.try_io(|fd| {
+                let result =
+                    unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
     }
 
     fn setsockopt<T>(
