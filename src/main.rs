@@ -61,8 +61,7 @@ Options:\
 Options:\
 \n      --log-level=<LOG_LEVEL>         Log level [default: info]\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
-\n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
-\n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
+\n      --nat64-prefix=<IP6>            Specify NAT64 prefix and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
 \n      --pcap=<FILENAME>               (Optional) Enable packet capture into the specified tcpdump file\
 \n\n\
@@ -168,7 +167,7 @@ impl Args {
                         format_args!("Failed to parse destination fortivpn address: {err}"),
                     ),
                 };
-            } else if name == "--tunnel-domain" {
+            } else if action_type == ActionType::IkeV2 && name == "--tunnel-domain" {
                 // Domains should be in DNS IDNA A-label format for Unicode strings.
                 // All further processing assumes the domain is an ASCII UTF-8 string.
                 if !value.is_ascii() {
@@ -319,10 +318,17 @@ impl Args {
                 Args { log_level, action }
             }
             ActionType::L2Gateway => {
+                let nat64_prefix = match nat64_prefix {
+                    Some(nat64_prefix) => nat64_prefix,
+                    None => {
+                        eprintln!("--nat64-prefix is required when using l2gateway mode");
+                        println!("{USAGE_INSTRUCTIONS}");
+                        process::exit(2);
+                    }
+                };
                 #[cfg(target_os = "linux")]
                 {
                     let l2gateway_config = l2gateway::Config {
-                        tunnel_domains,
                         nat64_prefix,
                         dns64_domains,
                     };
