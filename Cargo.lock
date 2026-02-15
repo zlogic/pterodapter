@@ -405,7 +405,6 @@ dependencies = [
  "rand",
  "rustls-platform-verifier",
  "rustls-webpki",
- "socket2",
  "tokio",
  "tokio-rustls",
  "x509-cert",
