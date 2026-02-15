@@ -20,7 +20,6 @@ x509-cert = { version = "0.2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "*", default-features = false }
-socket2 = { version = "*", default-features = false }
 
 [profile.release]
 strip = true
