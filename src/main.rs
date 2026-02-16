@@ -351,8 +351,6 @@ impl Args {
 }
 
 fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
-    use tokio::sync::oneshot;
-
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -369,18 +367,7 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
         }
     };
 
-    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-
-    rt.spawn(async move {
-        if let Err(err) = signal::ctrl_c().await {
-            eprintln!("Failed to wait for CTRL+C signal: {err}");
-        }
-        info!("Started shutdown");
-        if shutdown_sender.send(()).is_err() {
-            eprintln!("Shutdown listener is closed");
-        }
-    });
-
+    let shutdown_receiver = shutdown_listener(rt.handle());
     let pcap_sender = if let Some(pcap_file) = config.pcap {
         match rt.block_on(pcap::PcapWriter::new(pcap_file)) {
             Ok(pcap_writer) => {
@@ -406,10 +393,60 @@ fn serve_ikev2(config: Ikev2Config) -> Result<(), i32> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn serve_l2gateway(config: L2GatewayConfig) -> Result<(), i32> {
+fn shutdown_listener(rt: &tokio::runtime::Handle) -> tokio::sync::oneshot::Receiver<()> {
+    use std::future;
+    use std::pin::pin;
+    use std::task::Poll;
     use tokio::sync::oneshot;
 
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+
+    rt.spawn(async move {
+        let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(sigterm) => sigterm,
+            Err(err) => {
+                eprintln!("Failed to register for SIGTERM notifications: {err}");
+                return;
+            }
+        };
+        let mut ctrl_c = pin!(signal::ctrl_c());
+        let mut ctrl_c_failed = false;
+        future::poll_fn(|cx| {
+            let sigterm = match sigterm.poll_recv(cx) {
+                Poll::Ready(_) => true,
+                Poll::Pending => false,
+            };
+            let ctrl_c = if !ctrl_c_failed {
+                match ctrl_c.as_mut().poll(cx) {
+                    Poll::Ready(Ok(_)) => true,
+                    Poll::Ready(Err(err)) => {
+                        eprintln!("Failed to register for CTRL+C signal: {err}");
+                        ctrl_c_failed = true;
+                        false
+                    }
+                    Poll::Pending => false,
+                }
+            } else {
+                false
+            };
+            if sigterm || ctrl_c {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        info!("Started shutdown");
+        if shutdown_sender.send(()).is_err() {
+            eprintln!("Shutdown listener is closed");
+        }
+    });
+
+    shutdown_receiver
+}
+
+#[cfg(target_os = "linux")]
+fn serve_l2gateway(config: L2GatewayConfig) -> Result<(), i32> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -420,18 +457,7 @@ fn serve_l2gateway(config: L2GatewayConfig) -> Result<(), i32> {
         })?;
     let mut server = l2gateway::Server::new(config.l2gateway);
 
-    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-
-    rt.spawn(async move {
-        if let Err(err) = signal::ctrl_c().await {
-            eprintln!("Failed to wait for CTRL+C signal: {err}");
-        }
-        info!("Started shutdown");
-        if shutdown_sender.send(()).is_err() {
-            eprintln!("Shutdown listener is closed");
-        }
-    });
-
+    let shutdown_receiver = shutdown_listener(rt.handle());
     let pcap_sender = if let Some(pcap_file) = config.pcap {
         match rt.block_on(pcap::PcapWriter::new(pcap_file)) {
             Ok(pcap_writer) => {
