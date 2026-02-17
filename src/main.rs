@@ -1,6 +1,6 @@
 use std::{
     env, fmt, fs,
-    net::{IpAddr, Ipv6Addr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     process,
     str::FromStr as _,
     sync::Arc,
@@ -268,13 +268,19 @@ impl Args {
                 eprintln!("Unsupported argument {arg}");
             }
         }
-
+        let cookie_listen_address = match action_type {
+            // Assume IKEv2 is running locally, or is getting redirected.
+            ActionType::IkeV2 => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8020),
+            // Gateway mode uses the cookie sender address to get the client IP.
+            ActionType::L2Gateway => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8020),
+        };
         let uplink_config = match (fortivpn_addr, fortivpn_hostport) {
             (Some(fortivpn_addr), Some(fortivpn_hostport)) => {
                 uplink::Config::FortiVPN(fortivpn::Config {
                     destination_addr: fortivpn_addr,
                     destination_hostport: fortivpn_hostport,
                     tls_config,
+                    cookie_listen_address,
                 })
             }
             _ => {
@@ -412,10 +418,7 @@ fn shutdown_listener(rt: &tokio::runtime::Handle) -> tokio::sync::oneshot::Recei
         let mut ctrl_c = pin!(signal::ctrl_c());
         let mut ctrl_c_failed = false;
         future::poll_fn(|cx| {
-            let sigterm = match sigterm.poll_recv(cx) {
-                Poll::Ready(_) => true,
-                Poll::Pending => false,
-            };
+            let sigterm = sigterm.poll_recv(cx).is_ready();
             let ctrl_c = if !ctrl_c_failed {
                 match ctrl_c.as_mut().poll(cx) {
                     Poll::Ready(Ok(_)) => true,
