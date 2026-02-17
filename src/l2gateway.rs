@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::pin::pin;
 use std::task::Poll;
@@ -5,14 +6,18 @@ use std::time::Duration;
 use std::{error, fmt, net::Ipv6Addr};
 use std::{future, io};
 
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::{runtime, sync::oneshot};
 
+use crate::ip;
 use crate::logger::fmt_slice_hex;
 use crate::uplink::UplinkService as _;
 use crate::{ip::Nat64Prefix, pcap, uplink};
+
+// Maximum ethernet frame (as send by the Linux kernel), the ethernet header will be reused for PPP headers.
+const MAX_PACKET_SIZE: usize = 1500;
 
 pub struct Config {
     pub nat64_prefix: Ipv6Addr,
@@ -22,13 +27,25 @@ pub struct Config {
 pub struct Server {
     dns64_domains: Vec<String>,
     nat64_prefix: Nat64Prefix,
+    raw_read_buffer: [u8; MAX_PACKET_SIZE],
+    raw_write_buffer: [u8; MAX_PACKET_SIZE],
+    uplink_read_buffer: [u8; MAX_PACKET_SIZE],
+    uplink_write_buffer: [u8; MAX_PACKET_SIZE],
 }
 
 impl Server {
     pub fn new(config: Config) -> Server {
+        let raw_read_buffer = [0u8; MAX_PACKET_SIZE];
+        let raw_write_buffer = [0u8; MAX_PACKET_SIZE];
+        let uplink_read_buffer = [0u8; MAX_PACKET_SIZE];
+        let uplink_write_buffer = [0u8; MAX_PACKET_SIZE];
         Server {
             dns64_domains: config.dns64_domains,
             nat64_prefix: Nat64Prefix::new(config.nat64_prefix),
+            raw_read_buffer,
+            raw_write_buffer,
+            uplink_read_buffer,
+            uplink_write_buffer,
         }
     }
 
@@ -39,7 +56,11 @@ impl Server {
         shutdown_receiver: oneshot::Receiver<()>,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
-        let result = rt.block_on(self.run_process(shutdown_receiver, uplink));
+        let network =
+            ip::Network::new(Some(self.nat64_prefix.clone()), self.dns64_domains.clone())?;
+        let packet_filter = PacketFilter::new(network, pcap_sender);
+
+        let result = rt.block_on(self.run_process(shutdown_receiver, packet_filter, uplink));
         rt.shutdown_timeout(Duration::from_secs(60));
         result
     }
@@ -47,12 +68,10 @@ impl Server {
     async fn run_process(
         &mut self,
         shutdown_receiver: oneshot::Receiver<()>,
-        uplink: uplink::UplinkServiceType,
+        mut packet_filter: PacketFilter,
+        mut uplink: uplink::UplinkServiceType,
     ) -> Result<(), L2GatewayError> {
-        // TODO GATEWAY: use a fixed limit matching the Ethernet limit (1500), FortiVPN can reuse
-        // space from Ethernet frames.
-        let mut buf = [0u8; 2000];
-        let socket = match RawSocket::new(RawSocketProtocol::IPv6).await {
+        let socket = match RawSocket::new().await {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
@@ -67,25 +86,43 @@ impl Server {
 
         let mut shutdown_command = pin!(shutdown_receiver);
         let mut shutdown = false;
+        let uplink_reserved_header_size = uplink.reserved_header_bytes();
         loop {
             let uplink_is_connected = uplink.is_connected();
             if shutdown && !uplink_is_connected {
                 debug!("Shutdown completed");
                 return Ok(());
             }
-            let (shutdown_requested, raw_packet) = {
+            let client_ip = match &uplink {
+                uplink::UplinkServiceType::FortiVPN(forti_service) => {
+                    forti_service.cookie_client_ip()
+                }
+            };
+            packet_filter.update_ip(uplink.ip_configuration(), client_ip);
+            let (shutdown_requested, raw_packet, uplink_event) = {
+                let ignore_uplink = shutdown && !uplink_is_connected;
+                let mut uplink_event = None;
                 let mut raw_packet = None;
                 let mut shutdown_requested = shutdown;
+                let mut receive_uplink_event =
+                    pin!(uplink.wait_event(&mut self.uplink_read_buffer));
                 future::poll_fn(|cx| {
-                    if !shutdown_requested {
-                        shutdown_requested = match shutdown_command.as_mut().poll(cx) {
-                            Poll::Ready(_) => true,
-                            Poll::Pending => false,
-                        }
+                    if uplink_event.is_none() {
+                        uplink_event = if !ignore_uplink {
+                            let uplink_event = receive_uplink_event.as_mut().poll(cx);
+                            match uplink_event {
+                                Poll::Ready(cmd) => Some(cmd),
+                                Poll::Pending => None,
+                            }
+                        } else {
+                            // Avoid waking if uplink/VPN is already shut down.
+                            None
+                        };
                     }
-                    // shutdown_command.poll(cx)
+                    shutdown_requested =
+                        shutdown_requested || shutdown_command.as_mut().poll(cx).is_ready();
                     if raw_packet.is_none() {
-                        raw_packet = match socket.poll_recv(cx, &mut buf) {
+                        raw_packet = match socket.poll_recv(cx, &mut self.raw_read_buffer) {
                             Poll::Ready(result) => Some(result),
                             Poll::Pending => None,
                         };
@@ -97,29 +134,344 @@ impl Server {
                     }
                 })
                 .await;
-                (shutdown_requested, raw_packet)
+                (shutdown_requested, raw_packet, uplink_event)
             };
-            //let bytes_read = socket.read(&mut buf).await.expect("read data");
             if shutdown_requested {
                 shutdown = true;
+                if let Err(err) = uplink.terminate().await {
+                    warn!("Failed to terminate uplink/VPN client connection: {err}");
+                }
             }
-            if let Some(raw_packet) = raw_packet {
-                match raw_packet {
-                    Ok(bytes_read) => {
-                        let data = &buf[..bytes_read];
-                        println!("! Got data {}", fmt_slice_hex(data));
+            let uplink_action = match uplink_event {
+                Some(Ok(())) => match uplink.read_packet(&mut self.uplink_read_buffer).await {
+                    Ok(data) => {
+                        let read_bytes = data.len();
+
+                        match packet_filter.process_uplink_packet(
+                            &mut self.uplink_read_buffer[uplink_reserved_header_size..],
+                            read_bytes,
+                            &mut self.uplink_write_buffer,
+                        ) {
+                            Ok(action) => action,
+                            Err(err) => {
+                                warn!("Failed to forward uplink/VPN packet to IKEv2: {err}");
+                                UplinkRoutingAction::Drop
+                            }
+                        }
                     }
                     Err(err) => {
-                        warn!("Failed to read raw packet: {err}");
+                        warn!("Failed to read packet from uplink/VPN: {err}");
+                        UplinkRoutingAction::Drop
+                    }
+                },
+                Some(Err(err)) => {
+                    warn!("Uplink/VPN reported an error status: {err}");
+                    UplinkRoutingAction::Drop
+                }
+                None => UplinkRoutingAction::Drop,
+            };
+            let (uplink_reply, uplink_send_to_raw) = uplink_action.into_packets();
+            let raw_action = match raw_packet {
+                Some(Ok(read_bytes)) => {
+                    let result = packet_filter.process_raw_packet(
+                        &mut self.raw_read_buffer,
+                        read_bytes,
+                        &mut self.raw_write_buffer,
+                    );
+                    match result {
+                        Ok(action) => action,
+                        Err(err) => {
+                            warn!("Failed to process raw packet: {err}");
+                            RawRoutingAction::Drop
+                        }
                     }
                 }
+                Some(Err(err)) => {
+                    warn!("Failed to read raw packet: {err}");
+                    RawRoutingAction::Drop
+                }
+                None => RawRoutingAction::Drop,
+            };
+            let (raw_reply, raw_send_to_uplink) = raw_action.into_packets();
+            // TODO: remove this debug code
+            {
+                if let Some(packet) = raw_reply {
+                    let packet = ip::IpPacket::from_data(packet).expect("raw reply");
+                    println!("Sending reply:\n{packet}")
+                }
+                if !raw_send_to_uplink.is_empty() {
+                    let packet = ip::IpPacket::from_data(raw_send_to_uplink).expect("send to vpn");
+                    println!("Sending packet to VPN:\n{packet}")
+                }
+            }
+            let (uplink_event, sent_raw_response, forwarded_raw_packet) = {
+                let send_slices_to_uplink = [uplink_reply, raw_send_to_uplink];
+                let mut process_uplink_events = pin!(uplink.process_events(&send_slices_to_uplink));
+                let mut sent_raw_response = None;
+                let mut forwarded_raw_packet = None;
+                let mut uplink_event = None;
+                future::poll_fn(|cx| {
+                    if uplink_event.is_none() {
+                        uplink_event = match process_uplink_events.as_mut().poll(cx) {
+                            Poll::Ready(result) => Some(result),
+                            Poll::Pending => None,
+                        };
+                    }
+                    if sent_raw_response.is_none() {
+                        sent_raw_response = if let Some(raw_reply_data) = &raw_reply {
+                            match socket.poll_send(cx, raw_reply_data) {
+                                Poll::Ready(result) => Some(result),
+                                Poll::Pending => None,
+                            }
+                        } else {
+                            Some(Ok(0))
+                        }
+                    }
+                    if forwarded_raw_packet.is_none() {
+                        forwarded_raw_packet = if let Some(uplink_packet) = &uplink_send_to_raw {
+                            match socket.poll_send(cx, uplink_packet) {
+                                Poll::Ready(result) => Some(result),
+                                Poll::Pending => None,
+                            }
+                        } else {
+                            Some(Ok(0))
+                        }
+                    }
+                    if uplink_event.is_some()
+                        && sent_raw_response.is_some()
+                        && forwarded_raw_packet.is_some()
+                    {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                (uplink_event, sent_raw_response, forwarded_raw_packet)
+            };
+            if let Some(Err(err)) = sent_raw_response {
+                warn!("Failed to send UDP ESP response: {err}");
+            }
+            if let Some(Err(err)) = forwarded_raw_packet {
+                warn!("Failed to forward message to UDP ESP: {err}");
+            }
+            if let Some(Err(err)) = uplink_event {
+                warn!("Failed to process uplink/VPN lifecycle events: {err}");
+            }
+            if uplink_is_connected && !uplink.is_connected() {
+                // TODO GATEWAY: forget client MAC?
             }
         }
     }
 }
 
-enum RawSocketProtocol {
-    IPv6,
+struct MacAddr([u8; 6]);
+
+impl MacAddr {
+    fn from_data(data: &[u8]) -> MacAddr {
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(data);
+        MacAddr(mac)
+    }
+}
+
+impl fmt::Display for MacAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EtherType(u16);
+
+impl EtherType {
+    const IPV4: EtherType = EtherType(0x0800);
+    const IPV6: EtherType = EtherType(0x86DD);
+
+    fn from_data(data: &[u8]) -> EtherType {
+        let mut et = [0u8; 2];
+        et.copy_from_slice(data);
+        EtherType(u16::from_be_bytes(et))
+    }
+}
+
+impl fmt::Display for EtherType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::IPV4 => write!(f, "IPv4"),
+            Self::IPV6 => write!(f, "IPv6"),
+            _ => write!(f, "Unknown EtherType {:#04x}", self.0),
+        }
+    }
+}
+
+struct PacketFilter {
+    network: ip::Network,
+    pcap_sender: Option<pcap::PcapSender>,
+    client_ip: Option<Ipv6Addr>,
+    client_mac: Option<MacAddr>,
+    server_mac: Option<MacAddr>,
+}
+
+impl PacketFilter {
+    fn new(network: ip::Network, pcap_sender: Option<pcap::PcapSender>) -> PacketFilter {
+        PacketFilter {
+            network,
+            pcap_sender,
+            client_ip: None,
+            client_mac: None,
+            server_mac: None,
+        }
+    }
+
+    fn update_ip(&mut self, configuration: Option<(IpAddr, &[IpAddr])>, client_ip: Option<IpAddr>) {
+        let (internal_addr, dns_addrs): (Option<IpAddr>, &[IpAddr]) =
+            if let Some((internal_addr, dns_addrs)) = configuration {
+                (Some(internal_addr), dns_addrs)
+            } else {
+                (None, &[])
+            };
+        self.network
+            .update_ip_configuration(internal_addr, dns_addrs);
+
+        let client_ip = match client_ip {
+            Some(IpAddr::V6(client_ip)) => Some(client_ip),
+            Some(IpAddr::V4(_)) | None => None,
+        };
+        if client_ip != self.client_ip {
+            self.client_ip = client_ip;
+            self.client_mac = None;
+            self.server_mac = None;
+        }
+    }
+
+    fn process_raw_packet<'a>(
+        &mut self,
+        in_buf: &'a mut [u8],
+        data_len: usize,
+        out_buf: &'a mut [u8],
+    ) -> Result<RawRoutingAction<'a>, L2GatewayError> {
+        let data = &in_buf[..data_len];
+        trace!("Received ethernet frame\n{}", fmt_slice_hex(data));
+        if data.len() < 14 {
+            return Err("Not enough data in ethernet frame".into());
+        }
+        let dest_mac = MacAddr::from_data(&data[0..6]);
+        let src_mac = MacAddr::from_data(&data[6..12]);
+        let ether_type = EtherType::from_data(&data[12..14]);
+        if ether_type != EtherType::IPV6 {
+            debug!(
+                "Received unsupported EtherType: {ether_type}\n{}",
+                fmt_slice_hex(data),
+            );
+            return Err("Received unsupported EtherType".into());
+        }
+        let data = &data[14..];
+        if let Some(pcap_sender) = &mut self.pcap_sender {
+            pcap_sender.send_packet(data);
+        }
+        let ip_packet = match ip::IpPacket::from_data(data) {
+            Ok(packet) => packet,
+            Err(err) => {
+                warn!(
+                    "Failed to parse IP packet from ethernet frame: {}\n{}",
+                    err,
+                    fmt_slice_hex(data),
+                );
+                return Err("Failed to parse IP packet from ethernet frame".into());
+            }
+        };
+        trace!(
+            "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dest_mac} {ip_packet}"
+        );
+        let header = ip_packet.to_header();
+        // TODO GATEWAY: check source/dest IP (or MAC if registered)
+        // TODO GATEWAY: rewrite source IP to match network configuration (network function), only need checksum in UDP/TCP header; or override client IP in ip::Network.
+        // TODO GATEWAY: rewrite all DNS packets?
+        match self
+            .network
+            .translate_packet_from_client(ip_packet, header, out_buf)
+        {
+            Ok(ip::RoutingActionClient::Forward(buf)) => Ok(RawRoutingAction::Forward(buf)),
+            Ok(ip::RoutingActionClient::ReturnToSender(buf, msg_len)) => {
+                // TODO GATEWAY: prepend Ethernet frame.
+                Ok(RawRoutingAction::ReturnToSender(&buf[..msg_len]))
+            }
+            Ok(ip::RoutingActionClient::Drop) => Ok(RawRoutingAction::Drop),
+            Err(err) => {
+                warn!("Failed to NAT packet from client: {err}");
+                Err("Failed to NAT packet from client".into())
+            }
+        }
+    }
+
+    fn process_uplink_packet<'a>(
+        &mut self,
+        in_buf: &'a mut [u8],
+        data_len: usize,
+        out_buf: &'a mut [u8],
+    ) -> Result<UplinkRoutingAction<'a>, L2GatewayError> {
+        if data_len == 0 {
+            return Ok(UplinkRoutingAction::Drop);
+        }
+        trace!(
+            "Received packet from uplink/VPN\n{}",
+            fmt_slice_hex(&in_buf[..data_len])
+        );
+        let ip_packet = match ip::IpPacket::from_data(&in_buf[..data_len]) {
+            Ok(packet) => packet,
+            Err(err) => {
+                warn!(
+                    "Failed to decode IP packet from uplink/VPN: {}\n{}",
+                    err,
+                    fmt_slice_hex(&in_buf[..data_len]),
+                );
+                return Err("Failed to decode IP packet from uplink/VPN".into());
+            }
+        };
+        trace!("Decoded IP packet from uplink/VPN {ip_packet}");
+        let ip_header = ip_packet.to_header();
+        // TODO GATEWAY: forward packet only if there's a MAC on record.
+        // TODO GATEWAY: apply transformation as done in ESP (+ pcap writer)
+        debug!("No client MAC address found for uplink/VPN packet {ip_header}");
+        Err("No client MAC address found for uplink/VPN packet".into())
+    }
+}
+
+enum RawRoutingAction<'a> {
+    Forward(&'a [u8]),
+    ReturnToSender(&'a [u8]),
+    Drop,
+}
+
+impl<'a> RawRoutingAction<'a> {
+    fn into_packets(self) -> (Option<&'a [u8]>, &'a [u8]) {
+        match self {
+            RawRoutingAction::Forward(data) => (None, data),
+            RawRoutingAction::ReturnToSender(data) => (Some(data), &[]),
+            RawRoutingAction::Drop => (None, &[]),
+        }
+    }
+}
+
+enum UplinkRoutingAction<'a> {
+    Forward(&'a [u8]),
+    ReturnToSender(&'a [u8]),
+    Drop,
+}
+
+impl<'a> UplinkRoutingAction<'a> {
+    fn into_packets(self) -> (&'a [u8], Option<&'a [u8]>) {
+        match self {
+            UplinkRoutingAction::Forward(data) => (&[], Some(data)),
+            UplinkRoutingAction::ReturnToSender(data) => (data, None),
+            UplinkRoutingAction::Drop => (&[], None),
+        }
+    }
 }
 
 struct RawSocket {
@@ -127,11 +479,8 @@ struct RawSocket {
 }
 
 impl RawSocket {
-    async fn new(protocol: RawSocketProtocol) -> Result<RawSocket, io::Error> {
-        let protocol = match protocol {
-            RawSocketProtocol::IPv6 => libc::ETH_P_IPV6,
-        };
-        let protocol = u16::from_be(protocol as u16) as libc::c_int;
+    async fn new() -> Result<RawSocket, io::Error> {
+        let protocol = u16::from_be(libc::ETH_P_IPV6 as u16) as libc::c_int;
         let socket = match unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) } {
             0 => return Err(io::Error::last_os_error()),
             fd => fd as std::os::unix::io::RawFd,
@@ -189,6 +538,28 @@ impl RawSocket {
         }
     }
 
+    fn poll_send(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        loop {
+            let mut guard = std::task::ready!(self.socket.poll_write_ready(cx))?;
+            match guard.try_io(|fd| {
+                let result =
+                    unsafe { libc::send(fd.as_raw_fd(), buf.as_ptr() as *const _, buf.len(), 0) };
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
     fn setsockopt<T>(
         &self,
         level: libc::c_int,
@@ -228,6 +599,7 @@ impl RawSocket {
     }
 
     fn set_nat64_filter(&self, prefix: &Nat64Prefix) -> Result<(), io::Error> {
+        // See https://docs.kernel.org/networking/filter.html for more information.
         let mut filter_data = BpfFilter::new_nat64_filter(prefix);
         let filter = libc::sock_fprog {
             len: filter_data.ops_len as libc::c_ushort,
@@ -267,7 +639,7 @@ struct BpfFilter {
 
 impl BpfFilter {
     fn new_program(prog: &[BpfFilterOp]) -> BpfFilter {
-        let mut program_data = vec![0u8; std::mem::size_of::<BpfFilterOp>() * prog.len()];
+        let mut program_data = vec![0u8; std::mem::size_of_val(prog)];
         // TODO GATEWAY: write bytes directly, BPF is a standard documented in RFC 9669.
         program_data
             .chunks_exact_mut(std::mem::size_of::<BpfFilterOp>())
@@ -304,6 +676,7 @@ impl BpfFilter {
 #[derive(Debug)]
 pub enum L2GatewayError {
     Internal(&'static str),
+    Ip(ip::IpError),
     Uplink(uplink::UplinkError),
     Io(io::Error),
 }
@@ -312,6 +685,7 @@ impl fmt::Display for L2GatewayError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
+            Self::Ip(e) => write!(f, "IP error: {e}"),
             Self::Uplink(e) => write!(f, "Uplink/VPN error: {e}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
         }
@@ -322,6 +696,7 @@ impl error::Error for L2GatewayError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Internal(_msg) => None,
+            Self::Ip(err) => Some(err),
             Self::Uplink(err) => Some(err),
             Self::Io(err) => Some(err),
         }
@@ -331,6 +706,12 @@ impl error::Error for L2GatewayError {
 impl From<&'static str> for L2GatewayError {
     fn from(msg: &'static str) -> L2GatewayError {
         Self::Internal(msg)
+    }
+}
+
+impl From<ip::IpError> for L2GatewayError {
+    fn from(err: ip::IpError) -> L2GatewayError {
+        Self::Ip(err)
     }
 }
 
