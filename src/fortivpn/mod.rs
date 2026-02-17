@@ -1,6 +1,6 @@
 use std::{
     error, fmt, io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
 };
@@ -24,6 +24,7 @@ pub struct Config {
     pub tls_config: Arc<rustls::client::ClientConfig>,
     pub destination_addr: SocketAddr,
     pub destination_hostport: String,
+    pub cookie_listen_address: SocketAddr,
 }
 
 // ESP_MTU specifies the MTU matching the ESP slice size.
@@ -38,29 +39,29 @@ pub const PPP_HEADER_SIZE: usize = 8;
 
 const MAX_MTU: usize = ESP_MTU as usize;
 
-// TODO: check how FortiVPN chooses the listen port - is it fixed or sent as a parameter?
-const REDIRECT_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8020);
-
 const ECHO_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const ECHO_SEND_INTERVAL: Duration = Duration::from_secs(10);
 
-pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
+pub async fn get_oauth_cookie(config: &Config) -> Result<(String, IpAddr), FortiError> {
     println!(
         "Please open https://{}/remote/saml/start?redirect=1 in your browser...",
         config.destination_hostport
     );
 
-    let listener = match TcpListener::bind(REDIRECT_ADDRESS).await {
+    let listener = match TcpListener::bind(config.cookie_listen_address).await {
         Ok(listener) => listener,
         Err(err) => {
-            warn!("Failed to bind listener on {REDIRECT_ADDRESS}: {err}");
+            warn!(
+                "Failed to bind listener on {}: {err}",
+                config.cookie_listen_address
+            );
             return Err("Failed to bind listener".into());
         }
     };
-    let socket = match listener.accept().await {
-        Ok((socket, addr)) => {
-            debug!("New connection on SAML redirect port from {addr}");
-            socket
+    let (socket, client_addr) = match listener.accept().await {
+        Ok((socket, client_addr)) => {
+            debug!("New connection on SAML redirect port from {client_addr}");
+            (socket, client_addr.ip())
         }
         Err(err) => {
             warn!("Failed to accept incoming connection: {err}");
@@ -135,7 +136,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     let response = include_bytes!("../static/token.html");
     http::write_sso_response(&mut socket, response).await?;
 
-    Ok(cookie)
+    Ok((cookie, client_addr))
 }
 
 struct IpConfig {

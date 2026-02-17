@@ -9,8 +9,14 @@ use super::{Config, FortiVPNTunnel};
 
 const FLUSH_INTERVAL: usize = 5;
 
+struct ConnectingData {
+    tunnel: FortiVPNTunnel,
+    cookie_client_ip: IpAddr,
+}
+
 struct ConnectedData {
     tunnel: FortiVPNTunnel,
+    cookie_client_ip: IpAddr,
     echo_timer: Interval,
     need_echo: bool,
     unflushed_writes: usize,
@@ -18,7 +24,7 @@ struct ConnectedData {
 
 enum ConnectionState {
     Disconnected,
-    Connecting(JoinHandle<Result<FortiVPNTunnel, uplink::UplinkError>>),
+    Connecting(JoinHandle<Result<ConnectingData, uplink::UplinkError>>),
     Connected(Box<ConnectedData>),
 }
 
@@ -37,10 +43,22 @@ impl FortiService {
         }
     }
 
-    async fn connect(config: Config) -> Result<FortiVPNTunnel, uplink::UplinkError> {
-        let sslvpn_cookie = super::get_oauth_cookie(&config).await?;
+    async fn connect(config: Config) -> Result<ConnectingData, uplink::UplinkError> {
+        let (sslvpn_cookie, cookie_client_ip) = super::get_oauth_cookie(&config).await?;
         debug!("VPN cookie received");
-        Ok(FortiVPNTunnel::new(&config, sslvpn_cookie).await?)
+        let vpn_tunnel = FortiVPNTunnel::new(&config, sslvpn_cookie).await?;
+        Ok(ConnectingData {
+            tunnel: vpn_tunnel,
+            cookie_client_ip,
+        })
+    }
+
+    pub fn cookie_client_ip(&self) -> Option<IpAddr> {
+        if let ConnectionState::Connected(connected_data) = &self.state {
+            Some(connected_data.cookie_client_ip)
+        } else {
+            None
+        }
     }
 }
 
@@ -71,12 +89,13 @@ impl uplink::UplinkService for FortiService {
                 Ok(())
             }
             ConnectionState::Connecting(join_handle) => match join_handle.await? {
-                Ok(tunnel) => {
+                Ok(connecting_data) => {
                     info!("VPN service is connected");
                     let mut echo_timer = tokio::time::interval(super::ECHO_SEND_INTERVAL);
                     echo_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     self.state = ConnectionState::Connected(Box::new(ConnectedData {
-                        tunnel,
+                        tunnel: connecting_data.tunnel,
+                        cookie_client_ip: connecting_data.cookie_client_ip,
                         echo_timer,
                         need_echo: false,
                         unflushed_writes: 0,
