@@ -126,14 +126,18 @@ impl Server {
             CLEANUP_INTERVAL,
             command_sender.clone(),
         ));
-        let network = ip::Network::new(self.nat64_prefix.clone(), self.dns64_domains.clone())?;
+        let network = ip::Network::new(
+            self.nat64_prefix,
+            self.dns64_domains.clone(),
+            ip::DnsDetection::Ip,
+        )?;
         if !self.tunnel_domains.is_empty() {
             rt.spawn(SplitRouteRegistry::monitor_addresses(
                 self.tunnel_domains.clone(),
                 command_sender.clone(),
             ));
         }
-        let split_route_registry = SplitRouteRegistry::new(self.nat64_prefix.clone());
+        let split_route_registry = SplitRouteRegistry::new(self.nat64_prefix);
 
         let sessions = Sessions::new(
             self.pki_processing.clone(),

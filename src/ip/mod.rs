@@ -1230,6 +1230,14 @@ impl IpHeader {
     pub fn transport_protocol(&self) -> TransportProtocolType {
         self.transport_protocol
     }
+
+    fn is_dns_request(&self) -> bool {
+        self.transport_protocol == TransportProtocolType::UDP && self.dst_port == Some(53)
+    }
+
+    fn is_dns_response(&self) -> bool {
+        self.transport_protocol == TransportProtocolType::UDP && self.src_port == Some(53)
+    }
 }
 
 impl fmt::Display for IpHeader {
@@ -1327,7 +1335,7 @@ impl TransportData<'_> {
         }
     }
 
-    fn write_translated_checksum(&self, dest: &mut [u8], remove: Checksum, add: Checksum) {
+    fn translated_checksum(&self, remove: Checksum, add: Checksum) -> Option<(usize, u16)> {
         match self {
             TransportData::Udp(data) => {
                 let mut checksum = [0u8; 2];
@@ -1340,7 +1348,9 @@ impl TransportData<'_> {
 
                     let checksum = checksum.value();
                     let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
-                    dest[6..8].copy_from_slice(&checksum.to_be_bytes());
+                    Some((6, checksum))
+                } else {
+                    Some((6, checksum))
                 }
             }
             TransportData::Tcp(data, _) => {
@@ -1349,7 +1359,7 @@ impl TransportData<'_> {
                 let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
                 checksum.incremental_update(remove, add);
                 checksum.fold();
-                dest[16..18].copy_from_slice(&checksum.value().to_be_bytes());
+                Some((16, checksum.value()))
             }
             TransportData::Generic(protocol, data) => {
                 // Translating from ICMPv6 to ICMPv4 should drop the header checksum.
@@ -1367,11 +1377,17 @@ impl TransportData<'_> {
                         checksum.incremental_update(remove, add);
                         checksum.fold();
                         let checksum = checksum.value();
-                        dest[2..4].copy_from_slice(&checksum.to_be_bytes());
+                        Some((2, checksum))
                     }
-                    _ => {}
+                    _ => None,
                 }
             }
+        }
+    }
+
+    fn write_translated_checksum(&self, dest: &mut [u8], remove: Checksum, add: Checksum) {
+        if let Some((offset, checksum)) = self.translated_checksum(remove, add) {
+            dest[offset..offset + 2].copy_from_slice(&checksum.to_be_bytes());
         }
     }
 
@@ -1438,7 +1454,7 @@ impl fmt::Display for TransportData<'_> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Nat64Prefix([u8; 12]);
 
 impl Nat64Prefix {
@@ -1453,6 +1469,13 @@ impl Nat64Prefix {
         segments[0..12].copy_from_slice(&self.0);
         segments[12..16].copy_from_slice(&addr.octets());
         segments.into()
+    }
+
+    pub fn matches_addr(&self, addr: &IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(_) => false,
+            IpAddr::V6(addr) => self.0 == addr.octets()[0..12],
+        }
     }
 }
 
@@ -1471,11 +1494,18 @@ pub enum IpNetmask {
 }
 
 #[derive(Clone)]
+pub enum DnsDetection {
+    Ip,
+    Port,
+}
+
+#[derive(Clone)]
 pub struct Network {
     nat64_prefix: Option<Nat64Prefix>,
     real_ip: Option<IpAddr>,
     ip_netmasks: Vec<IpNetmask>,
     dns_addrs: Vec<IpAddr>,
+    dns_detection: DnsDetection,
     tunnel_ips: Vec<IpAddr>,
     dns64_domains_idna: Vec<Vec<u8>>,
     dns64_domains_dns: TunnelDomainsDns,
@@ -1487,6 +1517,7 @@ impl Network {
     pub fn new(
         nat64_prefix: Option<Nat64Prefix>,
         dns64_domains: Vec<String>,
+        dns_detection: DnsDetection,
     ) -> Result<Network, IpError> {
         let dns64_domains_idna = dns64_domains
             .iter()
@@ -1496,13 +1527,14 @@ impl Network {
 
         let dns_translator = nat64_prefix
             .as_ref()
-            .map(|nat64_prefix| dns::Dns64Translator::new(nat64_prefix.clone()));
+            .map(|nat64_prefix| dns::Dns64Translator::new(*nat64_prefix));
         let icmp_rate_limiter = icmp::RateLimiter::new();
         Ok(Network {
             nat64_prefix,
             real_ip: None,
             ip_netmasks: vec![],
             dns_addrs: vec![],
+            dns_detection,
             tunnel_ips: vec![],
             dns64_domains_idna,
             dns64_domains_dns,
@@ -1603,9 +1635,13 @@ impl Network {
     ) -> Result<RoutingActionClient<'a>, IpError> {
         if !self.is_nat64() {
             let data = packet.into_data();
-            return Ok(RoutingActionClient::Forward(data));
+            out_buf.copy_from_slice(data);
+            return Ok(RoutingActionClient::Forward(&mut out_buf[..data.len()]));
         };
-        let is_dns_ip = self.dns_addrs.contains(header.dst_addr());
+        let is_dns = match self.dns_detection {
+            DnsDetection::Ip => self.dns_addrs.contains(header.dst_addr()),
+            DnsDetection::Port => header.is_dns_request(),
+        };
         match packet {
             IpPacket::V6(packet) => {
                 if packet.hop_limit() <= TTL_HOP_DECREMENT {
@@ -1630,9 +1666,9 @@ impl Network {
                     // If fragment header is followed by an unsupported extension header, drop it.
                     warn!("Dropping IPv6 packet with extension header after a Fragment header");
                     Ok(RoutingActionClient::Drop)
-                } else if !is_dns_ip {
+                } else if !is_dns {
                     let length = packet.write_translated(out_buf, false)?;
-                    Ok(RoutingActionClient::Forward(&out_buf[..length]))
+                    Ok(RoutingActionClient::Forward(&mut out_buf[..length]))
                 } else {
                     self.translate_dns_packet_from_client(IpPacket::V6(packet), header, out_buf)
                 }
@@ -1650,9 +1686,9 @@ impl Network {
                         .write_error_response(&IpPacket::V4(packet), out_buf)?;
                     return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
                 }
-                if !is_dns_ip || packet.transport_protocol() == TransportProtocolType::ICMP {
+                if !is_dns || packet.transport_protocol() == TransportProtocolType::ICMP {
                     let length = packet.write_ipv4_decrease_ttl(out_buf)?;
-                    Ok(RoutingActionClient::Forward(&out_buf[..length]))
+                    Ok(RoutingActionClient::Forward(&mut out_buf[..length]))
                 } else {
                     self.translate_dns_packet_from_client(IpPacket::V4(packet), header, out_buf)
                 }
@@ -1675,9 +1711,7 @@ impl Network {
         if packet.fragment_offset().is_some() {
             return Err("DNS packet is fragmented".into());
         }
-        let is_dns_port = header.transport_protocol() == TransportProtocolType::UDP
-            && header.dst_port() == Some(&53);
-        if !is_dns_port {
+        if !header.is_dns_request() {
             warn!("Dropping non-standard packet to DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
@@ -1695,7 +1729,7 @@ impl Network {
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE_IPV4];
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated_ipv4(out_buf, false)?;
-            return Ok(RoutingActionClient::Forward(&out_buf[..length]));
+            return Ok(RoutingActionClient::Forward(&mut out_buf[..length]));
         }
 
         let dns_translator = if let Some(dns_translator) = &mut self.dns_translator {
@@ -1717,7 +1751,7 @@ impl Network {
                     MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
                 )?;
                 let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-                RoutingActionClient::Forward(&out_buf[start_offset..data_end])
+                RoutingActionClient::Forward(&mut out_buf[start_offset..data_end])
             }
             dns::DnsTranslationAction::ReplyToSender(length) => {
                 if log::log_enabled!(log::Level::Trace) {
@@ -1765,7 +1799,7 @@ impl Network {
                 }
 
                 let length = packet.write_icmp_translated(out_buf, length)?;
-                RoutingActionClient::Forward(&out_buf[..length])
+                RoutingActionClient::Forward(&mut out_buf[..length])
             }
             icmp::IcmpTranslationAction::Drop => RoutingActionClient::Drop,
         };
@@ -1780,7 +1814,7 @@ impl Network {
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionUplink<'a>, IpError> {
         let nat64_prefix = if let Some(nat64_prefix) = self.nat64_prefix.as_ref() {
-            nat64_prefix.clone()
+            *nat64_prefix
         } else {
             return Ok(RoutingActionUplink::Forward(in_buf, data_len));
         };
@@ -1789,14 +1823,17 @@ impl Network {
             IpPacket::V4(packet) => packet,
             IpPacket::V6(_) => return Err("Cannot translate IPv6 packet in NAT64".into()),
         };
-        let is_dns_ip = {
-            // DNS responses will arrive from an IPv4 address, need to check if it matches
-            // a NAT64 address or a dns_addrs_ipv4 address.
-            let packet_src_addr = packet.src_addr().octets();
-            self.dns_addrs.iter().any(|dns_addr| match dns_addr {
-                IpAddr::V4(addr) => addr.octets() == packet_src_addr,
-                IpAddr::V6(addr) => addr.octets()[12..16] == packet_src_addr,
-            })
+        let is_dns = match self.dns_detection {
+            DnsDetection::Ip => {
+                // DNS responses will arrive from an IPv4 address, need to check if it matches
+                // a NAT64 address or a dns_addrs_ipv4 address.
+                let packet_src_addr = packet.src_addr().octets();
+                self.dns_addrs.iter().any(|dns_addr| match dns_addr {
+                    IpAddr::V4(addr) => addr.octets() == packet_src_addr,
+                    IpAddr::V6(addr) => addr.octets()[12..16] == packet_src_addr,
+                })
+            }
+            DnsDetection::Port => header.is_dns_response(),
         };
         let is_ipv4_tunnel = self.tunnel_ips.contains(header.src_addr());
         if packet.ttl() <= TTL_HOP_DECREMENT {
@@ -1813,7 +1850,7 @@ impl Network {
         }
         if packet.transport_protocol() == TransportProtocolType::ICMP {
             self.translate_icmp_packet_from_uplink(packet, out_buf, &nat64_prefix)
-        } else if is_dns_ip {
+        } else if is_dns {
             self.translate_dns_packet_from_uplink(packet, header, &nat64_prefix, out_buf)
         } else if is_ipv4_tunnel {
             let length = packet.write_ipv4_decrease_ttl(out_buf)?;
@@ -1840,9 +1877,7 @@ impl Network {
         if packet.fragment_offset().is_some() {
             return Err("DNS packet is fragmented".into());
         }
-        let is_dns_port = header.transport_protocol() == TransportProtocolType::UDP
-            && header.src_port() == Some(&53);
-        if !is_dns_port {
+        if !header.is_dns_response() {
             warn!("Dropping non-standard packet from DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
@@ -1860,6 +1895,7 @@ impl Network {
             return Ok(RoutingActionUplink::Forward(out_buf, length));
         }
 
+        // Reserve space for UDP header.
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE_RESPONSE];
         let dns_translator = if let Some(dns_translator) = &mut self.dns_translator {
@@ -1923,10 +1959,125 @@ impl Network {
         };
         Ok(action)
     }
+
+    pub fn update_packet_ip(
+        &self,
+        data: &mut [u8],
+        src_addr: Option<IpAddr>,
+        dst_addr: Option<IpAddr>,
+    ) -> Result<(), IpError> {
+        let ip_packet = IpPacket::from_data(data)?;
+        let header_len = match &ip_packet {
+            IpPacket::V4(_) => {
+                if !matches!(src_addr, Some(IpAddr::V4(_)) | None) {
+                    return Err("Cannot update an IPv4 packet to use IPv6 source address".into());
+                }
+                if !matches!(dst_addr, Some(IpAddr::V4(_)) | None) {
+                    return Err(
+                        "Cannot update an IPv4 packet to use IPv6 destination address".into(),
+                    );
+                }
+                Ipv4Packet::header_length(data)
+            }
+            IpPacket::V6(packet) => {
+                if !matches!(src_addr, Some(IpAddr::V6(_)) | None) {
+                    return Err("Cannot update an IPv6 packet to use IPv4 source address".into());
+                }
+                if !matches!(dst_addr, Some(IpAddr::V6(_)) | None) {
+                    return Err(
+                        "Cannot update an IPv6 packet to use IPv4 destination address".into(),
+                    );
+                }
+                packet.data.len() - packet.transport_data.full_data().len()
+            }
+        };
+        let header = ip_packet.to_header();
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        if let Some(src_addr) = src_addr {
+            match header.src_addr() {
+                IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
+                IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
+            }
+            match src_addr {
+                IpAddr::V4(addr) => add.add_slice(&addr.octets()),
+                IpAddr::V6(addr) => add.add_slice(&addr.octets()),
+            }
+        }
+        if let Some(dst_addr) = dst_addr {
+            match header.dst_addr() {
+                IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
+                IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
+            }
+            match dst_addr {
+                IpAddr::V4(addr) => add.add_slice(&addr.octets()),
+                IpAddr::V6(addr) => add.add_slice(&addr.octets()),
+            }
+        }
+
+        let transport_checksum = ip_packet
+            .transport_protocol_data()
+            .translated_checksum(remove, add);
+        let ipv4_checksum = if let IpPacket::V4(packet) = ip_packet {
+            let mut checksum = [0u8; 2];
+            checksum.copy_from_slice(&packet.data[10..12]);
+            let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+            checksum.incremental_update(remove, add);
+            checksum.fold();
+            Some(checksum.value())
+        } else {
+            None
+        };
+
+        match src_addr {
+            Some(IpAddr::V4(addr)) => {
+                data[12..16].copy_from_slice(&addr.octets());
+            }
+            Some(IpAddr::V6(addr)) => {
+                data[8..24].copy_from_slice(&addr.octets());
+            }
+            None => {}
+        }
+        match dst_addr {
+            Some(IpAddr::V4(addr)) => {
+                data[16..20].copy_from_slice(&addr.octets());
+            }
+            Some(IpAddr::V6(addr)) => {
+                data[24..40].copy_from_slice(&addr.octets());
+            }
+            None => {}
+        }
+
+        if let Some(checksum) = ipv4_checksum {
+            data[10..12].copy_from_slice(&checksum.to_be_bytes());
+        }
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            data[header_len + checksum_offset..header_len + checksum_offset + 2]
+                .copy_from_slice(&checksum.to_be_bytes())
+        }
+
+        // TODO GATEWAY: remove this test code.
+        {
+            let ip_packet = IpPacket::from_data(data)?;
+            if !ip_packet.validate_ip_checksum() {
+                warn!(
+                    "IP packet has invalid header checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+            if !ip_packet.validate_transport_checksum() {
+                warn!(
+                    "IP packet has invalid transport data checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub enum RoutingActionClient<'a> {
-    Forward(&'a [u8]),
+    Forward(&'a mut [u8]),
     ReturnToSender(&'a mut [u8], usize),
     Drop,
 }
@@ -1937,6 +2088,7 @@ pub enum RoutingActionUplink<'a> {
     Drop,
 }
 
+#[derive(Clone, Copy)]
 struct Checksum(u32);
 
 impl Checksum {
