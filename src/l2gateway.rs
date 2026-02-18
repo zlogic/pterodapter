@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use std::pin::pin;
 use std::task::Poll;
@@ -7,14 +7,12 @@ use std::{error, fmt, net::Ipv6Addr};
 use std::{future, io};
 
 use log::{debug, info, trace, warn};
-use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::{runtime, sync::oneshot};
 
-use crate::ip;
 use crate::logger::fmt_slice_hex;
 use crate::uplink::UplinkService as _;
-use crate::{ip::Nat64Prefix, pcap, uplink};
+use crate::{ip, pcap, uplink};
 
 // Maximum ethernet frame (as send by the Linux kernel), the ethernet header will be reused for PPP headers.
 const MAX_PACKET_SIZE: usize = 1500;
@@ -26,7 +24,7 @@ pub struct Config {
 
 pub struct Server {
     dns64_domains: Vec<String>,
-    nat64_prefix: Nat64Prefix,
+    nat64_prefix: ip::Nat64Prefix,
     raw_read_buffer: [u8; MAX_PACKET_SIZE],
     raw_write_buffer: [u8; MAX_PACKET_SIZE],
     uplink_read_buffer: [u8; MAX_PACKET_SIZE],
@@ -41,7 +39,7 @@ impl Server {
         let uplink_write_buffer = [0u8; MAX_PACKET_SIZE];
         Server {
             dns64_domains: config.dns64_domains,
-            nat64_prefix: Nat64Prefix::new(config.nat64_prefix),
+            nat64_prefix: ip::Nat64Prefix::new(config.nat64_prefix),
             raw_read_buffer,
             raw_write_buffer,
             uplink_read_buffer,
@@ -56,9 +54,12 @@ impl Server {
         shutdown_receiver: oneshot::Receiver<()>,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
-        let network =
-            ip::Network::new(Some(self.nat64_prefix.clone()), self.dns64_domains.clone())?;
-        let packet_filter = PacketFilter::new(network, pcap_sender);
+        let network = ip::Network::new(
+            Some(self.nat64_prefix),
+            self.dns64_domains.clone(),
+            ip::DnsDetection::Port,
+        )?;
+        let packet_filter = PacketFilter::new(network, self.nat64_prefix, pcap_sender);
 
         let result = rt.block_on(self.run_process(shutdown_receiver, packet_filter, uplink));
         rt.shutdown_timeout(Duration::from_secs(60));
@@ -259,12 +260,13 @@ impl Server {
                 warn!("Failed to process uplink/VPN lifecycle events: {err}");
             }
             if uplink_is_connected && !uplink.is_connected() {
-                // TODO GATEWAY: forget client MAC?
+                packet_filter.update_ip(None, None);
             }
         }
     }
 }
 
+#[derive(PartialEq)]
 struct MacAddr([u8; 6]);
 
 impl MacAddr {
@@ -311,6 +313,7 @@ impl fmt::Display for EtherType {
 
 struct PacketFilter {
     network: ip::Network,
+    nat64_prefix: ip::Nat64Prefix,
     pcap_sender: Option<pcap::PcapSender>,
     client_ip: Option<Ipv6Addr>,
     client_mac: Option<MacAddr>,
@@ -318,9 +321,14 @@ struct PacketFilter {
 }
 
 impl PacketFilter {
-    fn new(network: ip::Network, pcap_sender: Option<pcap::PcapSender>) -> PacketFilter {
+    fn new(
+        network: ip::Network,
+        nat64_prefix: ip::Nat64Prefix,
+        pcap_sender: Option<pcap::PcapSender>,
+    ) -> PacketFilter {
         PacketFilter {
             network,
+            nat64_prefix,
             pcap_sender,
             client_ip: None,
             client_mac: None,
@@ -360,7 +368,7 @@ impl PacketFilter {
         if data.len() < 14 {
             return Err("Not enough data in ethernet frame".into());
         }
-        let dest_mac = MacAddr::from_data(&data[0..6]);
+        let dst_mac = MacAddr::from_data(&data[0..6]);
         let src_mac = MacAddr::from_data(&data[6..12]);
         let ether_type = EtherType::from_data(&data[12..14]);
         if ether_type != EtherType::IPV6 {
@@ -370,6 +378,19 @@ impl PacketFilter {
             );
             return Err("Received unsupported EtherType".into());
         }
+        if let Some(server_mac) = &self.server_mac
+            && &dst_mac != server_mac
+        {
+            debug!("Ethernet frame has destination {dst_mac}, should be {server_mac}");
+            return Ok(RawRoutingAction::Drop);
+        }
+        if let Some(client_mac) = &self.client_mac
+            && &src_mac != client_mac
+        {
+            debug!("Ethernet frame has source {src_mac}, should be {client_mac}");
+            return Ok(RawRoutingAction::Drop);
+        }
+
         let data = &data[14..];
         if let Some(pcap_sender) = &mut self.pcap_sender {
             pcap_sender.send_packet(data);
@@ -386,17 +407,38 @@ impl PacketFilter {
             }
         };
         trace!(
-            "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dest_mac} {ip_packet}"
+            "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
         );
         let header = ip_packet.to_header();
-        // TODO GATEWAY: check source/dest IP (or MAC if registered)
-        // TODO GATEWAY: rewrite source IP to match network configuration (network function), only need checksum in UDP/TCP header; or override client IP in ip::Network.
-        // TODO GATEWAY: rewrite all DNS packets?
+        if !self.nat64_prefix.matches_addr(header.dst_addr()) {
+            debug!(
+                "Packet destination {} doesn't match NAT64 prefix",
+                header.dst_addr()
+            );
+            return Ok(RawRoutingAction::Drop);
+        }
+        // Register client MAC for additional authentication, and to send back replies.
+        if self.client_ip.is_some() && self.client_mac.is_none() && self.server_mac.is_none() {
+            self.client_mac = Some(src_mac);
+            self.server_mac = Some(dst_mac);
+        }
+
         match self
             .network
             .translate_packet_from_client(ip_packet, header, out_buf)
         {
-            Ok(ip::RoutingActionClient::Forward(buf)) => Ok(RawRoutingAction::Forward(buf)),
+            Ok(ip::RoutingActionClient::Forward(buf)) => {
+                // TODO GATEWAY: use vpn-assigned IP address (real_ip)
+                if let Err(err) = self.network.update_packet_ip(
+                    buf,
+                    Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 11))),
+                    None,
+                ) {
+                    warn!("Failed to update packet source IP: {err}");
+                    return Err("Failed to update packet source IP".into());
+                }
+                Ok(RawRoutingAction::Forward(buf))
+            }
             Ok(ip::RoutingActionClient::ReturnToSender(buf, msg_len)) => {
                 // TODO GATEWAY: prepend Ethernet frame.
                 Ok(RawRoutingAction::ReturnToSender(&buf[..msg_len]))
@@ -503,19 +545,6 @@ impl RawSocket {
         Ok(socket)
     }
 
-    async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.socket
-            .async_io(Interest::READABLE, |fd| {
-                let result = unsafe { libc::recv(*fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            })
-            .await
-    }
-
     fn poll_recv(
         &self,
         cx: &mut std::task::Context<'_>,
@@ -598,7 +627,7 @@ impl RawSocket {
         self.setsockopt(level, name, &value)
     }
 
-    fn set_nat64_filter(&self, prefix: &Nat64Prefix) -> Result<(), io::Error> {
+    fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
         // See https://docs.kernel.org/networking/filter.html for more information.
         let mut filter_data = BpfFilter::new_nat64_filter(prefix);
         let filter = libc::sock_fprog {
@@ -651,7 +680,7 @@ impl BpfFilter {
         }
     }
 
-    fn new_nat64_filter(prefix: &Nat64Prefix) -> BpfFilter {
+    fn new_nat64_filter(prefix: &ip::Nat64Prefix) -> BpfFilter {
         let prefix_part = |i: usize| -> u32 {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&prefix[i * 4..(i + 1) * 4]);

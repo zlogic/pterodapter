@@ -1529,7 +1529,7 @@ impl Dns64Translator {
 
 impl Clone for Dns64Translator {
     fn clone(&self) -> Self {
-        Dns64Translator::new(self.nat64_prefix.clone())
+        Dns64Translator::new(self.nat64_prefix)
     }
 }
 
