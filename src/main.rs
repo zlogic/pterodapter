@@ -46,7 +46,6 @@ Options:\
 \n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
 \n      --ike-port=<PORT>               IKEv2 port [default: 500]\
 \n      --nat-port=<PORT>               NAT port for IKEv2 and ESP [default: 4500]\
-\n      --listen-ip=<IP>                Listen IP address, multiple options can be provided [default: ::]\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --tunnel-domain=<DOMAIN>        (Optional) Only forward domain to VPN through split routing; can be specified multiple times\
 \n      --nat64-prefix=<IP6>            (Optional) Enable NAT64 mode and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
@@ -60,6 +59,7 @@ Options:\
 > pterodapter [OPTIONS] l2gateway\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>         Log level [default: info]\
+\n      --listen-interface=<IFACE>      Listen interafce, e.g. eth0\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --nat64-prefix=<IP6>            Specify NAT64 prefix and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
@@ -110,6 +110,7 @@ impl Args {
         let mut fortivpn_hostport = None;
 
         let mut listen_ips = vec![];
+        let mut listen_interace = None;
         let mut ike_port = 500u16;
         let mut nat_port = 4500u16;
         let mut id_hostname: Option<String> = None;
@@ -200,6 +201,8 @@ impl Args {
                         format_args!("Failed to parse IP address: {err}"),
                     ),
                 };
+            } else if action_type == ActionType::L2Gateway && name == "--listen-interface" {
+                listen_interace = Some(value.to_string());
             } else if action_type == ActionType::IkeV2 && name == "--ike-port" {
                 match u16::from_str(value) {
                     Ok(port) => ike_port = port,
@@ -332,9 +335,18 @@ impl Args {
                         process::exit(2);
                     }
                 };
+                let listen_interface = match listen_interace {
+                    Some(listen_interface) => listen_interface,
+                    None => {
+                        eprintln!("--listen-interface is required when using l2gateway mode");
+                        println!("{USAGE_INSTRUCTIONS}");
+                        process::exit(2);
+                    }
+                };
                 #[cfg(target_os = "linux")]
                 {
                     let l2gateway_config = l2gateway::Config {
+                        listen_interface,
                         nat64_prefix,
                         dns64_domains,
                     };

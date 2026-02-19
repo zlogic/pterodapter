@@ -1960,58 +1960,104 @@ impl Network {
         Ok(action)
     }
 
-    pub fn update_packet_ip(
-        &self,
-        data: &mut [u8],
-        src_addr: Option<IpAddr>,
-        dst_addr: Option<IpAddr>,
-    ) -> Result<(), IpError> {
+    pub fn update_dst_addr(&self, data: &mut [u8], dst_addr: IpAddr) -> Result<(), IpError> {
         let ip_packet = IpPacket::from_data(data)?;
-        let header_len = match &ip_packet {
-            IpPacket::V4(_) => {
-                if !matches!(src_addr, Some(IpAddr::V4(_)) | None) {
-                    return Err("Cannot update an IPv4 packet to use IPv6 source address".into());
-                }
-                if !matches!(dst_addr, Some(IpAddr::V4(_)) | None) {
-                    return Err(
-                        "Cannot update an IPv4 packet to use IPv6 destination address".into(),
-                    );
-                }
-                Ipv4Packet::header_length(data)
-            }
-            IpPacket::V6(packet) => {
-                if !matches!(src_addr, Some(IpAddr::V6(_)) | None) {
-                    return Err("Cannot update an IPv6 packet to use IPv4 source address".into());
-                }
-                if !matches!(dst_addr, Some(IpAddr::V6(_)) | None) {
-                    return Err(
-                        "Cannot update an IPv6 packet to use IPv4 destination address".into(),
-                    );
-                }
+        let header_len = match (&ip_packet, dst_addr) {
+            (IpPacket::V4(_), IpAddr::V4(_)) => Ipv4Packet::header_length(data),
+            (IpPacket::V6(packet), IpAddr::V6(_)) => {
                 packet.data.len() - packet.transport_data.full_data().len()
+            }
+            (IpPacket::V4(_), IpAddr::V6(_)) => {
+                return Err("Cannot update an IPv4 packet to use IPv6 destination address".into());
+            }
+            (IpPacket::V6(_), IpAddr::V4(_)) => {
+                return Err("Cannot update an IPv6 packet to use IPv4 destination address".into());
             }
         };
         let header = ip_packet.to_header();
         let (mut remove, mut add) = (Checksum::new(), Checksum::new());
-        if let Some(src_addr) = src_addr {
-            match header.src_addr() {
-                IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
-                IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
+        match header.dst_addr() {
+            IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
+            IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
+        }
+        match dst_addr {
+            IpAddr::V4(addr) => add.add_slice(&addr.octets()),
+            IpAddr::V6(addr) => add.add_slice(&addr.octets()),
+        }
+
+        let transport_checksum = ip_packet
+            .transport_protocol_data()
+            .translated_checksum(remove, add);
+        let ipv4_checksum = if let IpPacket::V4(packet) = ip_packet {
+            let mut checksum = [0u8; 2];
+            checksum.copy_from_slice(&packet.data[10..12]);
+            let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+            checksum.incremental_update(remove, add);
+            checksum.fold();
+            Some(checksum.value())
+        } else {
+            None
+        };
+
+        match dst_addr {
+            IpAddr::V4(addr) => data[16..20].copy_from_slice(&addr.octets()),
+
+            IpAddr::V6(addr) => data[24..40].copy_from_slice(&addr.octets()),
+        }
+
+        if let Some(checksum) = ipv4_checksum {
+            data[10..12].copy_from_slice(&checksum.to_be_bytes());
+        }
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            data[header_len + checksum_offset..header_len + checksum_offset + 2]
+                .copy_from_slice(&checksum.to_be_bytes())
+        }
+
+        // TODO GATEWAY: replace IP address in ICMP as well.
+
+        // TODO GATEWAY: remove this test code.
+        {
+            let ip_packet = IpPacket::from_data(data)?;
+            if !ip_packet.validate_ip_checksum() {
+                warn!(
+                    "IP packet has invalid header checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
             }
-            match src_addr {
-                IpAddr::V4(addr) => add.add_slice(&addr.octets()),
-                IpAddr::V6(addr) => add.add_slice(&addr.octets()),
+            if !ip_packet.validate_transport_checksum() {
+                warn!(
+                    "IP packet has invalid transport data checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
             }
         }
-        if let Some(dst_addr) = dst_addr {
-            match header.dst_addr() {
-                IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
-                IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
+
+        Ok(())
+    }
+
+    pub fn update_src_addr(&self, data: &mut [u8], src_addr: IpAddr) -> Result<(), IpError> {
+        let ip_packet = IpPacket::from_data(data)?;
+        let header_len = match (&ip_packet, src_addr) {
+            (IpPacket::V4(_), IpAddr::V4(_)) => Ipv4Packet::header_length(data),
+            (IpPacket::V6(packet), IpAddr::V6(_)) => {
+                packet.data.len() - packet.transport_data.full_data().len()
             }
-            match dst_addr {
-                IpAddr::V4(addr) => add.add_slice(&addr.octets()),
-                IpAddr::V6(addr) => add.add_slice(&addr.octets()),
+            (IpPacket::V4(_), IpAddr::V6(_)) => {
+                return Err("Cannot update an IPv4 packet to use IPv6 source address".into());
             }
+            (IpPacket::V6(_), IpAddr::V4(_)) => {
+                return Err("Cannot update an IPv6 packet to use IPv4 source address".into());
+            }
+        };
+        let header = ip_packet.to_header();
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        match header.src_addr() {
+            IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
+            IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
+        }
+        match src_addr {
+            IpAddr::V4(addr) => add.add_slice(&addr.octets()),
+            IpAddr::V6(addr) => add.add_slice(&addr.octets()),
         }
 
         let transport_checksum = ip_packet
@@ -2029,22 +2075,8 @@ impl Network {
         };
 
         match src_addr {
-            Some(IpAddr::V4(addr)) => {
-                data[12..16].copy_from_slice(&addr.octets());
-            }
-            Some(IpAddr::V6(addr)) => {
-                data[8..24].copy_from_slice(&addr.octets());
-            }
-            None => {}
-        }
-        match dst_addr {
-            Some(IpAddr::V4(addr)) => {
-                data[16..20].copy_from_slice(&addr.octets());
-            }
-            Some(IpAddr::V6(addr)) => {
-                data[24..40].copy_from_slice(&addr.octets());
-            }
-            None => {}
+            IpAddr::V4(addr) => data[12..16].copy_from_slice(&addr.octets()),
+            IpAddr::V6(addr) => data[8..24].copy_from_slice(&addr.octets()),
         }
 
         if let Some(checksum) = ipv4_checksum {
@@ -2055,6 +2087,8 @@ impl Network {
                 .copy_from_slice(&checksum.to_be_bytes())
         }
 
+        // TODO GATEWAY: replace IP address in ICMP as well.
+        //
         // TODO GATEWAY: remove this test code.
         {
             let ip_packet = IpPacket::from_data(data)?;
