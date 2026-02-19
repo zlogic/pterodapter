@@ -18,11 +18,13 @@ use crate::{ip, pcap, uplink};
 const MAX_PACKET_SIZE: usize = 1500;
 
 pub struct Config {
+    pub listen_interface: String,
     pub nat64_prefix: Ipv6Addr,
     pub dns64_domains: Vec<String>,
 }
 
 pub struct Server {
+    listen_interface: String,
     dns64_domains: Vec<String>,
     nat64_prefix: ip::Nat64Prefix,
     raw_read_buffer: [u8; MAX_PACKET_SIZE],
@@ -38,6 +40,7 @@ impl Server {
         let uplink_read_buffer = [0u8; MAX_PACKET_SIZE];
         let uplink_write_buffer = [0u8; MAX_PACKET_SIZE];
         Server {
+            listen_interface: config.listen_interface,
             dns64_domains: config.dns64_domains,
             nat64_prefix: ip::Nat64Prefix::new(config.nat64_prefix),
             raw_read_buffer,
@@ -59,9 +62,8 @@ impl Server {
             self.dns64_domains.clone(),
             ip::DnsDetection::Port,
         )?;
-        let packet_filter = PacketFilter::new(network, self.nat64_prefix, pcap_sender);
 
-        let result = rt.block_on(self.run_process(shutdown_receiver, packet_filter, uplink));
+        let result = rt.block_on(self.run_process(shutdown_receiver, uplink, network, pcap_sender));
         rt.shutdown_timeout(Duration::from_secs(60));
         result
     }
@@ -69,10 +71,11 @@ impl Server {
     async fn run_process(
         &mut self,
         shutdown_receiver: oneshot::Receiver<()>,
-        mut packet_filter: PacketFilter,
         mut uplink: uplink::UplinkServiceType,
+        network: ip::Network,
+        pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
-        let socket = match RawSocket::new().await {
+        let socket = match RawSocket::new(self.listen_interface.as_str()).await {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
@@ -82,6 +85,9 @@ impl Server {
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
             warn!("Failed to enable BPF filter, will rely on a less efficient packet filter: {err}")
         }
+
+        let mut packet_filter =
+            PacketFilter::new(network, self.nat64_prefix, socket.if_mac(), pcap_sender);
 
         info!("Started server");
 
@@ -197,7 +203,7 @@ impl Server {
             // TODO: remove this debug code
             {
                 if let Some(packet) = raw_reply {
-                    let packet = ip::IpPacket::from_data(packet).expect("raw reply");
+                    let packet = ip::IpPacket::from_data(&packet[14..]).expect("raw reply");
                     println!("Sending reply:\n{packet}")
                 }
                 if !raw_send_to_uplink.is_empty() {
@@ -251,10 +257,10 @@ impl Server {
                 (uplink_event, sent_raw_response, forwarded_raw_packet)
             };
             if let Some(Err(err)) = sent_raw_response {
-                warn!("Failed to send UDP ESP response: {err}");
+                warn!("Failed to send UDP raw socket response: {err}");
             }
             if let Some(Err(err)) = forwarded_raw_packet {
-                warn!("Failed to forward message to UDP ESP: {err}");
+                warn!("Failed to forward message to UDP raw socket: {err}");
             }
             if let Some(Err(err)) = uplink_event {
                 warn!("Failed to process uplink/VPN lifecycle events: {err}");
@@ -266,7 +272,7 @@ impl Server {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct MacAddr([u8; 6]);
 
 impl MacAddr {
@@ -274,6 +280,10 @@ impl MacAddr {
         let mut mac = [0u8; 6];
         mac.copy_from_slice(data);
         MacAddr(mac)
+    }
+
+    fn as_slice(&self) -> &[u8; 6] {
+        &self.0
     }
 }
 
@@ -299,6 +309,10 @@ impl EtherType {
         et.copy_from_slice(data);
         EtherType(u16::from_be_bytes(et))
     }
+
+    fn to_u16(&self) -> u16 {
+        self.0
+    }
 }
 
 impl fmt::Display for EtherType {
@@ -317,13 +331,14 @@ struct PacketFilter {
     pcap_sender: Option<pcap::PcapSender>,
     client_ip: Option<Ipv6Addr>,
     client_mac: Option<MacAddr>,
-    server_mac: Option<MacAddr>,
+    server_mac: MacAddr,
 }
 
 impl PacketFilter {
     fn new(
         network: ip::Network,
         nat64_prefix: ip::Nat64Prefix,
+        server_mac: MacAddr,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> PacketFilter {
         PacketFilter {
@@ -332,7 +347,7 @@ impl PacketFilter {
             pcap_sender,
             client_ip: None,
             client_mac: None,
-            server_mac: None,
+            server_mac,
         }
     }
 
@@ -353,7 +368,6 @@ impl PacketFilter {
         if client_ip != self.client_ip {
             self.client_ip = client_ip;
             self.client_mac = None;
-            self.server_mac = None;
         }
     }
 
@@ -378,10 +392,11 @@ impl PacketFilter {
             );
             return Err("Received unsupported EtherType".into());
         }
-        if let Some(server_mac) = &self.server_mac
-            && &dst_mac != server_mac
-        {
-            debug!("Ethernet frame has destination {dst_mac}, should be {server_mac}");
+        if &dst_mac != &self.server_mac {
+            debug!(
+                "Ethernet frame has destination {dst_mac}, should be {}",
+                self.server_mac
+            );
             return Ok(RawRoutingAction::Drop);
         }
         if let Some(client_mac) = &self.client_mac
@@ -418,9 +433,8 @@ impl PacketFilter {
             return Ok(RawRoutingAction::Drop);
         }
         // Register client MAC for additional authentication, and to send back replies.
-        if self.client_ip.is_some() && self.client_mac.is_none() && self.server_mac.is_none() {
+        if self.client_ip.is_some() && self.client_mac.is_none() {
             self.client_mac = Some(src_mac);
-            self.server_mac = Some(dst_mac);
         }
 
         match self
@@ -429,19 +443,22 @@ impl PacketFilter {
         {
             Ok(ip::RoutingActionClient::Forward(buf)) => {
                 // TODO GATEWAY: use vpn-assigned IP address (real_ip)
-                if let Err(err) = self.network.update_packet_ip(
-                    buf,
-                    Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 11))),
-                    None,
-                ) {
+                if let Err(err) = self
+                    .network
+                    .update_src_addr(buf, IpAddr::V4(Ipv4Addr::new(192, 168, 0, 11)))
+                {
                     warn!("Failed to update packet source IP: {err}");
                     return Err("Failed to update packet source IP".into());
                 }
                 Ok(RawRoutingAction::Forward(buf))
             }
             Ok(ip::RoutingActionClient::ReturnToSender(buf, msg_len)) => {
-                // TODO GATEWAY: prepend Ethernet frame.
-                Ok(RawRoutingAction::ReturnToSender(&buf[..msg_len]))
+                // Prepend Ethernet headers.
+                buf.copy_within(..msg_len, 14);
+                buf[0..6].copy_from_slice(src_mac.as_slice());
+                buf[6..12].copy_from_slice(dst_mac.as_slice());
+                buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
+                Ok(RawRoutingAction::ReturnToSender(&buf[..14 + msg_len]))
             }
             Ok(ip::RoutingActionClient::Drop) => Ok(RawRoutingAction::Drop),
             Err(err) => {
@@ -518,22 +535,29 @@ impl<'a> UplinkRoutingAction<'a> {
 
 struct RawSocket {
     socket: AsyncFd<std::os::unix::io::RawFd>,
+    mac: MacAddr,
+    if_index: libc::c_int,
 }
 
 impl RawSocket {
-    async fn new() -> Result<RawSocket, io::Error> {
+    async fn new(listen_interface: &str) -> Result<RawSocket, L2GatewayError> {
         let protocol = u16::from_be(libc::ETH_P_IPV6 as u16) as libc::c_int;
         let socket = match unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) } {
-            0 => return Err(io::Error::last_os_error()),
+            0 => return Err(io::Error::last_os_error().into()),
             fd => fd as std::os::unix::io::RawFd,
         };
         if unsafe { libc::fcntl(socket, libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
             let err = io::Error::last_os_error();
             warn!("Failed to enable nonblocking operations: {err}");
-            return Err(err);
+            return Err(err.into());
         };
+        let (mac, if_index) = RawSocket::iface_config(socket, listen_interface)?;
         let socket = AsyncFd::new(socket)?;
-        let socket = RawSocket { socket };
+        let socket = RawSocket {
+            socket,
+            mac,
+            if_index,
+        };
         if let Err(err) =
             socket.setsockopt_bool(libc::SOL_PACKET, libc::PACKET_IGNORE_OUTGOING, true)
         {
@@ -543,6 +567,10 @@ impl RawSocket {
         }
 
         Ok(socket)
+    }
+
+    fn if_mac(&self) -> MacAddr {
+        self.mac
     }
 
     fn poll_recv(
@@ -572,11 +600,30 @@ impl RawSocket {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        let mut sll_addr = [0u8; 8];
+        sll_addr[0..6].copy_from_slice(self.mac.as_slice());
+        let srcaddr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as u16,
+            sll_protocol: libc::ETH_P_IPV6 as u16,
+            sll_ifindex: self.if_index,
+            sll_hatype: libc::ARPHRD_ETHER,
+            sll_pkttype: 0,
+            sll_halen: 6,
+            sll_addr,
+        };
         loop {
             let mut guard = std::task::ready!(self.socket.poll_write_ready(cx))?;
             match guard.try_io(|fd| {
-                let result =
-                    unsafe { libc::send(fd.as_raw_fd(), buf.as_ptr() as *const _, buf.len(), 0) };
+                let result = unsafe {
+                    libc::sendto(
+                        fd.as_raw_fd(),
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        0,
+                        std::ptr::from_ref(&srcaddr).cast(),
+                        std::mem::size_of_val(&srcaddr) as libc::socklen_t,
+                    )
+                };
                 if result >= 0 {
                     Ok(result as usize)
                 } else {
@@ -627,9 +674,75 @@ impl RawSocket {
         self.setsockopt(level, name, &value)
     }
 
+    fn iface_config(
+        fd: std::os::unix::io::RawFd,
+        name: &str,
+    ) -> Result<(MacAddr, libc::c_int), L2GatewayError> {
+        let mut ifr_name = [0; libc::IFNAMSIZ];
+        match std::ffi::CString::new(name) {
+            Ok(name) => {
+                let name = name.as_bytes_with_nul();
+                if name.len() > ifr_name.len() {
+                    return Err("Listen interace name is too long".into());
+                }
+                ifr_name
+                    .iter_mut()
+                    .zip(name.into_iter())
+                    .for_each(|(dst, src)| *dst = *src as libc::c_char);
+            }
+            Err(err) => {
+                warn!("Failed to parse interface name {name}: {err}");
+                return Err("Failed to parse interface name".into());
+            }
+        };
+
+        let mut ifreq = libc::ifreq {
+            ifr_name,
+            ifr_ifru: libc::__c_anonymous_ifr_ifru {
+                ifru_hwaddr: libc::sockaddr {
+                    sa_family: libc::AF_PACKET as u16,
+                    sa_data: [0; 14],
+                },
+            },
+        };
+        let mac_addr = unsafe {
+            match { libc::ioctl(fd, libc::SIOCGIFHWADDR, std::ptr::from_mut(&mut ifreq)) } {
+                0 => {
+                    let mut mac_addr = [0u8; 6];
+                    mac_addr
+                        .iter_mut()
+                        .zip(&ifreq.ifr_ifru.ifru_hwaddr.sa_data[0..6])
+                        .for_each(|(dst, src)| *dst = *src as u8);
+                    MacAddr::from_data(&mac_addr)
+                }
+                _ => {
+                    let err = io::Error::last_os_error();
+                    warn!("Failed to get hardware address for {name}: {err}");
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
+        };
+        let mut ifreq = libc::ifreq {
+            ifr_name,
+            ifr_ifru: libc::__c_anonymous_ifr_ifru { ifru_ifindex: 0 },
+        };
+        let if_index = unsafe {
+            match { libc::ioctl(fd, libc::SIOCGIFINDEX, std::ptr::from_mut(&mut ifreq)) } {
+                0 => ifreq.ifr_ifru.ifru_ifindex,
+                _ => {
+                    let err = io::Error::last_os_error();
+                    warn!("Failed to get interface index for {name}: {err}");
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
+        };
+
+        Ok((mac_addr, if_index))
+    }
+
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
         // See https://docs.kernel.org/networking/filter.html for more information.
-        let mut filter_data = BpfFilter::new_nat64_filter(prefix);
+        let mut filter_data = BpfFilter::new_nat64_filter(&self.mac, prefix);
         let filter = libc::sock_fprog {
             len: filter_data.ops_len as libc::c_ushort,
             filter: filter_data.program_data.as_mut_ptr().cast(),
@@ -680,14 +793,24 @@ impl BpfFilter {
         }
     }
 
-    fn new_nat64_filter(prefix: &ip::Nat64Prefix) -> BpfFilter {
+    fn new_nat64_filter(if_mac: &MacAddr, prefix: &ip::Nat64Prefix) -> BpfFilter {
         let prefix_part = |i: usize| -> u32 {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&prefix[i * 4..(i + 1) * 4]);
             u32::from_be_bytes(bytes)
         };
-        // Output of 'sudo tcpdump -i wlo1 ip6 dst net 0064:ff9b::/96 -ddd'
+        let mut mac_part = [0u8; 4];
+        mac_part.copy_from_slice(&if_mac.as_slice()[2..6]);
+        let mac_end = u32::from_be_bytes(mac_part);
+        let mut mac_part = [0u8; 4];
+        mac_part[2..4].copy_from_slice(&if_mac.as_slice()[0..2]);
+        let mac_start = u32::from_be_bytes(mac_part);
+        // Output of 'sudo tcpdump -i wlo1 ether dst 12:34:56:78:9a:bc and ip6 dst net 0064:ff9b::/96 -ddd'
         BpfFilter::new_program(&[
+            BpfFilterOp::new(32, 0, 0, 2),
+            BpfFilterOp::new(21, 0, 11, mac_end),
+            BpfFilterOp::new(40, 0, 0, 0),
+            BpfFilterOp::new(21, 0, 9, mac_start),
             BpfFilterOp::new(40, 0, 0, 12),
             BpfFilterOp::new(21, 0, 7, 34525),
             BpfFilterOp::new(32, 0, 0, 38),
