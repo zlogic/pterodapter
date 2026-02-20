@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::pin::pin;
 use std::task::Poll;
@@ -135,7 +135,7 @@ impl Server {
                             Poll::Pending => None,
                         };
                     }
-                    if raw_packet.is_some() || shutdown_requested {
+                    if uplink_event.is_some() || raw_packet.is_some() || shutdown_requested {
                         Poll::Ready(())
                     } else {
                         Poll::Pending
@@ -513,8 +513,20 @@ impl PacketFilter {
             .translate_packet_from_uplink(ip_header, in_buf, data_len, out_buf)
         {
             Ok(ip::RoutingActionUplink::Forward(buf, data_len)) => {
+                trace!(
+                    "Forwarding response to raw socket: {}",
+                    fmt_slice_hex(&buf[..data_len])
+                );
                 if let Some(pcap_sender) = &mut self.pcap_sender {
                     pcap_sender.send_packet(&buf[..data_len]);
+                }
+                let client_ip = match self.client_ip {
+                    Some(client_ip) => IpAddr::V6(client_ip),
+                    None => return Err("No client IP address found for uplink/VPN packet".into()),
+                };
+                if let Err(err) = ip::IpPacket::update_dst_addr(&mut buf[..data_len], client_ip) {
+                    warn!("Failed to update packet destination IP: {err}");
+                    return Err("Failed to update packet destination IP".into());
                 }
                 let dst_mac = match &self.client_mac {
                     Some(client_mac) => client_mac,
@@ -531,10 +543,14 @@ impl PacketFilter {
                 }
                 // Prepend Ethernet headers.
                 buf.copy_within(..data_len, 14);
-                buf[0..6].copy_from_slice(self.server_mac.as_slice());
-                buf[6..12].copy_from_slice(dst_mac.as_slice());
+                buf[0..6].copy_from_slice(dst_mac.as_slice());
+                buf[6..12].copy_from_slice(self.server_mac.as_slice());
                 buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
 
+                trace!(
+                    "Sending ethernet frame: {}",
+                    fmt_slice_hex(&buf[..ethernet_len])
+                );
                 Ok(UplinkRoutingAction::Forward(&buf[..ethernet_len]))
             }
             Ok(ip::RoutingActionUplink::ReturnToSender(buf)) => {
