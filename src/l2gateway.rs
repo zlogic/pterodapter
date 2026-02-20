@@ -436,15 +436,6 @@ impl PacketFilter {
                 return Err("Failed to parse IP packet from ethernet frame".into());
             }
         };
-        // TODO: remove this debug code
-        {
-            if !ip_packet.validate_ip_checksum() {
-                return Err("RAW packet has invalid IP checksum".into());
-            }
-            if !ip_packet.validate_transport_checksum() {
-                return Err("RAW packet has invalid UDP checksum".into());
-            }
-        }
         trace!(
             "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
         );
