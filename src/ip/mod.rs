@@ -1222,14 +1222,14 @@ impl<'a> IpPacket<'a> {
         }
     }
 
-    pub fn validate_ip_checksum(&self) -> bool {
+    fn validate_ip_checksum(&self) -> bool {
         match self {
             IpPacket::V4(packet) => packet.validate_ip_checksum(),
             IpPacket::V6(_) => true,
         }
     }
 
-    pub fn validate_transport_checksum(&self) -> bool {
+    fn validate_transport_checksum(&self) -> bool {
         match self {
             IpPacket::V4(packet) => packet.validate_transport_checksum(),
             IpPacket::V6(packet) => packet.validate_transport_checksum(),
