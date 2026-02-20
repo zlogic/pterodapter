@@ -165,7 +165,7 @@ impl Server {
                         ) {
                             Ok(action) => action,
                             Err(err) => {
-                                warn!("Failed to forward uplink/VPN packet to IKEv2: {err}");
+                                warn!("Failed to forward uplink/VPN packet to raw socket: {err}");
                                 UplinkRoutingAction::Drop
                             }
                         }
@@ -262,10 +262,10 @@ impl Server {
                 (uplink_event, sent_raw_response, forwarded_raw_packet)
             };
             if let Some(Err(err)) = sent_raw_response {
-                warn!("Failed to send UDP raw socket response: {err}");
+                warn!("Failed to send raw socket response: {err}");
             }
             if let Some(Err(err)) = forwarded_raw_packet {
-                warn!("Failed to forward message to UDP raw socket: {err}");
+                warn!("Failed to forward message to raw socket: {err}");
             }
             if let Some(Err(err)) = uplink_event {
                 warn!("Failed to process uplink/VPN lifecycle events: {err}");
