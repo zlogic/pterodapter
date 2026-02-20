@@ -59,7 +59,8 @@ Options:\
 > pterodapter [OPTIONS] l2gateway\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>         Log level [default: info]\
-\n      --listen-interface=<IFACE>      Listen interafce, e.g. eth0\
+\n      --listen-interface=<IFACE>      Listen interface, e.g. eth0\
+\n      --set-mtu                       Increase MTU of the listen interface (if necessary)\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --nat64-prefix=<IP6>            Specify NAT64 prefix and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
@@ -111,6 +112,7 @@ impl Args {
 
         let mut listen_ips = vec![];
         let mut listen_interace = None;
+        let mut set_mtu = false;
         let mut ike_port = 500u16;
         let mut nat_port = 4500u16;
         let mut id_hostname: Option<String> = None;
@@ -138,6 +140,11 @@ impl Args {
             .take(env::args().len().saturating_sub(1))
             .skip(1)
         {
+            if action_type == ActionType::L2Gateway && arg == "--set-mtu" {
+                set_mtu = true;
+                continue;
+            }
+
             let (name, value) = if let Some(arg) = arg.split_once('=') {
                 arg
             } else {
@@ -347,6 +354,7 @@ impl Args {
                 {
                     let l2gateway_config = l2gateway::Config {
                         listen_interface,
+                        set_mtu,
                         nat64_prefix,
                         dns64_domains,
                     };
