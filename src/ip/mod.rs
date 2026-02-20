@@ -612,6 +612,60 @@ impl<'a> Ipv4Packet<'a> {
         udp_header[6..8].copy_from_slice(&checksum.to_be_bytes());
         Ok(start_offset)
     }
+
+    fn update_src_addr(data: &'a mut [u8], src_addr: Ipv4Addr) -> Result<(), IpError> {
+        let ip_packet = Ipv4Packet::from_data(data)?;
+        let header_len = Ipv4Packet::header_length(data);
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.src_addr().octets());
+        add.add_slice(&src_addr.octets());
+
+        let transport_checksum = ip_packet
+            .transport_protocol_data()
+            .translated_checksum(remove, add);
+
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&data[10..12]);
+        let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+        checksum.incremental_update(remove, add);
+        checksum.fold();
+        let checksum = checksum.value();
+
+        data[10..12].copy_from_slice(&checksum.to_be_bytes());
+        data[12..16].copy_from_slice(&src_addr.octets());
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            data[header_len + checksum_offset..header_len + checksum_offset + 2]
+                .copy_from_slice(&checksum.to_be_bytes())
+        }
+        Ok(())
+    }
+
+    fn update_dst_addr(data: &'a mut [u8], dst_addr: Ipv4Addr) -> Result<(), IpError> {
+        let ip_packet = Ipv4Packet::from_data(data)?;
+        let header_len = Ipv4Packet::header_length(data);
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.dst_addr().octets());
+        add.add_slice(&dst_addr.octets());
+
+        let transport_checksum = ip_packet
+            .transport_protocol_data()
+            .translated_checksum(remove, add);
+
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&data[10..12]);
+        let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+        checksum.incremental_update(remove, add);
+        checksum.fold();
+        let checksum = checksum.value();
+
+        data[10..12].copy_from_slice(&checksum.to_be_bytes());
+        data[16..20].copy_from_slice(&dst_addr.octets());
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            data[header_len + checksum_offset..header_len + checksum_offset + 2]
+                .copy_from_slice(&checksum.to_be_bytes())
+        }
+        Ok(())
+    }
 }
 
 pub struct Ipv6Packet<'a> {
@@ -978,6 +1032,44 @@ impl<'a> Ipv6Packet<'a> {
         udp_header[6..8].copy_from_slice(&checksum.to_be_bytes());
         Ok(start_offset)
     }
+
+    fn update_src_addr(data: &'a mut [u8], src_addr: Ipv6Addr) -> Result<(), IpError> {
+        let ip_packet = Ipv6Packet::from_data(data)?;
+        let header_len = ip_packet.data.len() - ip_packet.transport_data.full_data().len();
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.src_addr().octets());
+        add.add_slice(&src_addr.octets());
+
+        let transport_checksum = ip_packet
+            .transport_protocol_data()
+            .translated_checksum(remove, add);
+
+        data[8..24].copy_from_slice(&src_addr.octets());
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            data[header_len + checksum_offset..header_len + checksum_offset + 2]
+                .copy_from_slice(&checksum.to_be_bytes())
+        }
+        Ok(())
+    }
+
+    fn update_dst_addr(data: &'a mut [u8], dst_addr: Ipv6Addr) -> Result<(), IpError> {
+        let ip_packet = Ipv6Packet::from_data(data)?;
+        let header_len = ip_packet.data.len() - ip_packet.transport_data.full_data().len();
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.dst_addr().octets());
+        add.add_slice(&dst_addr.octets());
+
+        let transport_checksum = ip_packet
+            .transport_protocol_data()
+            .translated_checksum(remove, add);
+
+        data[24..40].copy_from_slice(&dst_addr.octets());
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            data[header_len + checksum_offset..header_len + checksum_offset + 2]
+                .copy_from_slice(&checksum.to_be_bytes())
+        }
+        Ok(())
+    }
 }
 
 pub struct Ipv6PayloadHeader<'a> {
@@ -1022,14 +1114,26 @@ pub enum IpPacket<'a> {
     V6(Ipv6Packet<'a>),
 }
 
+enum IpProtocolVersion {
+    V4,
+    V6,
+}
+
 impl<'a> IpPacket<'a> {
     pub fn from_data(data: &[u8]) -> Result<IpPacket<'_>, IpError> {
         if data.is_empty() {
             return Err("IP packet is empty, cannot extract header data".into());
         }
+        match Self::protocol_version(data)? {
+            IpProtocolVersion::V4 => Ok(IpPacket::V4(Ipv4Packet::from_data(data)?)),
+            IpProtocolVersion::V6 => Ok(IpPacket::V6(Ipv6Packet::from_data(data)?)),
+        }
+    }
+
+    fn protocol_version(data: &[u8]) -> Result<IpProtocolVersion, IpError> {
         match data[0] >> 4 {
-            4 => Ok(IpPacket::V4(Ipv4Packet::from_data(data)?)),
-            6 => Ok(IpPacket::V6(Ipv6Packet::from_data(data)?)),
+            4 => Ok(IpProtocolVersion::V4),
+            6 => Ok(IpProtocolVersion::V6),
             _ => {
                 warn!(
                     "Client IP packet is not a supported IP version: {:x}",
@@ -1149,6 +1253,83 @@ impl<'a> IpPacket<'a> {
             IpPacket::V4(packet) => packet.write_udp_response(dest, data_range),
             IpPacket::V6(packet) => packet.write_udp_response(dest, data_range),
         }
+    }
+
+    pub fn update_src_addr(data: &mut [u8], src_addr: IpAddr) -> Result<(), IpError> {
+        let protocol_version = Self::protocol_version(data)?;
+        match (protocol_version, src_addr) {
+            (IpProtocolVersion::V4, IpAddr::V4(src_addr)) => {
+                Ipv4Packet::update_src_addr(data, src_addr)?
+            }
+            (IpProtocolVersion::V6, IpAddr::V6(src_addr)) => {
+                Ipv6Packet::update_src_addr(data, src_addr)?
+            }
+            (IpProtocolVersion::V4, IpAddr::V6(_)) => {
+                return Err("Cannot update an IPv4 packet to use IPv6 source address".into());
+            }
+            (IpProtocolVersion::V6, IpAddr::V4(_)) => {
+                return Err("Cannot update an IPv6 packet to use IPv4 source address".into());
+            }
+        };
+
+        // TODO GATEWAY: replace IP address in ICMP as well.
+
+        // TODO GATEWAY: remove this test code.
+        {
+            let ip_packet = IpPacket::from_data(data)?;
+            if !ip_packet.validate_ip_checksum() {
+                warn!(
+                    "IP packet has invalid header checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+            if !ip_packet.validate_transport_checksum() {
+                warn!(
+                    "IP packet has invalid transport data checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn update_dst_addr(data: &mut [u8], dst_addr: IpAddr) -> Result<(), IpError> {
+        let protocol_version = Self::protocol_version(data)?;
+        match (protocol_version, dst_addr) {
+            (IpProtocolVersion::V4, IpAddr::V4(dst_addr)) => {
+                Ipv4Packet::update_dst_addr(data, dst_addr)?
+            }
+            (IpProtocolVersion::V6, IpAddr::V6(dst_addr)) => {
+                Ipv6Packet::update_dst_addr(data, dst_addr)?
+            }
+            (IpProtocolVersion::V4, IpAddr::V6(_)) => {
+                return Err("Cannot update an IPv4 packet to use IPv6 destination address".into());
+            }
+            (IpProtocolVersion::V6, IpAddr::V4(_)) => {
+                return Err("Cannot update an IPv6 packet to use IPv4 destination address".into());
+            }
+        };
+
+        // TODO GATEWAY: replace IP address in ICMP as well.
+
+        // TODO GATEWAY: remove this test code.
+        {
+            let ip_packet = IpPacket::from_data(data)?;
+            if !ip_packet.validate_ip_checksum() {
+                warn!(
+                    "IP packet has invalid header checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+            if !ip_packet.validate_transport_checksum() {
+                warn!(
+                    "IP packet has invalid transport data checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1958,155 +2139,6 @@ impl Network {
             icmp::IcmpTranslationAction::Drop => RoutingActionUplink::Drop,
         };
         Ok(action)
-    }
-
-    pub fn update_dst_addr(&self, data: &mut [u8], dst_addr: IpAddr) -> Result<(), IpError> {
-        let ip_packet = IpPacket::from_data(data)?;
-        let header_len = match (&ip_packet, dst_addr) {
-            (IpPacket::V4(_), IpAddr::V4(_)) => Ipv4Packet::header_length(data),
-            (IpPacket::V6(packet), IpAddr::V6(_)) => {
-                packet.data.len() - packet.transport_data.full_data().len()
-            }
-            (IpPacket::V4(_), IpAddr::V6(_)) => {
-                return Err("Cannot update an IPv4 packet to use IPv6 destination address".into());
-            }
-            (IpPacket::V6(_), IpAddr::V4(_)) => {
-                return Err("Cannot update an IPv6 packet to use IPv4 destination address".into());
-            }
-        };
-        let header = ip_packet.to_header();
-        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
-        match header.dst_addr() {
-            IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
-            IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
-        }
-        match dst_addr {
-            IpAddr::V4(addr) => add.add_slice(&addr.octets()),
-            IpAddr::V6(addr) => add.add_slice(&addr.octets()),
-        }
-
-        let transport_checksum = ip_packet
-            .transport_protocol_data()
-            .translated_checksum(remove, add);
-        let ipv4_checksum = if let IpPacket::V4(packet) = ip_packet {
-            let mut checksum = [0u8; 2];
-            checksum.copy_from_slice(&packet.data[10..12]);
-            let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
-            checksum.incremental_update(remove, add);
-            checksum.fold();
-            Some(checksum.value())
-        } else {
-            None
-        };
-
-        match dst_addr {
-            IpAddr::V4(addr) => data[16..20].copy_from_slice(&addr.octets()),
-
-            IpAddr::V6(addr) => data[24..40].copy_from_slice(&addr.octets()),
-        }
-
-        if let Some(checksum) = ipv4_checksum {
-            data[10..12].copy_from_slice(&checksum.to_be_bytes());
-        }
-        if let Some((checksum_offset, checksum)) = transport_checksum {
-            data[header_len + checksum_offset..header_len + checksum_offset + 2]
-                .copy_from_slice(&checksum.to_be_bytes())
-        }
-
-        // TODO GATEWAY: replace IP address in ICMP as well.
-
-        // TODO GATEWAY: remove this test code.
-        {
-            let ip_packet = IpPacket::from_data(data)?;
-            if !ip_packet.validate_ip_checksum() {
-                warn!(
-                    "IP packet has invalid header checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-            if !ip_packet.validate_transport_checksum() {
-                warn!(
-                    "IP packet has invalid transport data checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn update_src_addr(&self, data: &mut [u8], src_addr: IpAddr) -> Result<(), IpError> {
-        let ip_packet = IpPacket::from_data(data)?;
-        let header_len = match (&ip_packet, src_addr) {
-            (IpPacket::V4(_), IpAddr::V4(_)) => Ipv4Packet::header_length(data),
-            (IpPacket::V6(packet), IpAddr::V6(_)) => {
-                packet.data.len() - packet.transport_data.full_data().len()
-            }
-            (IpPacket::V4(_), IpAddr::V6(_)) => {
-                return Err("Cannot update an IPv4 packet to use IPv6 source address".into());
-            }
-            (IpPacket::V6(_), IpAddr::V4(_)) => {
-                return Err("Cannot update an IPv6 packet to use IPv4 source address".into());
-            }
-        };
-        let header = ip_packet.to_header();
-        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
-        match header.src_addr() {
-            IpAddr::V4(addr) => remove.add_slice(&addr.octets()),
-            IpAddr::V6(addr) => remove.add_slice(&addr.octets()),
-        }
-        match src_addr {
-            IpAddr::V4(addr) => add.add_slice(&addr.octets()),
-            IpAddr::V6(addr) => add.add_slice(&addr.octets()),
-        }
-
-        let transport_checksum = ip_packet
-            .transport_protocol_data()
-            .translated_checksum(remove, add);
-        let ipv4_checksum = if let IpPacket::V4(packet) = ip_packet {
-            let mut checksum = [0u8; 2];
-            checksum.copy_from_slice(&packet.data[10..12]);
-            let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
-            checksum.incremental_update(remove, add);
-            checksum.fold();
-            Some(checksum.value())
-        } else {
-            None
-        };
-
-        match src_addr {
-            IpAddr::V4(addr) => data[12..16].copy_from_slice(&addr.octets()),
-            IpAddr::V6(addr) => data[8..24].copy_from_slice(&addr.octets()),
-        }
-
-        if let Some(checksum) = ipv4_checksum {
-            data[10..12].copy_from_slice(&checksum.to_be_bytes());
-        }
-        if let Some((checksum_offset, checksum)) = transport_checksum {
-            data[header_len + checksum_offset..header_len + checksum_offset + 2]
-                .copy_from_slice(&checksum.to_be_bytes())
-        }
-
-        // TODO GATEWAY: replace IP address in ICMP as well.
-        //
-        // TODO GATEWAY: remove this test code.
-        {
-            let ip_packet = IpPacket::from_data(data)?;
-            if !ip_packet.validate_ip_checksum() {
-                warn!(
-                    "IP packet has invalid header checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-            if !ip_packet.validate_transport_checksum() {
-                warn!(
-                    "IP packet has invalid transport data checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-        }
-
-        Ok(())
     }
 }
 
