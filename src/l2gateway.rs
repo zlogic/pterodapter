@@ -16,6 +16,7 @@ use crate::{ip, pcap, uplink};
 
 // Maximum ethernet frame (as send by the Linux kernel), the ethernet header will be reused for PPP headers.
 const MAX_PACKET_SIZE: usize = 1500;
+const L2_ETHERNET_HEADER_SIZE: usize = 6 + 6 + 2;
 
 pub struct Config {
     pub listen_interface: String,
@@ -143,6 +144,7 @@ impl Server {
                 .await;
                 (shutdown_requested, raw_packet, uplink_event)
             };
+            // Process all ready events.
             if shutdown_requested {
                 shutdown = true;
                 if let Err(err) = uplink.terminate().await {
@@ -203,7 +205,8 @@ impl Server {
             // TODO: remove this debug code
             if log::log_enabled!(log::Level::Trace) {
                 if let Some(packet) = raw_reply {
-                    let packet = ip::IpPacket::from_data(&packet[14..]).expect("raw reply");
+                    let packet = ip::IpPacket::from_data(&packet[L2_ETHERNET_HEADER_SIZE..])
+                        .expect("raw reply");
                     trace!("Sending reply:\n{packet}")
                 }
                 if !raw_send_to_uplink.is_empty() {
@@ -382,7 +385,7 @@ impl PacketFilter {
     ) -> Result<RawRoutingAction<'a>, L2GatewayError> {
         let data = &in_buf[..data_len];
         trace!("Received ethernet frame\n{}", fmt_slice_hex(data));
-        if data.len() < 14 {
+        if data.len() < L2_ETHERNET_HEADER_SIZE {
             return Err("Not enough data in ethernet frame".into());
         }
         let dst_mac = MacAddr::from_data(&data[0..6]);
@@ -409,7 +412,7 @@ impl PacketFilter {
             return Ok(RawRoutingAction::Drop);
         }
 
-        let data = &data[14..];
+        let data = &data[L2_ETHERNET_HEADER_SIZE..];
         if let Some(pcap_sender) = &mut self.pcap_sender {
             pcap_sender.send_packet(data);
         }
@@ -462,11 +465,13 @@ impl PacketFilter {
             }
             Ok(ip::RoutingActionClient::ReturnToSender(buf, msg_len)) => {
                 // Prepend Ethernet headers.
-                buf.copy_within(..msg_len, 14);
+                buf.copy_within(..msg_len, L2_ETHERNET_HEADER_SIZE);
                 buf[0..6].copy_from_slice(src_mac.as_slice());
                 buf[6..12].copy_from_slice(dst_mac.as_slice());
                 buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
-                Ok(RawRoutingAction::ReturnToSender(&buf[..14 + msg_len]))
+                Ok(RawRoutingAction::ReturnToSender(
+                    &buf[..L2_ETHERNET_HEADER_SIZE + msg_len],
+                ))
             }
             Ok(ip::RoutingActionClient::Drop) => Ok(RawRoutingAction::Drop),
             Err(err) => {
@@ -502,10 +507,45 @@ impl PacketFilter {
         };
         trace!("Decoded IP packet from uplink/VPN {ip_packet}");
         let ip_header = ip_packet.to_header();
-        // TODO GATEWAY: forward packet only if there's a MAC on record.
-        // TODO GATEWAY: apply transformation as done in ESP (+ pcap writer)
-        debug!("No client MAC address found for uplink/VPN packet {ip_header}");
-        Err("No client MAC address found for uplink/VPN packet".into())
+
+        match self
+            .network
+            .translate_packet_from_uplink(ip_header, in_buf, data_len, out_buf)
+        {
+            Ok(ip::RoutingActionUplink::Forward(buf, data_len)) => {
+                if let Some(pcap_sender) = &mut self.pcap_sender {
+                    pcap_sender.send_packet(&buf[..data_len]);
+                }
+                let dst_mac = match &self.client_mac {
+                    Some(client_mac) => client_mac,
+                    None => return Err("No client MAC address found for uplink/VPN packet".into()),
+                };
+                let ethernet_len = 14 + data_len;
+                if ethernet_len > buf.len() {
+                    // This sometimes happens when FortiVPN returns a zero-padded packet.
+                    warn!(
+                        "Slice doesn't have capacity for ethernet headers, message length is {ethernet_len}, buffer has {}",
+                        buf.len()
+                    );
+                    return Err("Slice doesn't have capacity for ESP headers".into());
+                }
+                // Prepend Ethernet headers.
+                buf.copy_within(..data_len, 14);
+                buf[0..6].copy_from_slice(self.server_mac.as_slice());
+                buf[6..12].copy_from_slice(dst_mac.as_slice());
+                buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
+
+                Ok(UplinkRoutingAction::Forward(&buf[..ethernet_len]))
+            }
+            Ok(ip::RoutingActionUplink::ReturnToSender(buf)) => {
+                Ok(UplinkRoutingAction::ReturnToSender(buf))
+            }
+            Ok(ip::RoutingActionUplink::Drop) => Ok(UplinkRoutingAction::Drop),
+            Err(err) => {
+                warn!("Failed to NAT packet from uplink/VPN: {err}");
+                Err("Failed to NAT packet from uplink/VPN".into())
+            }
+        }
     }
 }
 
