@@ -109,12 +109,6 @@ impl Server {
                 debug!("Shutdown completed");
                 return Ok(());
             }
-            let client_ip = match &uplink {
-                uplink::UplinkServiceType::FortiVPN(forti_service) => {
-                    forti_service.cookie_client_ip()
-                }
-            };
-            packet_filter.update_ip(uplink.ip_configuration(), client_ip);
             let (shutdown_requested, raw_packet, uplink_event) = {
                 let ignore_uplink = shutdown && !uplink_is_connected;
                 let mut uplink_event = None;
@@ -276,7 +270,14 @@ impl Server {
             if let Some(Err(err)) = uplink_event {
                 warn!("Failed to process uplink/VPN lifecycle events: {err}");
             }
-            if uplink_is_connected && !uplink.is_connected() {
+            if !uplink_is_connected && uplink.is_connected() {
+                let client_ip = match &uplink {
+                    uplink::UplinkServiceType::FortiVPN(forti_service) => {
+                        forti_service.cookie_client_ip()
+                    }
+                };
+                packet_filter.update_ip(uplink.ip_configuration(), client_ip);
+            } else if uplink_is_connected && !uplink.is_connected() {
                 packet_filter.update_ip(None, None);
             }
         }
@@ -435,6 +436,15 @@ impl PacketFilter {
                 return Err("Failed to parse IP packet from ethernet frame".into());
             }
         };
+        // TODO: remove this debug code
+        {
+            if !ip_packet.validate_ip_checksum() {
+                return Err("RAW packet has invalid IP checksum".into());
+            }
+            if !ip_packet.validate_transport_checksum() {
+                return Err("RAW packet has invalid UDP checksum".into());
+            }
+        }
         trace!(
             "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
         );
@@ -547,7 +557,7 @@ impl PacketFilter {
                         "Slice doesn't have capacity for ethernet headers, message length is {ethernet_len}, buffer has {}",
                         buf.len()
                     );
-                    return Err("Slice doesn't have capacity for ESP headers".into());
+                    return Err("Slice doesn't have capacity for ethernet headers".into());
                 }
                 // Prepend Ethernet headers.
                 buf.copy_within(..data_len, 14);
