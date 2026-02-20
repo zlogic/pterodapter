@@ -20,12 +20,14 @@ const L2_ETHERNET_HEADER_SIZE: usize = 6 + 6 + 2;
 
 pub struct Config {
     pub listen_interface: String,
+    pub set_mtu: bool,
     pub nat64_prefix: Ipv6Addr,
     pub dns64_domains: Vec<String>,
 }
 
 pub struct Server {
     listen_interface: String,
+    set_mtu: bool,
     dns64_domains: Vec<String>,
     nat64_prefix: ip::Nat64Prefix,
     raw_read_buffer: [u8; MAX_PACKET_SIZE],
@@ -42,6 +44,7 @@ impl Server {
         let uplink_write_buffer = [0u8; MAX_PACKET_SIZE];
         Server {
             listen_interface: config.listen_interface,
+            set_mtu: config.set_mtu,
             dns64_domains: config.dns64_domains,
             nat64_prefix: ip::Nat64Prefix::new(config.nat64_prefix),
             raw_read_buffer,
@@ -76,7 +79,12 @@ impl Server {
         network: ip::Network,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
-        let socket = match RawSocket::new(self.listen_interface.as_str()).await {
+        let mtu = if self.set_mtu {
+            Some(MAX_PACKET_SIZE)
+        } else {
+            None
+        };
+        let socket = match RawSocket::new(self.listen_interface.as_str(), mtu).await {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
@@ -532,7 +540,7 @@ impl PacketFilter {
                     Some(client_mac) => client_mac,
                     None => return Err("No client MAC address found for uplink/VPN packet".into()),
                 };
-                let ethernet_len = 14 + data_len;
+                let ethernet_len = L2_ETHERNET_HEADER_SIZE + data_len;
                 if ethernet_len > buf.len() {
                     // This sometimes happens when FortiVPN returns a zero-padded packet.
                     warn!(
@@ -604,7 +612,7 @@ struct RawSocket {
 }
 
 impl RawSocket {
-    async fn new(listen_interface: &str) -> Result<RawSocket, L2GatewayError> {
+    async fn new(listen_interface: &str, mtu: Option<usize>) -> Result<RawSocket, L2GatewayError> {
         let protocol = u16::from_be(libc::ETH_P_IPV6 as u16) as libc::c_int;
         let socket = match unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) } {
             0 => return Err(io::Error::last_os_error().into()),
@@ -616,6 +624,19 @@ impl RawSocket {
             return Err(err.into());
         };
         let (mac, if_index) = RawSocket::iface_config(socket, listen_interface)?;
+        if let Some(mtu) = mtu {
+            match RawSocket::set_mtu(socket, listen_interface, mtu) {
+                Ok(true) => {
+                    info!("Updated MTU to {mtu}")
+                }
+                Ok(false) => {
+                    debug!("MTU is already up to date")
+                }
+                Err(err) => {
+                    warn!("Failed to update MTU: {err}")
+                }
+            }
+        }
         let socket = AsyncFd::new(socket)?;
         let socket = RawSocket {
             socket,
@@ -738,14 +759,11 @@ impl RawSocket {
         self.setsockopt(level, name, &value)
     }
 
-    fn iface_config(
-        fd: std::os::unix::io::RawFd,
-        name: &str,
-    ) -> Result<(MacAddr, libc::c_int), L2GatewayError> {
-        let mut ifr_name = [0; libc::IFNAMSIZ];
+    fn ifr_name(name: &str) -> Result<[libc::c_char; libc::IFNAMSIZ], L2GatewayError> {
         match std::ffi::CString::new(name) {
             Ok(name) => {
                 let name = name.as_bytes_with_nul();
+                let mut ifr_name = [0; libc::IFNAMSIZ];
                 if name.len() > ifr_name.len() {
                     return Err("Listen interace name is too long".into());
                 }
@@ -753,13 +771,20 @@ impl RawSocket {
                     .iter_mut()
                     .zip(name.into_iter())
                     .for_each(|(dst, src)| *dst = *src as libc::c_char);
+                Ok(ifr_name)
             }
             Err(err) => {
                 warn!("Failed to parse interface name {name}: {err}");
-                return Err("Failed to parse interface name".into());
+                Err("Failed to parse interface name".into())
             }
-        };
+        }
+    }
 
+    fn iface_config(
+        fd: std::os::unix::io::RawFd,
+        name: &str,
+    ) -> Result<(MacAddr, libc::c_int), L2GatewayError> {
+        let ifr_name = Self::ifr_name(name)?;
         let mut ifreq = libc::ifreq {
             ifr_name,
             ifr_ifru: libc::__c_anonymous_ifr_ifru {
@@ -800,8 +825,48 @@ impl RawSocket {
                 }
             }
         };
-
         Ok((mac_addr, if_index))
+    }
+
+    fn set_mtu(
+        fd: std::os::unix::io::RawFd,
+        name: &str,
+        mtu: usize,
+    ) -> Result<bool, L2GatewayError> {
+        let ifr_name = Self::ifr_name(name)?;
+        let mut ifreq = libc::ifreq {
+            ifr_name,
+            ifr_ifru: libc::__c_anonymous_ifr_ifru { ifru_mtu: 0 },
+        };
+        let current_mtu = unsafe {
+            match { libc::ioctl(fd, libc::SIOCGIFMTU, std::ptr::from_mut(&mut ifreq)) } {
+                0 => ifreq.ifr_ifru.ifru_mtu,
+                _ => {
+                    let err = io::Error::last_os_error();
+                    warn!("Failed to get MTU {name}: {err}");
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
+        };
+        if current_mtu >= mtu as i32 {
+            return Ok(false);
+        }
+        let mut ifreq = libc::ifreq {
+            ifr_name,
+            ifr_ifru: libc::__c_anonymous_ifr_ifru {
+                ifru_mtu: mtu as libc::c_int,
+            },
+        };
+        unsafe {
+            match { libc::ioctl(fd, libc::SIOCSIFMTU, std::ptr::from_mut(&mut ifreq)) } {
+                0 => Ok(true),
+                _ => {
+                    let err = io::Error::last_os_error();
+                    warn!("Failed to set MTU {name}: {err}");
+                    Err(io::Error::last_os_error().into())
+                }
+            }
+        }
     }
 
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
