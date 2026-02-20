@@ -201,14 +201,14 @@ impl Server {
             };
             let (raw_reply, raw_send_to_uplink) = raw_action.into_packets();
             // TODO: remove this debug code
-            {
+            if log::log_enabled!(log::Level::Trace) {
                 if let Some(packet) = raw_reply {
                     let packet = ip::IpPacket::from_data(&packet[14..]).expect("raw reply");
-                    println!("Sending reply:\n{packet}")
+                    trace!("Sending reply:\n{packet}")
                 }
                 if !raw_send_to_uplink.is_empty() {
                     let packet = ip::IpPacket::from_data(raw_send_to_uplink).expect("send to vpn");
-                    println!("Sending packet to VPN:\n{packet}")
+                    trace!("Sending packet to VPN:\n{packet}")
                 }
             }
             let (uplink_event, sent_raw_response, forwarded_raw_packet) = {
@@ -331,6 +331,7 @@ struct PacketFilter {
     pcap_sender: Option<pcap::PcapSender>,
     client_ip: Option<Ipv6Addr>,
     client_mac: Option<MacAddr>,
+    vpn_real_ip: Option<IpAddr>,
     server_mac: MacAddr,
 }
 
@@ -347,6 +348,7 @@ impl PacketFilter {
             pcap_sender,
             client_ip: None,
             client_mac: None,
+            vpn_real_ip: None,
             server_mac,
         }
     }
@@ -360,6 +362,7 @@ impl PacketFilter {
             };
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
+        self.vpn_real_ip = internal_addr;
 
         let client_ip = match client_ip {
             Some(IpAddr::V6(client_ip)) => Some(client_ip),
@@ -442,11 +445,16 @@ impl PacketFilter {
             .translate_packet_from_client(ip_packet, header, out_buf)
         {
             Ok(ip::RoutingActionClient::Forward(buf)) => {
-                // TODO GATEWAY: use vpn-assigned IP address (real_ip)
-                if let Err(err) = self
-                    .network
-                    .update_src_addr(buf, IpAddr::V4(Ipv4Addr::new(192, 168, 0, 11)))
-                {
+                let vpn_real_ip = match self.vpn_real_ip {
+                    Some(vpn_real_ip) => vpn_real_ip,
+                    None => {
+                        return Err(
+                            "VPN real IP is not configured, cannot translate packet source IP"
+                                .into(),
+                        );
+                    }
+                };
+                if let Err(err) = ip::IpPacket::update_src_addr(buf, vpn_real_ip) {
                     warn!("Failed to update packet source IP: {err}");
                     return Err("Failed to update packet source IP".into());
                 }
