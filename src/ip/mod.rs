@@ -1273,6 +1273,8 @@ impl<'a> IpPacket<'a> {
         };
 
         // TODO GATEWAY: replace IP address in ICMP as well.
+        // Use IcmpV4Message::translate_original_datagram_to_client for reference.
+        // Use Icmpv6Message::translate_original_datagram_to_uplink for reference.
 
         // TODO GATEWAY: remove this test code.
         {
@@ -1312,6 +1314,8 @@ impl<'a> IpPacket<'a> {
         };
 
         // TODO GATEWAY: replace IP address in ICMP as well.
+        // Use IcmpV4Message::translate_original_datagram_to_client for reference.
+        // Use Icmpv6Message::translate_original_datagram_to_uplink for reference.
 
         // TODO GATEWAY: remove this test code.
         {
