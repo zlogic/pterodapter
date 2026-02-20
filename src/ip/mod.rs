@@ -620,9 +620,15 @@ impl<'a> Ipv4Packet<'a> {
         remove.add_slice(&ip_packet.src_addr().octets());
         add.add_slice(&src_addr.octets());
 
-        let transport_checksum = ip_packet
-            .transport_protocol_data()
-            .translated_checksum(remove, add);
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
 
         let mut checksum = [0u8; 2];
         checksum.copy_from_slice(&data[10..12]);
@@ -647,9 +653,15 @@ impl<'a> Ipv4Packet<'a> {
         remove.add_slice(&ip_packet.dst_addr().octets());
         add.add_slice(&dst_addr.octets());
 
-        let transport_checksum = ip_packet
-            .transport_protocol_data()
-            .translated_checksum(remove, add);
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
 
         let mut checksum = [0u8; 2];
         checksum.copy_from_slice(&data[10..12]);
@@ -1040,9 +1052,15 @@ impl<'a> Ipv6Packet<'a> {
         remove.add_slice(&ip_packet.src_addr().octets());
         add.add_slice(&src_addr.octets());
 
-        let transport_checksum = ip_packet
-            .transport_protocol_data()
-            .translated_checksum(remove, add);
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
 
         data[8..24].copy_from_slice(&src_addr.octets());
         if let Some((checksum_offset, checksum)) = transport_checksum {
@@ -1059,9 +1077,15 @@ impl<'a> Ipv6Packet<'a> {
         remove.add_slice(&ip_packet.dst_addr().octets());
         add.add_slice(&dst_addr.octets());
 
-        let transport_checksum = ip_packet
-            .transport_protocol_data()
-            .translated_checksum(remove, add);
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
 
         data[24..40].copy_from_slice(&dst_addr.octets());
         if let Some((checksum_offset, checksum)) = transport_checksum {
