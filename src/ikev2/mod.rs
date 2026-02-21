@@ -130,6 +130,7 @@ impl Server {
             self.nat64_prefix,
             self.dns64_domains.clone(),
             ip::DnsDetection::Ip,
+            None,
         )?;
         if !self.tunnel_domains.is_empty() {
             rt.spawn(SplitRouteRegistry::monitor_addresses(

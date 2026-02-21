@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, Range},
 };
 
-use log::{info, trace, warn};
+use log::{debug, info, trace, warn};
 
 use crate::logger::fmt_slice_hex;
 
@@ -294,6 +294,10 @@ impl<'a> Ipv4Packet<'a> {
             Some(0) | None => false,
             Some(_) => true,
         }
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.data.len() < self.total_length_header() as usize
     }
 
     fn write_translated_ip_header(
@@ -799,6 +803,10 @@ impl<'a> Ipv6Packet<'a> {
         }
     }
 
+    fn is_truncated(&self) -> bool {
+        self.data.len() < 40 + self.payload_length_header() as usize
+    }
+
     fn pseudo_checksum(
         data: &[u8],
         transport_protocol: TransportProtocolType,
@@ -1247,6 +1255,20 @@ impl<'a> IpPacket<'a> {
         match self {
             IpPacket::V4(packet) => packet.is_fragment_shifted(),
             IpPacket::V6(packet) => packet.is_fragment_shifted(),
+        }
+    }
+
+    fn data_length(&self) -> usize {
+        match self {
+            IpPacket::V4(packet) => packet.data.len(),
+            IpPacket::V6(packet) => packet.data.len(),
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        match self {
+            IpPacket::V4(packet) => packet.is_truncated(),
+            IpPacket::V6(packet) => packet.is_truncated(),
         }
     }
 
@@ -1720,6 +1742,7 @@ pub struct Network {
     dns64_domains_dns: TunnelDomainsDns,
     dns_translator: Option<dns::Dns64Translator>,
     icmp_rate_limiter: icmp::RateLimiter,
+    mtu_limit: Option<usize>,
 }
 
 impl Network {
@@ -1727,6 +1750,7 @@ impl Network {
         nat64_prefix: Option<Nat64Prefix>,
         dns64_domains: Vec<String>,
         dns_detection: DnsDetection,
+        mtu_limit: Option<usize>,
     ) -> Result<Network, IpError> {
         let dns64_domains_idna = dns64_domains
             .iter()
@@ -1749,6 +1773,7 @@ impl Network {
             dns64_domains_dns,
             dns_translator,
             icmp_rate_limiter,
+            mtu_limit,
         })
     }
 
@@ -1851,8 +1876,24 @@ impl Network {
             DnsDetection::Ip => self.dns_addrs.contains(header.dst_addr()),
             DnsDetection::Port => header.is_dns_request(),
         };
+        let mtu_limit = if packet.is_truncated() {
+            Some(packet.data_length())
+        } else if let Some(mtu) = self.mtu_limit {
+            Some(mtu)
+        } else {
+            None
+        };
         match packet {
             IpPacket::V6(packet) => {
+                if let Some(mtu) = mtu_limit {
+                    debug!("Received packet that's truncated or exceeds MTU: {header}");
+                    let length = icmp::ICMP_ERROR_MTU_EXCEEDED.write_error_response(
+                        &IpPacket::V6(packet),
+                        icmp::IcmpErrorResponseData::Mtu(mtu as u16),
+                        out_buf,
+                    )?;
+                    return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
+                }
                 if packet.hop_limit() <= TTL_HOP_DECREMENT {
                     // RFC 7915, Section 5.1:
                     // Hop limit will be reduced to 0 - will be dropped by the next hop.
@@ -1861,8 +1902,11 @@ impl Network {
                         info!("ICMP rate limit reached, dropping response");
                         return Ok(RoutingActionClient::Drop);
                     }
-                    let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
-                        .write_error_response(&IpPacket::V6(packet), out_buf)?;
+                    let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT.write_error_response(
+                        &IpPacket::V6(packet),
+                        icmp::IcmpErrorResponseData::None,
+                        out_buf,
+                    )?;
                     return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
                 }
                 if header.transport_protocol() == TransportProtocolType::IPV6_ICMP {
@@ -1891,8 +1935,11 @@ impl Network {
                         info!("ICMP rate limit reached, dropping response");
                         return Ok(RoutingActionClient::Drop);
                     }
-                    let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
-                        .write_error_response(&IpPacket::V4(packet), out_buf)?;
+                    let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT.write_error_response(
+                        &IpPacket::V4(packet),
+                        icmp::IcmpErrorResponseData::None,
+                        out_buf,
+                    )?;
                     return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
                 }
                 if !is_dns || packet.transport_protocol() == TransportProtocolType::ICMP {
@@ -1926,8 +1973,11 @@ impl Network {
                 info!("ICMP rate limit reached, dropping response");
                 return Ok(RoutingActionClient::Drop);
             }
-            let length =
-                icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(&packet, out_buf)?;
+            let length = icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(
+                &packet,
+                icmp::IcmpErrorResponseData::None,
+                out_buf,
+            )?;
             return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
         }
         let dns_packet =
@@ -2053,8 +2103,11 @@ impl Network {
                 info!("ICMP rate limit reached, dropping response");
                 return Ok(RoutingActionUplink::Drop);
             }
-            let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
-                .write_error_response(&IpPacket::V4(packet), out_buf)?;
+            let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT.write_error_response(
+                &IpPacket::V4(packet),
+                icmp::IcmpErrorResponseData::None,
+                out_buf,
+            )?;
             return Ok(RoutingActionUplink::ReturnToSender(&out_buf[..length]));
         }
         if packet.transport_protocol() == TransportProtocolType::ICMP {
@@ -2092,8 +2145,11 @@ impl Network {
                 info!("ICMP rate limit reached, dropping response");
                 return Ok(RoutingActionUplink::Drop);
             }
-            let length = icmp::ICMP_ERROR_COMMUNICATION_PROHIBITED
-                .write_error_response(&IpPacket::V4(packet), out_buf)?;
+            let length = icmp::ICMP_ERROR_COMMUNICATION_PROHIBITED.write_error_response(
+                &IpPacket::V4(packet),
+                icmp::IcmpErrorResponseData::None,
+                out_buf,
+            )?;
             return Ok(RoutingActionUplink::ReturnToSender(&out_buf[..length]));
         }
         let dns_packet =

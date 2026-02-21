@@ -14,8 +14,12 @@ use crate::logger::fmt_slice_hex;
 use crate::uplink::UplinkService as _;
 use crate::{ip, pcap, uplink};
 
-// Maximum ethernet frame (as send by the Linux kernel), the ethernet header will be reused for PPP headers.
+// Maximum ethernet frame size, the ethernet header will be reused for PPP headers.
 const MAX_PACKET_SIZE: usize = 1500;
+// Limit the packet size to IPv6 minimum, any packet that exceeds this size will be rejected with an
+// ICMPv6 Packet Too Big message.
+// This prevents jumbo frames which will be rejected by the uplink.
+const PATH_MTU: usize = 1280;
 const L2_ETHERNET_HEADER_SIZE: usize = 6 + 6 + 2;
 
 pub struct Config {
@@ -65,6 +69,7 @@ impl Server {
             Some(self.nat64_prefix),
             self.dns64_domains.clone(),
             ip::DnsDetection::Port,
+            Some(PATH_MTU),
         )?;
 
         let result = rt.block_on(self.run_process(shutdown_receiver, uplink, network, pcap_sender));
