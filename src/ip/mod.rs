@@ -1876,22 +1876,26 @@ impl Network {
             DnsDetection::Ip => self.dns_addrs.contains(header.dst_addr()),
             DnsDetection::Port => header.is_dns_request(),
         };
-        let mtu_limit = if packet.is_truncated() {
+        let mtu_exceeded = if packet.is_truncated() {
             Some(packet.data_length())
+        } else if let Some(mtu) = self.mtu_limit
+            && packet.data_length() > mtu
+        {
+            Some(mtu)
         } else {
-            self.mtu_limit
+            None
         };
+        if let Some(mtu) = mtu_exceeded {
+            debug!("Received packet that's truncated or exceeds MTU: {header}");
+            let length = icmp::ICMP_ERROR_MTU_EXCEEDED.write_error_response(
+                &packet,
+                icmp::IcmpErrorResponseData::Mtu(mtu as u16),
+                out_buf,
+            )?;
+            return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
+        }
         match packet {
             IpPacket::V6(packet) => {
-                if let Some(mtu) = mtu_limit {
-                    debug!("Received packet that's truncated or exceeds MTU: {header}");
-                    let length = icmp::ICMP_ERROR_MTU_EXCEEDED.write_error_response(
-                        &IpPacket::V6(packet),
-                        icmp::IcmpErrorResponseData::Mtu(mtu as u16),
-                        out_buf,
-                    )?;
-                    return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
-                }
                 if packet.hop_limit() <= TTL_HOP_DECREMENT {
                     // RFC 7915, Section 5.1:
                     // Hop limit will be reduced to 0 - will be dropped by the next hop.
