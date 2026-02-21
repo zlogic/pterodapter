@@ -93,7 +93,7 @@ impl Server {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
-                return Err(err.into());
+                return Err(err);
             }
         };
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
@@ -314,7 +314,7 @@ impl fmt::Display for MacAddr {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct EtherType(u16);
 
 impl EtherType {
@@ -412,7 +412,7 @@ impl PacketFilter {
             );
             return Err("Received unsupported EtherType".into());
         }
-        if &dst_mac != &self.server_mac {
+        if dst_mac != self.server_mac {
             debug!(
                 "Ethernet frame has destination {dst_mac}, should be {}",
                 self.server_mac
@@ -624,11 +624,6 @@ impl RawSocket {
             0 => return Err(io::Error::last_os_error().into()),
             fd => fd as std::os::unix::io::RawFd,
         };
-        if unsafe { libc::fcntl(socket, libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
-            let err = io::Error::last_os_error();
-            warn!("Failed to enable nonblocking operations: {err}");
-            return Err(err.into());
-        };
         let (mac, if_index) = RawSocket::iface_config(socket, listen_interface)?;
         if let Some(mtu) = mtu {
             match RawSocket::set_mtu(socket, listen_interface, mtu) {
@@ -672,8 +667,14 @@ impl RawSocket {
         loop {
             let mut guard = std::task::ready!(self.socket.poll_read_ready(cx))?;
             match guard.try_io(|fd| {
-                let result =
-                    unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+                let result = unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
                 if result >= 0 {
                     Ok(result as usize)
                 } else {
@@ -710,7 +711,7 @@ impl RawSocket {
                         fd.as_raw_fd(),
                         buf.as_ptr() as *const _,
                         buf.len(),
-                        0,
+                        libc::MSG_DONTWAIT,
                         std::ptr::from_ref(&srcaddr).cast(),
                         std::mem::size_of_val(&srcaddr) as libc::socklen_t,
                     )
@@ -775,7 +776,7 @@ impl RawSocket {
                 }
                 ifr_name
                     .iter_mut()
-                    .zip(name.into_iter())
+                    .zip(name)
                     .for_each(|(dst, src)| *dst = *src as libc::c_char);
                 Ok(ifr_name)
             }
@@ -801,7 +802,7 @@ impl RawSocket {
             },
         };
         let mac_addr = unsafe {
-            match { libc::ioctl(fd, libc::SIOCGIFHWADDR, std::ptr::from_mut(&mut ifreq)) } {
+            match libc::ioctl(fd, libc::SIOCGIFHWADDR, std::ptr::from_mut(&mut ifreq)) {
                 0 => {
                     let mut mac_addr = [0u8; 6];
                     mac_addr
@@ -822,7 +823,7 @@ impl RawSocket {
             ifr_ifru: libc::__c_anonymous_ifr_ifru { ifru_ifindex: 0 },
         };
         let if_index = unsafe {
-            match { libc::ioctl(fd, libc::SIOCGIFINDEX, std::ptr::from_mut(&mut ifreq)) } {
+            match libc::ioctl(fd, libc::SIOCGIFINDEX, std::ptr::from_mut(&mut ifreq)) {
                 0 => ifreq.ifr_ifru.ifru_ifindex,
                 _ => {
                     let err = io::Error::last_os_error();
@@ -845,7 +846,7 @@ impl RawSocket {
             ifr_ifru: libc::__c_anonymous_ifr_ifru { ifru_mtu: 0 },
         };
         let current_mtu = unsafe {
-            match { libc::ioctl(fd, libc::SIOCGIFMTU, std::ptr::from_mut(&mut ifreq)) } {
+            match libc::ioctl(fd, libc::SIOCGIFMTU, std::ptr::from_mut(&mut ifreq)) {
                 0 => ifreq.ifr_ifru.ifru_mtu,
                 _ => {
                     let err = io::Error::last_os_error();
@@ -864,7 +865,7 @@ impl RawSocket {
             },
         };
         unsafe {
-            match { libc::ioctl(fd, libc::SIOCSIFMTU, std::ptr::from_mut(&mut ifreq)) } {
+            match libc::ioctl(fd, libc::SIOCSIFMTU, std::ptr::from_mut(&mut ifreq)) {
                 0 => Ok(true),
                 _ => {
                     let err = io::Error::last_os_error();
