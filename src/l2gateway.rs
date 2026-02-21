@@ -478,6 +478,9 @@ impl PacketFilter {
                 Ok(RawRoutingAction::Forward(buf))
             }
             Ok(ip::RoutingActionClient::ReturnToSender(buf, msg_len)) => {
+                if let Some(pcap_sender) = &mut self.pcap_sender {
+                    pcap_sender.send_packet(&buf[..msg_len]);
+                }
                 // Prepend Ethernet headers.
                 buf.copy_within(..msg_len, L2_ETHERNET_HEADER_SIZE);
                 buf[0..6].copy_from_slice(src_mac.as_slice());
