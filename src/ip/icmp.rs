@@ -778,13 +778,51 @@ pub(crate) const ICMP_ERROR_TTL_HOP_LIMIT: IcmpErrorResponse = IcmpErrorResponse
     IcmpV6::TimeExceeded(IcmpV6TimeExceeded(0)),
 );
 
+pub(crate) const ICMP_ERROR_MTU_EXCEEDED: IcmpErrorResponse = IcmpErrorResponse(
+    IcmpV4::DestinationUnreachable(IcmpV4DestinationUnreachable(4)),
+    IcmpV6::PacketTooBig,
+);
+
+pub(crate) enum IcmpErrorResponseData {
+    Mtu(u16),
+    None,
+}
+
+impl IcmpErrorResponseData {
+    fn write_to(&self, dest: &mut [u8]) {
+        match self {
+            Self::Mtu(mtu) => {
+                // ICMPv4: As specified in RFC 1191, Section 4: the lower 2 bytes should contain the MTU, and the upper 2 bytes should be zero.
+                // ICMPv6: As specified in RFC 4443, Section 3.2: the entire 4 bytes should contain the MTU.
+                // As the MTU doesn't exceed 16 bits, both cases are identical.
+                let mtu = *mtu as u32;
+                dest[0..4].copy_from_slice(&mtu.to_be_bytes());
+            }
+            Self::None => dest.fill(0),
+        }
+    }
+}
+
 impl IcmpErrorResponse {
     pub fn write_error_response(
         &self,
         packet: &IpPacket,
+        extra_data: IcmpErrorResponseData,
         dest: &mut [u8],
     ) -> Result<usize, IpError> {
-        let src_own_ip = self == &ICMP_ERROR_HOST_UNREACHABLE || self == &ICMP_ERROR_TTL_HOP_LIMIT;
+        let src_own_ip = self == &ICMP_ERROR_HOST_UNREACHABLE
+            || self == &ICMP_ERROR_TTL_HOP_LIMIT
+            || self == &ICMP_ERROR_MTU_EXCEEDED;
+        let extra_data = match self {
+            &ICMP_ERROR_MTU_EXCEEDED => {
+                if let IcmpErrorResponseData::Mtu(_) = extra_data {
+                    extra_data
+                } else {
+                    IcmpErrorResponseData::None
+                }
+            }
+            _ => IcmpErrorResponseData::None,
+        };
         match packet {
             IpPacket::V4(packet) => {
                 let src_addr = if src_own_ip {
@@ -803,7 +841,8 @@ impl IcmpErrorResponse {
                 let icmp_data = &mut dest[start_offset..start_offset + 8 + available_bytes];
                 icmp_data[0] = self.0.type_u8();
                 icmp_data[1] = self.0.code_u8();
-                icmp_data[2..8].fill(0);
+                icmp_data[2..4].fill(0);
+                extra_data.write_to(&mut icmp_data[4..8]);
 
                 icmp_data[8..].copy_from_slice(&packet.data[..available_bytes]);
 
@@ -838,7 +877,8 @@ impl IcmpErrorResponse {
                 let icmp_data = &mut dest[start_offset..start_offset + 8 + available_bytes];
                 icmp_data[0] = self.1.type_u8();
                 icmp_data[1] = self.1.code_u8();
-                icmp_data[2..8].fill(0);
+                icmp_data[2..4].fill(0);
+                extra_data.write_to(&mut icmp_data[4..8]);
 
                 icmp_data[8..].copy_from_slice(&packet.data[..available_bytes]);
 
