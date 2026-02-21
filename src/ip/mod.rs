@@ -1878,10 +1878,8 @@ impl Network {
         };
         let mtu_limit = if packet.is_truncated() {
             Some(packet.data_length())
-        } else if let Some(mtu) = self.mtu_limit {
-            Some(mtu)
         } else {
-            None
+            self.mtu_limit
         };
         match packet {
             IpPacket::V6(packet) => {
