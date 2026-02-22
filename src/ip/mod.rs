@@ -2068,12 +2068,12 @@ impl Network {
             DnsDetection::Ip => self.dns_addrs.contains(header.dst_addr()),
             DnsDetection::Port => header.is_dns_request(),
         };
-        let mtu_exceeded = if packet.is_truncated() {
-            Some(packet.data_length())
-        } else if let Some(mtu) = self.mtu_limit
+        let mtu_exceeded = if let Some(mtu) = self.mtu_limit
             && packet.data_length() > mtu
         {
             Some(mtu)
+        } else if packet.is_truncated() {
+            Some(packet.data_length())
         } else {
             None
         };
