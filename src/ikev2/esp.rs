@@ -175,10 +175,13 @@ impl SecurityAssociation {
 
         match self
             .network
-            .translate_packet_from_esp(ip_packet, ip_header, out_buf)
+            .translate_packet_from_client(ip_packet, ip_header, out_buf)
         {
-            Ok(ip::RoutingActionEsp::Forward(buf)) => Ok(RoutingAction::Forward(buf)),
-            Ok(ip::RoutingActionEsp::ReturnToSender(buf, msg_len)) => {
+            Ok(ip::RoutingActionClient::Forward(buf)) => Ok(RoutingAction::Forward(buf)),
+            Ok(ip::RoutingActionClient::ReturnToSender(buf, msg_len)) => {
+                if let Some(pcap_sender) = pcap_sender {
+                    pcap_sender.send_packet(&buf[..msg_len]);
+                }
                 trace!(
                     "Encrypting response to sender: {}",
                     fmt_slice_hex(&buf[..msg_len])
@@ -186,7 +189,7 @@ impl SecurityAssociation {
                 let encrypted_response = self.encrypt_esp(buf, msg_len)?;
                 Ok(RoutingAction::ReturnToSender(encrypted_response))
             }
-            Ok(ip::RoutingActionEsp::Drop) => Ok(RoutingAction::Drop),
+            Ok(ip::RoutingActionClient::Drop) => Ok(RoutingAction::Drop),
             Err(err) => {
                 warn!("Failed to NAT packet from ESP: {err}");
                 Err("Failed to NAT packet from ESP".into())
@@ -259,7 +262,7 @@ impl SecurityAssociation {
                         encoded_length,
                         buf.len()
                     );
-                    return Err("Vector doesn't have capacity for ESP headers".into());
+                    return Err("Slice doesn't have capacity for ESP headers".into());
                 }
                 buf[data_len..encoded_length].fill(0);
                 let encrypted_data = self.encrypt_esp(&mut buf[..encoded_length], data_len)?;
