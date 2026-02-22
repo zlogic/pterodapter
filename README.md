@@ -25,7 +25,78 @@ sudo setcap CAP_NET_BIND_SERVICE=+eip pterodapter
 
 To run pterodapter locally, use WSL on Windows, or [add firewall redirection](docs/macos-pf.md) on macOS.
 
+## L2 Gateway mode
+
+The L2 Gateway mode is an experimental mode, acting as a regular L2 gateway/router.
+
+For example it's possible to run pterodapter in a container with bridged networking, e.g. in [Apple container](https://github.com/apple/container).
+To send traffic to the VPN, simply add the container's IPv6 address as a route:
+
+```shell
+CONTAINER_NAME=pterodapter
+CONTAINER_IP=$(container inspect $CONTAINER_NAME | jq -r '.[0].networks[0].ipv6Address|split("/").[0]')
+# Add a route for the NAT64 prefix
+sudo route add -inet6 64:ff9b::/64 ${CONTAINER_IP}%bridge100
+# Route DNS for gitlab.example.com to the container's DNS64 address
+cat << EOF | sudo tee /etc/resolver/gitlab.example.com
+nameserver 64:ff9b::808:808
+nameserver 64:ff9b::808:404
+search_order 1
+EOF
+```
+
+🚫 Unfortunately, this doesn't work correctly at the moment.
+macOS sends jumbo frames to the `bridge100` network and NAT64 would need to fragment them; macOS seems to ignore the MTU and ICMPv6 _Packet Too Big_ replies.
+In addition, macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
+
 # How to use it
+
+## L2 Gateway mode
+
+Run pterodapter with the following arguments:
+
+```shell
+pterotapter [--log-level=<level>] [--listen-interface=<iface>] [--set-mtu] --fortivpn=<hostport> --nat64-prefix=<ip6prefix> [--dns64-tunnel-suffix=<domain>] [--pcap=<filename>] l2gateway
+```
+
+`--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
+
+`--listen-interface=<ip-address>` specifies the network interface which the gateway should be listening on, for example `--listen-interface=eth0`.
+
+`--set-mtu` is an optional argument indicating that the network interface (specified in `--listen-interface`) should have its MTU increased to 1500.
+
+`--fortivpn=<hostport>` specifies the FortiVPN connection address, for example `--fortivpn=fortivpn.example.com:443`.
+
+`--nat64-prefix=<ip6prefix>` specified the [NAT64](https://en.wikipedia.org/wiki/NAT64) network prefix to use , for example `--nat64-prefix=64:ff9b::` will remap IPv4 addresses to a /96 IPv6 subnet matching `64:ff9b::`-`64:ff9b::ffff:ffff`.
+In NAT64 mode, pterodapter will intercept DNS responses and remap external IPv4 addresses to IPv6 addresses in the specified subnet.
+This is done only for domains matching a suffix listed in `--tunnel-domain`.
+The IKEv2 client will use IPv6 traffic, which is translated into IPv4 and sent to VPN, based on the SIIT algorithm documented in [RFC 7915](https://datatracker.ietf.org/doc/html/rfc7915).
+This approach simplifies the routing table (IKEv2 Traffic Selector) to use only one network or traffic selector; it also allows to use domain suffixes and handle DNS updates without reconnecting the client.
+Inspired by ideas from [Microsoft DirectAccess](https://en.wikipedia.org/wiki/DirectAccess).
+
+`--dns64-tunnel-suffix=<domain>` specifies an optional argument indicating that `<domain>` and its subdomains should be sent through the VPN using NAT64 (DNS64).
+To specify multiple domains, add a `--dns64-tunnel-suffix` argument for each one.
+If no `--dns64-tunnel-suffix` arguments are specified, DNS64 won't be used, but will still remain available - for example, to be used with a custom DNS64 server.
+
+`--pcap=<filename>` specifies an optional argument indicating that all IP traffic passing through pterodapter should be captured into the specified PCAP file.
+
+### Network permissions
+
+To use the `l2gateway` mode, pterodapter needs to be running in Linux (or a Linux-based container) and needs `CAP_NET_RAW` permissions:
+
+```shell
+setcap cap_net_raw+eip pterodapter
+```
+
+For the `--set-mtu` option to work, pterodapter also needs `CAP_NET_ADMIN` permissions
+
+```shell
+setcap cap_net_raw,cap_net_admin+eip pterodapter
+```
+
+⚠️ It's best to run the `l2gateway` mode in a container, as a non-root user and with the minimum available permissions.
+
+## IKEv2 VPN
 
 Run pterodapter with the following arguments:
 
