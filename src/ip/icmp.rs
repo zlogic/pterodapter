@@ -292,6 +292,15 @@ impl IcmpV4Message<'_> {
             .ok()
     }
 
+    pub fn has_original_datagram(&self) -> bool {
+        match self.icmp_type() {
+            IcmpV4::DestinationUnreachable(_)
+            | IcmpV4::TimeExceeded(_)
+            | IcmpV4::ParameterProblem(_) => true,
+            _ => false,
+        }
+    }
+
     fn translate_original_datagram_to_client(
         &self,
         dest: &mut [u8],
@@ -563,6 +572,16 @@ impl IcmpV6Message<'_> {
             .write_icmp_translated(dest, length)
             .map_err(|err| warn!("Failed to translate Echo original header: {err}"))
             .ok()
+    }
+
+    pub fn has_original_datagram(&self) -> bool {
+        match self.icmp_type() {
+            IcmpV6::DestinationUnreachable(_)
+            | IcmpV6::PacketTooBig
+            | IcmpV6::TimeExceeded(_)
+            | IcmpV6::ParameterProblem(_) => true,
+            _ => false,
+        }
     }
 
     fn translate_original_datagram_to_uplink(

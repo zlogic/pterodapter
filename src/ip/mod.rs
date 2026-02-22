@@ -633,6 +633,7 @@ impl<'a> Ipv4Packet<'a> {
         } else {
             None
         };
+        let is_icmp = ip_packet.transport_protocol() == TransportProtocolType::ICMP;
 
         let mut checksum = [0u8; 2];
         checksum.copy_from_slice(&data[10..12]);
@@ -647,10 +648,109 @@ impl<'a> Ipv4Packet<'a> {
             data[header_len + checksum_offset..header_len + checksum_offset + 2]
                 .copy_from_slice(&checksum.to_be_bytes())
         }
+
+        let data = &mut data[..header_len];
+        if !is_icmp || icmp::IcmpV4Message::from_data(data)?.has_original_datagram() {
+            return Ok(());
+        }
+
+        let (icmp_header, data) = data.split_at_mut(8);
+
+        let mut icmp_checksum = [0u8; 2];
+        icmp_checksum.copy_from_slice(&icmp_header[2..4]);
+        let mut icmp_checksum = Checksum::from_inverted(u16::from_be_bytes(icmp_checksum));
+        let (mut icmp_remove, mut icmp_add) = (Checksum::new(), Checksum::new());
+
+        // Process the embedded original datagram, tracking all changes to update ICMP checksum.
+        // As this is a reply, it should update the destination address instead.
+        let ip_packet = Ipv4Packet::from_data(data)?;
+        let header_len = Ipv4Packet::header_length(data);
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.dst_addr().octets());
+        add.add_slice(&src_addr.octets());
+
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
+
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&data[10..12]);
+        let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+        checksum.incremental_update(remove, add);
+        checksum.fold();
+        let checksum = checksum.value();
+
+        icmp_remove.add_slice(&data[10..12]);
+        icmp_remove.add_slice(&data[16..20]);
+        data[10..12].copy_from_slice(&checksum.to_be_bytes());
+        data[16..20].copy_from_slice(&src_addr.octets());
+        icmp_add.add_slice(&data[10..12]);
+        icmp_add.add_slice(&data[16..20]);
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            let checksum_range = header_len + checksum_offset..header_len + checksum_offset + 2;
+            icmp_remove.add_slice(&data[checksum_range.clone()]);
+            data[checksum_range.clone()].copy_from_slice(&checksum.to_be_bytes());
+            icmp_add.add_slice(&data[checksum_range]);
+        }
+
+        icmp_checksum.incremental_update(icmp_remove, icmp_add);
+        icmp_checksum.fold();
+        icmp_header[2..4].copy_from_slice(&icmp_checksum.value().to_be_bytes());
         Ok(())
     }
 
     fn update_dst_addr(data: &'a mut [u8], dst_addr: Ipv4Addr) -> Result<(), IpError> {
+        let ip_packet = Ipv4Packet::from_data(data)?;
+        let header_len = Ipv4Packet::header_length(data);
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.dst_addr().octets());
+        add.add_slice(&dst_addr.octets());
+
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
+        let is_icmp = ip_packet.transport_protocol() == TransportProtocolType::ICMP;
+
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&data[10..12]);
+        let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+        checksum.incremental_update(remove, add);
+        checksum.fold();
+        let checksum = checksum.value();
+
+        data[10..12].copy_from_slice(&checksum.to_be_bytes());
+        data[16..20].copy_from_slice(&dst_addr.octets());
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            data[header_len + checksum_offset..header_len + checksum_offset + 2]
+                .copy_from_slice(&checksum.to_be_bytes())
+        }
+
+        let data = &mut data[..header_len];
+        if !is_icmp || icmp::IcmpV4Message::from_data(data)?.has_original_datagram() {
+            return Ok(());
+        }
+
+        let (icmp_header, data) = data.split_at_mut(8);
+
+        let mut icmp_checksum = [0u8; 2];
+        icmp_checksum.copy_from_slice(&icmp_header[2..4]);
+        let mut icmp_checksum = Checksum::from_inverted(u16::from_be_bytes(icmp_checksum));
+        let (mut icmp_remove, mut icmp_add) = (Checksum::new(), Checksum::new());
+
+        // Process the embedded original datagram, tracking all changes to update ICMP checksum.
+        // As this is a reply, it should update the source address instead.
         let ip_packet = Ipv4Packet::from_data(data)?;
         let header_len = Ipv4Packet::header_length(data);
         let (mut remove, mut add) = (Checksum::new(), Checksum::new());
@@ -674,12 +774,22 @@ impl<'a> Ipv4Packet<'a> {
         checksum.fold();
         let checksum = checksum.value();
 
+        icmp_remove.add_slice(&data[10..12]);
+        icmp_remove.add_slice(&data[12..16]);
         data[10..12].copy_from_slice(&checksum.to_be_bytes());
-        data[16..20].copy_from_slice(&dst_addr.octets());
+        data[12..16].copy_from_slice(&dst_addr.octets());
+        icmp_add.add_slice(&data[10..12]);
+        icmp_add.add_slice(&data[12..16]);
         if let Some((checksum_offset, checksum)) = transport_checksum {
-            data[header_len + checksum_offset..header_len + checksum_offset + 2]
-                .copy_from_slice(&checksum.to_be_bytes())
+            let checksum_range = header_len + checksum_offset..header_len + checksum_offset + 2;
+            icmp_remove.add_slice(&data[checksum_range.clone()]);
+            data[checksum_range.clone()].copy_from_slice(&checksum.to_be_bytes());
+            icmp_add.add_slice(&data[checksum_range]);
         }
+
+        icmp_checksum.incremental_update(icmp_remove, icmp_add);
+        icmp_checksum.fold();
+        icmp_header[2..4].copy_from_slice(&icmp_checksum.value().to_be_bytes());
         Ok(())
     }
 }
@@ -1069,12 +1179,57 @@ impl<'a> Ipv6Packet<'a> {
         } else {
             None
         };
+        let is_icmp = ip_packet.transport_protocol() == TransportProtocolType::IPV6_ICMP;
 
         data[8..24].copy_from_slice(&src_addr.octets());
         if let Some((checksum_offset, checksum)) = transport_checksum {
             data[header_len + checksum_offset..header_len + checksum_offset + 2]
                 .copy_from_slice(&checksum.to_be_bytes())
         }
+
+        let data = &mut data[..header_len];
+        if !is_icmp || icmp::IcmpV6Message::from_data(data)?.has_original_datagram() {
+            return Ok(());
+        }
+
+        let (icmp_header, data) = data.split_at_mut(8);
+
+        let mut icmp_checksum = [0u8; 2];
+        icmp_checksum.copy_from_slice(&icmp_header[2..4]);
+        let mut icmp_checksum = Checksum::from_inverted(u16::from_be_bytes(icmp_checksum));
+        let (mut icmp_remove, mut icmp_add) = (Checksum::new(), Checksum::new());
+
+        // Process the embedded original datagram, tracking all changes to update ICMP checksum.
+        // As this is a reply, it should update the destination address instead.
+        let ip_packet = Ipv6Packet::from_data(data)?;
+        let header_len = ip_packet.data.len() - ip_packet.transport_data.full_data().len();
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.src_addr().octets());
+        add.add_slice(&src_addr.octets());
+
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
+
+        icmp_remove.add_slice(&data[24..40]);
+        data[24..40].copy_from_slice(&src_addr.octets());
+        icmp_add.add_slice(&data[24..40]);
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            let checksum_range = header_len + checksum_offset..header_len + checksum_offset + 2;
+            icmp_remove.add_slice(&data[checksum_range.clone()]);
+            data[checksum_range.clone()].copy_from_slice(&checksum.to_be_bytes());
+            icmp_add.add_slice(&data[checksum_range]);
+        }
+
+        icmp_checksum.incremental_update(icmp_remove, icmp_add);
+        icmp_checksum.fold();
+        icmp_header[2..4].copy_from_slice(&icmp_checksum.value().to_be_bytes());
         Ok(())
     }
 
@@ -1094,12 +1249,57 @@ impl<'a> Ipv6Packet<'a> {
         } else {
             None
         };
+        let is_icmp = ip_packet.transport_protocol() == TransportProtocolType::IPV6_ICMP;
 
         data[24..40].copy_from_slice(&dst_addr.octets());
         if let Some((checksum_offset, checksum)) = transport_checksum {
             data[header_len + checksum_offset..header_len + checksum_offset + 2]
                 .copy_from_slice(&checksum.to_be_bytes())
         }
+
+        let data = &mut data[..header_len];
+        if !is_icmp || icmp::IcmpV6Message::from_data(data)?.has_original_datagram() {
+            return Ok(());
+        }
+
+        let (icmp_header, data) = data.split_at_mut(8);
+
+        let mut icmp_checksum = [0u8; 2];
+        icmp_checksum.copy_from_slice(&icmp_header[2..4]);
+        let mut icmp_checksum = Checksum::from_inverted(u16::from_be_bytes(icmp_checksum));
+        let (mut icmp_remove, mut icmp_add) = (Checksum::new(), Checksum::new());
+
+        // Process the embedded original datagram, tracking all changes to update ICMP checksum.
+        // As this is a reply, it should update the source address instead.
+        let ip_packet = Ipv6Packet::from_data(data)?;
+        let header_len = ip_packet.data.len() - ip_packet.transport_data.full_data().len();
+        let (mut remove, mut add) = (Checksum::new(), Checksum::new());
+        remove.add_slice(&ip_packet.src_addr().octets());
+        add.add_slice(&dst_addr.octets());
+
+        let transport_checksum = if !ip_packet.is_fragment_shifted()
+            && ip_packet.transport_protocol().supports_checksum()
+        {
+            ip_packet
+                .transport_protocol_data()
+                .translated_checksum(remove, add)
+        } else {
+            None
+        };
+
+        icmp_remove.add_slice(&data[8..24]);
+        data[8..24].copy_from_slice(&dst_addr.octets());
+        icmp_add.add_slice(&data[8..24]);
+        if let Some((checksum_offset, checksum)) = transport_checksum {
+            let checksum_range = header_len + checksum_offset..header_len + checksum_offset + 2;
+            icmp_remove.add_slice(&data[checksum_range.clone()]);
+            data[checksum_range.clone()].copy_from_slice(&checksum.to_be_bytes());
+            icmp_add.add_slice(&data[checksum_range]);
+        }
+
+        icmp_checksum.incremental_update(icmp_remove, icmp_add);
+        icmp_checksum.fold();
+        icmp_header[2..4].copy_from_slice(&icmp_checksum.value().to_be_bytes());
         Ok(())
     }
 }
@@ -1318,10 +1518,6 @@ impl<'a> IpPacket<'a> {
             }
         };
 
-        // TODO GATEWAY: replace IP address in ICMP as well.
-        // Use IcmpV4Message::translate_original_datagram_to_client for reference.
-        // Use Icmpv6Message::translate_original_datagram_to_uplink for reference.
-
         // TODO GATEWAY: remove this test code.
         {
             let ip_packet = IpPacket::from_data(data)?;
@@ -1358,10 +1554,6 @@ impl<'a> IpPacket<'a> {
                 return Err("Cannot update an IPv6 packet to use IPv4 destination address".into());
             }
         };
-
-        // TODO GATEWAY: replace IP address in ICMP as well.
-        // Use IcmpV4Message::translate_original_datagram_to_client for reference.
-        // Use Icmpv6Message::translate_original_datagram_to_uplink for reference.
 
         // TODO GATEWAY: remove this test code.
         {
