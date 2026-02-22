@@ -299,12 +299,11 @@ impl IcmpV4Message<'_> {
     ) -> Result<IcmpTranslationAction, IpError> {
         // RFC 4884, Section 4 states that the sixth octet contains the datagram length.
         // All following octets (after the datagram) contain extensions.
-        let data_len = self[5] as usize * 8;
+        let data_len = self[5] as usize * 4;
         let (original_datagram, icmp_extensions) = if data_len == 0 {
-            // No extensions.
             (&self[8..], &[] as &[u8])
         } else {
-            (&self[8..8 + data_len * 8], &self[8 + data_len * 8..])
+            (&self[8..8 + data_len], &self[8 + data_len..])
         };
 
         let original_packet = match IpPacket::from_data(original_datagram) {
@@ -577,7 +576,7 @@ impl IcmpV6Message<'_> {
             // No extensions.
             (&self[8..], &[] as &[u8])
         } else {
-            (&self[8..8 + data_len * 8], &self[8 + data_len * 8..])
+            (&self[8..8 + data_len], &self[8 + data_len..])
         };
 
         let original_packet = match IpPacket::from_data(original_datagram) {
