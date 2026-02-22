@@ -292,7 +292,7 @@ impl IcmpV4Message<'_> {
             .ok()
     }
 
-    fn translate_original_datagram_to_esp(
+    fn translate_original_datagram_to_client(
         &self,
         dest: &mut [u8],
         nat64_prefix: &Nat64Prefix,
@@ -358,7 +358,7 @@ impl IcmpV4Message<'_> {
         }
     }
 
-    pub fn translate_to_esp(
+    pub fn translate_to_client(
         &self,
         dest: &mut [u8],
         nat64_prefix: &Nat64Prefix,
@@ -412,14 +412,14 @@ impl IcmpV4Message<'_> {
                     }
                 }
 
-                self.translate_original_datagram_to_esp(dest, nat64_prefix)
+                self.translate_original_datagram_to_client(dest, nat64_prefix)
             }
             IcmpV4::TimeExceeded(IcmpV4TimeExceeded(code)) => {
                 dest[0] = 3;
                 dest[1] = code;
                 dest[2..8].fill(0);
 
-                self.translate_original_datagram_to_esp(dest, nat64_prefix)
+                self.translate_original_datagram_to_client(dest, nat64_prefix)
             }
             IcmpV4::ParameterProblem(IcmpV4ParameterProblem(code)) => {
                 dest[0] = 4;
@@ -447,7 +447,7 @@ impl IcmpV4Message<'_> {
                         };
                         dest[4..8].copy_from_slice(&pointer_value.to_be_bytes());
 
-                        self.translate_original_datagram_to_esp(dest, nat64_prefix)
+                        self.translate_original_datagram_to_client(dest, nat64_prefix)
                     }
                     2 => {
                         dest[1] = 0;
@@ -462,7 +462,7 @@ impl IcmpV4Message<'_> {
                         };
                         dest[4..8].copy_from_slice(&pointer_value.to_be_bytes());
 
-                        self.translate_original_datagram_to_esp(dest, nat64_prefix)
+                        self.translate_original_datagram_to_client(dest, nat64_prefix)
                     }
                     _ => {
                         debug!("Dropping unsupported ICMPv4 request {self}");

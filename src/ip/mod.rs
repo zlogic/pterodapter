@@ -1031,7 +1031,10 @@ impl<'a> IpPacket<'a> {
             4 => Ok(IpPacket::V4(Ipv4Packet::from_data(data)?)),
             6 => Ok(IpPacket::V6(Ipv6Packet::from_data(data)?)),
             _ => {
-                warn!("ESP IP packet is not a supported IP version: {:x}", data[0]);
+                warn!(
+                    "Client IP packet is not a supported IP version: {:x}",
+                    data[0]
+                );
                 Err("Unsupported IP protocol version".into())
             }
         }
@@ -1592,15 +1595,15 @@ impl Network {
             .any(|domain| dns_packet.matches_nat64(domain))
     }
 
-    pub fn translate_packet_from_esp<'a>(
+    pub fn translate_packet_from_client<'a>(
         &mut self,
         packet: IpPacket<'a>,
         header: IpHeader,
         out_buf: &'a mut [u8],
-    ) -> Result<RoutingActionEsp<'a>, IpError> {
+    ) -> Result<RoutingActionClient<'a>, IpError> {
         if !self.is_nat64() {
             let data = packet.into_data();
-            return Ok(RoutingActionEsp::Forward(data));
+            return Ok(RoutingActionClient::Forward(data));
         };
         let is_dns_ip = self.dns_addrs.contains(header.dst_addr());
         match packet {
@@ -1608,17 +1611,17 @@ impl Network {
                 if packet.hop_limit() <= TTL_HOP_DECREMENT {
                     // RFC 7915, Section 5.1:
                     // Hop limit will be reduced to 0 - will be dropped by the next hop.
-                    warn!("Received packet with expired Hop limit from ESP: {header}");
+                    warn!("Received packet with expired Hop limit from client: {header}");
                     if !self.icmp_rate_limiter.can_send() {
                         info!("ICMP rate limit reached, dropping response");
-                        return Ok(RoutingActionEsp::Drop);
+                        return Ok(RoutingActionClient::Drop);
                     }
                     let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
                         .write_error_response(&IpPacket::V6(packet), out_buf)?;
-                    return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
+                    return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
                 }
                 if header.transport_protocol() == TransportProtocolType::IPV6_ICMP {
-                    self.translate_icmp_packet_from_esp(packet, out_buf)
+                    self.translate_icmp_packet_from_client(packet, out_buf)
                 } else if packet
                     .fragment_next_header()
                     .is_some_and(|protocol| protocol.is_ipv6_extension())
@@ -1626,12 +1629,12 @@ impl Network {
                     // RFC 7915, Section 5.1.1
                     // If fragment header is followed by an unsupported extension header, drop it.
                     warn!("Dropping IPv6 packet with extension header after a Fragment header");
-                    Ok(RoutingActionEsp::Drop)
+                    Ok(RoutingActionClient::Drop)
                 } else if !is_dns_ip {
                     let length = packet.write_translated(out_buf, false)?;
-                    Ok(RoutingActionEsp::Forward(&out_buf[..length]))
+                    Ok(RoutingActionClient::Forward(&out_buf[..length]))
                 } else {
-                    self.translate_dns_packet_from_esp(IpPacket::V6(packet), header, out_buf)
+                    self.translate_dns_packet_from_client(IpPacket::V6(packet), header, out_buf)
                 }
             }
             IpPacket::V4(packet) => {
@@ -1641,28 +1644,28 @@ impl Network {
                     warn!("Received packet with expired TTL: {header}");
                     if !self.icmp_rate_limiter.can_send() {
                         info!("ICMP rate limit reached, dropping response");
-                        return Ok(RoutingActionEsp::Drop);
+                        return Ok(RoutingActionClient::Drop);
                     }
                     let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT
                         .write_error_response(&IpPacket::V4(packet), out_buf)?;
-                    return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
+                    return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
                 }
                 if !is_dns_ip || packet.transport_protocol() == TransportProtocolType::ICMP {
                     let length = packet.write_ipv4_decrease_ttl(out_buf)?;
-                    Ok(RoutingActionEsp::Forward(&out_buf[..length]))
+                    Ok(RoutingActionClient::Forward(&out_buf[..length]))
                 } else {
-                    self.translate_dns_packet_from_esp(IpPacket::V4(packet), header, out_buf)
+                    self.translate_dns_packet_from_client(IpPacket::V4(packet), header, out_buf)
                 }
             }
         }
     }
 
-    fn translate_dns_packet_from_esp<'a>(
+    fn translate_dns_packet_from_client<'a>(
         &mut self,
         packet: IpPacket<'a>,
         header: IpHeader,
         out_buf: &'a mut [u8],
-    ) -> Result<RoutingActionEsp<'a>, IpError> {
+    ) -> Result<RoutingActionClient<'a>, IpError> {
         if !packet.validate_ip_checksum() {
             return Err("DNS packet has invalid IP checksum".into());
         }
@@ -1678,21 +1681,21 @@ impl Network {
             warn!("Dropping non-standard packet to DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
                 info!("ICMP rate limit reached, dropping response");
-                return Ok(RoutingActionEsp::Drop);
+                return Ok(RoutingActionClient::Drop);
             }
             let length =
                 icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(&packet, out_buf)?;
-            return Ok(RoutingActionEsp::ReturnToSender(out_buf, length));
+            return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
         }
         let dns_packet =
             dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
-        trace!("Decoded DNS packet from ESP: {dns_packet}");
+        trace!("Decoded DNS packet from client: {dns_packet}");
         // Reserve space for UDP header.
         let dest_buf = &mut out_buf[MAX_TRANSLATED_IP_HEADER_LENGTH
             ..MAX_TRANSLATED_IP_HEADER_LENGTH + dns::MAX_PACKET_SIZE_IPV4];
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated_ipv4(out_buf, false)?;
-            return Ok(RoutingActionEsp::Forward(&out_buf[..length]));
+            return Ok(RoutingActionClient::Forward(&out_buf[..length]));
         }
 
         let dns_translator = if let Some(dns_translator) = &mut self.dns_translator {
@@ -1706,7 +1709,7 @@ impl Network {
             dns::DnsTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
-                    trace!("Rewrote DNS request from ESP: {dns_packet}");
+                    trace!("Rewrote DNS request from client: {dns_packet}");
                 }
 
                 let start_offset = packet.write_updated_udp_ipv4(
@@ -1714,19 +1717,19 @@ impl Network {
                     MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
                 )?;
                 let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-                RoutingActionEsp::Forward(&out_buf[start_offset..data_end])
+                RoutingActionClient::Forward(&out_buf[start_offset..data_end])
             }
             dns::DnsTranslationAction::ReplyToSender(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
-                    trace!("Sending immediate DNS reply to ESP: {dns_packet}");
+                    trace!("Sending immediate DNS reply to client: {dns_packet}");
                 }
                 let start_offset = packet.write_udp_response(
                     out_buf,
                     MAX_TRANSLATED_IP_HEADER_LENGTH..MAX_TRANSLATED_IP_HEADER_LENGTH + length,
                 )?;
                 let data_end = MAX_TRANSLATED_IP_HEADER_LENGTH + length;
-                RoutingActionEsp::ReturnToSender(
+                RoutingActionClient::ReturnToSender(
                     &mut out_buf[start_offset..],
                     data_end - start_offset,
                 )
@@ -1735,11 +1738,11 @@ impl Network {
         Ok(action)
     }
 
-    fn translate_icmp_packet_from_esp<'a>(
+    fn translate_icmp_packet_from_client<'a>(
         &mut self,
         packet: Ipv6Packet<'a>,
         out_buf: &'a mut [u8],
-    ) -> Result<RoutingActionEsp<'a>, IpError> {
+    ) -> Result<RoutingActionClient<'a>, IpError> {
         if !packet.validate_transport_checksum() {
             return Err("ICMPv6 packet has invalid ICMP checksum".into());
         }
@@ -1758,13 +1761,13 @@ impl Network {
             icmp::IcmpTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let icmp_packet = icmp::IcmpV4Message::from_data(&dest_buf[..length])?;
-                    trace!("Rewrote ICMPv6 packet from ESP: {icmp_packet}");
+                    trace!("Rewrote ICMPv6 packet from client: {icmp_packet}");
                 }
 
                 let length = packet.write_icmp_translated(out_buf, length)?;
-                RoutingActionEsp::Forward(&out_buf[..length])
+                RoutingActionClient::Forward(&out_buf[..length])
             }
-            icmp::IcmpTranslationAction::Drop => RoutingActionEsp::Drop,
+            icmp::IcmpTranslationAction::Drop => RoutingActionClient::Drop,
         };
         Ok(action)
     }
@@ -1852,7 +1855,6 @@ impl Network {
         let dns_packet =
             dns::DnsPacket::from_udp_payload(packet.transport_protocol_data().payload_data())?;
         trace!("Decoded DNS packet from uplink/VPN: {dns_packet}");
-        // Reserve space for UDP header.
         if !self.dns_matches_nat64(&dns_packet) {
             let length = packet.write_translated(out_buf, nat_prefix, false)?;
             return Ok(RoutingActionUplink::Forward(out_buf, length));
@@ -1867,7 +1869,7 @@ impl Network {
         };
 
         trace!("Applying DNS64 translation to response");
-        let length = dns_translator.translate_to_esp(&dns_packet, dest_buf)?;
+        let length = dns_translator.translate_to_client(&dns_packet, dest_buf)?;
         if log::log_enabled!(log::Level::Trace) {
             let dns_packet = dns::DnsPacket::from_udp_payload(&dest_buf[..length])?;
             trace!("Rewrote DNS response from uplink/VPN: {dns_packet}");
@@ -1906,7 +1908,7 @@ impl Network {
         // Reserve space for IPv6 header.
         let dest_buf = &mut out_buf[40..];
 
-        let translation = icmp_packet.translate_to_esp(dest_buf, nat64_prefix)?;
+        let translation = icmp_packet.translate_to_client(dest_buf, nat64_prefix)?;
         let action = match translation {
             icmp::IcmpTranslationAction::Forward(length) => {
                 if log::log_enabled!(log::Level::Trace) {
@@ -1923,7 +1925,7 @@ impl Network {
     }
 }
 
-pub enum RoutingActionEsp<'a> {
+pub enum RoutingActionClient<'a> {
     Forward(&'a [u8]),
     ReturnToSender(&'a mut [u8], usize),
     Drop,

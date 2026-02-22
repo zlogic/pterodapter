@@ -1425,7 +1425,7 @@ impl Dns64Translator {
         }
     }
 
-    pub fn translate_to_esp(
+    pub fn translate_to_client(
         &mut self,
         request: &DnsPacket,
         dest: &mut [u8],
