@@ -45,8 +45,11 @@ search_order 1
 EOF
 ```
 
-🚫 Unfortunately, this doesn't work correctly at the moment.
-macOS sends jumbo frames to the `bridge100` network and NAT64 would need to fragment them; macOS seems to ignore the MTU and ICMPv6 _Packet Too Big_ replies.
+⚠️ The Linux kernel enables [GRO](https://doc.dpdk.org/guides/prog_guide/generic_receive_offload_lib.html) by default and reassembles TCP fragments into larger chunks.
+Apple Container runs the Linux kernel from Kata (with GRO enabled by default), causing jumbo IP packets that exceed the negotiated TCP MSS size.
+
+pterodapter can automatically disable GRO and adjust the MTU if necessary with the `--fix-mtu` option.
+
 In addition, macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
 
 # How to use it
@@ -56,14 +59,14 @@ In addition, macOS _Limit IP address tracking_ needs to be disabled for DNS64 to
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-interface=<iface>] [--set-mtu] --fortivpn=<hostport> --nat64-prefix=<ip6prefix> [--dns64-tunnel-suffix=<domain>] [--pcap=<filename>] l2gateway
+pterotapter [--log-level=<level>] [--listen-interface=<iface>] [--fix-mtu] --fortivpn=<hostport> --nat64-prefix=<ip6prefix> [--dns64-tunnel-suffix=<domain>] [--pcap=<filename>] l2gateway
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
 
 `--listen-interface=<ip-address>` specifies the network interface which the gateway should be listening on, for example `--listen-interface=eth0`.
 
-`--set-mtu` is an optional argument indicating that the network interface (specified in `--listen-interface`) should have its MTU increased to 1500.
+`--fix-mtu` is an optional argument indicating that the network interface (specified in `--listen-interface`) should have its MTU increased to 1500, and that [GRO](https://doc.dpdk.org/guides/prog_guide/generic_receive_offload_lib.html) should be disabled.
 
 `--fortivpn=<hostport>` specifies the FortiVPN connection address, for example `--fortivpn=fortivpn.example.com:443`.
 
@@ -88,7 +91,7 @@ To use the `l2gateway` mode, pterodapter needs to be running in Linux (or a Linu
 setcap cap_net_raw+eip pterodapter
 ```
 
-For the `--set-mtu` option to work, pterodapter also needs `CAP_NET_ADMIN` permissions
+For the `--fix-mtu` option to work, pterodapter also needs `CAP_NET_ADMIN` permissions:
 
 ```shell
 setcap cap_net_raw,cap_net_admin+eip pterodapter
