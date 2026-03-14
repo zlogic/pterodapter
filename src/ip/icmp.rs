@@ -293,12 +293,12 @@ impl IcmpV4Message<'_> {
     }
 
     pub fn has_original_datagram(&self) -> bool {
-        match self.icmp_type() {
+        matches!(
+            self.icmp_type(),
             IcmpV4::DestinationUnreachable(_)
-            | IcmpV4::TimeExceeded(_)
-            | IcmpV4::ParameterProblem(_) => true,
-            _ => false,
-        }
+                | IcmpV4::TimeExceeded(_)
+                | IcmpV4::ParameterProblem(_),
+        )
     }
 
     fn translate_original_datagram_to_client(
@@ -575,13 +575,13 @@ impl IcmpV6Message<'_> {
     }
 
     pub fn has_original_datagram(&self) -> bool {
-        match self.icmp_type() {
+        matches!(
+            self.icmp_type(),
             IcmpV6::DestinationUnreachable(_)
-            | IcmpV6::PacketTooBig
-            | IcmpV6::TimeExceeded(_)
-            | IcmpV6::ParameterProblem(_) => true,
-            _ => false,
-        }
+                | IcmpV6::PacketTooBig
+                | IcmpV6::TimeExceeded(_)
+                | IcmpV6::ParameterProblem(_)
+        )
     }
 
     fn translate_original_datagram_to_uplink(
