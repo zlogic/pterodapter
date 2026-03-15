@@ -45,10 +45,10 @@ search_order 1
 EOF
 ```
 
-⚠️ The Linux kernel enables [GRO and GSO](https://docs.kernel.org/networking/segmentation-offloads.html) by default and reassembles TCP fragments into larger chunks.
-Apple Container runs the Linux kernel from Kata (with GRO and GSO enabled by default), causing jumbo IP packets that exceed the negotiated TCP MSS size.
+⚠️ The Linux kernel enables [GRO](https://docs.kernel.org/networking/segmentation-offloads.html) by default and reassembles TCP fragments into larger chunks.
+Apple Container runs the Linux kernel from Kata (with GRO enabled by default), causing jumbo IP packets that exceed the negotiated TCP MSS size.
 
-pterodapter can automatically disable GRO and GSO and adjust the MTU if necessary with the `--fix-mtu` option.
+pterodapter can automatically disable GRO and adjust the MTU if necessary with the `--fix-mtu` option.
 
 In addition, macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
 
