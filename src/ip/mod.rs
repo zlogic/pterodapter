@@ -1518,23 +1518,6 @@ impl<'a> IpPacket<'a> {
             }
         };
 
-        // TODO GATEWAY: remove this test code.
-        {
-            let ip_packet = IpPacket::from_data(data)?;
-            if !ip_packet.validate_ip_checksum() {
-                warn!(
-                    "IP packet has invalid header checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-            if !ip_packet.validate_transport_checksum() {
-                warn!(
-                    "IP packet has invalid transport data checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-        }
-
         Ok(())
     }
 
@@ -1555,22 +1538,6 @@ impl<'a> IpPacket<'a> {
             }
         };
 
-        // TODO GATEWAY: remove this test code.
-        {
-            let ip_packet = IpPacket::from_data(data)?;
-            if !ip_packet.validate_ip_checksum() {
-                warn!(
-                    "IP packet has invalid header checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-            if !ip_packet.validate_transport_checksum() {
-                warn!(
-                    "IP packet has invalid transport data checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-        }
         Ok(())
     }
 }
