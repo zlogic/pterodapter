@@ -646,16 +646,10 @@ impl RawSocket {
             }
         }
         if disable_reassembly {
-            for feature in [
-                ethtool::Feature::TSO,
-                ethtool::Feature::GRO,
-                ethtool::Feature::GSO,
-            ] {
-                match RawSocket::ethtool_set(socket, listen_interface, feature, false) {
-                    Ok(true) => info!("Disabled {feature}"),
-                    Ok(false) => debug!("{feature} is already disabled"),
-                    Err(err) => warn!("Failed to disable {feature}: {err}"),
-                }
+            match RawSocket::ethtool_set(socket, listen_interface, ethtool::Feature::GRO, false) {
+                Ok(true) => info!("Disabled GRO"),
+                Ok(false) => debug!("GRO is already disabled"),
+                Err(err) => warn!("Failed to disable GRO: {err}"),
             }
         }
         let socket = AsyncFd::new(socket)?;
@@ -1047,12 +1041,8 @@ mod ethtool {
         pub data: libc::__u32,
     }
 
-    const ETHTOOL_GTSO: libc::__u32 = 0x0000001e;
-    const ETHTOOL_STSO: libc::__u32 = 0x0000001f;
     const ETHTOOL_GGRO: libc::__u32 = 0x0000002b;
     const ETHTOOL_SGRO: libc::__u32 = 0x0000002c;
-    const ETHTOOL_GGSO: libc::__u32 = 0x00000023;
-    const ETHTOOL_SGSO: libc::__u32 = 0x00000024;
 
     #[derive(Clone, Copy, PartialEq)]
     pub struct Feature {
@@ -1061,14 +1051,6 @@ mod ethtool {
     }
 
     impl Feature {
-        pub const TSO: Self = Self {
-            cmd_get: ETHTOOL_GTSO,
-            cmd_set: ETHTOOL_STSO,
-        };
-        pub const GSO: Self = Self {
-            cmd_get: ETHTOOL_GGSO,
-            cmd_set: ETHTOOL_SGSO,
-        };
         pub const GRO: Self = Self {
             cmd_get: ETHTOOL_GGRO,
             cmd_set: ETHTOOL_SGRO,
@@ -1078,8 +1060,6 @@ mod ethtool {
     impl fmt::Display for Feature {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                &Self::TSO => write!(f, "TSO"),
-                &Self::GSO => write!(f, "GSO"),
                 &Self::GRO => write!(f, "GRO"),
                 unknown_feature => write!(
                     f,
