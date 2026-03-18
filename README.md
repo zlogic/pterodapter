@@ -45,12 +45,7 @@ search_order 1
 EOF
 ```
 
-⚠️ The Linux kernel enables [GRO](https://docs.kernel.org/networking/segmentation-offloads.html) by default and reassembles TCP fragments into larger chunks.
-Apple Container runs the Linux kernel from Kata (with GRO enabled by default), causing jumbo IP packets that exceed the negotiated TCP MSS size.
-
-pterodapter can automatically disable GRO and adjust the MTU if necessary with the `--fix-mtu` option.
-
-In addition, macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
+macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
 
 # How to use it
 
@@ -66,7 +61,7 @@ pterotapter [--log-level=<level>] [--listen-interface=<iface>] [--fix-mtu] --for
 
 `--listen-interface=<ip-address>` specifies the network interface which the gateway should be listening on, for example `--listen-interface=eth0`.
 
-`--fix-mtu` is an optional argument indicating that the network interface (specified in `--listen-interface`) should have its MTU increased to 1500, and that [GRO](https://doc.dpdk.org/guides/prog_guide/generic_receive_offload_lib.html) should be disabled.
+`--fix-mtu` is an optional argument indicating that the network interface (specified in `--listen-interface`) should have its MTU increased to 1500.
 
 `--fortivpn=<hostport>` specifies the FortiVPN connection address, for example `--fortivpn=fortivpn.example.com:443`.
 

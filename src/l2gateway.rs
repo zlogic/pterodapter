@@ -93,7 +93,7 @@ impl Server {
         } else {
             None
         };
-        let socket = match RawSocket::new(self.listen_interface.as_str(), mtu, self.fix_mtu).await {
+        let socket = match RawSocket::new(self.listen_interface.as_str(), mtu).await {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
@@ -625,11 +625,7 @@ struct RawSocket {
 }
 
 impl RawSocket {
-    async fn new(
-        listen_interface: &str,
-        mtu: Option<usize>,
-        disable_reassembly: bool,
-    ) -> Result<RawSocket, L2GatewayError> {
+    async fn new(listen_interface: &str, mtu: Option<usize>) -> Result<RawSocket, L2GatewayError> {
         let protocol = u16::from_be(libc::ETH_P_IPV6 as u16) as libc::c_int;
         let socket = match unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) } {
             0 => return Err(io::Error::last_os_error().into()),
@@ -647,13 +643,6 @@ impl RawSocket {
                 Err(err) => {
                     warn!("Failed to update MTU: {err}")
                 }
-            }
-        }
-        if disable_reassembly {
-            match RawSocket::ethtool_set(socket, listen_interface, ethtool::Feature::GRO, false) {
-                Ok(true) => info!("Disabled GRO"),
-                Ok(false) => debug!("GRO is already disabled"),
-                Err(err) => warn!("Failed to disable GRO: {err}"),
             }
         }
         let socket = AsyncFd::new(socket)?;
@@ -894,60 +883,6 @@ impl RawSocket {
         }
     }
 
-    fn ethtool_set(
-        fd: std::os::unix::io::RawFd,
-        name: &str,
-        feature: ethtool::Feature,
-        enable: bool,
-    ) -> Result<bool, L2GatewayError> {
-        let ifr_name = Self::ifr_name(name)?;
-        let mut val = ethtool::ethtool_value {
-            cmd: feature.cmd_get,
-            data: 0,
-        };
-        let mut ifreq = libc::ifreq {
-            ifr_name,
-            ifr_ifru: libc::__c_anonymous_ifr_ifru {
-                ifru_data: std::ptr::from_mut(&mut val) as *mut _,
-            },
-        };
-        let is_enabled = unsafe {
-            match libc::ioctl(fd, libc::SIOCETHTOOL, std::ptr::from_mut(&mut ifreq)) {
-                0 => val.data != 0,
-                _ => {
-                    let err = io::Error::last_os_error();
-                    warn!("Failed to get {feature} {name}: {err}");
-                    return Err(io::Error::last_os_error().into());
-                }
-            }
-        };
-        if is_enabled == enable {
-            return Ok(false);
-        }
-
-        let val_data = if enable { 1 } else { 0 };
-        let mut val = ethtool::ethtool_value {
-            cmd: feature.cmd_set,
-            data: val_data,
-        };
-        let mut ifreq = libc::ifreq {
-            ifr_name,
-            ifr_ifru: libc::__c_anonymous_ifr_ifru {
-                ifru_data: std::ptr::from_mut(&mut val) as *mut _,
-            },
-        };
-        unsafe {
-            match libc::ioctl(fd, libc::SIOCETHTOOL, std::ptr::from_mut(&mut ifreq)) {
-                0 => Ok(true),
-                _ => {
-                    let err = io::Error::last_os_error();
-                    warn!("Failed to disable set feature {feature} {name}: {err}");
-                    Err(io::Error::last_os_error().into())
-                }
-            }
-        }
-    }
-
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
         // See https://docs.kernel.org/networking/filter.html for more information.
         let mut filter_data = BpfFilter::new_nat64_filter(&self.mac, prefix);
@@ -1030,48 +965,6 @@ impl BpfFilter {
             BpfFilterOp::new(6, 0, 0, 262144),
             BpfFilterOp::new(6, 0, 0, 0),
         ])
-    }
-}
-
-// ethtool provides Rust bindings to <linux/ethtool.h>.
-// Needs to be in sync with /usr/include/linux/ethtool.h.
-// If the struct changes its size/fields, or the consts are updated, this could break.
-mod ethtool {
-    use std::fmt;
-
-    #[repr(C)]
-    pub struct ethtool_value {
-        pub cmd: libc::__u32,
-        pub data: libc::__u32,
-    }
-
-    const ETHTOOL_GGRO: libc::__u32 = 0x0000002b;
-    const ETHTOOL_SGRO: libc::__u32 = 0x0000002c;
-
-    #[derive(Clone, Copy, PartialEq)]
-    pub struct Feature {
-        pub cmd_get: libc::__u32,
-        pub cmd_set: libc::__u32,
-    }
-
-    impl Feature {
-        pub const GRO: Self = Self {
-            cmd_get: ETHTOOL_GGRO,
-            cmd_set: ETHTOOL_SGRO,
-        };
-    }
-
-    impl fmt::Display for Feature {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                &Self::GRO => write!(f, "GRO"),
-                unknown_feature => write!(
-                    f,
-                    "Unknown feature with cmd set={:#08X} get={:#08X}",
-                    unknown_feature.cmd_get, unknown_feature.cmd_set
-                ),
-            }
-        }
     }
 }
 
