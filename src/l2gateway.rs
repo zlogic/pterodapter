@@ -16,10 +16,14 @@ use crate::{ip, pcap, uplink};
 
 // Maximum ethernet frame size, the ethernet header will be reused for PPP headers.
 const MAX_PACKET_SIZE: usize = 1500;
-// Limit the packet size to IPv6 minimum, any packet that exceeds this size will be rejected with an
+// Limit the packet size, any packet that exceeds this size will be rejected with an
 // ICMPv6 Packet Too Big message.
 // This prevents jumbo frames which will be rejected by the uplink.
-const PATH_MTU: usize = 1280;
+// * In macOS/Safari, QUIC payloads are limited to 1200 or 1350 bytes (for IPv6)
+// * Quiche defaults to 1200 bytes
+// * For TCP routed through FortiVPN, the max MSS 1440 (MTU=1480)
+// Use FortiVPN's limit as a reasonable default.
+const PATH_MTU: usize = 1480;
 const L2_ETHERNET_HEADER_SIZE: usize = 6 + 6 + 2;
 
 pub struct Config {
