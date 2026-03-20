@@ -1682,9 +1682,143 @@ impl fmt::Display for IpHeader {
     }
 }
 
+pub struct TransportDataUdp<'a> {
+    data: &'a [u8],
+}
+
+impl TransportDataUdp<'_> {
+    fn from_data(data: &[u8]) -> Result<TransportDataUdp<'_>, IpError> {
+        if data.len() >= 4 {
+            Ok(TransportDataUdp { data })
+        } else {
+            Err("Not enough data for UDP header".into())
+        }
+    }
+
+    fn full_data(&self) -> &[u8] {
+        self.data
+    }
+
+    fn payload_data(&self) -> &[u8] {
+        &self.data[8..]
+    }
+
+    fn checksum(&self) -> Option<u16> {
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&self.data[6..8]);
+        Some(u16::from_be_bytes(checksum))
+    }
+
+    fn translated_checksum(&self, remove: Checksum, add: Checksum) -> Option<(usize, u16)> {
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&self.data[6..8]);
+        let checksum = u16::from_be_bytes(checksum);
+        if checksum != 0x0000 {
+            let mut checksum = Checksum::from_inverted(checksum);
+            checksum.incremental_update(remove, add);
+            checksum.fold();
+
+            let checksum = checksum.value();
+            let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
+            Some((6, checksum))
+        } else {
+            Some((6, checksum))
+        }
+    }
+
+    fn src_port(&self) -> Option<u16> {
+        let mut src_port = [0u8; 2];
+        src_port.copy_from_slice(&self.data[0..2]);
+        Some(u16::from_be_bytes(src_port))
+    }
+
+    fn dst_port(&self) -> Option<u16> {
+        let mut dst_port = [0u8; 2];
+        dst_port.copy_from_slice(&self.data[2..4]);
+        Some(u16::from_be_bytes(dst_port))
+    }
+}
+
+impl fmt::Display for TransportDataUdp<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(checksum) = self.checksum() {
+            write!(f, "UDP C={:#06X}: {}", checksum, fmt_slice_hex(self.data))
+        } else {
+            write!(f, "UDP C=?: {}", fmt_slice_hex(self.data))
+        }
+    }
+}
+
+pub struct TransportDataTcp<'a> {
+    data: &'a [u8],
+    data_offset: usize,
+}
+
+impl TransportDataTcp<'_> {
+    fn from_data(data: &[u8]) -> Result<TransportDataTcp<'_>, IpError> {
+        if data.len() >= 20 {
+            let data_offset = ((data[12] >> 4) & 0x0f) as usize * 4;
+            if data_offset > data.len() {
+                Err("TCP data offset overflow".into())
+            } else if data_offset < 20 {
+                Err("TCP data offset folds into the header".into())
+            } else {
+                Ok(TransportDataTcp { data, data_offset })
+            }
+        } else {
+            Err("Not enough data for TCP header".into())
+        }
+    }
+
+    fn full_data(&self) -> &[u8] {
+        self.data
+    }
+
+    fn payload_data(&self) -> &[u8] {
+        &self.data[self.data_offset..]
+    }
+
+    fn checksum(&self) -> Option<u16> {
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&self.data[16..18]);
+        Some(u16::from_be_bytes(checksum))
+    }
+
+    fn translated_checksum(&self, remove: Checksum, add: Checksum) -> Option<(usize, u16)> {
+        let mut checksum = [0u8; 2];
+        checksum.copy_from_slice(&self.data[16..18]);
+        let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+        checksum.incremental_update(remove, add);
+        checksum.fold();
+        Some((16, checksum.value()))
+    }
+
+    fn src_port(&self) -> Option<u16> {
+        let mut src_port = [0u8; 2];
+        src_port.copy_from_slice(&self.data[0..2]);
+        Some(u16::from_be_bytes(src_port))
+    }
+
+    fn dst_port(&self) -> Option<u16> {
+        let mut dst_port = [0u8; 2];
+        dst_port.copy_from_slice(&self.data[2..4]);
+        Some(u16::from_be_bytes(dst_port))
+    }
+}
+
+impl fmt::Display for TransportDataTcp<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(checksum) = self.checksum() {
+            write!(f, "TCP C={:#06X}: {}", checksum, fmt_slice_hex(self.data))
+        } else {
+            write!(f, "TCP C=?: {}", fmt_slice_hex(self.data))
+        }
+    }
+}
+
 pub enum TransportData<'a> {
-    Udp(&'a [u8]),
-    Tcp(&'a [u8], usize),
+    Udp(TransportDataUdp<'a>),
+    Tcp(TransportDataTcp<'a>),
     Generic(TransportProtocolType, &'a [u8]),
 }
 
@@ -1695,25 +1829,10 @@ impl TransportData<'_> {
     ) -> Result<TransportData<'_>, IpError> {
         match protocol {
             TransportProtocolType::UDP => {
-                if data.len() >= 4 {
-                    Ok(TransportData::Udp(data))
-                } else {
-                    Err("Not enough data for UDP header".into())
-                }
+                Ok(TransportData::Udp(TransportDataUdp::from_data(data)?))
             }
             TransportProtocolType::TCP => {
-                if data.len() >= 20 {
-                    let data_offset = ((data[12] >> 4) & 0x0f) as usize * 4;
-                    if data_offset > data.len() {
-                        Err("TCP data offset overflow".into())
-                    } else if data_offset < 20 {
-                        Err("TCP data offset folds into the header".into())
-                    } else {
-                        Ok(TransportData::Tcp(data, data_offset))
-                    }
-                } else {
-                    Err("Not enough data for TCP header".into())
-                }
+                Ok(TransportData::Tcp(TransportDataTcp::from_data(data)?))
             }
             generic => Ok(TransportData::Generic(generic, data)),
         }
@@ -1721,32 +1840,24 @@ impl TransportData<'_> {
 
     fn full_data(&self) -> &[u8] {
         match self {
-            TransportData::Udp(data) => data,
-            TransportData::Tcp(data, _) => data,
+            TransportData::Udp(data) => data.full_data(),
+            TransportData::Tcp(data) => data.full_data(),
             TransportData::Generic(_, data) => data,
         }
     }
 
     fn payload_data(&self) -> &[u8] {
         match self {
-            TransportData::Udp(data) => &data[8..],
-            TransportData::Tcp(data, data_offset) => &data[*data_offset..],
+            TransportData::Udp(data) => data.payload_data(),
+            TransportData::Tcp(data) => data.payload_data(),
             TransportData::Generic(_, data) => data,
         }
     }
 
     fn checksum(&self) -> Option<u16> {
         match self {
-            TransportData::Udp(data) => {
-                let mut checksum = [0u8; 2];
-                checksum.copy_from_slice(&data[6..8]);
-                Some(u16::from_be_bytes(checksum))
-            }
-            TransportData::Tcp(data, _) => {
-                let mut checksum = [0u8; 2];
-                checksum.copy_from_slice(&data[16..18]);
-                Some(u16::from_be_bytes(checksum))
-            }
+            TransportData::Udp(data) => data.checksum(),
+            TransportData::Tcp(data) => data.checksum(),
             TransportData::Generic(protocol, data) => match *protocol {
                 TransportProtocolType::ICMP | TransportProtocolType::IPV6_ICMP => {
                     let mut checksum = [0u8; 2];
@@ -1760,30 +1871,8 @@ impl TransportData<'_> {
 
     fn translated_checksum(&self, remove: Checksum, add: Checksum) -> Option<(usize, u16)> {
         match self {
-            TransportData::Udp(data) => {
-                let mut checksum = [0u8; 2];
-                checksum.copy_from_slice(&data[6..8]);
-                let checksum = u16::from_be_bytes(checksum);
-                if checksum != 0x0000 {
-                    let mut checksum = Checksum::from_inverted(checksum);
-                    checksum.incremental_update(remove, add);
-                    checksum.fold();
-
-                    let checksum = checksum.value();
-                    let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
-                    Some((6, checksum))
-                } else {
-                    Some((6, checksum))
-                }
-            }
-            TransportData::Tcp(data, _) => {
-                let mut checksum = [0u8; 2];
-                checksum.copy_from_slice(&data[16..18]);
-                let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
-                checksum.incremental_update(remove, add);
-                checksum.fold();
-                Some((16, checksum.value()))
-            }
+            TransportData::Udp(data) => data.translated_checksum(remove, add),
+            TransportData::Tcp(data) => data.translated_checksum(remove, add),
             TransportData::Generic(protocol, data) => {
                 // Translating from ICMPv6 to ICMPv4 should drop the header checksum.
                 let (remove, add) = match *protocol {
@@ -1817,29 +1906,23 @@ impl TransportData<'_> {
     fn protocol(&self) -> TransportProtocolType {
         match self {
             TransportData::Udp(_) => TransportProtocolType::UDP,
-            TransportData::Tcp(_, _) => TransportProtocolType::TCP,
+            TransportData::Tcp(_) => TransportProtocolType::TCP,
             TransportData::Generic(protocol, _) => *protocol,
         }
     }
 
     fn src_port(&self) -> Option<u16> {
         match self {
-            TransportData::Tcp(data, _) | TransportData::Udp(data) => {
-                let mut src_port = [0u8; 2];
-                src_port.copy_from_slice(&data[0..2]);
-                Some(u16::from_be_bytes(src_port))
-            }
+            TransportData::Udp(data) => data.src_port(),
+            TransportData::Tcp(data) => data.src_port(),
             TransportData::Generic(_, _) => None,
         }
     }
 
     fn dst_port(&self) -> Option<u16> {
         match self {
-            TransportData::Tcp(data, _) | TransportData::Udp(data) => {
-                let mut dst_port = [0u8; 2];
-                dst_port.copy_from_slice(&data[2..4]);
-                Some(u16::from_be_bytes(dst_port))
-            }
+            TransportData::Udp(data) => data.dst_port(),
+            TransportData::Tcp(data) => data.dst_port(),
             TransportData::Generic(_, _) => None,
         }
     }
@@ -1848,20 +1931,8 @@ impl TransportData<'_> {
 impl fmt::Display for TransportData<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransportData::Udp(data) => {
-                if let Some(checksum) = self.checksum() {
-                    write!(f, "UDP C={:#06X}: {}", checksum, fmt_slice_hex(data))
-                } else {
-                    write!(f, "UDP C=?: {}", fmt_slice_hex(data))
-                }
-            }
-            TransportData::Tcp(data, _) => {
-                if let Some(checksum) = self.checksum() {
-                    write!(f, "TCP C={:#06X}: {}", checksum, fmt_slice_hex(data))
-                } else {
-                    write!(f, "TCP C=?: {}", fmt_slice_hex(data))
-                }
-            }
+            TransportData::Udp(data) => data.fmt(f),
+            TransportData::Tcp(data) => data.fmt(f),
             TransportData::Generic(protocol, data) => match *protocol {
                 TransportProtocolType::ICMP => match icmp::IcmpV4Message::from_data(data) {
                     Ok(icmp) => icmp.fmt(f),
