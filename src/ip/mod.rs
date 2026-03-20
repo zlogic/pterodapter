@@ -1703,13 +1703,13 @@ impl TransportDataUdp<'_> {
         &self.data[8..]
     }
 
-    fn checksum(&self) -> Option<u16> {
+    fn checksum(&self) -> u16 {
         let mut checksum = [0u8; 2];
         checksum.copy_from_slice(&self.data[6..8]);
-        Some(u16::from_be_bytes(checksum))
+        u16::from_be_bytes(checksum)
     }
 
-    fn translated_checksum(&self, remove: Checksum, add: Checksum) -> Option<(usize, u16)> {
+    fn translated_checksum(&self, remove: Checksum, add: Checksum) -> (usize, u16) {
         let mut checksum = [0u8; 2];
         checksum.copy_from_slice(&self.data[6..8]);
         let checksum = u16::from_be_bytes(checksum);
@@ -1720,32 +1720,33 @@ impl TransportDataUdp<'_> {
 
             let checksum = checksum.value();
             let checksum = if checksum == 0x0000 { 0xffff } else { checksum };
-            Some((6, checksum))
+            (6, checksum)
         } else {
-            Some((6, checksum))
+            (6, checksum)
         }
     }
 
-    fn src_port(&self) -> Option<u16> {
+    fn src_port(&self) -> u16 {
         let mut src_port = [0u8; 2];
         src_port.copy_from_slice(&self.data[0..2]);
-        Some(u16::from_be_bytes(src_port))
+        u16::from_be_bytes(src_port)
     }
 
-    fn dst_port(&self) -> Option<u16> {
+    fn dst_port(&self) -> u16 {
         let mut dst_port = [0u8; 2];
         dst_port.copy_from_slice(&self.data[2..4]);
-        Some(u16::from_be_bytes(dst_port))
+        u16::from_be_bytes(dst_port)
     }
 }
 
 impl fmt::Display for TransportDataUdp<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(checksum) = self.checksum() {
-            write!(f, "UDP C={:#06X}: {}", checksum, fmt_slice_hex(self.data))
-        } else {
-            write!(f, "UDP C=?: {}", fmt_slice_hex(self.data))
-        }
+        write!(
+            f,
+            "UDP C={:#06X}: {}",
+            self.checksum(),
+            fmt_slice_hex(self.data)
+        )
     }
 }
 
@@ -1757,7 +1758,7 @@ pub struct TransportDataTcp<'a> {
 impl TransportDataTcp<'_> {
     fn from_data(data: &[u8]) -> Result<TransportDataTcp<'_>, IpError> {
         if data.len() >= 20 {
-            let data_offset = ((data[12] >> 4) & 0x0f) as usize * 4;
+            let data_offset = Self::data_offset(data);
             if data_offset > data.len() {
                 Err("TCP data offset overflow".into())
             } else if data_offset < 20 {
@@ -1770,6 +1771,10 @@ impl TransportDataTcp<'_> {
         }
     }
 
+    fn data_offset(data: &[u8]) -> usize {
+        ((data[12] >> 4) & 0x0f) as usize * 4
+    }
+
     fn full_data(&self) -> &[u8] {
         self.data
     }
@@ -1778,40 +1783,366 @@ impl TransportDataTcp<'_> {
         &self.data[self.data_offset..]
     }
 
-    fn checksum(&self) -> Option<u16> {
+    fn checksum(&self) -> u16 {
         let mut checksum = [0u8; 2];
         checksum.copy_from_slice(&self.data[16..18]);
-        Some(u16::from_be_bytes(checksum))
+        u16::from_be_bytes(checksum)
     }
 
-    fn translated_checksum(&self, remove: Checksum, add: Checksum) -> Option<(usize, u16)> {
+    fn translated_checksum(&self, remove: Checksum, add: Checksum) -> (usize, u16) {
         let mut checksum = [0u8; 2];
         checksum.copy_from_slice(&self.data[16..18]);
         let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
         checksum.incremental_update(remove, add);
         checksum.fold();
-        Some((16, checksum.value()))
+        (16, checksum.value())
     }
 
-    fn src_port(&self) -> Option<u16> {
+    fn src_port(&self) -> u16 {
         let mut src_port = [0u8; 2];
         src_port.copy_from_slice(&self.data[0..2]);
-        Some(u16::from_be_bytes(src_port))
+        u16::from_be_bytes(src_port)
     }
 
-    fn dst_port(&self) -> Option<u16> {
+    fn dst_port(&self) -> u16 {
         let mut dst_port = [0u8; 2];
         dst_port.copy_from_slice(&self.data[2..4]);
-        Some(u16::from_be_bytes(dst_port))
+        u16::from_be_bytes(dst_port)
+    }
+
+    fn seq(&self) -> u32 {
+        let mut seq = [0u8; 4];
+        seq.copy_from_slice(&self.data[4..8]);
+        u32::from_be_bytes(seq)
+    }
+
+    fn ack(&self) -> u32 {
+        let mut ack = [0u8; 4];
+        ack.copy_from_slice(&self.data[8..12]);
+        u32::from_be_bytes(ack)
+    }
+
+    fn flags(&self) -> TcpFlags {
+        TcpFlags::from_u8(self.data[13])
+    }
+
+    fn window(&self) -> u16 {
+        let mut window = [0u8; 2];
+        window.copy_from_slice(&self.data[14..16]);
+        u16::from_be_bytes(window)
+    }
+
+    fn urgent_pointer(&self) -> u16 {
+        let mut urgent_pointer = [0u8; 2];
+        urgent_pointer.copy_from_slice(&self.data[18..20]);
+        u16::from_be_bytes(urgent_pointer)
+    }
+
+    fn iter_options(&self) -> TcpOptionIter<'_> {
+        TcpOptionIter {
+            data: &self.data[20..self.data_offset],
+        }
     }
 }
 
 impl fmt::Display for TransportDataTcp<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(checksum) = self.checksum() {
-            write!(f, "TCP C={:#06X}: {}", checksum, fmt_slice_hex(self.data))
+        write!(
+            f,
+            "TCP S={} A={} F={} W={} C={:#06X} U={}",
+            self.seq(),
+            self.ack(),
+            self.flags(),
+            self.window(),
+            self.checksum(),
+            self.urgent_pointer(),
+        )?;
+        self.iter_options()
+            .enumerate()
+            .try_for_each(|(i, option)| match option {
+                Ok(option) => {
+                    if i == 0 {
+                        write!(f, " O {}", option)
+                    } else {
+                        write!(f, ",{}", option)
+                    }
+                }
+                Err(err) => {
+                    if i == 0 {
+                        write!(f, " O {}", err)
+                    } else {
+                        write!(f, ",{}", err)
+                    }
+                }
+            })?;
+        write!(f, ": {}", fmt_slice_hex(self.data))
+    }
+}
+
+struct TcpFlags(u8);
+
+impl TcpFlags {
+    const CWR: u8 = 1 << 7;
+    const ECE: u8 = 1 << 6;
+    const URG: u8 = 1 << 5;
+    const ACK: u8 = 1 << 4;
+    const PSH: u8 = 1 << 3;
+    const RST: u8 = 1 << 2;
+    const SYN: u8 = 1 << 1;
+    const FIN: u8 = 1;
+
+    fn from_u8(flags: u8) -> TcpFlags {
+        TcpFlags(flags)
+    }
+
+    fn cwr(&self) -> bool {
+        self.0 & Self::CWR == Self::CWR
+    }
+
+    fn ece(&self) -> bool {
+        self.0 & Self::ECE == Self::ECE
+    }
+
+    fn urg(&self) -> bool {
+        self.0 & Self::URG == Self::URG
+    }
+
+    fn ack(&self) -> bool {
+        self.0 & Self::ACK == Self::ACK
+    }
+
+    fn psh(&self) -> bool {
+        self.0 & Self::PSH == Self::PSH
+    }
+
+    fn rst(&self) -> bool {
+        self.0 & Self::RST == Self::RST
+    }
+
+    fn syn(&self) -> bool {
+        self.0 & Self::SYN == Self::SYN
+    }
+
+    fn fin(&self) -> bool {
+        self.0 & Self::FIN == Self::FIN
+    }
+}
+
+impl fmt::Display for TcpFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut wrote_data = false;
+        let mut write_flag = |name: &str, val: bool| -> std::fmt::Result {
+            if val {
+                if wrote_data {
+                    write!(f, ",{name}")?;
+                } else {
+                    write!(f, "{name}")?;
+                }
+                wrote_data = true;
+            }
+            Ok(())
+        };
+        write_flag("CWR", self.cwr())?;
+        write_flag("ECE", self.ece())?;
+        write_flag("URG", self.urg())?;
+        write_flag("ACK", self.ack())?;
+        write_flag("PSH", self.psh())?;
+        write_flag("RST", self.rst())?;
+        write_flag("SYN", self.syn())?;
+        write_flag("FIN", self.fin())
+    }
+}
+
+struct TcpOption<'a> {
+    kind: TcpOptionKind,
+    data: &'a [u8],
+}
+
+impl TcpOption<'_> {}
+
+impl fmt::Display for TcpOption<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            TcpOptionKind::END_OF_OPTIONS_LIST => write!(f, "EOL"),
+            TcpOptionKind::NO_OPERATION => write!(f, "NOP"),
+            TcpOptionKind::MAXIMUM_SEGMENT_SIZE => {
+                let mut mss = [0u8; 2];
+                mss.copy_from_slice(&self.data);
+                let mss = u16::from_be_bytes(mss);
+                write!(f, "MSS={mss}")
+            }
+            TcpOptionKind::WINDOW_SCALE => write!(f, "WS={:#04X}", self.data[0]),
+            TcpOptionKind::SACK_PERMITTED => write!(f, "SACK-Permitted"),
+            TcpOptionKind::SACK => {
+                let (chunks, remainder) = self.data.as_chunks::<4>();
+                write!(f, "SACK=")?;
+                chunks.iter().enumerate().try_for_each(|(i, chunk)| {
+                    let val = u32::from_be_bytes(*chunk);
+                    if i == 0 {
+                        write!(f, "{val}")
+                    } else if i % 1 == 0 {
+                        write!(f, ",{val}")
+                    } else {
+                        write!(f, "-{val}")
+                    }
+                })?;
+                if !remainder.is_empty() {
+                    // This should never happen.
+                    write!(f, "+{}", fmt_slice_hex(remainder))?
+                }
+                Ok(())
+            }
+            TcpOptionKind::TIMESTAMPS => {
+                let mut ts = [0u8; 4];
+                let mut ecr = [0u8; 4];
+                ts.copy_from_slice(&self.data[0..4]);
+                ecr.copy_from_slice(&self.data[4..8]);
+                let ts = u32::from_be_bytes(ts);
+                let ecr = u32::from_be_bytes(ecr);
+                write!(f, "TS={ts}/{ecr}")
+            }
+            TcpOptionKind::USER_TIMEOUT => {
+                let mut uto = [0u8; 2];
+                uto.copy_from_slice(&self.data[0..2]);
+                let uto = u16::from_be_bytes(uto);
+                const GRANULARITY_MINUTES: u16 = 1 << 15;
+                if uto & GRANULARITY_MINUTES == GRANULARITY_MINUTES {
+                    let uto = uto & (!GRANULARITY_MINUTES);
+                    write!(f, "UTO={uto}m")
+                } else {
+                    write!(f, "UTO={uto}s")
+                }
+            }
+            TcpOptionKind::TCP_AO => write!(f, "TCP-AO={}", fmt_slice_hex(self.data)),
+            TcpOptionKind::MULTIPATH_TCP => write!(f, "MPTCP={}", fmt_slice_hex(self.data)),
+            TcpOptionKind(other) => write!(f, "Unknown TCP option {other}"),
+        }
+    }
+}
+
+struct TcpOptionIter<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Iterator for TcpOptionIter<'a> {
+    type Item = Result<TcpOption<'a>, IpError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let kind = TcpOptionKind::from_u8(self.data[0]);
+        let option_length = match kind.len(self.data) {
+            Ok(length) => length,
+            Err(err) => {
+                self.data = &[];
+                return Some(Err(err));
+            }
+        };
+        if self.data.len() < option_length {
+            self.data = &[];
+            return Some(Err("TCP option length overlow".into()));
+        }
+        let data = if option_length >= 2 {
+            &self.data[2..option_length]
         } else {
-            write!(f, "TCP C=?: {}", fmt_slice_hex(self.data))
+            &[]
+        };
+        self.data = &self.data[option_length..];
+        Some(Ok(TcpOption { kind, data }))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct TcpOptionKind(u8);
+
+impl TcpOptionKind {
+    const END_OF_OPTIONS_LIST: Self = TcpOptionKind(0);
+    const NO_OPERATION: Self = TcpOptionKind(1);
+    const MAXIMUM_SEGMENT_SIZE: Self = TcpOptionKind(2);
+    const WINDOW_SCALE: Self = TcpOptionKind(3);
+    const SACK_PERMITTED: Self = TcpOptionKind(4);
+    const SACK: Self = TcpOptionKind(5);
+    const TIMESTAMPS: Self = TcpOptionKind(8);
+    const USER_TIMEOUT: Self = TcpOptionKind(28);
+    const TCP_AO: Self = TcpOptionKind(29);
+    const MULTIPATH_TCP: Self = TcpOptionKind(30);
+
+    fn from_u8(kind: u8) -> TcpOptionKind {
+        TcpOptionKind(kind)
+    }
+
+    fn len(&self, data: &[u8]) -> Result<usize, IpError> {
+        match *self {
+            Self::END_OF_OPTIONS_LIST => Ok(1),
+            Self::NO_OPERATION => Ok(1),
+            Self::MAXIMUM_SEGMENT_SIZE => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in MSS".into())
+                } else if data[1] as usize != 4 {
+                    Err("Mismatching MSS length".into())
+                } else {
+                    Ok(4)
+                }
+            }
+            Self::WINDOW_SCALE => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in WS".into())
+                } else if data[1] as usize != 3 {
+                    Err("Mismatching WS length".into())
+                } else {
+                    Ok(3)
+                }
+            }
+            Self::SACK_PERMITTED => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in SACK Permitted".into())
+                } else if data[1] as usize != 2 {
+                    Err("Mismatching SACK Permitted length".into())
+                } else {
+                    Ok(2)
+                }
+            }
+            Self::SACK => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in SACK".into())
+                } else {
+                    Ok(data[1] as usize)
+                }
+            }
+            Self::TIMESTAMPS => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in TS".into())
+                } else if data[1] as usize != 10 {
+                    Err("Mismatching TS length".into())
+                } else {
+                    Ok(10)
+                }
+            }
+            Self::USER_TIMEOUT => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in UTO".into())
+                } else if data[1] as usize != 4 {
+                    Err("Mismatching UTO length".into())
+                } else {
+                    Ok(4)
+                }
+            }
+            Self::TCP_AO => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in TCP-AO".into())
+                } else {
+                    Ok(data[1] as usize)
+                }
+            }
+            Self::MULTIPATH_TCP => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in MPTCP".into())
+                } else {
+                    Ok(data[1] as usize)
+                }
+            }
+            _ => Ok(data.len()),
         }
     }
 }
@@ -1856,8 +2187,8 @@ impl TransportData<'_> {
 
     fn checksum(&self) -> Option<u16> {
         match self {
-            TransportData::Udp(data) => data.checksum(),
-            TransportData::Tcp(data) => data.checksum(),
+            TransportData::Udp(data) => Some(data.checksum()),
+            TransportData::Tcp(data) => Some(data.checksum()),
             TransportData::Generic(protocol, data) => match *protocol {
                 TransportProtocolType::ICMP | TransportProtocolType::IPV6_ICMP => {
                     let mut checksum = [0u8; 2];
@@ -1871,8 +2202,8 @@ impl TransportData<'_> {
 
     fn translated_checksum(&self, remove: Checksum, add: Checksum) -> Option<(usize, u16)> {
         match self {
-            TransportData::Udp(data) => data.translated_checksum(remove, add),
-            TransportData::Tcp(data) => data.translated_checksum(remove, add),
+            TransportData::Udp(data) => Some(data.translated_checksum(remove, add)),
+            TransportData::Tcp(data) => Some(data.translated_checksum(remove, add)),
             TransportData::Generic(protocol, data) => {
                 // Translating from ICMPv6 to ICMPv4 should drop the header checksum.
                 let (remove, add) = match *protocol {
@@ -1913,16 +2244,16 @@ impl TransportData<'_> {
 
     fn src_port(&self) -> Option<u16> {
         match self {
-            TransportData::Udp(data) => data.src_port(),
-            TransportData::Tcp(data) => data.src_port(),
+            TransportData::Udp(data) => Some(data.src_port()),
+            TransportData::Tcp(data) => Some(data.src_port()),
             TransportData::Generic(_, _) => None,
         }
     }
 
     fn dst_port(&self) -> Option<u16> {
         match self {
-            TransportData::Udp(data) => data.dst_port(),
-            TransportData::Tcp(data) => data.dst_port(),
+            TransportData::Udp(data) => Some(data.dst_port()),
+            TransportData::Tcp(data) => Some(data.dst_port()),
             TransportData::Generic(_, _) => None,
         }
     }
