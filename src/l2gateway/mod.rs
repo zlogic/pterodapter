@@ -25,6 +25,9 @@ const MAX_PACKET_SIZE: usize = 1500;
 // Use FortiVPN's limit as a reasonable default.
 const PATH_MTU: usize = 1480;
 const L2_ETHERNET_HEADER_SIZE: usize = 6 + 6 + 2;
+// Matching the default Linux GSO, not sure what's the default in macOS.
+const GSO_MAX_SIZE: usize = 65536;
+const GSO_MAX_FRAGMENTS: usize = GSO_MAX_SIZE / (PATH_MTU - 40 - 60) + 1;
 
 pub struct Config {
     pub listen_interface: String,
@@ -38,6 +41,7 @@ pub struct Server {
     fix_mtu: bool,
     dns64_domains: Vec<String>,
     nat64_prefix: ip::Nat64Prefix,
+    tso_refragmenter: ip::TsoRefragmenter<GSO_MAX_SIZE, GSO_MAX_FRAGMENTS>,
     raw_read_buffer: [u8; MAX_PACKET_SIZE],
     raw_write_buffer: [u8; MAX_PACKET_SIZE],
     uplink_read_buffer: [u8; MAX_PACKET_SIZE],
@@ -50,11 +54,13 @@ impl Server {
         let raw_write_buffer = [0u8; MAX_PACKET_SIZE];
         let uplink_read_buffer = [0u8; MAX_PACKET_SIZE];
         let uplink_write_buffer = [0u8; MAX_PACKET_SIZE];
+        let tso_refragmenter = ip::TsoRefragmenter::new(L2_ETHERNET_HEADER_SIZE + PATH_MTU);
         Server {
             listen_interface: config.listen_interface,
             fix_mtu: config.fix_mtu,
             dns64_domains: config.dns64_domains,
             nat64_prefix: ip::Nat64Prefix::new(config.nat64_prefix),
+            tso_refragmenter,
             raw_read_buffer,
             raw_write_buffer,
             uplink_read_buffer,
@@ -141,10 +147,20 @@ impl Server {
                     shutdown_requested =
                         shutdown_requested || shutdown_command.as_mut().poll(cx).is_ready();
                     if raw_packet.is_none() {
-                        raw_packet = match socket.poll_recv(cx, &mut self.raw_read_buffer) {
+                        raw_packet = match self.tso_refragmenter.poll_recv(
+                            cx,
+                            &mut self.raw_read_buffer,
+                            |cx, buf| match socket.poll_recv(cx, buf) {
+                                Poll::Ready(Ok(bytes_read)) => {
+                                    Poll::Ready(Ok(L2_ETHERNET_HEADER_SIZE..bytes_read))
+                                }
+                                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                                Poll::Pending => Poll::Pending,
+                            },
+                        ) {
                             Poll::Ready(result) => Some(result),
                             Poll::Pending => None,
-                        };
+                        }
                     }
                     if uplink_event.is_some() || raw_packet.is_some() || shutdown_requested {
                         Poll::Ready(())
@@ -153,6 +169,9 @@ impl Server {
                     }
                 })
                 .await;
+                if matches!(raw_packet, Some(Ok(0))) {
+                    raw_packet = None;
+                }
                 (shutdown_requested, raw_packet, uplink_event)
             };
             // Process all ready events.
