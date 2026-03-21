@@ -10,6 +10,7 @@ use crate::logger::fmt_slice_hex;
 
 mod dns;
 mod icmp;
+mod tso;
 
 // Reserve this amount of bytes for the translated IP header.
 // The worst case scenario is IPv6 with fragmentation.
@@ -1441,6 +1442,26 @@ impl<'a> IpPacket<'a> {
         match self {
             IpPacket::V4(packet) => packet.validate_transport_checksum(),
             IpPacket::V6(packet) => packet.validate_transport_checksum(),
+        }
+    }
+
+    fn pseudo_checksum(&self) -> Option<Checksum> {
+        if self.is_fragment_shifted() {
+            None
+        } else {
+            let checksum = match self {
+                IpPacket::V4(packet) => Ipv4Packet::pseudo_checksum(
+                    packet.data,
+                    packet.transport_protocol(),
+                    packet.transport_data.full_data().len(),
+                ),
+                IpPacket::V6(packet) => Ipv6Packet::pseudo_checksum(
+                    packet.data,
+                    packet.transport_protocol(),
+                    packet.transport_data.full_data().len(),
+                ),
+            };
+            Some(checksum)
         }
     }
 
@@ -2923,6 +2944,8 @@ impl TunnelDomainsDns {
         &self.tunnel_domains
     }
 }
+
+pub type TsoRefragmenter<const B: usize, const F: usize> = tso::Refragmenter<B, F>;
 
 #[derive(Debug)]
 pub enum IpError {
