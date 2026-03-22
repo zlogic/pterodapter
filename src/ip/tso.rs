@@ -2,12 +2,16 @@ use std::{error, fmt, io, ops::Range, task::Poll};
 
 use log::{debug, warn};
 
-use super::{Checksum, IpError, IpPacket, TransportProtocolType};
+use crate::logger::fmt_slice_hex;
+
+use super::{Checksum, IpError, IpPacket, IpProtocolVersion, TransportProtocolType};
 
 pub struct Refragmenter<const B: usize, const F: usize> {
     mtu: usize,
     buf: [u8; B],
-    header_len: usize,
+    ip_header_start: usize,
+    tcp_header_start: usize,
+    tcp_data_start: usize,
     fragments: [DataFragment; F],
     fragments_len: usize,
     current_fragment: usize,
@@ -18,7 +22,9 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         Refragmenter {
             mtu,
             buf: [0u8; B],
-            header_len: 0,
+            ip_header_start: 0,
+            tcp_header_start: 0,
+            tcp_data_start: 0,
             fragments: [DataFragment::new(); F],
             fragments_len: 0,
             current_fragment: 0,
@@ -26,7 +32,9 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
     }
 
     fn reset(&mut self) {
-        self.header_len = 0;
+        self.ip_header_start = 0;
+        self.tcp_header_start = 0;
+        self.tcp_data_start = 0;
         self.fragments_len = 0;
         self.current_fragment = 0;
     }
@@ -64,13 +72,58 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             debug!("Received fragmented packet, skipping GRO reassembly");
             return self.return_passthrough(data_range, dest);
         };
+        let protocol_version = match packet {
+            IpPacket::V4(_) => IpProtocolVersion::V4,
+            IpPacket::V6(_) => IpProtocolVersion::V6,
+        };
         let payload_data_range =
             data_range.end - transport_protocol.payload_data().len()..data_range.end;
         let tcp_range =
             data_range.end - transport_protocol.full_data().len()..payload_data_range.start;
-        if let Err(err) = self.init_fragments(tcp_range, payload_data_range, pseudo_checksum) {
+        let ip_range = data_range.start..tcp_range.start;
+        self.ip_header_start = data_range.start;
+        self.tcp_header_start = tcp_range.start;
+        self.tcp_data_start = tcp_range.end;
+        if let Err(err) =
+            self.init_fragments(tcp_range.clone(), payload_data_range, pseudo_checksum)
+        {
+            self.reset();
             Poll::Ready(Err(err))
         } else {
+            // Reset packet headers to payload with 0-length, and update checksums accordingly.
+            // * Reset IP header length to 0
+            // * Reset IPv4 header checksum to match length 0
+            let mut tcp_checksum = pseudo_checksum;
+            let tcp_length = (self.tcp_header_start..data_range.end).len();
+            match protocol_version {
+                IpProtocolVersion::V4 => {
+                    tcp_checksum.incremental_update(
+                        Checksum::from_slice(&(tcp_length as u16).to_be_bytes()),
+                        Checksum::new(),
+                    );
+
+                    let ip_header = &mut self.buf[ip_range];
+                    ip_header[2..4].fill(0);
+                    ip_header[10..12].fill(0);
+                    let mut ip_checksum = Checksum::from_slice(ip_header);
+                    ip_checksum.fold();
+                    ip_header[10..12].copy_from_slice(&ip_checksum.value().to_be_bytes());
+                }
+                IpProtocolVersion::V6 => {
+                    tcp_checksum.incremental_update(
+                        Checksum::from_slice(&(tcp_length as u32).to_be_bytes()),
+                        Checksum::new(),
+                    );
+                    let ip_header = &mut self.buf[ip_range];
+                    ip_header[4..6].fill(0);
+                }
+            }
+            // Reset TCP pseudoheader checksum to match TCP length 0.
+            let tcp_header = &mut self.buf[tcp_range];
+            tcp_header[16..18].fill(0);
+            tcp_checksum.add_slice(tcp_header);
+            tcp_checksum.fold();
+            tcp_header[16..18].copy_from_slice(&tcp_checksum.value().to_be_bytes());
             Poll::Ready(Ok(self.next_fragment(dest)))
         }
     }
@@ -91,12 +144,88 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             return 0;
         }
         let fragment = self.fragments[self.current_fragment];
-        let fragment_data = &self.buf[fragment.range()];
         self.current_fragment += 1;
-        // TODO GATEWAY: update IP headers if needed.
-        dest[0..self.header_len].copy_from_slice(&self.buf[0..self.header_len]);
-        dest[self.header_len..self.header_len + fragment_data.len()].copy_from_slice(fragment_data);
-        self.header_len + fragment_data.len()
+
+        // Copy all headers (including L2) unchanged.
+        dest[..self.tcp_data_start].copy_from_slice(&self.buf[..self.tcp_data_start]);
+
+        let ip_header_range = self.ip_header_start..self.tcp_header_start;
+        let tcp_header_range = self.tcp_header_start..self.tcp_data_start;
+
+        let tcp_header_length = tcp_header_range.len();
+        let fragment_length = fragment.range().len();
+        let packet_len = ip_header_range.len() + tcp_header_length + fragment_length;
+
+        let ip_header = &mut dest[ip_header_range];
+        let ip_version = match IpPacket::protocol_version(ip_header) {
+            Ok(version) => version,
+            Err(_) => {
+                // This should never happen unless there's serious data corruption.
+                self.reset();
+                return 0;
+            }
+        };
+
+        // Set length and checksum in IP header.
+        match ip_version {
+            IpProtocolVersion::V4 => {
+                ip_header[2..4].copy_from_slice(&(packet_len as u16).to_be_bytes());
+
+                let mut checksum = [0u8; 2];
+                checksum.copy_from_slice(&ip_header[10..12]);
+                let checksum = u16::from_be_bytes(checksum);
+                let mut checksum = Checksum::from_inverted(checksum);
+                checksum.add_slice(&ip_header[2..4]);
+                checksum.fold();
+                ip_header[10..12].copy_from_slice(&checksum.value().to_be_bytes());
+            }
+            IpProtocolVersion::V6 => {
+                ip_header[4..6].copy_from_slice(&((packet_len - 40) as u16).to_be_bytes());
+            }
+        }
+
+        // Update TCP checksum to match the packet length.
+        let tcp_header = &mut dest[tcp_header_range];
+        let mut pseudo_checksum = {
+            let mut checksum = [0u8; 2];
+            checksum.copy_from_slice(&tcp_header[16..18]);
+            Checksum::from_inverted(u16::from_be_bytes(checksum))
+        };
+        match ip_version {
+            IpProtocolVersion::V4 => pseudo_checksum
+                .add_slice(&((tcp_header_length + fragment_length) as u16).to_be_bytes()),
+            IpProtocolVersion::V6 => pseudo_checksum
+                .add_slice(&((tcp_header_length + fragment_length) as u32).to_be_bytes()),
+        }
+        pseudo_checksum
+            .incremental_update(Checksum::new(), Checksum::from_inverted(fragment.checksum));
+        pseudo_checksum.fold();
+        tcp_header[16..18].copy_from_slice(&pseudo_checksum.value().to_be_bytes());
+
+        let fragment_data = &self.buf[fragment.range()];
+        dest[self.tcp_data_start..self.tcp_data_start + fragment_data.len()]
+            .copy_from_slice(fragment_data);
+
+        // TODO GATEWAY: modify TCP headers and flags in last/non-last packets
+
+        // TODO GATEWAY: remove this debug code
+        {
+            let data = &dest[self.ip_header_start..self.tcp_data_start + fragment_data.len()];
+            let ip_packet = IpPacket::from_data(data).unwrap();
+            if !ip_packet.validate_ip_checksum() {
+                warn!(
+                    "IP packet has invalid header checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+            if !ip_packet.validate_transport_checksum() {
+                warn!(
+                    "IP packet has invalid transport data checksum after translation: {}",
+                    fmt_slice_hex(data)
+                );
+            }
+        }
+        self.tcp_data_start + fragment_data.len()
     }
 
     fn init_fragments(
@@ -105,9 +234,8 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         data_range: Range<usize>,
         pseudo_checksum: Checksum,
     ) -> Result<(), TsoError> {
-        self.header_len = data_range.start;
-        let tcp_header = &mut self.buf[tcp_range.clone()];
-        let fragment_size = ((self.mtu - self.header_len) / 4) * 4;
+        let tcp_header = &mut self.buf[tcp_range];
+        let fragment_size = ((self.mtu - self.tcp_data_start) / 2) * 2;
         if fragment_size == 0 {
             return Err("Not enough remaining space to fit payload fragment data".into());
         }
@@ -144,7 +272,7 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             if let Some(aggregated_checksum) = &mut aggregated_checksum {
                 aggregated_checksum.incremental_update(Checksum::new(), checksum);
             }
-            fragment.update(start..end, !checksum.value());
+            fragment.update(start..end, checksum.value());
         }
 
         if fragments_count > self.fragments_len {
@@ -164,7 +292,6 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         if let Some(mut checksum) = aggregated_checksum {
             checksum.fold();
             if checksum.value() != orig_checksum.value() {
-                self.reset();
                 Err("Packet has invalid payload checksum".into())
             } else {
                 Ok(())
