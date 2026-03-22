@@ -1,6 +1,6 @@
 use std::{error, fmt, io, ops::Range, task::Poll};
 
-use crate::logger::fmt_slice_hex;
+use log::{debug, warn};
 
 use super::{Checksum, IpError, IpPacket, TransportProtocolType};
 
@@ -13,16 +13,22 @@ pub struct Refragmenter<const B: usize, const F: usize> {
     current_fragment: usize,
 }
 
-impl<const N: usize, const F: usize> Refragmenter<N, F> {
-    pub fn new(mtu: usize) -> Refragmenter<N, F> {
+impl<const B: usize, const F: usize> Refragmenter<B, F> {
+    pub fn new(mtu: usize) -> Refragmenter<B, F> {
         Refragmenter {
             mtu,
-            buf: [0u8; N],
+            buf: [0u8; B],
             header_len: 0,
             fragments: [DataFragment::new(); F],
             fragments_len: 0,
             current_fragment: 0,
         }
+    }
+
+    fn reset(&mut self) {
+        self.header_len = 0;
+        self.fragments_len = 0;
+        self.current_fragment = 0;
     }
 
     pub fn poll_recv<R>(
@@ -42,33 +48,42 @@ impl<const N: usize, const F: usize> Refragmenter<N, F> {
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
             Poll::Pending => return Poll::Pending,
         };
-        self.header_len = 0;
-        self.fragments_len = 0;
-        self.current_fragment = 0;
-        if data_range.end <= self.mtu {
-            println!("FUll {}", fmt_slice_hex(&self.buf[data_range.clone()]));
-            dest[..data_range.end].copy_from_slice(&self.buf[..data_range.end]);
-            return Poll::Ready(Ok(data_range.end));
-        }
+        self.reset();
         let packet = match IpPacket::from_data(&self.buf[data_range.clone()]) {
             Ok(packet) => packet,
             Err(err) => return Poll::Ready(Err(err.into())),
         };
         let transport_protocol = packet.transport_protocol_data();
         if transport_protocol.protocol() != TransportProtocolType::TCP {
-            // Copy non-TCP packets as-is (in truncated form).
-            let data_len = dest.len().min(data_range.end);
-            dest[..data_len].copy_from_slice(&self.buf[..data_len]);
-            return Poll::Ready(Ok(data_len));
+            return self.return_passthrough(data_range, dest);
         }
-        // With TSO, Windows and/or Linux might only be providing partial checksums (pseudoheader only).
-        // It's potentially impossible to verify validity of TCP checksums in this scenario.
-        let pseudo_checksum = packet.pseudo_checksum();
-        println!("Split {}", fmt_slice_hex(&self.buf[data_range.clone()]));
-        let data_range = data_range.end - transport_protocol.payload_data().len()..data_range.end;
-        let tcp_range = data_range.end - transport_protocol.full_data().len()..data_range.start;
-        self.init_fragments(tcp_range, data_range, pseudo_checksum);
-        Poll::Ready(Ok(self.next_fragment(dest)))
+        let pseudo_checksum = if let Some(mut pseudo_checksum) = packet.pseudo_checksum() {
+            pseudo_checksum.fold();
+            pseudo_checksum
+        } else {
+            debug!("Received fragmented packet, skipping GRO reassembly");
+            return self.return_passthrough(data_range, dest);
+        };
+        let payload_data_range =
+            data_range.end - transport_protocol.payload_data().len()..data_range.end;
+        let tcp_range =
+            data_range.end - transport_protocol.full_data().len()..payload_data_range.start;
+        if let Err(err) = self.init_fragments(tcp_range, payload_data_range, pseudo_checksum) {
+            Poll::Ready(Err(err))
+        } else {
+            Poll::Ready(Ok(self.next_fragment(dest)))
+        }
+    }
+
+    fn return_passthrough(
+        &self,
+        data_range: Range<usize>,
+        dest: &mut [u8],
+    ) -> Poll<Result<usize, TsoError>> {
+        // Copy packets as-is (even if truncated).
+        let data_len = dest.len().min(data_range.end);
+        dest[..data_len].copy_from_slice(&self.buf[..data_len]);
+        Poll::Ready(Ok(data_len))
     }
 
     fn next_fragment(&mut self, dest: &mut [u8]) -> usize {
@@ -80,59 +95,83 @@ impl<const N: usize, const F: usize> Refragmenter<N, F> {
         self.current_fragment += 1;
         // TODO GATEWAY: update IP headers if needed.
         dest[0..self.header_len].copy_from_slice(&self.buf[0..self.header_len]);
-        dest[self.header_len..self.header_len + fragment.len()].copy_from_slice(fragment_data);
-        self.header_len + fragment.len()
+        dest[self.header_len..self.header_len + fragment_data.len()].copy_from_slice(fragment_data);
+        self.header_len + fragment_data.len()
     }
 
     fn init_fragments(
         &mut self,
         tcp_range: Range<usize>,
         data_range: Range<usize>,
-        pseudo_checksum: Option<Checksum>,
-    ) {
+        pseudo_checksum: Checksum,
+    ) -> Result<(), TsoError> {
         self.header_len = data_range.start;
-        let tcp_header = &self.buf[tcp_range.clone()];
-        let chunk_size = ((self.mtu - self.header_len) / 4) * 4;
-        let mut aggregated_checksum = if let Some(mut checksum) = pseudo_checksum {
-            checksum.fold();
-            println!("Pseudo checksum {}", checksum.value());
+        let tcp_header = &mut self.buf[tcp_range.clone()];
+        let fragment_size = ((self.mtu - self.header_len) / 4) * 4;
+        if fragment_size == 0 {
+            return Err("Not enough remaining space to fit payload fragment data".into());
+        }
+        let fragments_count = (data_range.len() + fragment_size - 1) / fragment_size;
+        let orig_checksum = {
             let mut orig_checksum = [0u8; 2];
             orig_checksum.copy_from_slice(&tcp_header[16..18]);
-            let orig_checksum = !u16::from_be_bytes(orig_checksum);
-            println!("Orig checksum {orig_checksum}");
-            let orig_checksum = Checksum::from_inverted(orig_checksum);
-
-            checksum.add_slice(tcp_header);
-            println!("tcp checksum {}", checksum.value());
-            checksum.incremental_update(orig_checksum, Checksum::new());
-            checksum.fold();
-            Some(checksum)
-        } else {
-            None
+            Checksum::from_inverted(u16::from_be_bytes(orig_checksum))
         };
-        self.fragments_len = 0;
-        for start in (data_range.start..data_range.end).step_by(chunk_size) {
-            let end = (start + chunk_size).min(data_range.end);
+        let mut aggregated_checksum = {
+            // With TSO, Windows and/or Linux might only be providing partial checksums (pseudoheader only).
+            // For more information, see the "Partial Checksums" explanation in the Wireshark documentation.
+            // It's potentially impossible to verify validity of full TCP checksums in this scenario.
+            if pseudo_checksum.value() == !orig_checksum.value() {
+                debug!("Packet has a partial checksum, skipping payload validation");
+                None
+            } else {
+                let mut checksum = pseudo_checksum;
+                tcp_header[16..18].fill(0);
+                checksum.add_slice(tcp_header);
+                Some(checksum)
+            }
+        };
+        self.fragments_len = fragments_count.min(self.fragments.len());
+        for (i, fragment) in self.fragments.iter_mut().enumerate() {
+            let start = data_range.start + fragment_size * i;
+            if start >= data_range.end {
+                break;
+            }
+            let end = (start + fragment_size).min(data_range.end);
 
-            let mut checksum = Checksum::new();
-            checksum.add_slice(&self.buf[start..end]);
+            let mut checksum = Checksum::from_slice(&self.buf[start..end]);
             checksum.fold();
             if let Some(aggregated_checksum) = &mut aggregated_checksum {
                 aggregated_checksum.incremental_update(Checksum::new(), checksum);
             }
-            let checksum = checksum.value();
-            // TODO GATEWAY: check for overflow
-            self.fragments[self.fragments_len].update(start..end, checksum);
-            self.fragments_len += 1;
+            fragment.update(start..end, !checksum.value());
         }
 
-        if let Some(mut checksum) = aggregated_checksum {
-            checksum.fold();
-            if checksum.value() != 0x0000 {
-                println!("Checksum mismatch {}", checksum.value());
+        if fragments_count > self.fragments_len {
+            let total_bytes = data_range.len();
+            let max_bytes = fragment_size * self.fragments_len;
+            warn!(
+                "Not enough capacity to store all fragments, lost {} bytes",
+                total_bytes - max_bytes
+            );
+            // Continue calculating checksum if it's available.
+            if let Some(mut checksum) = aggregated_checksum {
+                let start = data_range.start + fragment_size * self.fragments_len;
+                let end = data_range.end;
+                checksum.add_slice(&self.buf[start..end])
             }
         }
-        println!("Checksum OK");
+        if let Some(mut checksum) = aggregated_checksum {
+            checksum.fold();
+            if checksum.value() != orig_checksum.value() {
+                self.reset();
+                Err("Packet has invalid payload checksum".into())
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -160,10 +199,6 @@ impl DataFragment {
 
     fn range(&self) -> Range<usize> {
         self.start..self.end
-    }
-
-    fn len(&self) -> usize {
-        self.end - self.start
     }
 }
 
