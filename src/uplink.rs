@@ -10,6 +10,7 @@ pub enum Config {
 pub trait UplinkService {
     fn is_connected(&self) -> bool;
     fn ip_configuration(&self) -> Option<(IpAddr, &[IpAddr])>;
+    fn mtu(&self) -> u16;
     async fn wait_event(&mut self, buf: &mut [u8]) -> Result<(), UplinkError>;
     async fn read_packet<'a>(&mut self, buffer: &'a mut [u8]) -> Result<&'a [u8], UplinkError>;
     async fn process_events(&mut self, send_slices: &[&[u8]]) -> Result<(), UplinkError>;
@@ -47,6 +48,12 @@ impl UplinkService for UplinkServiceType {
     fn ip_configuration(&self) -> Option<(IpAddr, &[IpAddr])> {
         match self {
             UplinkServiceType::FortiVPN(svc) => svc.ip_configuration(),
+        }
+    }
+
+    fn mtu(&self) -> u16 {
+        match self {
+            UplinkServiceType::FortiVPN(svc) => svc.mtu(),
         }
     }
 

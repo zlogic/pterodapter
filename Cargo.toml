@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Dmitry Zolotukhin <zlogic@gmail.com>"]
 repository = "https://github.com/zlogic/pterodapter"
 license = "Apache-2.0"
-rust-version = "1.89"
+rust-version = "1.94"
 
 [dependencies]
 log = { version = "0.4", default-features = false }
@@ -13,10 +13,18 @@ tokio = { version = "1.50", default-features = false, features = ["rt", "io-util
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 rustls-platform-verifier = { version = "0.6", default-features = false }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"] }
-aws-lc-rs = { version = "*", default-features = false }
-rustls-webpki = { version = "*", default-features = false, features = ["aws-lc-rs"] }
-base64 = { version = "*", default-features = false, features = ["std"] }
-x509-cert = { version = "0.2", default-features = false }
+
+smoltcp = { version = "0.13", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "proto-ipv6-fragmentation", "socket-tcp"] }
+
+aws-lc-rs = { version = "*", optional = true, default-features = false }
+rustls-webpki = { version = "*", optional = true, default-features = false, features = ["aws-lc-rs"] }
+base64 = { version = "*", optional = true, default-features = false, features = ["std"] }
+x509-cert = { version = "0.2", optional = true, default-features = false }
+
+[features]
+default = ["proxy", "ikev2"]
+proxy = ["smoltcp", "tokio/fs"]
+ikev2 = ["aws-lc-rs", "rustls-webpki", "base64", "x509-cert"]
 
 [profile.release]
 strip = true

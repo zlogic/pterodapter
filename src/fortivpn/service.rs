@@ -49,6 +49,10 @@ impl uplink::UplinkService for FortiService {
         matches!(self.state, ConnectionState::Connected(_))
     }
 
+    fn mtu(&self) -> u16 {
+        self.config.mtu
+    }
+
     fn ip_configuration(&self) -> Option<(IpAddr, &[IpAddr])> {
         match self.state {
             ConnectionState::Connected(ref state) => {
