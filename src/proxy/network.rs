@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error, fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    task::Poll,
 };
 
 use log::{debug, trace, warn};
@@ -58,7 +59,7 @@ impl Network<'_> {
         let mut next_wake = tokio::time::Instant::now();
         let mut uplink_buffer = [0u8; MAX_MTU_SIZE];
         while !self.shutdown {
-            let (uplink_event, command) = {
+            let (uplink_event, command, bridges_ready) = {
                 let mut uplink_event = pin!(self.device.wait_event(&mut uplink_buffer));
                 let mut device_ready = pin!(tokio::time::sleep_until(next_wake));
                 let mut receive_command = pin!(command_receiver.recv());
@@ -77,19 +78,35 @@ impl Network<'_> {
                     let mut bridges_ready = false;
                     for (handle, proxy_client) in self.bridges.iter_mut() {
                         use smoltcp::socket::tcp;
-                        if let Some(tunnel) = proxy_client.tunnel.as_ref() {
-                            let socket = self.sockets.get::<tcp::Socket>(*handle);
-                            proxy_client.can_write =
-                                socket.can_recv() && tunnel.poll_write_ready(cx).is_ready();
-                            proxy_client.can_read =
-                                socket.can_send() && tunnel.poll_read_ready(cx).is_ready();
-                            if proxy_client.can_read || proxy_client.can_write || !socket.is_open()
-                            {
+
+                        let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+                        if !socket.is_open() {
+                            bridges_ready = true;
+                            // Socket is closing, need to process the close event.
+                            continue;
+                        }
+                        match proxy_client.poll_read(cx, socket) {
+                            Poll::Ready(Ok(_)) => {
                                 bridges_ready = true;
                             }
-                        } else {
+                            Poll::Ready(Err(err)) => {
+                                debug!("Failed to perform IO on client socket: {err}")
+                            }
+                            Poll::Pending => {}
+                        }
+                        if !socket.is_open() {
                             // Socket is closing, need to process the close event.
                             bridges_ready = true;
+                            continue;
+                        }
+                        match proxy_client.poll_write(cx, socket) {
+                            Poll::Ready(Ok(_)) => {
+                                bridges_ready = true;
+                            }
+                            Poll::Ready(Err(err)) => {
+                                debug!("Failed to perform IO on client socket: {err}")
+                            }
+                            Poll::Pending => {}
                         }
                     }
                     if bridges_ready
@@ -97,14 +114,14 @@ impl Network<'_> {
                         || device_ready
                         || command.is_some()
                     {
-                        Poll::Ready((uplink_event_received, command))
+                        Poll::Ready((uplink_event_received, command, bridges_ready))
                     } else {
                         Poll::Pending
                     }
                 })
                 .await
             };
-            let data_copied = self.copy_all_data().await;
+            self.maintain_bridges().await;
             if let Some(command) = command {
                 self.process_command(command);
             }
@@ -134,7 +151,7 @@ impl Network<'_> {
                 }
             };
             if tokio::time::Instant::now() > next_wake
-                || data_copied
+                || bridges_ready
                 || vpn_data_received
                 || vpn_data_sent
             {
@@ -155,23 +172,21 @@ impl Network<'_> {
         debug!("Shutdown completed");
     }
 
-    async fn copy_all_data(&mut self) -> bool {
-        // This is not fancy, but with a single-user (a few connections) should work OK.
-        // smoltcp's poll works exactly the same way and seems to show reasonable performance.
-        // The alternative is using poll/waking and additional buffers (or perhaps a list of futures), which
-        // doesn't work well with smoltcp - as smoltcp keeps ownership of most of its data, and any writes
-        // need to be guarded.
+    async fn maintain_bridges(&mut self) {
         use socket::tcp;
-        let mut data_copied = false;
-        for (handle, proxy_client) in self.bridges.iter_mut() {
-            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
-            match proxy_client.transfer_data(socket).await {
-                Ok(true) => data_copied = true,
-                Ok(false) => {}
-                Err(err) => debug!("Failed to perform IO on client socket: {err}"),
-            }
-        }
 
+        let rt = tokio::runtime::Handle::current();
+        self.bridges.values_mut().for_each(|bridge| {
+            if let Some(mut tunnel) = bridge.take_shutdown_tunnel() {
+                // Spawn shutdown as background task to prevent blocking the event loop.
+                rt.spawn(async move {
+                    use tokio::io::AsyncWriteExt as _;
+                    if let Err(err) = tunnel.shutdown().await {
+                        debug!("Failed to shut down proxy client socket: {err}");
+                    }
+                });
+            };
+        });
         self.bridges.retain(|_, tunnel| tunnel.is_open());
         let closed_sockets = self
             .sockets
@@ -241,7 +256,6 @@ impl Network<'_> {
         }
         self.opening_connections
             .retain(|_, response| !response.is_processed());
-        data_copied
     }
 
     fn update_ip_configuration(&mut self, ip_addr: Option<IpAddr>) -> Result<(), NetworkError> {
@@ -382,17 +396,15 @@ impl SocketConnectionRequest {
 }
 
 struct ProxyClientConnection {
-    tunnel: Option<tokio::net::TcpStream>,
-    can_read: bool,
-    can_write: bool,
+    tunnel: Option<tokio::io::BufStream<tokio::net::TcpStream>>,
+    stream_closed: bool,
 }
 
 impl ProxyClientConnection {
-    fn new(tunnel: tokio::net::TcpStream) -> ProxyClientConnection {
+    fn new(tunnel: tokio::io::BufStream<tokio::net::TcpStream>) -> ProxyClientConnection {
         ProxyClientConnection {
             tunnel: Some(tunnel),
-            can_read: false,
-            can_write: false,
+            stream_closed: false,
         }
     }
 
@@ -400,101 +412,115 @@ impl ProxyClientConnection {
         self.tunnel.is_some()
     }
 
-    async fn transfer_data(
+    fn poll_read(
         &mut self,
+        cx: &mut std::task::Context<'_>,
         socket: &mut smoltcp::socket::tcp::Socket<'_>,
-    ) -> Result<bool, NetworkError> {
-        let tunnel = if let Some(tunnel) = self.tunnel.as_mut() {
-            tunnel
+    ) -> Poll<Result<usize, NetworkError>> {
+        use std::pin::pin;
+        use tokio::io::AsyncRead as _;
+        use tokio::io::ReadBuf;
+
+        let tunnel = if !socket.can_send() {
+            return Poll::Pending;
+        } else if self.stream_closed {
+            return Poll::Ready(Err("Proxy reader is closed".into()));
+        } else if let Some(tunnel) = self.tunnel.as_mut() {
+            pin!(tunnel)
         } else {
-            return Err("Proxy client connection is closed".into());
+            return Poll::Ready(Err("Proxy client connection is closed".into()));
         };
-        let mut sent_data = false;
-        while self.can_read && socket.can_send() {
-            let result = socket.send(|dest| match tunnel.try_read(dest) {
-                Ok(bytes) => {
-                    if bytes > 0 && !dest.is_empty() {
-                        (bytes, Ok(bytes))
-                    } else {
-                        // Zero bytes means the stream is closed.
-                        (0, Err(NetworkError::Internal("Proxy reader is closed")))
-                    }
+        let result = socket.send(|dest| {
+            let mut dest = ReadBuf::new(dest);
+            match tunnel.poll_read(cx, &mut dest) {
+                Poll::Ready(Ok(())) => {
+                    let bytes = dest.filled().len();
+                    (bytes, Poll::Ready(Ok(bytes)))
                 }
-                Err(err) => match err.kind() {
-                    io::ErrorKind::WouldBlock => (0, Ok(0)),
-                    _ => (0, Err(err.into())),
-                },
-            });
-            match result {
-                Ok(Ok(bytes)) => {
-                    if bytes > 0 {
-                        sent_data = true;
-                    } else {
-                        self.can_read = false;
-                    }
+                Poll::Ready(Err(err)) => (0, Poll::Ready(Err(err))),
+                Poll::Pending => (0, Poll::Pending),
+            }
+        });
+        match result {
+            Ok(Poll::Ready(Ok(bytes))) => {
+                if bytes == 0 {
+                    // Zero bytes means the stream is closed.
+                    self.close_socket(socket);
                 }
-                Ok(Err(err)) => {
-                    debug!("Failed to read data from proxy client socket: {err}");
-                    self.close(socket).await;
-                    return Err("Failed to read data from proxy client socket".into());
-                }
-                Err(err) => {
-                    // Not critical if socket is still opening.
-                    warn!("Failed to send data to virtual socket: {err}");
-                }
+                Poll::Ready(Ok(bytes))
+            }
+            Ok(Poll::Ready(Err(err))) => {
+                debug!("Failed to read data from proxy client socket: {err}");
+                self.close_socket(socket);
+                Poll::Ready(Err("Failed to read data from proxy client socket".into()))
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(err) => {
+                warn!("Failed to read data from virtual socket: {err}");
+                self.close_socket(socket);
+                Poll::Ready(Err("Failed to read data from virtual socket".into()))
             }
         }
-
-        let mut received_data = false;
-        while self.can_write && socket.can_recv() {
-            let result = socket.recv(|src| match tunnel.try_write(src) {
-                Ok(bytes) => (bytes, Ok(bytes)),
-                Err(err) => match err.kind() {
-                    io::ErrorKind::WouldBlock => (0, Ok(0)),
-                    _ => (0, Err(err)),
-                },
-            });
-            match result {
-                Ok(Ok(bytes)) => {
-                    if bytes > 0 {
-                        received_data = true;
-                    } else {
-                        self.can_write = false
-                    }
-                }
-                Ok(Err(err)) => {
-                    debug!("Failed to write data to proxy client socket: {err}");
-                    self.close(socket).await;
-                    return Err("Failed to write data to proxy client socket".into());
-                }
-                Err(err) => {
-                    warn!("Failed to read data from virtual socket: {err}");
-                }
-            }
-        }
-
-        self.can_read = false;
-        self.can_write = false;
-
-        if !socket.is_open() {
-            self.close(socket).await;
-        }
-        Ok(sent_data || received_data)
     }
 
-    async fn close(&mut self, socket: &mut smoltcp::socket::tcp::Socket<'_>) {
-        use tokio::io::AsyncWriteExt;
-        socket.close();
-        if let Some(mut tunnel) = self.tunnel.take()
-            && let Err(err) = tunnel.shutdown().await {
-                debug!("Failed to shut down proxy client socket: {err}");
+    fn poll_write(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &mut smoltcp::socket::tcp::Socket<'_>,
+    ) -> Poll<Result<usize, NetworkError>> {
+        use std::pin::pin;
+        use tokio::io::AsyncWrite as _;
+
+        let tunnel = if !socket.can_recv() {
+            return Poll::Pending;
+        } else if self.stream_closed {
+            return Poll::Ready(Err("Proxy reader is closed".into()));
+        } else if let Some(tunnel) = self.tunnel.as_mut() {
+            pin!(tunnel)
+        } else {
+            return Poll::Ready(Err("Proxy client connection is closed".into()));
+        };
+        let result = socket.recv(|dest| match tunnel.poll_write(cx, dest) {
+            Poll::Ready(Ok(bytes)) => (bytes, Poll::Ready(Ok(bytes))),
+            Poll::Ready(Err(err)) => (0, Poll::Ready(Err(err))),
+            Poll::Pending => (0, Poll::Pending),
+        });
+        match result {
+            Ok(Poll::Ready(Ok(bytes))) => Poll::Ready(Ok(bytes)),
+            Ok(Poll::Ready(Err(err))) => {
+                debug!("Failed to write data to proxy client socket: {err}");
+                self.close_socket(socket);
+                Poll::Ready(Err("Failed to write data to proxy client socket".into()))
             }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(err) => {
+                warn!("Failed to send data to virtual socket: {err}");
+                self.close_socket(socket);
+                Poll::Ready(Err("Failed to send data to virtual socket".into()))
+            }
+        }
+    }
+
+    fn take_shutdown_tunnel(&mut self) -> Option<tokio::io::BufStream<tokio::net::TcpStream>> {
+        if self.stream_closed {
+            self.tunnel.take()
+        } else {
+            None
+        }
+    }
+
+    fn close_socket(&mut self, socket: &mut smoltcp::socket::tcp::Socket<'_>) {
+        self.stream_closed = true;
+        socket.close();
     }
 }
 
 pub enum Command {
     Connect(std::net::SocketAddr, SocketConnectionRequest),
-    Bridge(iface::SocketHandle, tokio::net::TcpStream),
+    Bridge(
+        iface::SocketHandle,
+        tokio::io::BufStream<tokio::net::TcpStream>,
+    ),
     Shutdown,
 }
 

@@ -1,35 +1,37 @@
 use std::{error, fmt, io};
 
 use log::{debug, warn};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
 };
 use tokio_rustls::rustls;
 
 const HEADER_END_MARKER: &str = "\r\n\r\n";
-const BUFFER_SIZE: usize = 256;
 
-pub async fn read_headers<S>(socket: &mut S) -> Result<String, HttpError>
+pub async fn read_headers<S>(
+    socket: &mut S,
+    initial_data: Option<&str>,
+) -> Result<String, HttpError>
 where
     // TODO: use trait aliases once they become available.
     S: AsyncRead + AsyncBufRead + AsyncWrite + Unpin,
 {
-    read_until(socket, HEADER_END_MARKER).await
+    let result = if let Some(data) = initial_data {
+        data.to_string()
+    } else {
+        String::new()
+    };
+    read_until(socket, HEADER_END_MARKER, result).await
 }
 
-pub async fn read_headers_unbuffered(
-    socket: &mut TcpStream,
-    dest: &mut Vec<u8>,
-) -> Result<(), HttpError> {
-    read_until_unbuffered(socket, HEADER_END_MARKER, dest).await
-}
-
-async fn read_until<S>(socket: &mut S, end_of_message: &str) -> Result<String, HttpError>
+async fn read_until<S>(
+    socket: &mut S,
+    end_of_message: &str,
+    mut result: String,
+) -> Result<String, HttpError>
 where
     S: AsyncBufRead + AsyncWrite + Unpin,
 {
-    let mut result = String::new();
     while !result.ends_with(end_of_message) {
         if socket.read_line(&mut result).await? == 0 {
             // EOF reached.
@@ -37,36 +39,6 @@ where
         }
     }
     Ok(result)
-}
-
-async fn read_until_unbuffered(
-    socket: &mut TcpStream,
-    end_of_message: &str,
-    dest: &mut Vec<u8>,
-) -> Result<(), HttpError> {
-    let mut current_length = dest.len();
-    loop {
-        dest.resize(current_length + BUFFER_SIZE, 0);
-        let bytes_read = socket.peek(&mut dest[current_length..]).await?;
-        dest.truncate(current_length + bytes_read);
-        let mut found_index = None;
-        for i in current_length.saturating_sub(end_of_message.len())
-            ..=dest.len().saturating_sub(end_of_message.len())
-        {
-            if &dest[i..i + end_of_message.len()] == end_of_message.as_bytes() {
-                found_index = Some(i);
-                break;
-            }
-        }
-        if let Some(found_index) = found_index {
-            dest.truncate(found_index + end_of_message.len());
-            socket.read_exact(&mut dest[current_length..]).await?;
-            return Ok(());
-        } else {
-            socket.read_exact(&mut dest[current_length..]).await?;
-            current_length = dest.len();
-        }
-    }
 }
 
 async fn read_chunked_content<S>(socket: &mut S) -> Result<String, HttpError>
@@ -243,9 +215,10 @@ pub fn extract_connect_host(headers: &str) -> Option<&str> {
     let mut lines = headers.lines();
     if let Some(request_line) = lines.next()
         && let Some(remain) = request_line.strip_prefix("CONNECT ")
-            && let Some((request_host, _)) = remain.split_once(' ') {
-                return Some(request_host);
-            }
+        && let Some((request_host, _)) = remain.split_once(' ')
+    {
+        return Some(request_host);
+    }
     for line in lines {
         if let Some(request_host) = line.strip_prefix(HOST_HEADER) {
             return Some(request_host);

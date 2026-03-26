@@ -73,7 +73,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         }
     };
     let mut socket = BufReader::new(socket);
-    let headers = http::read_headers(&mut socket).await?;
+    let headers = http::read_headers(&mut socket, None).await?;
     let token_id = headers.lines().next().and_then(|line| {
         if !line.starts_with("GET /?id=") {
             return None;
@@ -115,7 +115,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
         socket.flush().await?;
         let mut cookie = None;
         debug!("Reading cookie response");
-        let headers = http::read_headers(&mut socket).await?;
+        let headers = http::read_headers(&mut socket, None).await?;
         http::validate_response_code(&headers)?;
         for line in headers.lines() {
             if cookie.is_none()
@@ -216,7 +216,7 @@ impl FortiVPNTunnel {
         socket.write_all(req.as_bytes()).await?;
         socket.flush().await?;
 
-        let headers = http::read_headers(socket).await?;
+        let headers = http::read_headers(socket, None).await?;
         http::validate_response_code(&headers)?;
         let content = http::read_content(socket, headers.as_str()).await?;
 
@@ -855,7 +855,7 @@ impl PPPState {
         self.first_packet = false;
         if &buf[..FALL_BACK_TO_HTTP.len()] == FALL_BACK_TO_HTTP {
             // FortiVPN will return an HTTP response if something goes wrong on setup.
-            let headers = http::read_headers(socket).await?;
+            let headers = http::read_headers(socket, None).await?;
             debug!("Tunnel not active, error response: {headers}");
             let content = http::read_content(socket, headers.as_str()).await?;
             debug!("Error contents: {content}");

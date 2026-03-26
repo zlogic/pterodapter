@@ -8,7 +8,7 @@ use std::{
 use log::{debug, info, warn};
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpListener, TcpStream},
     runtime,
     sync::{mpsc, oneshot},
@@ -47,13 +47,12 @@ impl Server {
     ) -> Result<(), ProxyError> {
         let (command_sender, command_receiver) = mpsc::channel(64);
 
-        // Non-critical futures will be terminated by Tokio during the shutdown_timeout phase.
-
         let mut client = network::Network::new(uplink).inspect_err(|err| {
             log::error!("Failed to start virtual network interface: {err}");
         })?;
 
         let shutdown_command_sender = command_sender.clone();
+        // Non-critical futures will be terminated by Tokio during the shutdown_timeout phase.
         rt.spawn(async move {
             if shutdown_receiver.await.is_ok()
                 && shutdown_command_sender
@@ -65,7 +64,7 @@ impl Server {
             }
         });
 
-        let server_handle = rt.spawn(self.run_process(command_sender));
+        let server_handle = rt.spawn(self.run_process(runtime::Handle::current(), command_sender));
 
         rt.block_on(client.run_process(command_receiver));
         server_handle.abort();
@@ -73,8 +72,9 @@ impl Server {
         Ok(())
     }
 
-    pub async fn run_process(
+    async fn run_process(
         self,
+        rt: runtime::Handle,
         command_bridge: mpsc::Sender<network::Command>,
     ) -> Result<(), ProxyError> {
         let listener = match TcpListener::bind(&self.listen_addr).await {
@@ -93,10 +93,10 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
+                    let socket = BufStream::new(socket);
                     debug!("Received connection from {}", addr);
                     let handler =
                         ProxyConnection::new(socket, options.clone(), command_bridge.clone());
-                    let rt = runtime::Handle::current();
                     rt.spawn(async move {
                         if let Err(err) = handler.handle_connection().await {
                             warn!("Proxy connection failed: {err}");
@@ -116,14 +116,14 @@ struct ProxyOptions {
 }
 
 struct ProxyConnection {
-    socket: Option<TcpStream>,
+    socket: Option<BufStream<TcpStream>>,
     options: Arc<ProxyOptions>,
     command_bridge: mpsc::Sender<network::Command>,
 }
 
 impl ProxyConnection {
     fn new(
-        socket: TcpStream,
+        socket: BufStream<TcpStream>,
         options: Arc<ProxyOptions>,
         command_bridge: mpsc::Sender<network::Command>,
     ) -> ProxyConnection {
@@ -143,8 +143,18 @@ impl ProxyConnection {
         let first_byte = socket.read_u8().await?;
         let destination_connection = match first_byte {
             b'a'..=b'z' | b'A'..=b'Z' => {
-                self.handle_http_request(&mut socket, vec![first_byte])
-                    .await?
+                let prefix = [first_byte];
+                let prefix = match str::from_utf8(&prefix) {
+                    Ok(prefix) => prefix,
+                    Err(err) => {
+                        warn!(
+                            "Failed to convert first char {:2x} into str: {err}",
+                            first_byte
+                        );
+                        return Err("Failed to convert first char into str".into());
+                    }
+                };
+                self.handle_http_request(&mut socket, prefix).await?
             }
             SOCKS5_VERSION => {
                 self.socks_handshake(&mut socket).await?;
@@ -186,12 +196,10 @@ impl ProxyConnection {
 
     async fn handle_http_request(
         &mut self,
-        socket: &mut TcpStream,
-        mut request: Vec<u8>,
+        socket: &mut BufStream<TcpStream>,
+        prefix: &str,
     ) -> Result<DestinationConnection, ProxyError> {
-        http::read_headers_unbuffered(socket, &mut request).await?;
-        let request =
-            String::from_utf8(request).map_err(|_| "First handshake byte is not utf-8")?;
+        let request = http::read_headers(socket, Some(prefix)).await?;
         if request.starts_with("GET /proxy.pac HTTP/1.1\r\n") {
             self.send_pac_file(socket).await?;
             Ok(DestinationConnection::None)
@@ -230,7 +238,7 @@ impl ProxyConnection {
         }
     }
 
-    async fn send_pac_file(&self, socket: &mut TcpStream) -> Result<(), ProxyError> {
+    async fn send_pac_file(&self, socket: &mut BufStream<TcpStream>) -> Result<(), ProxyError> {
         let pac_path = if let Some(pac_path) = self.options.pac_path.as_ref() {
             pac_path
         } else {
@@ -315,7 +323,10 @@ impl ProxyConnection {
         }
     }
 
-    async fn socks_handshake(&mut self, socket: &mut TcpStream) -> Result<(), ProxyError> {
+    async fn socks_handshake(
+        &mut self,
+        socket: &mut BufStream<TcpStream>,
+    ) -> Result<(), ProxyError> {
         let nmethods = socket.read_u8().await?;
         let mut selected_method = AuthenticationMethod::NO_ACCEPTABLE_METHODS;
         for _ in 0..nmethods {
@@ -332,7 +343,7 @@ impl ProxyConnection {
 
     async fn socks_read_request(
         &mut self,
-        socket: &mut TcpStream,
+        socket: &mut BufStream<TcpStream>,
     ) -> Result<DestinationConnection, ProxyError> {
         let version = socket.read_u8().await?;
         if version != SOCKS5_VERSION {
@@ -385,7 +396,7 @@ impl ProxyConnection {
 
     async fn socks_connect_to_host(
         &mut self,
-        socket: &mut TcpStream,
+        socket: &mut BufStream<TcpStream>,
         addr: Option<DestinationAddress>,
         port: u16,
     ) -> Result<DestinationConnection, ProxyError> {
@@ -457,7 +468,7 @@ impl ProxyConnection {
     }
 
     async fn socks_write_error_response(
-        socket: &mut TcpStream,
+        socket: &mut BufStream<TcpStream>,
         response: CommandResponse,
     ) -> Result<(), ProxyError> {
         socket.write_u8(response.0).await?;
