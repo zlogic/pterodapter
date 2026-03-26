@@ -656,7 +656,7 @@ impl FortiVPNTunnel {
     ) -> Result<&'a [u8], FortiError> {
         let protocol = match self.ppp_state.read_protocol(dest) {
             Some(protocol) => protocol,
-            None => return Ok(&[]),
+            None => return Ok(&[] as &[u8]),
         };
         match protocol {
             ppp::Protocol::LCP => {

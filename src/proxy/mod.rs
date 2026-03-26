@@ -64,7 +64,7 @@ impl Server {
             }
         });
 
-        let server_handle = rt.spawn(self.run_process(runtime::Handle::current(), command_sender));
+        let server_handle = rt.spawn(self.run_process(command_sender));
 
         rt.block_on(client.run_process(command_receiver));
         server_handle.abort();
@@ -74,7 +74,6 @@ impl Server {
 
     async fn run_process(
         self,
-        rt: runtime::Handle,
         command_bridge: mpsc::Sender<network::Command>,
     ) -> Result<(), ProxyError> {
         let listener = match TcpListener::bind(&self.listen_addr).await {
@@ -90,6 +89,7 @@ impl Server {
             tunnel_domains: self.tunnel_domains.clone(),
             listen_addr: self.listen_addr,
         });
+        let rt = runtime::Handle::current();
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
