@@ -142,7 +142,7 @@ pub fn validate_response_code(headers: &str) -> Result<(), HttpError> {
     }
 }
 
-pub async fn write_sso_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
+pub async fn write_html_response<S>(writer: &mut S, data: &[u8]) -> Result<(), HttpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -229,8 +229,9 @@ pub fn extract_connect_host(headers: &str) -> Option<&str> {
 
 pub fn extract_proxy_host(headers: &str) -> (String, Option<&str>) {
     const HOST_HEADER: &str = "Host: ";
+    const LINE_SEPARATOR: &str = "\r\n";
     let mut result = String::new();
-    let mut lines = headers.lines();
+    let mut lines = headers.split(LINE_SEPARATOR);
     let mut host = None;
     if let Some(request_line) = lines.next() {
         if let Some((verb, remain)) = request_line.split_once(' ') {
@@ -254,14 +255,14 @@ pub fn extract_proxy_host(headers: &str) -> (String, Option<&str>) {
             // Pass request line as-is.
             result.push_str(request_line);
         }
-        result.push('\n');
+        result.push_str(LINE_SEPARATOR);
     }
     for line in lines {
         if line.starts_with("Proxy-Authorization: ") || line.starts_with("Proxy-Connection: ") {
             continue;
         }
         result.push_str(line);
-        result.push('\n');
+        result.push_str(LINE_SEPARATOR);
         if let Some(request_host) = line.strip_prefix(HOST_HEADER) {
             host = Some(request_host);
         }

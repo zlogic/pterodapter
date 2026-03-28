@@ -138,7 +138,7 @@ pub async fn get_oauth_cookie(config: &Config) -> Result<String, FortiError> {
     debug!("Successfully obtained cookie");
 
     let response = include_bytes!("../static/token.html");
-    http::write_sso_response(&mut socket, response).await?;
+    http::write_html_response(&mut socket, response).await?;
 
     Ok(cookie)
 }

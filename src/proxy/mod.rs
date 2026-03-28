@@ -94,7 +94,7 @@ impl Server {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     let socket = BufStream::new(socket);
-                    debug!("Received connection from {}", addr);
+                    debug!("Received incoming connection from {addr}");
                     let handler =
                         ProxyConnection::new(socket, options.clone(), command_bridge.clone());
                     rt.spawn(async move {
@@ -195,21 +195,19 @@ impl ProxyConnection {
     }
 
     async fn handle_http_request(
-        &mut self,
+        &self,
         socket: &mut BufStream<TcpStream>,
         prefix: &str,
     ) -> Result<DestinationConnection, ProxyError> {
         let request = http::read_headers(socket, Some(prefix)).await?;
-        if request.starts_with("GET /proxy.pac HTTP/1.1\r\n") {
-            self.send_pac_file(socket).await?;
-            Ok(DestinationConnection::None)
-        } else if request.starts_with("CONNECT ") {
+        if request.starts_with("CONNECT ") {
+            debug!("Handling connection as HTTP CONNECT tunnel request");
             let host = if let Some(host) = http::extract_connect_host(&request) {
                 host
             } else {
                 return Err("CONNECT request has no Host details".into());
             };
-            match self.connect_to_domain(host, None).await {
+            match self.connect_to_domain(host, 443).await {
                 Ok(destination_connection) => {
                     socket
                         .write_all("HTTP/1.1 200 Connection Established\r\n\r\n".as_bytes())
@@ -226,15 +224,48 @@ impl ProxyConnection {
                 }
             }
         } else {
-            // Assume it's an HTTP Proxy protocol.
+            // This only works with unencrypted HTTP or PAC/discovery.
+            debug!("Handling request as regular HTTP request");
             let (request, host) = http::extract_proxy_host(&request);
             let host = if let Some(host) = host {
                 host
             } else {
                 return Err("HTTP proxy request has no Host header".into());
             };
-            self.connect_to_domain(host, Some(request.as_bytes().into()))
-                .await
+            if request.starts_with("GET /proxy.pac HTTP/1.1\r\n") {
+                debug!("Sending PAC response");
+                self.send_pac_file(socket).await?;
+                return Ok(DestinationConnection::None);
+            }
+            let addr = match Self::resolve_host_ip(host, 80).await {
+                Ok(addr) => addr,
+                Err(err) => {
+                    warn!("Failed to resolve host {host}: {err}");
+                    return Err(err);
+                }
+            };
+            if self.is_local_addr(&addr) {
+                // Reply 404 for all unsupported paths.
+                debug!("Sending 404 for a localhost HTTP request");
+                socket
+                    .write_all("HTTP/1.1 404 Not Found\r\n\r\n".as_bytes())
+                    .await?;
+                socket.flush().await?;
+                return Ok(DestinationConnection::None);
+            }
+            // Assume it's an HTTP Proxy protocol.
+            debug!("Starting a direct HTTP connection to {addr}");
+            let direct_connection = self.bypass_vpn(Self::host_domain(host));
+            let result = self
+                .connect_to_addr(addr, direct_connection, Some(request.as_bytes().into()))
+                .await;
+            if result.is_err() {
+                socket
+                    .write_all("HTTP/1.1 502 Bad Gateway\r\n\r\n".as_bytes())
+                    .await?;
+                socket.flush().await?;
+            }
+            result
         }
     }
 
@@ -253,42 +284,64 @@ impl ProxyConnection {
     }
 
     async fn connect_to_domain(
-        &mut self,
+        &self,
         host: &str,
-        initial_data: Option<Vec<u8>>,
+        default_port: u16,
     ) -> Result<DestinationConnection, ProxyError> {
-        let (host, domain) = if let Some((domain, _)) = host.split_once(":") {
-            (host.to_owned(), domain)
-        } else {
-            // Fallback to port 80 (the default).
-            (host.to_owned() + ":80", host)
-        };
-        let direct_connection = !(self.options.tunnel_domains.is_empty()
+        let direct_connection = self.bypass_vpn(Self::host_domain(host));
+        let ip = Self::resolve_host_ip(host, default_port).await?;
+        self.connect_to_addr(ip, direct_connection, None).await
+    }
+
+    fn bypass_vpn(&self, domain: &str) -> bool {
+        !(self.options.tunnel_domains.is_empty()
             || self
                 .options
                 .tunnel_domains
                 .iter()
-                .any(|tunnel_domain| domain.ends_with(tunnel_domain)));
-        let ip = tokio::net::lookup_host(host).await?.next();
-        match ip {
-            Some(addr) => {
-                self.connect_to_addr(addr, direct_connection, initial_data)
-                    .await
-            }
-            None => Err("Failed to lookup host".into()),
+                .any(|tunnel_domain| domain.ends_with(tunnel_domain)))
+    }
+
+    fn host_domain(host: &str) -> &str {
+        // TODO PROXY: handle IPv6 hosts in a [<addr>]:port format.
+        if let Some((domain, _port)) = host.rsplit_once(':') {
+            domain
+        } else {
+            host
         }
     }
 
+    async fn resolve_host_ip(host: &str, default_port: u16) -> Result<SocketAddr, ProxyError> {
+        // TODO PROXY: handle IPv6 hosts in a [<addr>]:port format.
+        let host = if host.contains(':') {
+            host.into()
+        } else {
+            format!("{host}:{default_port}")
+        };
+
+        match tokio::net::lookup_host(host)
+            .await
+            .map(|mut addrs| addrs.next())
+        {
+            Ok(Some(addr)) => Ok(addr),
+            Ok(None) => Err("Failed to lookup host".into()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn is_local_addr(&self, addr: &SocketAddr) -> bool {
+        addr.port() == self.options.listen_addr.port()
+            && ((self.options.listen_addr.ip().is_loopback() && addr.ip().is_loopback())
+                || addr.ip() == self.options.listen_addr.ip())
+    }
+
     async fn connect_to_addr(
-        &mut self,
+        &self,
         addr: SocketAddr,
         direct_connection: bool,
         initial_data: Option<Vec<u8>>,
     ) -> Result<DestinationConnection, ProxyError> {
-        if addr.port() == self.options.listen_addr.port()
-            && ((self.options.listen_addr.ip().is_loopback() && addr.ip().is_loopback())
-                || addr.ip() == self.options.listen_addr.ip())
-        {
+        if self.is_local_addr(&addr) {
             return Err("Loop detected".into());
         }
         if !direct_connection && addr.is_ipv4() {
@@ -323,10 +376,8 @@ impl ProxyConnection {
         }
     }
 
-    async fn socks_handshake(
-        &mut self,
-        socket: &mut BufStream<TcpStream>,
-    ) -> Result<(), ProxyError> {
+    async fn socks_handshake(&self, socket: &mut BufStream<TcpStream>) -> Result<(), ProxyError> {
+        debug!("Handling SOCKS handshake");
         let nmethods = socket.read_u8().await?;
         let mut selected_method = AuthenticationMethod::NO_ACCEPTABLE_METHODS;
         for _ in 0..nmethods {
@@ -342,7 +393,7 @@ impl ProxyConnection {
     }
 
     async fn socks_read_request(
-        &mut self,
+        &self,
         socket: &mut BufStream<TcpStream>,
     ) -> Result<DestinationConnection, ProxyError> {
         let version = socket.read_u8().await?;
@@ -395,7 +446,7 @@ impl ProxyConnection {
     }
 
     async fn socks_connect_to_host(
-        &mut self,
+        &self,
         socket: &mut BufStream<TcpStream>,
         addr: Option<DestinationAddress>,
         port: u16,
@@ -405,7 +456,7 @@ impl ProxyConnection {
                 self.connect_to_addr((ip, port).into(), false, None).await
             }
             Some(DestinationAddress::Domain(ref domain)) => {
-                self.connect_to_domain(format!("{}:{}", domain, port).as_str(), None)
+                self.connect_to_domain(format!("{domain}:{port}").as_str(), port)
                     .await
             }
             None => {
