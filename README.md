@@ -44,14 +44,14 @@ Build/download a copy, and follow the Proxy or IKEv2 VPN instructions.
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-address=<hostport>] --destination=<hostport> [--pac-file=<path>] [--tunnel-domain=<suffix>] proxy
+pterotapter [--log-level=<level>] [--listen-address=<hostport>] --fortivpn=<hostport> [--pac-file=<path>] [--tunnel-domain=<suffix>] proxy
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
 
 `--listen-address=<hostport>` is an optional argument to specify the proxy listen address, for example `--listen-address=127.0.0.1:3128`. If not specified, will use `:::5328` as the listen address (all IPv4 and IPv6 addresses, port 5328).
 
-`--destination=<hostport>` specifies the FortiVPN connection address, for example `--destination=fortivpn.example.com:443`.
+`--fortivpn=<hostport>` specifies the FortiVPN connection address, for example `--fortivpn=fortivpn.example.com:443`.
 
 `--pac-file=<path>` specifies the optional filename/path for a [PAC file](https://en.wikipedia.org/wiki/Proxy_auto-config). This pac file will be available at the listen address' `/proxy.pac` path, and can be used to self-host a PAC file for browsers/clients that support it.
 

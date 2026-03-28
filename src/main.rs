@@ -48,7 +48,7 @@ const USAGE_INSTRUCTIONS: &str = "Usage:\n\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>   Log level [default: info]\
 \n      --listen-address=<IP>     Listen IP address [default: :::5328]\
-\n      --destination=<HOSTPORT>  Destination FortiVPN address, e.g. sslvpn.example.com:443\
+\n      --fortivpn=<HOSTPORT>     Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --tunnel-domain=<SUFFIX>  (Optional) Forward only subdomains to VPN, other domains will use direct connection; can be specified multiple times\
 \n      --pac-file=<PATH>         (Optional) Path to pac file (available at /proxy.pac)\
 \n\n\
