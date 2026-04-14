@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: true
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Get current Rust version
       id: get-rust-version
@@ -20,7 +20,7 @@ jobs:
 
     - name: Cache Rust dependencies and artifacts
       id: cache-rust
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry/index
@@ -46,7 +46,7 @@ jobs:
           os: ubuntu
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Get current Rust version
       id: get-rust-version
@@ -54,7 +54,7 @@ jobs:
 
     - name: Cache Rust dependencies and artifacts
       id: cache-rust
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry/index
@@ -83,7 +83,7 @@ jobs:
       run: tar -cvjf pterodapter-${{ matrix.os }}-${{ matrix.arch }}.tar.bz2 -C target/${{ matrix.arch }}-unknown-linux-gnu/release pterodapter
 
     - name: Upload application
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: pterodapter-${{ matrix.os }}-${{ matrix.arch }}
         path: pterodapter-*.tar.bz2
@@ -98,7 +98,7 @@ jobs:
         arch: [aarch64, x86_64]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Get current Rust version
       id: get-rust-version
@@ -106,7 +106,7 @@ jobs:
 
     - name: Cache Rust dependencies and artifacts
       id: cache-rust
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry/index
@@ -126,7 +126,7 @@ jobs:
       run: tar -cvjf pterodapter-${{ runner.os }}-${{ matrix.arch }}.tar.bz2 -C target/${{ matrix.arch }}-apple-darwin/release pterodapter
 
     - name: Upload application
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: pterodapter-${{ runner.os }}-${{ matrix.arch }}
         path: pterodapter-*.tar.bz2
@@ -136,7 +136,7 @@ jobs:
     needs: [ "build-linux", "build-macos" ]
     steps:
       - name: Merge all applications
-        uses: actions/upload-artifact/merge@v4
+        uses: actions/upload-artifact/merge@v7
         with:
           name: pterodapter-all
           pattern: pterodapter-*
