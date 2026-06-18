@@ -1988,7 +1988,7 @@ impl fmt::Display for TcpOption<'_> {
             TcpOptionKind::NO_OPERATION => write!(f, "NOP"),
             TcpOptionKind::MAXIMUM_SEGMENT_SIZE => {
                 let mut mss = [0u8; 2];
-                mss.copy_from_slice(&self.data);
+                mss.copy_from_slice(self.data);
                 let mss = u16::from_be_bytes(mss);
                 write!(f, "MSS={mss}")
             }
@@ -2001,7 +2001,7 @@ impl fmt::Display for TcpOption<'_> {
                     let val = u32::from_be_bytes(*chunk);
                     if i == 0 {
                         write!(f, "{val}")
-                    } else if i % 1 == 0 {
+                    } else if i % 2 == 0 {
                         write!(f, ",{val}")
                     } else {
                         write!(f, "-{val}")

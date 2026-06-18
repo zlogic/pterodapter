@@ -239,7 +239,7 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         if fragment_size == 0 {
             return Err("Not enough remaining space to fit payload fragment data".into());
         }
-        let fragments_count = (data_range.len() + fragment_size - 1) / fragment_size;
+        let fragments_count = data_range.len().div_ceil(fragment_size);
         let orig_checksum = {
             let mut orig_checksum = [0u8; 2];
             orig_checksum.copy_from_slice(&tcp_header[16..18]);
