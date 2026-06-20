@@ -2,7 +2,7 @@
 name = "pterodapter"
 version = "0.6.0"
 edition = "2024"
-authors = ["Dmitry Zolotukhin <zlogic@gmail.com>"]
+authors = ["Dmitrii Zolotukhin <contact@3d-net.nl>"]
 repository = "https://github.com/zlogic/pterodapter"
 license = "Apache-2.0"
 rust-version = "1.89"
