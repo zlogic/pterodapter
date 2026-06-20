@@ -106,9 +106,12 @@ impl Server {
                 return Err(err);
             }
         };
+        // TODO: enable the filter after completing tests.
+        /*
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
             warn!("Failed to enable BPF filter, will rely on a less efficient packet filter: {err}")
         }
+        */
 
         let mut packet_filter =
             PacketFilter::new(network, self.nat64_prefix, socket.if_mac(), pcap_sender);
@@ -147,20 +150,11 @@ impl Server {
                     shutdown_requested =
                         shutdown_requested || shutdown_command.as_mut().poll(cx).is_ready();
                     if raw_packet.is_none() {
-                        raw_packet = match self.tso_refragmenter.poll_recv(
-                            cx,
-                            &mut self.raw_read_buffer,
-                            |cx, buf| match socket.poll_recv(cx, buf) {
-                                Poll::Ready(Ok(bytes_read)) => {
-                                    Poll::Ready(Ok(L2_ETHERNET_HEADER_SIZE..bytes_read))
-                                }
-                                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                                Poll::Pending => Poll::Pending,
-                            },
-                        ) {
-                            Poll::Ready(result) => Some(result),
+                        raw_packet = match socket.poll_recv(cx, &mut self.raw_read_buffer) {
+                            Poll::Ready(Ok(bytes_read)) => Some(Ok(bytes_read)),
+                            Poll::Ready(Err(err)) => Some(Err(err)),
                             Poll::Pending => None,
-                        }
+                        };
                     }
                     if uplink_event.is_some() || raw_packet.is_some() || shutdown_requested {
                         Poll::Ready(())

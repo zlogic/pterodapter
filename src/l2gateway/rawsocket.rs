@@ -1,6 +1,6 @@
 use std::{io, os::fd::AsRawFd, task::Poll};
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use tokio::io::unix::AsyncFd;
 
 use crate::ip;
@@ -18,11 +18,11 @@ impl RawSocket {
         listen_interface: &str,
         mtu: Option<usize>,
     ) -> Result<RawSocket, L2GatewayError> {
-        let protocol = u16::from_be(libc::ETH_P_IPV6 as u16) as libc::c_int;
-        let socket = match unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) } {
-            0 => return Err(io::Error::last_os_error().into()),
-            fd => fd as std::os::unix::io::RawFd,
-        };
+        let socket =
+            match unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_UDP) } {
+                0 => return Err(io::Error::last_os_error().into()),
+                fd => fd as std::os::unix::io::RawFd,
+            };
         let (mac, if_index) = RawSocket::iface_config(socket, listen_interface)?;
         if let Some(mtu) = mtu {
             match RawSocket::set_mtu(socket, listen_interface, mtu) {
@@ -43,12 +43,10 @@ impl RawSocket {
             mac,
             if_index,
         };
-        if let Err(err) =
-            socket.setsockopt_bool(libc::SOL_PACKET, libc::PACKET_IGNORE_OUTGOING, true)
-        {
-            warn!(
-                "Failed to enable PACKET_IGNORE_OUTGOING socket option, will rely on a less efficient packet filter: {err}"
-            )
+        //setsockopt(libc::SOL_SOCKET, libc::SO_BINDTODEVICE, listen_interface);
+        if let Err(err) = socket.setsockopt_bool(libc::SOL_IPV6, libc::IPV6_TRANSPARENT, true) {
+            error!("Failed to enable IP_TRANSPARENT socket option: {err}");
+            return Err(err.into());
         }
 
         Ok(socket)
