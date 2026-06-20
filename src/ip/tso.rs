@@ -51,12 +51,12 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         if self.current_fragment < self.fragments_len {
             return Poll::Ready(Ok(self.next_fragment(dest)));
         }
+        self.reset();
         let data_range = match recv(cx, &mut self.buf) {
             Poll::Ready(Ok(data_range)) => data_range,
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
             Poll::Pending => return Poll::Pending,
         };
-        self.reset();
         let packet = match IpPacket::from_data(&self.buf[data_range.clone()]) {
             Ok(packet) => packet,
             Err(err) => return Poll::Ready(Err(err.into())),
@@ -161,6 +161,7 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             Ok(version) => version,
             Err(_) => {
                 // This should never happen unless there's serious data corruption.
+                warn!("IP header has no protocol version");
                 self.reset();
                 return 0;
             }
@@ -184,8 +185,18 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             }
         }
 
-        // Update TCP checksum to match the packet length.
         let tcp_header = &mut dest[tcp_header_range];
+
+        // Update TCP SEQ to indicate the fragment's offset.
+        let current_seq = {
+            let mut seq = [0u8; 4];
+            seq.copy_from_slice(&tcp_header[4..8]);
+            u32::from_be_bytes(seq)
+        };
+        let new_seq = current_seq + (self.tcp_data_start..fragment.start).len() as u32;
+        tcp_header[4..8].copy_from_slice(&new_seq.to_be_bytes());
+
+        // Update TCP checksum to match the packet length.
         let mut pseudo_checksum = {
             let mut checksum = [0u8; 2];
             checksum.copy_from_slice(&tcp_header[16..18]);
@@ -197,6 +208,11 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             IpProtocolVersion::V6 => pseudo_checksum
                 .add_slice(&((tcp_header_length + fragment_length) as u32).to_be_bytes()),
         }
+
+        pseudo_checksum.incremental_update(
+            Checksum::from_slice(&current_seq.to_be_bytes()),
+            Checksum::from_slice(&new_seq.to_be_bytes()),
+        );
         pseudo_checksum
             .incremental_update(Checksum::new(), Checksum::from_inverted(fragment.checksum));
         pseudo_checksum.fold();
@@ -239,7 +255,8 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         if fragment_size == 0 {
             return Err("Not enough remaining space to fit payload fragment data".into());
         }
-        let fragments_count = data_range.len().div_ceil(fragment_size);
+        // Ensure that at least 1 fragment is sent, for TCP handshakes (with no data).
+        let fragments_count = data_range.len().div_ceil(fragment_size).max(1);
         let orig_checksum = {
             let mut orig_checksum = [0u8; 2];
             orig_checksum.copy_from_slice(&tcp_header[16..18]);
@@ -262,8 +279,12 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         self.fragments_len = fragments_count.min(self.fragments.len());
         for (i, fragment) in self.fragments.iter_mut().enumerate() {
             let start = data_range.start + fragment_size * i;
-            if start >= data_range.end {
+            if i >= fragments_count {
                 break;
+            }
+            if start >= data_range.end {
+                fragment.update(data_range.end..data_range.end, 0);
+                continue;
             }
             let end = (start + fragment_size).min(data_range.end);
 
