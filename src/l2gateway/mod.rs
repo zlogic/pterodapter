@@ -147,17 +147,7 @@ impl Server {
                     shutdown_requested =
                         shutdown_requested || shutdown_command.as_mut().poll(cx).is_ready();
                     if raw_packet.is_none() {
-                        raw_packet = match self.tso_refragmenter.poll_recv(
-                            cx,
-                            &mut self.raw_read_buffer,
-                            |cx, buf| match socket.poll_recv(cx, buf) {
-                                Poll::Ready(Ok(bytes_read)) => {
-                                    Poll::Ready(Ok(L2_ETHERNET_HEADER_SIZE..bytes_read))
-                                }
-                                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                                Poll::Pending => Poll::Pending,
-                            },
-                        ) {
+                        raw_packet = match socket.poll_recv(cx, &mut self.raw_read_buffer) {
                             Poll::Ready(result) => Some(result),
                             Poll::Pending => None,
                         }
