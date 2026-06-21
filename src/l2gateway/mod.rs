@@ -495,7 +495,10 @@ impl PacketFilter {
                     }
                 };
                 if let Err(err) = ip::IpPacket::update_src_addr(buf, vpn_real_ip) {
-                    warn!("Failed to update packet source IP: {err}");
+                    warn!(
+                        "Failed to update packet source IP: {err}\n{}",
+                        fmt_slice_hex(buf)
+                    );
                     return Err("Failed to update packet source IP".into());
                 }
                 Ok(RawRoutingAction::Forward(buf))

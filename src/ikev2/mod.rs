@@ -1078,8 +1078,7 @@ impl Sessions {
             Ok(packet) => packet,
             Err(err) => {
                 warn!(
-                    "Failed to decode IP packet from uplink/VPN: {}\n{}",
-                    err,
+                    "Failed to decode IP packet from uplink/VPN: {err}\n{}",
                     fmt_slice_hex(&in_buf[..data_len]),
                 );
                 return Err("Failed to decode IP packet from uplink/VPN".into());
