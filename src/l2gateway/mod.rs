@@ -12,6 +12,7 @@ use crate::logger::fmt_slice_hex;
 use crate::uplink::UplinkService as _;
 use crate::{ip, pcap, uplink};
 
+mod fallback;
 mod rawsocket;
 
 // Maximum ethernet frame size, the ethernet header will be reused for PPP headers.
@@ -113,6 +114,8 @@ impl Server {
         let mut packet_filter =
             PacketFilter::new(network, self.nat64_prefix, socket.if_mac(), pcap_sender);
 
+        let mut fallback_client = fallback::FallbackDnsClient::new();
+
         info!("Started server");
 
         let mut shutdown_command = pin!(shutdown_receiver);
@@ -124,13 +127,15 @@ impl Server {
                 debug!("Shutdown completed");
                 return Ok(());
             }
-            let (shutdown_requested, raw_packet, uplink_event) = {
+            let (shutdown_requested, raw_packet, uplink_event, fallback_event) = {
                 let ignore_uplink = shutdown && !uplink_is_connected;
                 let mut uplink_event = None;
                 let mut raw_packet = None;
+                let mut fallback_event = None;
                 let mut shutdown_requested = shutdown;
                 let mut receive_uplink_event =
                     pin!(uplink.wait_event(&mut self.uplink_read_buffer));
+                let mut receive_fallback_client_event = pin!(fallback_client.wait_event());
                 future::poll_fn(|cx| {
                     if uplink_event.is_none() {
                         uplink_event = if !ignore_uplink {
@@ -143,6 +148,12 @@ impl Server {
                             // Avoid waking if uplink/VPN is already shut down.
                             None
                         };
+                    }
+                    if fallback_event.is_none() {
+                        fallback_event = match receive_fallback_client_event.as_mut().poll(cx) {
+                            Poll::Ready(_) => Some(()),
+                            Poll::Pending => None,
+                        }
                     }
                     shutdown_requested =
                         shutdown_requested || shutdown_command.as_mut().poll(cx).is_ready();
@@ -172,7 +183,7 @@ impl Server {
                 if matches!(raw_packet, Some(Ok(0))) {
                     raw_packet = None;
                 }
-                (shutdown_requested, raw_packet, uplink_event)
+                (shutdown_requested, raw_packet, uplink_event, fallback_event)
             };
             // Process all ready events.
             if shutdown_requested {
@@ -312,7 +323,7 @@ impl Server {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
 struct MacAddr([u8; 6]);
 
 impl MacAddr {
@@ -480,6 +491,8 @@ impl PacketFilter {
             self.client_mac = Some(src_mac);
         }
 
+        // TODO GATEWAY: use fallback network here?
+
         match self
             .network
             .translate_packet_from_client(ip_packet, header, out_buf)
@@ -550,6 +563,8 @@ impl PacketFilter {
         };
         trace!("Decoded IP packet from uplink/VPN {ip_packet}");
         let ip_header = ip_packet.to_header();
+
+        // TODO GATEWAY: use fallback network here?
 
         match self
             .network
