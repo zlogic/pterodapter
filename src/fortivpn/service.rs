@@ -157,7 +157,7 @@ impl uplink::UplinkService for FortiService {
                 }
             }
         } else {
-            Ok(&[])
+            Ok(&[] as &[u8])
         }
     }
 
