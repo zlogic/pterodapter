@@ -1916,6 +1916,18 @@ impl TcpFlags {
         TcpFlags(flags)
     }
 
+    fn to_u8(&self) -> u8 {
+        self.0
+    }
+
+    fn toggle_mask(&mut self, mask: u8, enable: bool) {
+        if enable {
+            self.0 |= mask
+        } else {
+            self.0 &= !mask
+        }
+    }
+
     fn cwr(&self) -> bool {
         self.0 & Self::CWR == Self::CWR
     }

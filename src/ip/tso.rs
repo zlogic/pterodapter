@@ -2,7 +2,7 @@ use std::{error, fmt, io, ops::Range, task::Poll};
 
 use log::{debug, warn};
 
-use crate::logger::fmt_slice_hex;
+use crate::{ip::TcpFlags, logger::fmt_slice_hex};
 
 use super::{Checksum, IpError, IpPacket, IpProtocolVersion, TransportProtocolType};
 
@@ -143,6 +143,7 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         if self.current_fragment >= self.fragments_len {
             return 0;
         }
+        let current_fragment = self.current_fragment;
         let fragment = self.fragments[self.current_fragment];
         self.current_fragment += 1;
 
@@ -196,7 +197,25 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         let new_seq = current_seq + (self.tcp_data_start..fragment.start).len() as u32;
         tcp_header[4..8].copy_from_slice(&new_seq.to_be_bytes());
 
-        // Update TCP checksum to match the packet length.
+        // Update TCP control flags.
+        let current_flags_checksum = if self.fragments_len > 1 {
+            let mut flags = TcpFlags::from_u8(tcp_header[13]);
+            // See https://learn.microsoft.com/en-us/windows-hardware/drivers/network/offloading-the-segmentation-of-large-tcp-packets
+            // and other LSO documents.
+            if current_fragment > 0 {
+                flags.toggle_mask(TcpFlags::CWR, false);
+            }
+            if current_fragment + 1 == self.fragments_len {
+                flags.toggle_mask(TcpFlags::FIN | TcpFlags::PSH, false);
+            }
+            let current_flags_checksum = Checksum::from_slice(&tcp_header[12..14]);
+            tcp_header[13] = flags.to_u8();
+            Some(current_flags_checksum)
+        } else {
+            None
+        };
+
+        // Update TCP checksum to match the packet length and other modified fields.
         let mut pseudo_checksum = {
             let mut checksum = [0u8; 2];
             checksum.copy_from_slice(&tcp_header[16..18]);
@@ -213,6 +232,12 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             Checksum::from_slice(&current_seq.to_be_bytes()),
             Checksum::from_slice(&new_seq.to_be_bytes()),
         );
+        if let Some(current_flags_checksum) = current_flags_checksum {
+            pseudo_checksum.incremental_update(
+                current_flags_checksum,
+                Checksum::from_slice(&tcp_header[12..14]),
+            );
+        }
         pseudo_checksum
             .incremental_update(Checksum::new(), Checksum::from_inverted(fragment.checksum));
         pseudo_checksum.fold();
@@ -221,8 +246,6 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         let fragment_data = &self.buf[fragment.range()];
         dest[self.tcp_data_start..self.tcp_data_start + fragment_data.len()]
             .copy_from_slice(fragment_data);
-
-        // TODO GATEWAY: modify TCP headers and flags in last/non-last packets
 
         // TODO GATEWAY: remove this debug code
         {
