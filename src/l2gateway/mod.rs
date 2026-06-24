@@ -75,12 +75,13 @@ impl Server {
         shutdown_receiver: oneshot::Receiver<()>,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
-        let network = ip::Network::new(
+        let mut network = ip::Network::new(
             Some(self.nat64_prefix),
             self.dns64_domains.clone(),
             ip::DnsDetection::Port,
             Some(PATH_MTU),
         )?;
+        network.set_icmp_unreachable(true);
 
         let result = rt.block_on(self.run_process(shutdown_receiver, uplink, network, pcap_sender));
         rt.shutdown_timeout(Duration::from_secs(60));
@@ -402,6 +403,7 @@ impl PacketFilter {
             };
         self.network
             .update_ip_configuration(internal_addr, dns_addrs);
+        self.network.set_icmp_unreachable(configuration.is_none());
         self.vpn_real_ip = internal_addr;
 
         let client_ip = match client_ip {

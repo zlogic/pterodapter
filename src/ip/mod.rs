@@ -2370,6 +2370,7 @@ pub struct Network {
     dns_translator: Option<dns::Dns64Translator>,
     icmp_rate_limiter: icmp::RateLimiter,
     mtu_limit: Option<usize>,
+    icmp_unreachable: bool,
 }
 
 impl Network {
@@ -2401,6 +2402,7 @@ impl Network {
             dns_translator,
             icmp_rate_limiter,
             mtu_limit,
+            icmp_unreachable: false,
         })
     }
 
@@ -2440,6 +2442,10 @@ impl Network {
 
     pub fn set_split_routes(&mut self, ip_addresses: &[IpAddr]) {
         self.tunnel_ips = ip_addresses.to_vec();
+    }
+
+    pub fn set_icmp_unreachable(&mut self, icmp_unreachable: bool) {
+        self.icmp_unreachable = icmp_unreachable;
     }
 
     pub fn ip_netmasks(&self) -> &[IpNetmask] {
@@ -2499,6 +2505,18 @@ impl Network {
             out_buf.copy_from_slice(data);
             return Ok(RoutingActionClient::Forward(&mut out_buf[..data.len()]));
         };
+        if self.icmp_unreachable {
+            if !self.icmp_rate_limiter.can_send() {
+                debug!("ICMP rate limit reached, dropping response");
+                return Ok(RoutingActionClient::Drop);
+            }
+            let length = icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(
+                &packet,
+                icmp::IcmpErrorResponseData::None,
+                out_buf,
+            )?;
+            return Ok(RoutingActionClient::ReturnToSender(out_buf, length));
+        }
         let is_dns = match self.dns_detection {
             DnsDetection::Ip => self.dns_addrs.contains(header.dst_addr()),
             DnsDetection::Port => header.is_dns_request(),
@@ -2514,6 +2532,10 @@ impl Network {
         };
         if let Some(mtu) = mtu_exceeded {
             debug!("Received packet that's truncated or exceeds MTU: {header}");
+            if !self.icmp_rate_limiter.can_send() {
+                info!("ICMP rate limit reached, dropping response");
+                return Ok(RoutingActionClient::Drop);
+            }
             let length = icmp::ICMP_ERROR_MTU_EXCEEDED.write_error_response(
                 &packet,
                 icmp::IcmpErrorResponseData::Mtu(mtu as u16),
