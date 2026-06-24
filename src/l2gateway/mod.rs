@@ -495,6 +495,7 @@ impl PacketFilter {
                     }
                 };
                 if let Err(err) = ip::IpPacket::update_src_addr(buf, vpn_real_ip) {
+                    // TODO GATEWAY: do not log packet once the root cause is known.
                     warn!(
                         "Failed to update packet source IP: {err}\n{}",
                         fmt_slice_hex(buf)
