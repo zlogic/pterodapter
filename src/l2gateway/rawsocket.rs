@@ -277,30 +277,26 @@ impl RawSocket {
 
     pub fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
         // See https://docs.kernel.org/networking/filter.html for more information.
-        let mut filter_data = CBpfFilter::new_nat64_filter(&self.mac, prefix);
+        let mut filter_data = BpfFilter::new_nat64_filter(&self.mac, prefix);
         let filter = libc::sock_fprog {
             len: filter_data.ops_len as libc::c_ushort,
             filter: filter_data.program_data.as_mut_ptr().cast(),
         };
-        // SO_ATTACH_FILTER attaches cBPF, SO_ATTACH_BPF attaches eBPF.
-        // Need to test if SO_ATTACH_BPF runs with Apple Container's kernel.
-        // https://github.com/torvalds/linux/blob/master/samples/bpf/sock_example.c
-        // eBPF programs can be compiled from C sources, for example https://github.com/iovisor/bcc/blob/master/examples/networking/http_filter/http-parse-simple.c
         self.setsockopt(libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, &filter)
     }
 }
 
 #[repr(C)]
-struct CBpfFilterOp {
+struct BpfFilterOp {
     code: u16,
     jt: u8,
     jf: u8,
     k: u32,
 }
 
-impl CBpfFilterOp {
-    fn ldh(offset: u32) -> CBpfFilterOp {
-        CBpfFilterOp {
+impl BpfFilterOp {
+    fn ldh(offset: u32) -> BpfFilterOp {
+        BpfFilterOp {
             code: libc::BPF_LD as u16 | libc::BPF_H as u16 | libc::BPF_ABS as u16,
             jt: 0,
             jf: 0,
@@ -308,8 +304,8 @@ impl CBpfFilterOp {
         }
     }
 
-    fn ldw(offset: u32) -> CBpfFilterOp {
-        CBpfFilterOp {
+    fn ldw(offset: u32) -> BpfFilterOp {
+        BpfFilterOp {
             code: libc::BPF_LD as u16 | libc::BPF_W as u16 | libc::BPF_ABS as u16,
             jt: 0,
             jf: 0,
@@ -317,8 +313,8 @@ impl CBpfFilterOp {
         }
     }
 
-    fn jeq(jt: u8, jf: u8, val: u32) -> CBpfFilterOp {
-        CBpfFilterOp {
+    fn jeq(jt: u8, jf: u8, val: u32) -> BpfFilterOp {
+        BpfFilterOp {
             code: libc::BPF_JMP as u16 | libc::BPF_JEQ as u16,
             jt,
             jf,
@@ -326,8 +322,8 @@ impl CBpfFilterOp {
         }
     }
 
-    fn ret(val: u32) -> CBpfFilterOp {
-        CBpfFilterOp {
+    fn ret(val: u32) -> BpfFilterOp {
+        BpfFilterOp {
             code: libc::BPF_RET as u16,
             jt: 0,
             jf: 0,
@@ -339,32 +335,32 @@ impl CBpfFilterOp {
         unsafe {
             std::slice::from_raw_parts(
                 std::ptr::from_ref(self).cast(),
-                std::mem::size_of::<CBpfFilterOp>(),
+                std::mem::size_of::<BpfFilterOp>(),
             )
         }
     }
 }
 
-struct CBpfFilter {
+struct BpfFilter {
     ops_len: usize,
     program_data: Vec<u8>,
 }
 
-impl CBpfFilter {
-    fn new_program(prog: &[CBpfFilterOp]) -> CBpfFilter {
+impl BpfFilter {
+    fn new_program(prog: &[BpfFilterOp]) -> BpfFilter {
         let mut program_data = vec![0u8; std::mem::size_of_val(prog)];
-        // TODO GATEWAY: write bytes directly, BPF is a standard documented in RFC 9669.
         program_data
-            .chunks_exact_mut(std::mem::size_of::<CBpfFilterOp>())
+            .chunks_exact_mut(std::mem::size_of::<BpfFilterOp>())
             .zip(prog.iter())
             .for_each(|(data, op)| data.copy_from_slice(op.as_slice()));
-        CBpfFilter {
+        BpfFilter {
             ops_len: prog.len(),
             program_data,
         }
     }
 
-    fn new_nat64_filter(if_mac: &MacAddr, prefix: &ip::Nat64Prefix) -> CBpfFilter {
+    fn new_nat64_filter(if_mac: &MacAddr, prefix: &ip::Nat64Prefix) -> BpfFilter {
+        // This is cBPF, not eBPF, RFC 9669 doesn't apply here.
         let prefix_part = |i: usize| -> u32 {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&prefix[i * 4..(i + 1) * 4]);
@@ -376,33 +372,24 @@ impl CBpfFilter {
         let mut mac_part = [0u8; 4];
         mac_part[2..4].copy_from_slice(&if_mac.as_slice()[0..2]);
         let mac_start = u32::from_be_bytes(mac_part);
-        // Output of 'sudo tcpdump -i wlo1 ether dst 12:34:56:78:9a:bc and ip6 dst net 0064:ff9b::/96 -ddd'
-        // TODO GATEWAY: looks like it's just a number of equality checks of an Ethernet frame?
         // See https://www.kernel.org/doc/html/v6.0/bpf/instruction-set.html for more details on
         // legacy instructions.
-        // Also, see https://docs.kernel.org/networking/filter.html
-        // TODO: sort out BE/LE bytes.
-        // jt = jump if true, jf = jump if false in BPF, this changed in eBPF!
-        // this is cBPF, not eBPF
-        // LD* converts from network order into host order
-        // LDX is more modern, but might not work with other OSes.
-        // See /usr/include/linux/bpf.h for a full spec
-        CBpfFilter::new_program(&[
-            CBpfFilterOp::ldw(2),
-            CBpfFilterOp::jeq(0, 11, mac_end),
-            CBpfFilterOp::ldh(0),
-            CBpfFilterOp::jeq(0, 9, mac_start),
-            CBpfFilterOp::ldh(12),
-            CBpfFilterOp::jeq(0, 7, 0x86DD),
-            CBpfFilterOp::ldw(38),
-            CBpfFilterOp::jeq(0, 5, prefix_part(0)),
-            CBpfFilterOp::ldw(42),
-            CBpfFilterOp::jeq(0, 3, prefix_part(1)),
-            CBpfFilterOp::ldw(46),
-            CBpfFilterOp::jeq(0, 1, prefix_part(2)),
+        BpfFilter::new_program(&[
+            BpfFilterOp::ldw(2),
+            BpfFilterOp::jeq(0, 11, mac_end),
+            BpfFilterOp::ldh(0),
+            BpfFilterOp::jeq(0, 9, mac_start),
+            BpfFilterOp::ldh(12),
+            BpfFilterOp::jeq(0, 7, 0x86DD),
+            BpfFilterOp::ldw(38),
+            BpfFilterOp::jeq(0, 5, prefix_part(0)),
+            BpfFilterOp::ldw(42),
+            BpfFilterOp::jeq(0, 3, prefix_part(1)),
+            BpfFilterOp::ldw(46),
+            BpfFilterOp::jeq(0, 1, prefix_part(2)),
             // use first 262144 bytes, seems to be a magic number
-            CBpfFilterOp::ret(0x00040000),
-            CBpfFilterOp::ret(0),
+            BpfFilterOp::ret(0x00040000),
+            BpfFilterOp::ret(0),
         ])
     }
 }
