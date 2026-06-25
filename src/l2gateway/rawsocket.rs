@@ -282,6 +282,10 @@ impl RawSocket {
             len: filter_data.ops_len as libc::c_ushort,
             filter: filter_data.program_data.as_mut_ptr().cast(),
         };
+        // SO_ATTACH_FILTER attaches cBPF, SO_ATTACH_BPF attaches eBPF.
+        // Need to test if SO_ATTACH_BPF runs with Apple Container's kernel.
+        // https://github.com/torvalds/linux/blob/master/samples/bpf/sock_example.c
+        // eBPF programs can be compiled from C sources, for example https://github.com/iovisor/bcc/blob/master/examples/networking/http_filter/http-parse-simple.c
         self.setsockopt(libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, &filter)
     }
 }
@@ -295,6 +299,11 @@ struct BpfFilterOp {
 }
 
 impl BpfFilterOp {
+    const LDH_ABS: u16 = libc::BPF_LD as u16 | libc::BPF_H as u16 | libc::BPF_ABS as u16;
+    const LDW_ABS: u16 = libc::BPF_LD as u16 | libc::BPF_W as u16 | libc::BPF_ABS as u16;
+    const JEQ: u16 = libc::BPF_JMP as u16 | libc::BPF_JEQ as u16;
+    const RET: u16 = libc::BPF_RET as u16;
+
     fn new(code: u16, jt: u8, jf: u8, k: u32) -> BpfFilterOp {
         BpfFilterOp { code, jt, jf, k }
     }
@@ -341,21 +350,32 @@ impl BpfFilter {
         mac_part[2..4].copy_from_slice(&if_mac.as_slice()[0..2]);
         let mac_start = u32::from_be_bytes(mac_part);
         // Output of 'sudo tcpdump -i wlo1 ether dst 12:34:56:78:9a:bc and ip6 dst net 0064:ff9b::/96 -ddd'
+        // TODO GATEWAY: looks like it's just a number of equality checks of an Ethernet frame?
+        // See https://www.kernel.org/doc/html/v6.0/bpf/instruction-set.html for more details on
+        // legacy instructions.
+        // Also, see https://docs.kernel.org/networking/filter.html
+        // TODO: sort out BE/LE bytes.
+        // jt = jump if true, jf = jump if false in BPF, this changed in eBPF!
+        // this is cBPF, not eBPF
+        // LD* converts from network order into host order
+        // LDX is more modern, but might not work with other OSes.
+        // See /usr/include/linux/bpf.h for a full spec
         BpfFilter::new_program(&[
-            BpfFilterOp::new(32, 0, 0, 2),
-            BpfFilterOp::new(21, 0, 11, mac_end),
-            BpfFilterOp::new(40, 0, 0, 0),
-            BpfFilterOp::new(21, 0, 9, mac_start),
-            BpfFilterOp::new(40, 0, 0, 12),
-            BpfFilterOp::new(21, 0, 7, 34525),
-            BpfFilterOp::new(32, 0, 0, 38),
-            BpfFilterOp::new(21, 0, 5, prefix_part(0)),
-            BpfFilterOp::new(32, 0, 0, 42),
-            BpfFilterOp::new(21, 0, 3, prefix_part(1)),
-            BpfFilterOp::new(32, 0, 0, 46),
-            BpfFilterOp::new(21, 0, 1, prefix_part(2)),
-            BpfFilterOp::new(6, 0, 0, 262144),
-            BpfFilterOp::new(6, 0, 0, 0),
+            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 2),
+            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 11, mac_end),
+            BpfFilterOp::new(BpfFilterOp::LDH_ABS, 0, 0, 0),
+            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 9, mac_start),
+            BpfFilterOp::new(BpfFilterOp::LDH_ABS, 0, 0, 12),
+            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 7, 0x86DD),
+            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 38),
+            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 5, prefix_part(0)),
+            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 42),
+            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 3, prefix_part(1)),
+            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 46),
+            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 1, prefix_part(2)),
+            // use first 262144 bytes, seems to be a magic number
+            BpfFilterOp::new(BpfFilterOp::RET, 0, 0, 0x00040000),
+            BpfFilterOp::new(BpfFilterOp::RET, 0, 0, 0),
         ])
     }
 }
