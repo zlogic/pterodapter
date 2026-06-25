@@ -277,7 +277,7 @@ impl RawSocket {
 
     pub fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
         // See https://docs.kernel.org/networking/filter.html for more information.
-        let mut filter_data = BpfFilter::new_nat64_filter(&self.mac, prefix);
+        let mut filter_data = CBpfFilter::new_nat64_filter(&self.mac, prefix);
         let filter = libc::sock_fprog {
             len: filter_data.ops_len as libc::c_ushort,
             filter: filter_data.program_data.as_mut_ptr().cast(),
@@ -291,53 +291,80 @@ impl RawSocket {
 }
 
 #[repr(C)]
-struct BpfFilterOp {
+struct CBpfFilterOp {
     code: u16,
     jt: u8,
     jf: u8,
     k: u32,
 }
 
-impl BpfFilterOp {
-    const LDH_ABS: u16 = libc::BPF_LD as u16 | libc::BPF_H as u16 | libc::BPF_ABS as u16;
-    const LDW_ABS: u16 = libc::BPF_LD as u16 | libc::BPF_W as u16 | libc::BPF_ABS as u16;
-    const JEQ: u16 = libc::BPF_JMP as u16 | libc::BPF_JEQ as u16;
-    const RET: u16 = libc::BPF_RET as u16;
+impl CBpfFilterOp {
+    fn ldh(offset: u32) -> CBpfFilterOp {
+        CBpfFilterOp {
+            code: libc::BPF_LD as u16 | libc::BPF_H as u16 | libc::BPF_ABS as u16,
+            jt: 0,
+            jf: 0,
+            k: offset,
+        }
+    }
 
-    fn new(code: u16, jt: u8, jf: u8, k: u32) -> BpfFilterOp {
-        BpfFilterOp { code, jt, jf, k }
+    fn ldw(offset: u32) -> CBpfFilterOp {
+        CBpfFilterOp {
+            code: libc::BPF_LD as u16 | libc::BPF_W as u16 | libc::BPF_ABS as u16,
+            jt: 0,
+            jf: 0,
+            k: offset,
+        }
+    }
+
+    fn jeq(jt: u8, jf: u8, val: u32) -> CBpfFilterOp {
+        CBpfFilterOp {
+            code: libc::BPF_JMP as u16 | libc::BPF_JEQ as u16,
+            jt,
+            jf,
+            k: val,
+        }
+    }
+
+    fn ret(val: u32) -> CBpfFilterOp {
+        CBpfFilterOp {
+            code: libc::BPF_RET as u16,
+            jt: 0,
+            jf: 0,
+            k: val,
+        }
     }
 
     fn as_slice(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 std::ptr::from_ref(self).cast(),
-                std::mem::size_of::<BpfFilterOp>(),
+                std::mem::size_of::<CBpfFilterOp>(),
             )
         }
     }
 }
 
-struct BpfFilter {
+struct CBpfFilter {
     ops_len: usize,
     program_data: Vec<u8>,
 }
 
-impl BpfFilter {
-    fn new_program(prog: &[BpfFilterOp]) -> BpfFilter {
+impl CBpfFilter {
+    fn new_program(prog: &[CBpfFilterOp]) -> CBpfFilter {
         let mut program_data = vec![0u8; std::mem::size_of_val(prog)];
         // TODO GATEWAY: write bytes directly, BPF is a standard documented in RFC 9669.
         program_data
-            .chunks_exact_mut(std::mem::size_of::<BpfFilterOp>())
+            .chunks_exact_mut(std::mem::size_of::<CBpfFilterOp>())
             .zip(prog.iter())
             .for_each(|(data, op)| data.copy_from_slice(op.as_slice()));
-        BpfFilter {
+        CBpfFilter {
             ops_len: prog.len(),
             program_data,
         }
     }
 
-    fn new_nat64_filter(if_mac: &MacAddr, prefix: &ip::Nat64Prefix) -> BpfFilter {
+    fn new_nat64_filter(if_mac: &MacAddr, prefix: &ip::Nat64Prefix) -> CBpfFilter {
         let prefix_part = |i: usize| -> u32 {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&prefix[i * 4..(i + 1) * 4]);
@@ -360,22 +387,22 @@ impl BpfFilter {
         // LD* converts from network order into host order
         // LDX is more modern, but might not work with other OSes.
         // See /usr/include/linux/bpf.h for a full spec
-        BpfFilter::new_program(&[
-            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 2),
-            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 11, mac_end),
-            BpfFilterOp::new(BpfFilterOp::LDH_ABS, 0, 0, 0),
-            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 9, mac_start),
-            BpfFilterOp::new(BpfFilterOp::LDH_ABS, 0, 0, 12),
-            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 7, 0x86DD),
-            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 38),
-            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 5, prefix_part(0)),
-            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 42),
-            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 3, prefix_part(1)),
-            BpfFilterOp::new(BpfFilterOp::LDW_ABS, 0, 0, 46),
-            BpfFilterOp::new(BpfFilterOp::JEQ, 0, 1, prefix_part(2)),
+        CBpfFilter::new_program(&[
+            CBpfFilterOp::ldw(2),
+            CBpfFilterOp::jeq(0, 11, mac_end),
+            CBpfFilterOp::ldh(0),
+            CBpfFilterOp::jeq(0, 9, mac_start),
+            CBpfFilterOp::ldh(12),
+            CBpfFilterOp::jeq(0, 7, 0x86DD),
+            CBpfFilterOp::ldw(38),
+            CBpfFilterOp::jeq(0, 5, prefix_part(0)),
+            CBpfFilterOp::ldw(42),
+            CBpfFilterOp::jeq(0, 3, prefix_part(1)),
+            CBpfFilterOp::ldw(46),
+            CBpfFilterOp::jeq(0, 1, prefix_part(2)),
             // use first 262144 bytes, seems to be a magic number
-            BpfFilterOp::new(BpfFilterOp::RET, 0, 0, 0x00040000),
-            BpfFilterOp::new(BpfFilterOp::RET, 0, 0, 0),
+            CBpfFilterOp::ret(0x00040000),
+            CBpfFilterOp::ret(0),
         ])
     }
 }
