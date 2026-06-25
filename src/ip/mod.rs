@@ -651,7 +651,7 @@ impl<'a> Ipv4Packet<'a> {
         }
 
         let data = &mut data[..header_len];
-        if !is_icmp || icmp::IcmpV4Message::from_data(data)?.has_original_datagram() {
+        if !is_icmp || !icmp::IcmpV4Message::from_data(data)?.has_original_datagram() {
             return Ok(());
         }
 
@@ -739,7 +739,7 @@ impl<'a> Ipv4Packet<'a> {
         }
 
         let data = &mut data[..header_len];
-        if !is_icmp || icmp::IcmpV4Message::from_data(data)?.has_original_datagram() {
+        if !is_icmp || !icmp::IcmpV4Message::from_data(data)?.has_original_datagram() {
             return Ok(());
         }
 
@@ -1189,7 +1189,7 @@ impl<'a> Ipv6Packet<'a> {
         }
 
         let data = &mut data[..header_len];
-        if !is_icmp || icmp::IcmpV6Message::from_data(data)?.has_original_datagram() {
+        if !is_icmp || !icmp::IcmpV6Message::from_data(data)?.has_original_datagram() {
             return Ok(());
         }
 
@@ -1259,7 +1259,7 @@ impl<'a> Ipv6Packet<'a> {
         }
 
         let data = &mut data[..header_len];
-        if !is_icmp || icmp::IcmpV6Message::from_data(data)?.has_original_datagram() {
+        if !is_icmp || !icmp::IcmpV6Message::from_data(data)?.has_original_datagram() {
             return Ok(());
         }
 
