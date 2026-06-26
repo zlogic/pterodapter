@@ -403,6 +403,11 @@ impl<'a> Ipv4Packet<'a> {
         if !self.is_fragment_shifted() && transport_protocol.needs_pseudoheader_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
             let add = Ipv6Packet::pseudo_checksum(dest, transport_protocol, transport_data_len);
+            // Translating from ICMPv4 to ICMPv6 should add the header checksum.
+            let (remove, add) = match transport_protocol {
+                TransportProtocolType::ICMP => (Checksum::new(), add),
+                _ => (remove, add),
+            };
             self.transport_data.write_translated_checksum(
                 &mut dest[header_len..header_len + transport_data.len()],
                 remove,
@@ -1042,6 +1047,11 @@ impl<'a> Ipv6Packet<'a> {
         if !self.is_fragment_shifted() && transport_protocol.needs_pseudoheader_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
             let add = Ipv4Packet::pseudo_checksum(dest, transport_protocol, transport_data_len);
+            // Translating from ICMPv6 to ICMPv4 should drop the header checksum.
+            let (remove, add) = match transport_protocol {
+                TransportProtocolType::IPV6_ICMP => (remove, Checksum::new()),
+                _ => (remove, add),
+            };
             self.transport_data.write_translated_checksum(
                 &mut dest[20..20 + transport_data.len()],
                 remove,
@@ -2239,27 +2249,17 @@ impl TransportData<'_> {
         match self {
             TransportData::Udp(data) => Some(data.translated_checksum(remove, add)),
             TransportData::Tcp(data) => Some(data.translated_checksum(remove, add)),
-            TransportData::Generic(protocol, data) => {
-                // Translating from ICMPv6 to ICMPv4 should drop the header checksum.
-                let (remove, add) = match *protocol {
-                    TransportProtocolType::IPV6_ICMP => (remove, Checksum::new()),
-                    TransportProtocolType::ICMP => (Checksum::new(), add),
-                    _ => (remove, add),
-                };
-                match *protocol {
-                    TransportProtocolType::ICMP | TransportProtocolType::IPV6_ICMP => {
-                        let mut checksum = [0u8; 2];
-                        checksum.copy_from_slice(&data[2..4]);
-                        let checksum = u16::from_be_bytes(checksum);
-                        let mut checksum = Checksum::from_inverted(checksum);
-                        checksum.incremental_update(remove, add);
-                        checksum.fold();
-                        let checksum = checksum.value();
-                        Some((2, checksum))
-                    }
-                    _ => None,
+            TransportData::Generic(protocol, data) => match *protocol {
+                TransportProtocolType::ICMP | TransportProtocolType::IPV6_ICMP => {
+                    let mut checksum = [0u8; 2];
+                    checksum.copy_from_slice(&data[2..4]);
+                    let mut checksum = Checksum::from_inverted(u16::from_be_bytes(checksum));
+                    checksum.incremental_update(remove, add);
+                    checksum.fold();
+                    Some((2, checksum.value()))
                 }
-            }
+                _ => None,
+            },
         }
     }
 
