@@ -96,8 +96,8 @@ impl TransportProtocolType {
         )
     }
 
-    fn supports_checksum(&self) -> bool {
-        matches!(*self, Self::TCP | Self::UDP | Self::ICMP | Self::IPV6_ICMP)
+    fn needs_pseudoheader_checksum(&self) -> bool {
+        matches!(*self, Self::TCP | Self::UDP | Self::IPV6_ICMP)
     }
 }
 
@@ -400,7 +400,7 @@ impl<'a> Ipv4Packet<'a> {
             nat64_prefix,
         )?;
         dest[header_len..header_len + transport_data.len()].copy_from_slice(transport_data);
-        if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
+        if !self.is_fragment_shifted() && transport_protocol.needs_pseudoheader_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
             let add = Ipv6Packet::pseudo_checksum(dest, transport_protocol, transport_data_len);
             self.transport_data.write_translated_checksum(
@@ -449,7 +449,8 @@ impl<'a> Ipv4Packet<'a> {
             TransportProtocolType::IPV6_ICMP,
             icmp_data.len(),
         );
-        checksum.add_slice(icmp_data);
+        checksum.add_slice(&icmp_data[0..2]);
+        checksum.add_slice(&icmp_data[4..]);
         checksum.fold();
         icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
 
@@ -626,7 +627,7 @@ impl<'a> Ipv4Packet<'a> {
         add.add_slice(&src_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
@@ -671,7 +672,7 @@ impl<'a> Ipv4Packet<'a> {
         add.add_slice(&src_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
@@ -714,7 +715,7 @@ impl<'a> Ipv4Packet<'a> {
         add.add_slice(&dst_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
@@ -759,7 +760,7 @@ impl<'a> Ipv4Packet<'a> {
         add.add_slice(&dst_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
@@ -1038,7 +1039,7 @@ impl<'a> Ipv6Packet<'a> {
             transport_data_len,
         )?;
         dest[20..20 + transport_data.len()].copy_from_slice(transport_data);
-        if !self.is_fragment_shifted() && transport_protocol.supports_checksum() {
+        if !self.is_fragment_shifted() && transport_protocol.needs_pseudoheader_checksum() {
             let remove = Self::pseudo_checksum(self.data, transport_protocol, transport_data_len);
             let add = Ipv4Packet::pseudo_checksum(dest, transport_protocol, transport_data_len);
             self.transport_data.write_translated_checksum(
@@ -1054,7 +1055,8 @@ impl<'a> Ipv6Packet<'a> {
     fn write_icmp_translated(&self, dest: &mut [u8], icmp_len: usize) -> Result<usize, IpError> {
         let (ip_header, icmp_data) = dest[..20 + icmp_len].split_at_mut(20);
         let mut checksum = Checksum::new();
-        checksum.add_slice(icmp_data);
+        checksum.add_slice(&icmp_data[0..2]);
+        checksum.add_slice(&icmp_data[4..]);
         checksum.fold();
         icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
 
@@ -1172,7 +1174,7 @@ impl<'a> Ipv6Packet<'a> {
         add.add_slice(&src_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
@@ -1209,7 +1211,7 @@ impl<'a> Ipv6Packet<'a> {
         add.add_slice(&src_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
@@ -1242,7 +1244,7 @@ impl<'a> Ipv6Packet<'a> {
         add.add_slice(&dst_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
@@ -1279,7 +1281,7 @@ impl<'a> Ipv6Packet<'a> {
         add.add_slice(&dst_addr.octets());
 
         let transport_checksum = if !ip_packet.is_fragment_shifted()
-            && ip_packet.transport_protocol().supports_checksum()
+            && ip_packet.transport_protocol().needs_pseudoheader_checksum()
         {
             ip_packet
                 .transport_protocol_data()
