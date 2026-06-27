@@ -1,6 +1,6 @@
 use std::{error, fmt, io, ops::Range, task::Poll};
 
-use log::{debug, warn};
+use log::{debug, trace, warn};
 
 use crate::{ip::TcpFlags, logger::fmt_slice_hex};
 
@@ -62,7 +62,16 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             Err(err) => return Poll::Ready(Err(err.into())),
         };
         let transport_protocol = packet.transport_protocol_data();
-        if transport_protocol.protocol() != TransportProtocolType::TCP {
+        let fits_mtu = data_range.len() <= self.mtu;
+        if transport_protocol.protocol() != TransportProtocolType::TCP || fits_mtu {
+            // TODO GATEWAY: remove this debug code
+            if fits_mtu {
+                trace!(
+                    "TSO packet is {} bytes, fits MTU {} without splitting",
+                    data_range.len(),
+                    self.mtu
+                );
+            }
             return self.return_passthrough(data_range, dest);
         }
         let pseudo_checksum = if let Some(mut pseudo_checksum) = packet.pseudo_checksum() {
