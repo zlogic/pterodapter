@@ -233,18 +233,6 @@ impl Server {
                 None => RawRoutingAction::Drop,
             };
             let (raw_reply, raw_send_to_uplink) = raw_action.into_packets();
-            // TODO: remove this debug code
-            if log::log_enabled!(log::Level::Trace) {
-                if let Some(packet) = raw_reply {
-                    let packet = ip::IpPacket::from_data(&packet[L2_ETHERNET_HEADER_SIZE..])
-                        .expect("raw reply");
-                    trace!("Sending reply:\n{packet}")
-                }
-                if !raw_send_to_uplink.is_empty() {
-                    let packet = ip::IpPacket::from_data(raw_send_to_uplink).expect("send to vpn");
-                    trace!("Sending packet to VPN:\n{packet}")
-                }
-            }
             let (uplink_event, sent_raw_response, forwarded_raw_packet) = {
                 let send_slices_to_uplink = [uplink_reply, raw_send_to_uplink];
                 let mut process_uplink_events = pin!(uplink.process_events(&send_slices_to_uplink));
@@ -497,11 +485,7 @@ impl PacketFilter {
                     }
                 };
                 if let Err(err) = ip::IpPacket::update_src_addr(buf, vpn_real_ip) {
-                    // TODO GATEWAY: do not log packet once the root cause is known.
-                    warn!(
-                        "Failed to update packet source IP: {err}\n{}",
-                        fmt_slice_hex(buf)
-                    );
+                    warn!("Failed to update packet source IP: {err}",);
                     return Err("Failed to update packet source IP".into());
                 }
                 Ok(RawRoutingAction::Forward(buf))

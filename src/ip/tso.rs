@@ -2,7 +2,7 @@ use std::{error, fmt, io, ops::Range, task::Poll};
 
 use log::{debug, warn};
 
-use crate::{ip::TcpFlags, logger::fmt_slice_hex};
+use crate::ip::TcpFlags;
 
 use super::{Checksum, IpError, IpPacket, IpProtocolVersion, TransportProtocolType};
 
@@ -247,23 +247,6 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         dest[self.tcp_data_start..self.tcp_data_start + fragment_data.len()]
             .copy_from_slice(fragment_data);
 
-        // TODO GATEWAY: remove this debug code
-        {
-            let data = &dest[self.ip_header_start..self.tcp_data_start + fragment_data.len()];
-            let ip_packet = IpPacket::from_data(data).unwrap();
-            if !ip_packet.validate_ip_checksum() {
-                warn!(
-                    "IP packet has invalid header checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-            if !ip_packet.validate_transport_checksum() {
-                warn!(
-                    "IP packet has invalid transport data checksum after translation: {}",
-                    fmt_slice_hex(data)
-                );
-            }
-        }
         self.tcp_data_start + fragment_data.len()
     }
 
