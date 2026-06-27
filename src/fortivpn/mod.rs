@@ -827,7 +827,7 @@ impl PPPState {
         let packet_size = self.read_packet_size(buf);
         if self.bytes_consumed >= packet_size {
             self.bytes_consumed = 0;
-            if self.bytes_consumed > buf.len() {
+            if buf.len() < packet_size {
                 // Return empty packet if data was drained.
                 &[]
             } else {
