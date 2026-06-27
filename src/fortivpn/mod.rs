@@ -749,7 +749,7 @@ impl PPPState {
             );
             // Drain packet to prepare for reading the next one.
             let remaining_bytes = packet_size - self.bytes_consumed;
-            PPP_HEADER_SIZE..remaining_bytes
+            PPP_HEADER_SIZE..(PPP_HEADER_SIZE + remaining_bytes).min(buf.len())
         } else {
             self.bytes_consumed..packet_size
         };
