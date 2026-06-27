@@ -118,7 +118,7 @@ impl RawSocket {
                 Err(io::Error::last_os_error())
             }
         }) {
-            Ok(result) => return Poll::Ready(result),
+            Ok(result) => Poll::Ready(result),
             Err(_would_block) => Poll::Pending,
         }
     }
