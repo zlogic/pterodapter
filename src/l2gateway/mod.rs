@@ -15,7 +15,7 @@ use crate::{ip, pcap, uplink};
 mod rawsocket;
 
 // Maximum ethernet frame size, the ethernet header will be reused for PPP headers.
-const MAX_PACKET_SIZE: usize = 1500 + L2_ETHERNET_HEADER_SIZE;
+const MAX_PACKET_SIZE: usize = 1500;
 // Limit the packet size, any packet that exceeds this size will be rejected with an
 // ICMPv6 Packet Too Big message.
 // This prevents jumbo frames which will be rejected by the uplink.
