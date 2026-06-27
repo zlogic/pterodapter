@@ -63,24 +63,26 @@ impl RawSocket {
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, io::Error>> {
-        let mut guard = std::task::ready!(self.socket.poll_read_ready(cx))?;
-        match guard.try_io(|fd| {
-            let result = unsafe {
-                libc::recv(
-                    fd.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len(),
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            if result >= 0 {
-                Ok(result as usize)
-            } else {
-                Err(io::Error::last_os_error())
+        loop {
+            let mut guard = std::task::ready!(self.socket.poll_read_ready(cx))?;
+            match guard.try_io(|fd| {
+                let result = unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
             }
-        }) {
-            Ok(result) => Poll::Ready(result),
-            Err(_would_block) => Poll::Pending,
         }
     }
 
@@ -100,26 +102,28 @@ impl RawSocket {
             sll_halen: 6,
             sll_addr,
         };
-        let mut guard = std::task::ready!(self.socket.poll_write_ready(cx))?;
-        match guard.try_io(|fd| {
-            let result = unsafe {
-                libc::sendto(
-                    fd.as_raw_fd(),
-                    buf.as_ptr() as *const _,
-                    buf.len(),
-                    libc::MSG_DONTWAIT,
-                    std::ptr::from_ref(&srcaddr).cast(),
-                    std::mem::size_of_val(&srcaddr) as libc::socklen_t,
-                )
-            };
-            if result >= 0 {
-                Ok(result as usize)
-            } else {
-                Err(io::Error::last_os_error())
+        loop {
+            let mut guard = std::task::ready!(self.socket.poll_write_ready(cx))?;
+            match guard.try_io(|fd| {
+                let result = unsafe {
+                    libc::sendto(
+                        fd.as_raw_fd(),
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                        std::ptr::from_ref(&srcaddr).cast(),
+                        std::mem::size_of_val(&srcaddr) as libc::socklen_t,
+                    )
+                };
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
             }
-        }) {
-            Ok(result) => Poll::Ready(result),
-            Err(_would_block) => Poll::Pending,
         }
     }
 
