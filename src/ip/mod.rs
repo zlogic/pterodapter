@@ -1970,7 +1970,18 @@ struct TcpOption<'a> {
     data: &'a [u8],
 }
 
-impl TcpOption<'_> {}
+impl TcpOption<'_> {
+    fn kind(&self) -> TcpOptionKind {
+        self.kind
+    }
+
+    fn full_len(&self) -> usize {
+        match self.kind {
+            TcpOptionKind::END_OF_OPTIONS_LIST | TcpOptionKind::NO_OPERATION => 1,
+            _ => 2 + self.data.len(),
+        }
+    }
+}
 
 impl fmt::Display for TcpOption<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2154,7 +2165,14 @@ impl TcpOptionKind {
                     Ok(data[1] as usize)
                 }
             }
-            _ => Ok(data.len()),
+            // RFC 9292 MUST-68 states that all unknown options should have a defined length field.
+            _ => {
+                if data.len() < 2 {
+                    Err("Not enough bytes in unknown option".into())
+                } else {
+                    Ok(data.len().min(data[1] as usize))
+                }
+            }
         }
     }
 }
