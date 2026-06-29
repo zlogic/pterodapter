@@ -96,8 +96,6 @@ To send traffic to the VPN, simply add the container's IPv6 address as a route:
 ```shell
 CONTAINER_NAME=pterodapter
 CONTAINER_IP=$(container inspect $CONTAINER_NAME | jq -r '.[0].status.networks[0].ipv6Address|split("/").[0]')
-# Wait until network is up and running
-ping -oc 3 ${CONTAINER_IP}
 # Add a route for the NAT64 prefix
 sudo route add -inet6 64:ff9b::/64 ${CONTAINER_IP}%bridge100
 # Route DNS for gitlab.example.com to the container's DNS64 address
