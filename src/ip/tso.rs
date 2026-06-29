@@ -121,6 +121,8 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
                     ip_header[4..6].fill(0);
                 }
             }
+            // Adjust MSS if necessary.
+            self.adjust_mss(tcp_range.clone());
             // Reset TCP pseudoheader checksum to match TCP length 0.
             let tcp_header = &mut self.buf[tcp_range];
             tcp_header[16..18].fill(0);
@@ -218,40 +220,6 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             None
         };
 
-        // Adjust MSS if necessary.
-        let mss = {
-            let tcp_data = TransportDataTcp::from_data(tcp_header).unwrap();
-            let mut option_offset = 20;
-            let mut mss_checksum_update = None;
-            let max_mss = (self.mtu - super::MAX_TRANSLATED_IP_HEADER_LENGTH - 20) as u16;
-
-            for option in tcp_data.iter_options() {
-                let option = match option {
-                    Ok(option) => option,
-                    Err(err) => {
-                        warn!("Failed to iterate TCP option: {err}");
-                        break;
-                    }
-                };
-                if option.kind() != TcpOptionKind::MAXIMUM_SEGMENT_SIZE {
-                    option_offset += option.full_len();
-                } else {
-                    let mut mss = [0u8; 2];
-                    mss.copy_from_slice(option.data);
-                    let mss = u16::from_be_bytes(mss);
-                    if mss <= max_mss {
-                        break;
-                    }
-                    let new_mss = max_mss;
-                    tcp_header[option_offset + 2..option_offset + 4]
-                        .copy_from_slice(&new_mss.to_be_bytes());
-                    mss_checksum_update = Some((mss, new_mss));
-                    break;
-                }
-            }
-            mss_checksum_update
-        };
-
         // Update TCP checksum to match the packet length and other modified fields.
         let mut pseudo_checksum = {
             let mut checksum = [0u8; 2];
@@ -271,12 +239,6 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
                 Checksum::from_slice(&new_seq.to_be_bytes()),
             );
         }
-        if let Some((current_mss, new_mss)) = mss {
-            pseudo_checksum.incremental_update(
-                Checksum::from_slice(&current_mss.to_be_bytes()),
-                Checksum::from_slice(&new_mss.to_be_bytes()),
-            );
-        }
         if let Some(current_flags_checksum) = current_flags_checksum {
             pseudo_checksum.incremental_update(
                 current_flags_checksum,
@@ -293,6 +255,43 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
             .copy_from_slice(fragment_data);
 
         self.tcp_data_start + fragment_data.len()
+    }
+
+    fn adjust_mss(&mut self, tcp_range: Range<usize>) {
+        let tcp_header = &mut self.buf[tcp_range];
+        let tcp_data = match TransportDataTcp::from_data(tcp_header) {
+            Ok(tcp_data) => tcp_data,
+            Err(err) => {
+                warn!("Failed to adjust MSS: {err}");
+                return;
+            }
+        };
+
+        let mut option_offset = 20;
+        let max_mss = (self.mtu - super::MAX_TRANSLATED_IP_HEADER_LENGTH - 20) as u16;
+        for option in tcp_data.iter_options() {
+            let option = match option {
+                Ok(option) => option,
+                Err(err) => {
+                    warn!("Failed to iterate TCP option: {err}");
+                    return;
+                }
+            };
+            if option.kind() != TcpOptionKind::MAXIMUM_SEGMENT_SIZE {
+                option_offset += option.full_len();
+            } else {
+                let mut mss = [0u8; 2];
+                mss.copy_from_slice(option.data);
+                let mss = u16::from_be_bytes(mss);
+                if mss <= max_mss {
+                    return;
+                }
+                let new_mss = max_mss;
+                tcp_header[option_offset + 2..option_offset + 4]
+                    .copy_from_slice(&new_mss.to_be_bytes());
+                return;
+            }
+        }
     }
 
     fn init_fragments(
