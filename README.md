@@ -28,26 +28,19 @@ To run pterodapter locally, use WSL on Windows, or [add firewall redirection](do
 ## L2 Gateway mode
 
 The L2 Gateway mode is an experimental mode, acting as a regular L2 gateway/router.
+Instead of IKEv2, pterodapter listens to L2 ethernet frames matching the NAT64 prefix, and acts just like a regular network gateway router.
 
 For example it's possible to run pterodapter in a container with bridged networking, e.g. in [Apple container](https://github.com/apple/container).
-To send traffic to the VPN, simply add the container's IPv6 address as a route:
 
-```shell
-CONTAINER_NAME=pterodapter
-CONTAINER_IP=$(container inspect $CONTAINER_NAME | jq -r '.[0].networks[0].ipv6Address|split("/").[0]')
-# Add a route for the NAT64 prefix
-sudo route add -inet6 64:ff9b::/64 ${CONTAINER_IP}%bridge100
-# Route DNS for gitlab.example.com to the container's DNS64 address
-cat << EOF | sudo tee /etc/resolver/gitlab.example.com
-nameserver 64:ff9b::808:808
-nameserver 64:ff9b::808:404
-search_order 1
-EOF
-```
-
-macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
+⚠️ This mode has more overhead than IKEv2, as IP packets need a lot more processing, and have to pass between the host OS and the container VM. Linux applies [segmentation offloading](https://docs.kernel.org/networking/segmentation-offloads.html) such as GSO/GRO, which requires additional processing in software. Network speed is about 40% lower than IKEv2.
 
 # How to use it
+
+## Building the Docker container
+
+Run `docker build .` or a similar build command for `podman`, `container` or your build system.
+
+To create an image with Apple Silicon optimizations, run `container build --build-arg=RUSTFLAGS="-C target-cpu=apple-m4" .`
 
 ## L2 Gateway mode
 
@@ -93,6 +86,42 @@ setcap cap_net_raw,cap_net_admin+eip pterodapter
 ```
 
 ⚠️ It's best to run the `l2gateway` mode in a container, as a non-root user and with the minimum available permissions.
+
+In Apple container, add `--cap-add CAP_NET_RAW --cap-add CAP_NET_ADMIN` to ensure that pterodapter has the necessary permissions.
+
+### Routing traffic to the VPN
+
+To send traffic to the VPN, simply add the container's IPv6 address as a route:
+
+```shell
+CONTAINER_NAME=pterodapter
+CONTAINER_IP=$(container inspect $CONTAINER_NAME | jq -r '.[0].status.networks[0].ipv6Address|split("/").[0]')
+# Wait until network is up and running
+ping -oc 3 ${CONTAINER_IP}
+# Add a route for the NAT64 prefix
+sudo route add -inet6 64:ff9b::/64 ${CONTAINER_IP}%bridge100
+# Route DNS for gitlab.example.com to the container's DNS64 address
+cat << EOF | sudo tee /etc/resolver/gitlab.example.com
+nameserver 64:ff9b::808:808
+nameserver 64:ff9b::808:404
+search_order 1
+EOF
+```
+
+macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
+
+To authenticate with FortiVPN SSO, run the following script to open a browser, wait for a token and forward it into the pterodapter container:
+
+```shell
+CONTAINER_NAME=pterodapter
+CONTAINER_IP=$(container inspect $CONTAINER_NAME | jq -r '.[0].status.networks[0].ipv6Address|split("/").[0]')
+# Replace fortivpn.example.com with the actual server name
+open 'https://fortivpn.example.com/remote/saml/start?redirect=1'
+
+mkfifo .netcat
+nc -l 127.0.0.1 8020 < .netcat | nc $CONTAINER_IP 8020 > .netcat
+rm .netcat
+```
 
 ## IKEv2 VPN
 
