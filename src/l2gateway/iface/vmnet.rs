@@ -15,6 +15,7 @@ use crate::{
 pub struct Vmnet {
     iface: vmnet::Interface,
     packets_available: Arc<Notify>,
+    wait_for_packets: bool,
     mac: MacAddr,
 }
 
@@ -66,6 +67,7 @@ impl Vmnet {
         Ok(Vmnet {
             iface,
             packets_available,
+            wait_for_packets: false,
             mac,
         })
     }
@@ -109,19 +111,25 @@ impl super::Interface for Vmnet {
         buf: &mut [u8],
     ) -> std::task::Poll<Result<usize, InterfaceError>> {
         loop {
+            if self.wait_for_packets {
+                let res = pin!(self.packets_available.notified());
+                match res.poll(cx) {
+                    Poll::Ready(()) => {
+                        self.wait_for_packets = false;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
             let bytes_read = match self.iface.read(buf) {
                 Ok(bytes_read) => bytes_read,
-                Err(vmnet::Error::VmnetReadNothing) => 0,
+                Err(vmnet::Error::VmnetReadNothing) => {
+                    self.wait_for_packets = true;
+                    continue;
+                }
                 Err(err) => return Poll::Ready(Err(err.into())),
             };
-            if bytes_read > 0 {
-                return Poll::Ready(Ok(bytes_read));
-            }
-            let res = pin!(self.packets_available.notified());
-            match res.poll(cx) {
-                Poll::Ready(()) => {}
-                Poll::Pending => return Poll::Pending,
-            }
+            return Poll::Ready(Ok(bytes_read));
         }
     }
 
