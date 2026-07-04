@@ -14,7 +14,7 @@ pub(super) type L2Interface = rawsocket::RawSocket;
 pub(super) type L2Interface = vmnet::Vmnet;
 
 // TODO VMNET: enforce contract via this trait, add a new method
-pub(super) trait Interface {
+pub trait Interface {
     fn if_mac(&self) -> MacAddr;
 
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error>;

@@ -7,7 +7,7 @@ use crate::ip;
 
 use crate::l2gateway::{L2GatewayError, MacAddr};
 
-pub(super) struct RawSocket {
+pub struct RawSocket {
     socket: AsyncFd<std::os::unix::io::RawFd>,
     mac: MacAddr,
     if_index: libc::c_int,
@@ -52,79 +52,6 @@ impl RawSocket {
         }
 
         Ok(socket)
-    }
-
-    pub fn if_mac(&self) -> MacAddr {
-        self.mac
-    }
-
-    pub fn poll_recv(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        loop {
-            let mut guard = std::task::ready!(self.socket.poll_read_ready(cx))?;
-            match guard.try_io(|fd| {
-                let result = unsafe {
-                    libc::recv(
-                        fd.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut _,
-                        buf.len(),
-                        libc::MSG_DONTWAIT,
-                    )
-                };
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }) {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-
-    pub fn poll_send(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        let mut sll_addr = [0u8; 8];
-        sll_addr[0..6].copy_from_slice(self.mac.as_slice());
-        let srcaddr = libc::sockaddr_ll {
-            sll_family: libc::AF_PACKET as u16,
-            sll_protocol: libc::ETH_P_IPV6 as u16,
-            sll_ifindex: self.if_index,
-            sll_hatype: libc::ARPHRD_ETHER,
-            sll_pkttype: 0,
-            sll_halen: 6,
-            sll_addr,
-        };
-        loop {
-            let mut guard = std::task::ready!(self.socket.poll_write_ready(cx))?;
-            match guard.try_io(|fd| {
-                let result = unsafe {
-                    libc::sendto(
-                        fd.as_raw_fd(),
-                        buf.as_ptr() as *const _,
-                        buf.len(),
-                        libc::MSG_DONTWAIT,
-                        std::ptr::from_ref(&srcaddr).cast(),
-                        std::mem::size_of_val(&srcaddr) as libc::socklen_t,
-                    )
-                };
-                if result >= 0 {
-                    Ok(result as usize)
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }) {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
     }
 
     fn setsockopt<T>(
@@ -274,8 +201,14 @@ impl RawSocket {
             }
         }
     }
+}
 
-    pub fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
+impl super::Interface for RawSocket {
+    fn if_mac(&self) -> MacAddr {
+        self.mac
+    }
+
+    fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
         // See https://docs.kernel.org/networking/filter.html for more information.
         let mut filter_data = BpfFilter::new_nat64_filter(&self.mac, prefix);
         let filter = libc::sock_fprog {
@@ -283,6 +216,75 @@ impl RawSocket {
             filter: filter_data.program_data.as_mut_ptr().cast(),
         };
         self.setsockopt(libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, &filter)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        loop {
+            let mut guard = std::task::ready!(self.socket.poll_read_ready(cx))?;
+            match guard.try_io(|fd| {
+                let result = unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_send(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let mut sll_addr = [0u8; 8];
+        sll_addr[0..6].copy_from_slice(self.mac.as_slice());
+        let srcaddr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as u16,
+            sll_protocol: libc::ETH_P_IPV6 as u16,
+            sll_ifindex: self.if_index,
+            sll_hatype: libc::ARPHRD_ETHER,
+            sll_pkttype: 0,
+            sll_halen: 6,
+            sll_addr,
+        };
+        loop {
+            let mut guard = std::task::ready!(self.socket.poll_write_ready(cx))?;
+            match guard.try_io(|fd| {
+                let result = unsafe {
+                    libc::sendto(
+                        fd.as_raw_fd(),
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                        std::ptr::from_ref(&srcaddr).cast(),
+                        std::mem::size_of_val(&srcaddr) as libc::socklen_t,
+                    )
+                };
+                if result >= 0 {
+                    Ok(result as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
     }
 }
 
