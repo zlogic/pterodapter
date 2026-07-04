@@ -1,3 +1,5 @@
+mod iface;
+
 use std::net::IpAddr;
 use std::pin::pin;
 use std::task::Poll;
@@ -8,11 +10,10 @@ use std::{future, io};
 use log::{debug, info, trace, warn};
 use tokio::{runtime, sync::oneshot};
 
+use crate::l2gateway::iface::Interface as _;
 use crate::logger::fmt_slice_hex;
 use crate::uplink::UplinkService as _;
 use crate::{ip, pcap, uplink};
-
-mod rawsocket;
 
 // Maximum ethernet frame size, the ethernet header will be reused for PPP headers.
 const MAX_PACKET_SIZE: usize = 1500;
@@ -100,7 +101,7 @@ impl Server {
         } else {
             None
         };
-        let socket = match rawsocket::RawSocket::new(self.listen_interface.as_str(), mtu).await {
+        let socket = match iface::L2Interface::new(self.listen_interface.as_str(), mtu).await {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");

@@ -5,7 +5,7 @@ use tokio::io::unix::AsyncFd;
 
 use crate::ip;
 
-use super::{L2GatewayError, MacAddr};
+use crate::l2gateway::{L2GatewayError, MacAddr};
 
 pub(super) struct RawSocket {
     socket: AsyncFd<std::os::unix::io::RawFd>,

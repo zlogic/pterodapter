@@ -15,7 +15,6 @@ mod fortivpn;
 mod http;
 mod ikev2;
 mod ip;
-#[cfg(target_os = "linux")]
 mod l2gateway;
 mod logger;
 mod pcap;
@@ -24,7 +23,6 @@ mod uplink;
 
 enum Action {
     IkeV2(Ikev2Config),
-    #[cfg(target_os = "linux")]
     L2Gateway(L2GatewayConfig),
 }
 
@@ -74,7 +72,6 @@ struct Ikev2Config {
     pcap: Option<String>,
 }
 
-#[cfg(target_os = "linux")]
 struct L2GatewayConfig {
     l2gateway: l2gateway::Config,
     uplink: uplink::Config,
@@ -350,7 +347,6 @@ impl Args {
                         process::exit(2);
                     }
                 };
-                #[cfg(target_os = "linux")]
                 {
                     let l2gateway_config = l2gateway::Config {
                         listen_interface,
@@ -364,12 +360,6 @@ impl Args {
                         pcap: pcap_file,
                     });
                     Args { log_level, action }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    eprintln!("L2 Gateway is only supported in Linux");
-                    println!("{}", USAGE_INSTRUCTIONS);
-                    process::exit(2);
                 }
             }
         }
@@ -468,7 +458,6 @@ fn shutdown_listener(rt: &tokio::runtime::Handle) -> tokio::sync::oneshot::Recei
     shutdown_receiver
 }
 
-#[cfg(target_os = "linux")]
 fn serve_l2gateway(config: L2GatewayConfig) -> Result<(), i32> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -529,7 +518,6 @@ fn main() {
                 process::exit(exitcode);
             }
         }
-        #[cfg(target_os = "linux")]
         Action::L2Gateway(config) => {
             if let Err(exitcode) = serve_l2gateway(config) {
                 process::exit(exitcode)
