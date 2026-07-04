@@ -101,11 +101,11 @@ impl Server {
         } else {
             None
         };
-        let socket = match iface::L2Interface::new(self.listen_interface.as_str(), mtu).await {
+        let mut socket = match iface::L2Interface::new(self.listen_interface.as_str(), mtu).await {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
-                return Err(err);
+                return Err(err.into());
             }
         };
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
@@ -628,11 +628,14 @@ impl<'a> UplinkRoutingAction<'a> {
     }
 }
 
+pub type InterfaceError = iface::InterfaceError;
+
 #[derive(Debug)]
 pub enum L2GatewayError {
     Internal(&'static str),
     Ip(ip::IpError),
     Uplink(uplink::UplinkError),
+    RawInterface(iface::InterfaceError),
     Io(io::Error),
 }
 
@@ -642,6 +645,7 @@ impl fmt::Display for L2GatewayError {
             Self::Internal(msg) => f.write_str(msg),
             Self::Ip(e) => write!(f, "IP error: {e}"),
             Self::Uplink(e) => write!(f, "Uplink/VPN error: {e}"),
+            Self::RawInterface(e) => write!(f, "Raw interface error: {e}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
         }
     }
@@ -653,6 +657,7 @@ impl error::Error for L2GatewayError {
             Self::Internal(_msg) => None,
             Self::Ip(err) => Some(err),
             Self::Uplink(err) => Some(err),
+            Self::RawInterface(err) => Some(err),
             Self::Io(err) => Some(err),
         }
     }
@@ -673,6 +678,12 @@ impl From<ip::IpError> for L2GatewayError {
 impl From<uplink::UplinkError> for L2GatewayError {
     fn from(err: uplink::UplinkError) -> L2GatewayError {
         Self::Uplink(err)
+    }
+}
+
+impl From<iface::InterfaceError> for L2GatewayError {
+    fn from(err: iface::InterfaceError) -> L2GatewayError {
+        Self::RawInterface(err)
     }
 }
 

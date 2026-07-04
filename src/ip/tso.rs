@@ -1,8 +1,11 @@
-use std::{error, fmt, io, ops::Range, task::Poll};
+use std::{error, fmt, ops::Range, task::Poll};
 
 use log::{debug, warn};
 
-use crate::ip::TcpOptionKind;
+use crate::{
+    ip::TcpOptionKind,
+    l2gateway::{self},
+};
 
 use super::{
     Checksum, IpError, IpPacket, IpProtocolVersion, TcpFlags, TransportDataTcp,
@@ -49,7 +52,10 @@ impl<const B: usize, const F: usize> Refragmenter<B, F> {
         recv: R,
     ) -> Poll<Result<usize, TsoError>>
     where
-        R: FnOnce(&mut std::task::Context<'_>, &mut [u8]) -> Poll<Result<Range<usize>, io::Error>>,
+        R: FnOnce(
+            &mut std::task::Context<'_>,
+            &mut [u8],
+        ) -> Poll<Result<Range<usize>, l2gateway::InterfaceError>>,
     {
         if self.current_fragment < self.fragments_len {
             return Poll::Ready(Ok(self.next_fragment(dest)));
@@ -404,7 +410,7 @@ impl DataFragment {
 pub enum TsoError {
     Internal(&'static str),
     Ip(IpError),
-    Io(io::Error),
+    L2Interface(l2gateway::InterfaceError),
 }
 
 impl fmt::Display for TsoError {
@@ -412,7 +418,7 @@ impl fmt::Display for TsoError {
         match self {
             Self::Internal(msg) => f.write_str(msg),
             Self::Ip(e) => write!(f, "IP error: {e}"),
-            Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::L2Interface(e) => write!(f, "L2 interface error: {e}"),
         }
     }
 }
@@ -422,7 +428,7 @@ impl error::Error for TsoError {
         match self {
             Self::Internal(_msg) => None,
             Self::Ip(err) => Some(err),
-            Self::Io(err) => Some(err),
+            Self::L2Interface(err) => Some(err),
         }
     }
 }
@@ -433,9 +439,9 @@ impl From<super::IpError> for TsoError {
     }
 }
 
-impl From<io::Error> for TsoError {
-    fn from(err: io::Error) -> TsoError {
-        Self::Io(err)
+impl From<l2gateway::InterfaceError> for TsoError {
+    fn from(err: l2gateway::InterfaceError) -> TsoError {
+        Self::L2Interface(err)
     }
 }
 

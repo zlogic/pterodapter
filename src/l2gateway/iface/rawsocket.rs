@@ -1,3 +1,4 @@
+use std::{error, fmt};
 use std::{io, os::fd::AsRawFd, task::Poll};
 
 use log::{debug, info, warn};
@@ -5,7 +6,7 @@ use tokio::io::unix::AsyncFd;
 
 use crate::ip;
 
-use crate::l2gateway::{L2GatewayError, MacAddr};
+use crate::l2gateway::MacAddr;
 
 pub struct RawSocket {
     socket: AsyncFd<std::os::unix::io::RawFd>,
@@ -17,7 +18,7 @@ impl RawSocket {
     pub async fn new(
         listen_interface: &str,
         mtu: Option<usize>,
-    ) -> Result<RawSocket, L2GatewayError> {
+    ) -> Result<RawSocket, InterfaceError> {
         let protocol = u16::from_be(libc::ETH_P_IPV6 as u16) as libc::c_int;
         let socket = match unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol) } {
             0 => return Err(io::Error::last_os_error().into()),
@@ -92,7 +93,7 @@ impl RawSocket {
         self.setsockopt(level, name, &value)
     }
 
-    fn ifr_name(name: &str) -> Result<[libc::c_char; libc::IFNAMSIZ], L2GatewayError> {
+    fn ifr_name(name: &str) -> Result<[libc::c_char; libc::IFNAMSIZ], InterfaceError> {
         match std::ffi::CString::new(name) {
             Ok(name) => {
                 let name = name.as_bytes_with_nul();
@@ -116,7 +117,7 @@ impl RawSocket {
     fn iface_config(
         fd: std::os::unix::io::RawFd,
         name: &str,
-    ) -> Result<(MacAddr, libc::c_int), L2GatewayError> {
+    ) -> Result<(MacAddr, libc::c_int), InterfaceError> {
         let ifr_name = Self::ifr_name(name)?;
         let mut ifreq = libc::ifreq {
             ifr_name,
@@ -165,7 +166,7 @@ impl RawSocket {
         fd: std::os::unix::io::RawFd,
         name: &str,
         mtu: usize,
-    ) -> Result<bool, L2GatewayError> {
+    ) -> Result<bool, InterfaceError> {
         let ifr_name = Self::ifr_name(name)?;
         let mut ifreq = libc::ifreq {
             ifr_name,
@@ -219,10 +220,10 @@ impl super::Interface for RawSocket {
     }
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<Result<usize, io::Error>> {
+    ) -> Poll<Result<usize, InterfaceError>> {
         loop {
             let mut guard = std::task::ready!(self.socket.poll_read_ready(cx))?;
             match guard.try_io(|fd| {
@@ -240,17 +241,17 @@ impl super::Interface for RawSocket {
                     Err(io::Error::last_os_error())
                 }
             }) {
-                Ok(result) => return Poll::Ready(result),
+                Ok(result) => return Poll::Ready(Ok(result?)),
                 Err(_would_block) => continue,
             }
         }
     }
 
     fn poll_send(
-        &self,
+        &mut self,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
+    ) -> Poll<Result<usize, InterfaceError>> {
         let mut sll_addr = [0u8; 8];
         sll_addr[0..6].copy_from_slice(self.mac.as_slice());
         let srcaddr = libc::sockaddr_ll {
@@ -281,7 +282,7 @@ impl super::Interface for RawSocket {
                     Err(io::Error::last_os_error())
                 }
             }) {
-                Ok(result) => return Poll::Ready(result),
+                Ok(result) => return Poll::Ready(Ok(result?)),
                 Err(_would_block) => continue,
             }
         }
@@ -393,5 +394,41 @@ impl BpfFilter {
             BpfFilterOp::ret(0x00040000),
             BpfFilterOp::ret(0),
         ])
+    }
+}
+
+#[derive(Debug)]
+pub enum InterfaceError {
+    Internal(&'static str),
+    Io(io::Error),
+}
+
+impl fmt::Display for InterfaceError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Internal(msg) => f.write_str(msg),
+            Self::Io(e) => write!(f, "IO error: {e}"),
+        }
+    }
+}
+
+impl error::Error for InterfaceError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Internal(_msg) => None,
+            Self::Io(err) => Some(err),
+        }
+    }
+}
+
+impl From<&'static str> for InterfaceError {
+    fn from(msg: &'static str) -> InterfaceError {
+        Self::Internal(msg)
+    }
+}
+
+impl From<io::Error> for InterfaceError {
+    fn from(err: io::Error) -> InterfaceError {
+        Self::Io(err)
     }
 }

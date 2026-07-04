@@ -11,7 +11,12 @@ mod vmnet;
 #[cfg(target_os = "linux")]
 pub(super) type L2Interface = rawsocket::RawSocket;
 #[cfg(target_os = "macos")]
-pub(super) type L2Interface = vmnet::Vmnet;
+pub type L2Interface = vmnet::Vmnet;
+
+#[cfg(target_os = "linux")]
+pub(super) type InterfaceError = rawsocket::InterfaceError;
+#[cfg(target_os = "macos")]
+pub(super) type InterfaceError = vmnet::InterfaceError;
 
 // TODO VMNET: enforce contract via this trait, add a new method
 pub trait Interface {
@@ -20,14 +25,14 @@ pub trait Interface {
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error>;
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<Result<usize, io::Error>>;
+    ) -> Poll<Result<usize, InterfaceError>>;
 
     fn poll_send(
-        &self,
+        &mut self,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>>;
+    ) -> Poll<Result<usize, InterfaceError>>;
 }
