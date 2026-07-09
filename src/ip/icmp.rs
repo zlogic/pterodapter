@@ -450,7 +450,7 @@ impl IcmpV4Message<'_> {
                         } else {
                             debug!(
                                 "Failed to translate ICMPv4 parameter problem pointer {} to IPv6",
-                                &self[4]
+                                self[4]
                             );
                             return Ok(IcmpTranslationAction::Drop);
                         };
@@ -465,7 +465,7 @@ impl IcmpV4Message<'_> {
                         } else {
                             debug!(
                                 "Failed to translate ICMPv4 parameter problem pointer {} to IPv6",
-                                &self[4]
+                                self[4]
                             );
                             return Ok(IcmpTranslationAction::Drop);
                         };
@@ -725,7 +725,7 @@ impl IcmpV6Message<'_> {
                         } else {
                             debug!(
                                 "Failed to translate ICMPv6 parameter problem pointer {} to IPv4",
-                                &self[4]
+                                self[4]
                             );
                             return Ok(IcmpTranslationAction::Drop);
                         };

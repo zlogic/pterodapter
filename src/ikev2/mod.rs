@@ -740,7 +740,7 @@ impl Sessions {
 
     fn update_all_split_routes(&mut self, ip_addresses: &[IpAddr]) {
         self.split_route_registry.update_local_ts(ip_addresses);
-        for (_, session) in self.sessions.iter_mut() {
+        for session in self.sessions.values_mut() {
             session.expand_local_ts(&self.split_route_registry.local_ts)
         }
     }
