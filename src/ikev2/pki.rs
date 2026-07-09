@@ -105,8 +105,8 @@ impl PkiProcessing {
 
         let client_cert = x509_cert::Certificate::from_der(client_cert_der)?;
         let san = client_cert
-            .tbs_certificate
-            .filter::<pkix::SubjectAltName>()
+            .tbs_certificate()
+            .filter_extensions::<pkix::SubjectAltName>()
             .filter_map(|res| match res {
                 Ok((_, pkix::SubjectAltName(subject_alternative_name))) => subject_alternative_name
                     .iter()
@@ -128,9 +128,8 @@ impl PkiProcessing {
             })
             .next();
         let subject_cn = client_cert
-            .tbs_certificate
-            .subject
-            .0
+            .tbs_certificate()
+            .subject()
             .iter()
             .filter_map(|entry| format!("{entry}").into())
             .next();
@@ -139,16 +138,16 @@ impl PkiProcessing {
         } else if let Some(subject_cn) = subject_cn {
             subject_cn
         } else {
-            client_cert.tbs_certificate.subject.to_string()
+            client_cert.tbs_certificate().subject().to_string()
         };
         let serial = client_cert
-            .tbs_certificate
-            .serial_number
+            .tbs_certificate()
+            .serial_number()
             .as_bytes()
             .to_vec();
         let public_key = client_cert
-            .tbs_certificate
-            .subject_public_key_info
+            .tbs_certificate()
+            .subject_public_key_info()
             .subject_public_key
             .raw_bytes()
             .to_vec();

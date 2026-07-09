@@ -16,7 +16,7 @@ rand = { version = "0.10", default-features = false, features = ["std", "std_rng
 aws-lc-rs = { version = "*", default-features = false }
 rustls-webpki = { version = "*", default-features = false, features = ["aws-lc-rs"] }
 base64 = { version = "*", default-features = false, features = ["std"] }
-x509-cert = { version = "0.2", default-features = false }
+x509-cert = { version = "0.3", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "*", default-features = false }
