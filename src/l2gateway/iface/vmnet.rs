@@ -1,7 +1,7 @@
-use std::{error, fmt, pin::pin, sync::Arc, task::Poll};
+use std::{error, fmt, task::Poll};
 
 use log::{trace, warn};
-use tokio::sync::Notify;
+use tokio::sync::mpsc;
 use vmnet::{
     mode::{Mode, Shared},
     parameters::Parameter,
@@ -14,7 +14,7 @@ use crate::{
 
 pub struct Vmnet {
     iface: vmnet::Interface,
-    packets_available: Arc<Notify>,
+    packets_available: mpsc::Receiver<Option<u64>>,
     wait_for_packets: bool,
     mac: MacAddr,
 }
@@ -52,12 +52,16 @@ impl Vmnet {
             return Err("No MAC address assigned".into());
         };
 
-        let packets_available = Arc::new(Notify::new());
-        packets_available.notify_one();
-        let notify_packets = packets_available.clone();
+        let (notify_packets, packets_available) = mpsc::channel(1);
         if let Err(err) =
-            iface.set_event_callback(vmnet::Events::PACKETS_AVAILABLE, move |_events, _params| {
-                notify_packets.notify_one();
+            iface.set_event_callback(vmnet::Events::PACKETS_AVAILABLE, move |_events, params| {
+                let packets_available =
+                    match params.get(vmnet::parameters::ParameterKind::EstimatedPacketsAvailable) {
+                        Some(Parameter::EstimatedPacketsAvailable(count)) => Some(count),
+                        _ => None,
+                    };
+                // TODO VMNET: deregister callback on error?
+                let _ = notify_packets.blocking_send(packets_available);
             })
         {
             warn!("Failed to enable notifications for new packets: {err}");
@@ -112,9 +116,11 @@ impl super::Interface for Vmnet {
     ) -> std::task::Poll<Result<usize, InterfaceError>> {
         loop {
             if self.wait_for_packets {
-                let res = pin!(self.packets_available.notified());
-                match res.poll(cx) {
-                    Poll::Ready(()) => {
+                match self.packets_available.poll_recv(cx) {
+                    Poll::Ready(packets_available) => {
+                        if let Some(packets_available) = packets_available.flatten() {
+                            trace!("{packets_available} packets available");
+                        }
                         self.wait_for_packets = false;
                         continue;
                     }
