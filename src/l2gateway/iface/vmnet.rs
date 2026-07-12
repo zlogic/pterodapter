@@ -119,9 +119,16 @@ impl Vmnet {
 
         let iface = unsafe { sys::vmnet_start_interface(interface_desc, queue, raw_block) };
         if iface.is_null() {
+            unsafe {
+                sys::xpc_release(interface_desc);
+            }
             return Err("vmnet_start_interface returned null".into());
         }
-        let res = match rx.recv().await {
+        let res = rx.recv().await;
+        unsafe {
+            sys::xpc_release(interface_desc);
+        }
+        let res = match res {
             Some(res) => res?,
             None => return Err("vmnet_start_interface result channel closed".into()),
         };
@@ -261,9 +268,10 @@ impl super::Interface for Vmnet {
             match self.packets_available.poll_recv(cx) {
                 Poll::Ready(Some(packets_available)) => {
                     if let Some(packets_available) = packets_available
-                        && packets_available > 0 {
-                            self.wait_for_packets = false;
-                        }
+                        && packets_available > 0
+                    {
+                        self.wait_for_packets = false;
+                    }
                     if self.wait_for_packets {
                         continue;
                     }

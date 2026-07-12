@@ -33,6 +33,7 @@ fn bindgen_vmnet() {
         .allowlist_var("VMNET_SUCCESS")
         .allowlist_var("VMNET_INTERFACE_PACKETS_AVAILABLE")
         .allowlist_function("xpc_dictionary_create")
+        .allowlist_function("xpc_release")
         .allowlist_function("xpc_uint64_create")
         .allowlist_function("xpc_bool_create")
         .allowlist_function("xpc_dictionary_get_string")
