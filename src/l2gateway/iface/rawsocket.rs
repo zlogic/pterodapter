@@ -287,6 +287,10 @@ impl super::Interface for RawSocket {
             }
         }
     }
+
+    async fn terminate(&mut self) -> Result<(), InterfaceError> {
+        Ok(())
+    }
 }
 
 #[repr(C)]

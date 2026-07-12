@@ -21,6 +21,8 @@ mod pcap;
 mod ppp;
 mod uplink;
 
+#[cfg(target_os = "macos")]
+#[allow(dead_code, non_camel_case_types)]
 mod sys {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }

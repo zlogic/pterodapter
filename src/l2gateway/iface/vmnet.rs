@@ -19,6 +19,7 @@ struct Interface {
     queue: sys::dispatch_queue_t,
     iface: sys::interface_ref,
     mac: MacAddr,
+    terminated: bool,
 }
 
 impl Vmnet {
@@ -38,7 +39,9 @@ impl Vmnet {
                 } else {
                     None
                 };
-                let _ = notify_packets.blocking_send(packets_available).unwrap();
+                if notify_packets.blocking_send(packets_available).is_err() {
+                    trace!("Packets available channel closed for vmnet callback");
+                }
             },
         );
         let raw_callback = block2::RcBlock::into_raw(callback).cast();
@@ -55,7 +58,6 @@ impl Vmnet {
             return Err("Failed to enable notifications for new packets".into());
         }
 
-        println!("Mac is {}", iface.mac);
         Ok(Vmnet {
             iface,
             packets_available,
@@ -68,7 +70,7 @@ impl Vmnet {
             let mut dict = vec![
                 (
                     sys::vmnet_operation_mode_key,
-                    sys::xpc_uint64_create(sys::VMNET_SHARED_MODE as u64),
+                    sys::xpc_uint64_create(sys::VMNET_HOST_MODE as u64),
                 ),
                 (
                     sys::vmnet_allocate_mac_address_key,
@@ -113,7 +115,7 @@ impl Vmnet {
                 let _ = tx.blocking_send(res);
             },
         );
-        let raw_block = std::ptr::from_mut(&mut block.copy()).cast();
+        let raw_block = block2::RcBlock::into_raw(block).cast();
 
         let iface = unsafe { sys::vmnet_start_interface(interface_desc, queue, raw_block) };
         if iface.is_null() {
@@ -125,7 +127,12 @@ impl Vmnet {
         };
         if let Some(mac_addr) = res.mac {
             let mac = Self::parse_mac_from_string(&mac_addr)?;
-            Ok(Interface { queue, iface, mac })
+            Ok(Interface {
+                queue,
+                iface,
+                mac,
+                terminated: false,
+            })
         } else {
             Err("No MAC address assigned".into())
         }
@@ -203,6 +210,33 @@ impl Interface {
             Ok(pktdesc.vm_pkt_size)
         }
     }
+
+    async fn terminate(&mut self) -> Result<(), InterfaceError> {
+        if self.terminated {
+            return Ok(());
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        let block = block2::RcBlock::new(move |status: sys::vmnet_return_t| {
+            let _ = tx.blocking_send(status);
+        });
+        let raw_block = block2::RcBlock::into_raw(block).cast();
+        self.terminated = true;
+        let status = unsafe { sys::vmnet_stop_interface(self.iface, self.queue, raw_block) };
+        if status != sys::VMNET_SUCCESS {
+            warn!("Failed to stop vmnet interface: {status}");
+            return Err("Failed to stop vmnet interface".into());
+        }
+        if let Some(status) = rx.recv().await {
+            if status != sys::VMNET_SUCCESS {
+                warn!("Got error in vmnet_stop_interface callback: {status}");
+                Err("Got error in vmnet_stop_interface callback".into())
+            } else {
+                Ok(())
+            }
+        } else {
+            Err("Closed feedback channel of vmnet_stop_interface".into())
+        }
+    }
 }
 
 impl super::Interface for Vmnet {
@@ -220,14 +254,16 @@ impl super::Interface for Vmnet {
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<Result<usize, InterfaceError>> {
+        if self.iface.terminated {
+            return Poll::Pending;
+        }
         loop {
             match self.packets_available.poll_recv(cx) {
                 Poll::Ready(Some(packets_available)) => {
-                    if let Some(packets_available) = packets_available {
-                        if packets_available > 0 {
+                    if let Some(packets_available) = packets_available
+                        && packets_available > 0 {
                             self.wait_for_packets = false;
                         }
-                    }
                     if self.wait_for_packets {
                         continue;
                     }
@@ -248,7 +284,7 @@ impl super::Interface for Vmnet {
                     self.wait_for_packets = true;
                     continue;
                 }
-                Err(err) => return Poll::Ready(Err(err.into())),
+                Err(err) => return Poll::Ready(Err(err)),
             };
             return Poll::Ready(Ok(bytes_read));
         }
@@ -259,8 +295,16 @@ impl super::Interface for Vmnet {
         _cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, InterfaceError>> {
-        // vmnet can only perform blocking writes.
-        Poll::Ready(Ok(self.iface.write(buf)?))
+        if !self.iface.terminated {
+            // vmnet can only perform blocking writes.
+            Poll::Ready(Ok(self.iface.write(buf)?))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    async fn terminate(&mut self) -> Result<(), super::InterfaceError> {
+        self.iface.terminate().await
     }
 }
 

@@ -35,4 +35,6 @@ pub trait Interface {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, InterfaceError>>;
+
+    async fn terminate(&mut self) -> Result<(), InterfaceError>;
 }

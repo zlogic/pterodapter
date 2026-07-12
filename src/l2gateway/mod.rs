@@ -105,7 +105,7 @@ impl Server {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
-                return Err(err.into());
+                return Err(err);
             }
         };
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
@@ -181,6 +181,9 @@ impl Server {
                 shutdown = true;
                 if let Err(err) = uplink.terminate().await {
                     warn!("Failed to terminate uplink/VPN client connection: {err}");
+                }
+                if let Err(err) = socket.terminate().await {
+                    warn!("Failed to terminate raw socket client service: {err}");
                 }
             }
             let uplink_action = match uplink_event {
