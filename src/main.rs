@@ -21,6 +21,10 @@ mod pcap;
 mod ppp;
 mod uplink;
 
+mod sys {
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
+
 enum Action {
     IkeV2(Ikev2Config),
     L2Gateway(L2GatewayConfig),

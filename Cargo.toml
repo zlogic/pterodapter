@@ -1,6 +1,6 @@
 [package]
 name = "pterodapter"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 authors = ["Dmitrii Zolotukhin <contact@3d-net.nl>"]
 repository = "https://github.com/zlogic/pterodapter"
@@ -21,9 +21,11 @@ x509-cert = { version = "0.3", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "*", default-features = false }
 
-# TODO VMNET: replace with a smaller custom implementation
 [target.'cfg(target_os = "macos")'.dependencies]
-vmnet = "0"
+block2 = { version = "0.6", default-features = false, features = ["alloc"] }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+bindgen = { version = "0.72", default-features = false, features = ["runtime"] }
 
 [profile.release]
 strip = true

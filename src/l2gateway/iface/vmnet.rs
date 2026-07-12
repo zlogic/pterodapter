@@ -1,82 +1,137 @@
-use std::{error, fmt, task::Poll};
+use std::{error, ffi::CStr, fmt, task::Poll};
 
-use log::{trace, warn};
+use log::{debug, trace, warn};
 use tokio::sync::mpsc;
-use vmnet::{
-    mode::{Mode, Shared},
-    parameters::Parameter,
-};
 
 use crate::{
     ip,
     l2gateway::{L2GatewayError, MacAddr},
+    sys,
 };
 
 pub struct Vmnet {
-    iface: vmnet::Interface,
+    iface: Interface,
     packets_available: mpsc::Receiver<Option<u64>>,
     wait_for_packets: bool,
+}
+
+struct Interface {
+    queue: sys::dispatch_queue_t,
+    iface: sys::interface_ref,
     mac: MacAddr,
 }
 
 impl Vmnet {
     pub async fn new(_listen_interface: &str, mtu: Option<usize>) -> Result<Self, L2GatewayError> {
-        let shared_mode = Shared {
-            subnet_options: None,
-            nat66_prefix: None,
-            mtu: mtu.map(|mtu| mtu as u64),
-        };
-
-        let options = vmnet::Options {
-            allocate_mac_address: Some(true),
-            enable_checksum_offload: Some(false),
-            enable_tso: Some(false),
-            interface_id: None,
-            enable_isolation: None,
-        };
-
-        let mut iface = match vmnet::Interface::new(Mode::Shared(shared_mode), options) {
-            Ok(iface) => iface,
-            Err(err) => {
-                warn!("Failed to init vmnet interface: {err}");
-                return Err("Failed to init vmnet interface".into());
-            }
-        };
-
-        let params = iface.parameters();
-        let mac = if let Some(Parameter::MACAddress(mac_addr)) =
-            params.get(vmnet::parameters::ParameterKind::MACAddress)
-        {
-            Self::parse_mac_from_string(&mac_addr)?
-        } else {
-            return Err("No MAC address assigned".into());
-        };
+        let iface = Self::start_interface(mtu).await?;
 
         let (notify_packets, packets_available) = mpsc::channel(1);
-        if let Err(err) =
-            iface.set_event_callback(vmnet::Events::PACKETS_AVAILABLE, move |_events, params| {
-                let packets_available =
-                    match params.get(vmnet::parameters::ParameterKind::EstimatedPacketsAvailable) {
-                        Some(Parameter::EstimatedPacketsAvailable(count)) => Some(count),
-                        _ => None,
-                    };
-                // TODO VMNET: deregister callback on error?
-                let _ = notify_packets.blocking_send(packets_available);
-            })
-        {
-            warn!("Failed to enable notifications for new packets: {err}");
-            return Err("Failed to enable notifications for new packets".into());
+        let callback = block2::RcBlock::new(
+            move |status: sys::interface_event_t, params: sys::xpc_object_t| {
+                let packets_available = if status == sys::VMNET_INTERFACE_PACKETS_AVAILABLE {
+                    unsafe {
+                        Some(sys::xpc_dictionary_get_uint64(
+                            params,
+                            sys::vmnet_estimated_packets_available_key,
+                        ))
+                    }
+                } else {
+                    None
+                };
+                let _ = notify_packets.blocking_send(packets_available).unwrap();
+            },
+        );
+        let raw_callback = block2::RcBlock::into_raw(callback).cast();
+        let res = unsafe {
+            sys::vmnet_interface_set_event_callback(
+                iface.iface,
+                sys::VMNET_INTERFACE_PACKETS_AVAILABLE,
+                iface.queue,
+                raw_callback,
+            )
         };
+        if res != sys::VMNET_SUCCESS {
+            warn!("Failed to enable notifications for new packets: {res}");
+            return Err("Failed to enable notifications for new packets".into());
+        }
 
+        println!("Mac is {}", iface.mac);
         Ok(Vmnet {
             iface,
             packets_available,
             wait_for_packets: false,
-            mac,
         })
     }
 
-    fn parse_mac_from_string(mac: &str) -> Result<MacAddr, L2GatewayError> {
+    async fn start_interface(mtu: Option<usize>) -> Result<Interface, InterfaceError> {
+        let interface_desc = unsafe {
+            let mut dict = vec![
+                (
+                    sys::vmnet_operation_mode_key,
+                    sys::xpc_uint64_create(sys::VMNET_SHARED_MODE as u64),
+                ),
+                (
+                    sys::vmnet_allocate_mac_address_key,
+                    sys::xpc_bool_create(true),
+                ),
+                (
+                    sys::vmnet_enable_checksum_offload_key,
+                    sys::xpc_bool_create(false),
+                ),
+                (sys::vmnet_enable_tso_key, sys::xpc_bool_create(false)),
+            ];
+            if let Some(mtu) = mtu {
+                dict.push((sys::vmnet_mtu_key, sys::xpc_uint64_create(mtu as u64)));
+            }
+            let keys = dict.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+            let values = dict.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+            sys::xpc_dictionary_create(keys.as_ptr(), values.as_ptr(), keys.len().min(values.len()))
+        };
+        let queue = unsafe { sys::dispatch_get_global_queue(0, 0) };
+
+        struct VmnetParams {
+            mac: Option<String>,
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        let block = block2::RcBlock::new(
+            move |status: sys::vmnet_return_t, params: sys::xpc_object_t| {
+                let res = if status == sys::VMNET_SUCCESS {
+                    let mac = unsafe {
+                        let ptr =
+                            sys::xpc_dictionary_get_string(params, sys::vmnet_mac_address_key);
+                        if ptr.is_null() {
+                            None
+                        } else {
+                            CStr::from_ptr(ptr).to_str().ok().map(|str| str.to_owned())
+                        }
+                    };
+                    Ok(VmnetParams { mac })
+                } else {
+                    warn!("Failed vmnet_start_interface call, error code is {status}");
+                    Err("Failed vmnet_start_interface call")
+                };
+                let _ = tx.blocking_send(res);
+            },
+        );
+        let raw_block = std::ptr::from_mut(&mut block.copy()).cast();
+
+        let iface = unsafe { sys::vmnet_start_interface(interface_desc, queue, raw_block) };
+        if iface.is_null() {
+            return Err("vmnet_start_interface returned null".into());
+        }
+        let res = match rx.recv().await {
+            Some(res) => res?,
+            None => return Err("vmnet_start_interface result channel closed".into()),
+        };
+        if let Some(mac_addr) = res.mac {
+            let mac = Self::parse_mac_from_string(&mac_addr)?;
+            Ok(Interface { queue, iface, mac })
+        } else {
+            Err("No MAC address assigned".into())
+        }
+    }
+
+    fn parse_mac_from_string(mac: &str) -> Result<MacAddr, InterfaceError> {
         trace!("MAC address is {mac}");
         let mut mac_bytes = [0u8; 6];
         for (i, hex_part) in mac.split(':').enumerate() {
@@ -96,12 +151,63 @@ impl Vmnet {
         Ok(MacAddr::from_data(&mac_bytes))
     }
 
-    // TODO VMNET: implement shutdown code
+    // TODO VMNET: implement shutdown code based on the vmnetrs project
+}
+
+impl Interface {
+    fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, InterfaceError> {
+        let mut iov = sys::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let mut pktdesc = sys::vmpktdesc {
+            vm_pkt_size: iov.iov_len,
+            vm_pkt_iov: &mut iov,
+            vm_pkt_iovcnt: 1,
+            vm_flags: 0,
+        };
+        let mut pktcnt = 1;
+
+        let status = unsafe { sys::vmnet_read(self.iface, &mut pktdesc, &mut pktcnt) };
+        // TODO VMNET: use enum for status codes
+        if status != sys::VMNET_SUCCESS {
+            warn!("Failed to read from vmnet: {status}");
+            Err("Failed to read from vmnet".into())
+        } else if pktcnt == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(pktdesc.vm_pkt_size))
+        }
+    }
+
+    fn write(&mut self, buf: &[u8]) -> Result<usize, InterfaceError> {
+        let mut iov = sys::iovec {
+            iov_base: buf.as_ptr() as *mut _,
+            iov_len: buf.len(),
+        };
+        let mut pktdesc = sys::vmpktdesc {
+            vm_pkt_size: iov.iov_len,
+            vm_pkt_iov: &mut iov,
+            vm_pkt_iovcnt: 1,
+            vm_flags: 0,
+        };
+        let mut pktcnt = 1;
+
+        let status = unsafe { sys::vmnet_write(self.iface, &mut pktdesc, &mut pktcnt) };
+        if status != sys::VMNET_SUCCESS {
+            warn!("Failed to write to vmnet: {status}");
+            Err("Failed to write to vmnet".into())
+        } else if pktcnt == 0 {
+            Err("No packtets written".into())
+        } else {
+            Ok(pktdesc.vm_pkt_size)
+        }
+    }
 }
 
 impl super::Interface for Vmnet {
     fn if_mac(&self) -> crate::l2gateway::MacAddr {
-        self.mac
+        self.iface.mac
     }
 
     fn set_nat64_filter(&self, _prefix: &ip::Nat64Prefix) -> Result<(), std::io::Error> {
@@ -115,21 +221,30 @@ impl super::Interface for Vmnet {
         buf: &mut [u8],
     ) -> std::task::Poll<Result<usize, InterfaceError>> {
         loop {
-            if self.wait_for_packets {
-                match self.packets_available.poll_recv(cx) {
-                    Poll::Ready(packets_available) => {
-                        if let Some(packets_available) = packets_available.flatten() {
-                            trace!("{packets_available} packets available");
+            match self.packets_available.poll_recv(cx) {
+                Poll::Ready(Some(packets_available)) => {
+                    if let Some(packets_available) = packets_available {
+                        if packets_available > 0 {
+                            self.wait_for_packets = false;
                         }
-                        self.wait_for_packets = false;
+                    }
+                    if self.wait_for_packets {
                         continue;
                     }
-                    Poll::Pending => return Poll::Pending,
+                }
+                Poll::Ready(None) => {
+                    debug!("Packets available channel closed");
+                    return Poll::Pending;
+                }
+                Poll::Pending => {
+                    if self.wait_for_packets {
+                        return Poll::Pending;
+                    }
                 }
             }
             let bytes_read = match self.iface.read(buf) {
-                Ok(bytes_read) => bytes_read,
-                Err(vmnet::Error::VmnetReadNothing) => {
+                Ok(Some(bytes_read)) => bytes_read,
+                Ok(None) => {
                     self.wait_for_packets = true;
                     continue;
                 }
@@ -152,14 +267,12 @@ impl super::Interface for Vmnet {
 #[derive(Debug)]
 pub enum InterfaceError {
     Internal(&'static str),
-    Vmnet(vmnet::Error),
 }
 
 impl fmt::Display for InterfaceError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Internal(msg) => f.write_str(msg),
-            Self::Vmnet(e) => write!(f, "vmnet error: {e}"),
         }
     }
 }
@@ -168,7 +281,6 @@ impl error::Error for InterfaceError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Internal(_msg) => None,
-            Self::Vmnet(err) => Some(err),
         }
     }
 }
@@ -176,11 +288,5 @@ impl error::Error for InterfaceError {
 impl From<&'static str> for InterfaceError {
     fn from(msg: &'static str) -> InterfaceError {
         Self::Internal(msg)
-    }
-}
-
-impl From<vmnet::Error> for InterfaceError {
-    fn from(err: vmnet::Error) -> InterfaceError {
-        Self::Vmnet(err)
     }
 }
