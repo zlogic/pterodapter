@@ -1445,7 +1445,7 @@ impl<'a> Iterator for NdpOptionIter<'a> {
     type Item = Result<NdpOption<'a>, IpError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.data.len() == 0 {
+        if self.data.is_empty() {
             return None;
         }
         if self.data.len() < 2 {

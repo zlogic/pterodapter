@@ -3,11 +3,7 @@ use std::{error, ffi::CStr, fmt, task::Poll};
 use log::{debug, trace, warn};
 use tokio::sync::mpsc;
 
-use crate::{
-    ip,
-    l2gateway::{L2GatewayError, MacAddr},
-    sys,
-};
+use crate::{ip, l2gateway::MacAddr, sys};
 
 pub struct Vmnet {
     iface: Interface,
@@ -23,7 +19,7 @@ struct Interface {
 }
 
 impl Vmnet {
-    pub async fn new(_listen_interface: &str, mtu: Option<usize>) -> Result<Self, L2GatewayError> {
+    pub async fn new(_listen_interface: &str, mtu: Option<usize>) -> Result<Self, InterfaceError> {
         let iface = Self::start_interface(mtu).await?;
 
         let (notify_packets, packets_available) = mpsc::channel(1);

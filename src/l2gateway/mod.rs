@@ -105,7 +105,7 @@ impl Server {
             Ok(socket) => socket,
             Err(err) => {
                 log::error!("Failed to open raw IPv6 socket: {err}");
-                return Err(err);
+                return Err(err.into());
             }
         };
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
