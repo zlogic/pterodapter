@@ -17,6 +17,8 @@ fn bindgen_vmnet() {
     let bindings = bindgen::Builder::default()
         .header_contents("include.h", "#include <vmnet/vmnet.h>\n")
         .clang_arg(format!("-isysroot{}", sysroot.trim()))
+        .no_copy(".*")
+        .derive_copy(false)
         .allowlist_function("vmnet_start_interface")
         .allowlist_function("vmnet_stop_interface")
         .allowlist_function("vmnet_interface_set_event_callback")

@@ -53,7 +53,8 @@ impl Vmnet {
                 raw_callback,
             )
         };
-        if res != sys::VMNET_SUCCESS {
+        let res = VmnetResponse::from_code(res);
+        if res.is_err() {
             warn!("Failed to enable notifications for new packets: {res}");
             return Err("Failed to enable notifications for new packets".into());
         }
@@ -97,7 +98,8 @@ impl Vmnet {
         let (tx, mut rx) = mpsc::channel(1);
         let block = block2::RcBlock::new(
             move |status: sys::vmnet_return_t, params: sys::xpc_object_t| {
-                let res = if status == sys::VMNET_SUCCESS {
+                let status = VmnetResponse::from_code(status);
+                let res = if status.is_ok() {
                     let mac = unsafe {
                         let ptr =
                             sys::xpc_dictionary_get_string(params, sys::vmnet_mac_address_key);
@@ -164,8 +166,6 @@ impl Vmnet {
         }
         Ok(MacAddr::from_data(&mac_bytes))
     }
-
-    // TODO VMNET: implement shutdown code based on the vmnetrs project
 }
 
 impl Interface {
@@ -183,8 +183,8 @@ impl Interface {
         let mut pktcnt = 1;
 
         let status = unsafe { sys::vmnet_read(self.iface, &mut pktdesc, &mut pktcnt) };
-        // TODO VMNET: use enum for status codes
-        if status != sys::VMNET_SUCCESS {
+        let status = VmnetResponse(status);
+        if status.is_err() {
             warn!("Failed to read from vmnet: {status}");
             Err("Failed to read from vmnet".into())
         } else if pktcnt == 0 {
@@ -208,7 +208,8 @@ impl Interface {
         let mut pktcnt = 1;
 
         let status = unsafe { sys::vmnet_write(self.iface, &mut pktdesc, &mut pktcnt) };
-        if status != sys::VMNET_SUCCESS {
+        let status = VmnetResponse(status);
+        if status.is_err() {
             warn!("Failed to write to vmnet: {status}");
             Err("Failed to write to vmnet".into())
         } else if pktcnt == 0 {
@@ -229,12 +230,14 @@ impl Interface {
         let raw_block = block2::RcBlock::into_raw(block).cast();
         self.terminated = true;
         let status = unsafe { sys::vmnet_stop_interface(self.iface, self.queue, raw_block) };
-        if status != sys::VMNET_SUCCESS {
+        let status = VmnetResponse(status);
+        if status.is_err() {
             warn!("Failed to stop vmnet interface: {status}");
             return Err("Failed to stop vmnet interface".into());
         }
         if let Some(status) = rx.recv().await {
-            if status != sys::VMNET_SUCCESS {
+            let status = VmnetResponse(status);
+            if status.is_err() {
                 warn!("Got error in vmnet_stop_interface callback: {status}");
                 Err("Got error in vmnet_stop_interface callback".into())
             } else {
@@ -313,6 +316,56 @@ impl super::Interface for Vmnet {
 
     async fn terminate(&mut self) -> Result<(), super::InterfaceError> {
         self.iface.terminate().await
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VmnetResponse(sys::vmnet_return_t);
+
+impl VmnetResponse {
+    const VMNET_SUCCESS: VmnetResponse = VmnetResponse(1000);
+    const VMNET_FAILURE: VmnetResponse = VmnetResponse(1001);
+    const VMNET_MEM_FAILURE: VmnetResponse = VmnetResponse(1002);
+    const VMNET_INVALID_ARGUMENT: VmnetResponse = VmnetResponse(1003);
+    const VMNET_SETUP_INCOMPLETE: VmnetResponse = VmnetResponse(1004);
+    const VMNET_INVALID_ACCESS: VmnetResponse = VmnetResponse(1005);
+    const VMNET_PACKET_TOO_BIG: VmnetResponse = VmnetResponse(1006);
+    const VMNET_BUFFER_EXHAUSTED: VmnetResponse = VmnetResponse(1007);
+    const VMNET_TOO_MANY_PACKETS: VmnetResponse = VmnetResponse(1008);
+    const VMNET_SHARING_SERVICE_BUSY: VmnetResponse = VmnetResponse(1009);
+    const VMNET_NOT_AUTHORIZED: VmnetResponse = VmnetResponse(1010);
+
+    fn from_code(code: sys::vmnet_return_t) -> VmnetResponse {
+        VmnetResponse(code)
+    }
+
+    fn is_ok(&self) -> bool {
+        *self == Self::VMNET_SUCCESS
+    }
+
+    fn is_err(&self) -> bool {
+        *self != Self::VMNET_SUCCESS
+    }
+}
+
+impl fmt::Display for VmnetResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::VMNET_SUCCESS => write!(f, "Success"),
+            Self::VMNET_FAILURE => write!(f, "Failure"),
+            Self::VMNET_MEM_FAILURE => write!(f, "Out of memory"),
+            Self::VMNET_INVALID_ARGUMENT => write!(f, "Invalid argument"),
+            Self::VMNET_SETUP_INCOMPLETE => write!(f, "Incomplete interface setup"),
+            Self::VMNET_INVALID_ACCESS => write!(f, "Insufficient permissions"),
+            Self::VMNET_PACKET_TOO_BIG => write!(f, "Packet size exceeding MTU"),
+            Self::VMNET_BUFFER_EXHAUSTED => write!(f, "Buffers temporarily exhausted"),
+            Self::VMNET_TOO_MANY_PACKETS => {
+                write!(f, "Number of packets exceeding the system limit")
+            }
+            Self::VMNET_SHARING_SERVICE_BUSY => write!(f, "Sharing service busy"),
+            Self::VMNET_NOT_AUTHORIZED => write!(f, "Not authorized"),
+            _ => write!(f, "Unknown vmnet response {}", self.0),
+        }
     }
 }
 
