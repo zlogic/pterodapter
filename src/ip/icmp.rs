@@ -130,6 +130,11 @@ enum IcmpV6 {
     PacketTooBig,
     TimeExceeded(IcmpV6TimeExceeded),
     ParameterProblem(IcmpV6ParameterProblem),
+    RouterSolicitation,
+    RouterAdvertisement,
+    NeighborSolicitation,
+    NeighborAdvertisement,
+    Redirect,
     Unknown(u8, u8),
 }
 
@@ -142,13 +147,25 @@ impl IcmpV6 {
             IcmpV6::PacketTooBig => 2,
             IcmpV6::TimeExceeded(_) => 3,
             IcmpV6::ParameterProblem(_) => 4,
+            IcmpV6::RouterSolicitation => 133,
+            IcmpV6::RouterAdvertisement => 134,
+            IcmpV6::NeighborSolicitation => 135,
+            IcmpV6::NeighborAdvertisement => 136,
+            IcmpV6::Redirect => 137,
             IcmpV6::Unknown(code, _) => code,
         }
     }
 
     fn code_u8(&self) -> u8 {
         match *self {
-            IcmpV6::EchoRequest | IcmpV6::EchoReply | IcmpV6::PacketTooBig => 0,
+            IcmpV6::EchoRequest
+            | IcmpV6::EchoReply
+            | IcmpV6::PacketTooBig
+            | IcmpV6::RouterSolicitation
+            | IcmpV6::RouterAdvertisement
+            | IcmpV6::NeighborSolicitation
+            | IcmpV6::NeighborAdvertisement
+            | IcmpV6::Redirect => 0,
             IcmpV6::DestinationUnreachable(IcmpV6DestinationUnreachable(code))
             | IcmpV6::TimeExceeded(IcmpV6TimeExceeded(code))
             | IcmpV6::ParameterProblem(IcmpV6ParameterProblem(code))
@@ -212,6 +229,11 @@ impl fmt::Display for IcmpV6 {
             IcmpV6::PacketTooBig => write!(f, "Packet Too Big"),
             IcmpV6::TimeExceeded(code) => write!(f, "Time Exceeded ({code})"),
             IcmpV6::ParameterProblem(code) => write!(f, "Parameter Problem ({code})"),
+            IcmpV6::RouterSolicitation => write!(f, "Router Solicitation"),
+            IcmpV6::RouterAdvertisement => write!(f, "Router Advertisement"),
+            IcmpV6::NeighborSolicitation => write!(f, "Neighbor Solicitation"),
+            IcmpV6::NeighborAdvertisement => write!(f, "Neighbor Advertisement"),
+            IcmpV6::Redirect => write!(f, "Redirect"),
             IcmpV6::Unknown(t, code) => write!(f, "{t} ({code})"),
         }
     }
@@ -509,7 +531,7 @@ impl fmt::Display for IcmpV4Message<'_> {
 
 pub(super) struct IcmpV6Message<'a>(&'a [u8]);
 
-impl IcmpV6Message<'_> {
+impl<'a> IcmpV6Message<'a> {
     pub fn from_data(data: &[u8]) -> Result<IcmpV6Message<'_>, IpError> {
         if data.len() >= 4 {
             Ok(IcmpV6Message(data))
@@ -528,6 +550,11 @@ impl IcmpV6Message<'_> {
             4 => IcmpV6::ParameterProblem(IcmpV6ParameterProblem(icmp_code)),
             128 => IcmpV6::EchoRequest,
             129 => IcmpV6::EchoReply,
+            133 => IcmpV6::RouterSolicitation,
+            134 => IcmpV6::RouterAdvertisement,
+            135 => IcmpV6::NeighborSolicitation,
+            136 => IcmpV6::NeighborAdvertisement,
+            137 => IcmpV6::Redirect,
             icmp_type => IcmpV6::Unknown(icmp_type, icmp_code),
         }
     }
@@ -572,6 +599,10 @@ impl IcmpV6Message<'_> {
             .write_icmp_translated(dest, length)
             .map_err(|err| warn!("Failed to translate Echo original header: {err}"))
             .ok()
+    }
+
+    fn ndp_message(&self) -> Result<NdpMessage<'a>, IpError> {
+        NdpMessage::from_data(self.icmp_type(), self.0)
     }
 
     pub fn has_original_datagram(&self) -> bool {
@@ -746,6 +777,14 @@ impl IcmpV6Message<'_> {
                     }
                 }
             }
+            IcmpV6::RouterSolicitation
+            | IcmpV6::RouterAdvertisement
+            | IcmpV6::NeighborSolicitation
+            | IcmpV6::NeighborAdvertisement
+            | IcmpV6::Redirect => {
+                debug!("Dropping NDP ICMPv6 request {self}");
+                Ok(IcmpTranslationAction::Drop)
+            }
             IcmpV6::Unknown(_, _) => {
                 debug!("Dropping unsupported ICMPv6 request {self}");
                 Ok(IcmpTranslationAction::Drop)
@@ -764,13 +803,12 @@ impl Deref for IcmpV6Message<'_> {
 
 impl fmt::Display for IcmpV6Message<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ICMPv6 {} C={:#06X}: {}",
-            self.icmp_type(),
-            self.checksum(),
-            fmt_slice_hex(self)
-        )
+        write!(f, "ICMPv6 {} C={:#06X}", self.icmp_type(), self.checksum())?;
+        match self.ndp_message() {
+            Err(err) => writeln!(f, ":{} (failed to decode NDP: {err})", fmt_slice_hex(self)),
+            Ok(NdpMessage::None) => write!(f, ": {}", fmt_slice_hex(self)),
+            Ok(message) => write!(f, ": {message}"),
+        }
     }
 }
 
@@ -907,6 +945,527 @@ impl IcmpErrorResponse {
                 Ok(start_offset + icmp_data.len())
             }
         }
+    }
+}
+
+enum NdpMessage<'a> {
+    RouterSolicitation(NdpMessageRouterSolicitation<'a>),
+    RouterAdvertisement(NdpMessageRouterAdvertisement<'a>),
+    NeighborSolicication(NdpMessageNeighborSolicitation<'a>),
+    NeighborAdvertisement(NdpMessageNeighborAdvertisement<'a>),
+    Redirect(NdpMessageRedirect<'a>),
+    None,
+}
+
+impl<'a> NdpMessage<'a> {
+    fn from_data(icmp_type: IcmpV6, data: &'a [u8]) -> Result<NdpMessage<'a>, IpError> {
+        match icmp_type {
+            IcmpV6::RouterSolicitation => Ok(NdpMessage::RouterSolicitation(
+                NdpMessageRouterSolicitation::from_data(data)?,
+            )),
+            IcmpV6::RouterAdvertisement => Ok(NdpMessage::RouterAdvertisement(
+                NdpMessageRouterAdvertisement::from_data(data)?,
+            )),
+            IcmpV6::NeighborSolicitation => Ok(NdpMessage::NeighborSolicication(
+                NdpMessageNeighborSolicitation::from_data(data)?,
+            )),
+            IcmpV6::NeighborAdvertisement => Ok(NdpMessage::NeighborAdvertisement(
+                NdpMessageNeighborAdvertisement::from_data(data)?,
+            )),
+            IcmpV6::Redirect => Ok(NdpMessage::Redirect(NdpMessageRedirect::from_data(data)?)),
+            _ => Ok(NdpMessage::None),
+        }
+    }
+
+    fn iter_options(&self) -> NdpOptionIter<'a> {
+        match self {
+            NdpMessage::RouterSolicitation(msg) => msg.iter_options(),
+            NdpMessage::RouterAdvertisement(msg) => msg.iter_options(),
+            NdpMessage::NeighborSolicication(msg) => msg.iter_options(),
+            NdpMessage::NeighborAdvertisement(msg) => msg.iter_options(),
+            NdpMessage::Redirect(msg) => msg.iter_options(),
+            NdpMessage::None => NdpOptionIter { data: &[] },
+        }
+    }
+}
+
+impl fmt::Display for NdpMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NdpMessage::RouterSolicitation(_) => {}
+            NdpMessage::RouterAdvertisement(msg) => {
+                write!(f, "H={} ", msg.cur_hop_limit())?;
+                if msg.managed_address_bit() {
+                    write!(f, "M")?;
+                }
+                if msg.other_configuration_bit() {
+                    write!(f, "O")?;
+                }
+                if msg.managed_address_bit() || msg.other_configuration_bit() {
+                    write!(f, " ")?;
+                }
+                write!(
+                    f,
+                    "RL={} RT={} RTT={}",
+                    msg.router_lifetime(),
+                    msg.reachable_time(),
+                    msg.retransmission_timer()
+                )?
+            }
+            NdpMessage::NeighborSolicication(msg) => write!(f, "T={}", msg.target_address())?,
+            NdpMessage::NeighborAdvertisement(msg) => {
+                if msg.router_bit() {
+                    write!(f, "R")?;
+                }
+                if msg.solicited_bit() {
+                    write!(f, "S")?;
+                }
+                if msg.override_bit() {
+                    write!(f, "O")?;
+                }
+                if msg.router_bit() || msg.solicited_bit() || msg.override_bit() {
+                    write!(f, " ")?;
+                }
+                write!(f, "T={}", msg.target_address())?
+            }
+            NdpMessage::Redirect(msg) => write!(
+                f,
+                "T={} D={}",
+                msg.target_address(),
+                msg.destination_address()
+            )?,
+            NdpMessage::None => {}
+        }
+        self.iter_options()
+            .enumerate()
+            .try_for_each(|(i, option)| match option {
+                Ok(option) => {
+                    if i == 0 {
+                        write!(f, "; {option}")
+                    } else {
+                        write!(f, ",{option}")
+                    }
+                }
+                Err(err) => {
+                    if i == 0 {
+                        write!(f, "; {err}")
+                    } else {
+                        write!(f, ",{err}")
+                    }
+                }
+            })
+    }
+}
+
+struct NdpMessageRouterSolicitation<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpMessageRouterSolicitation<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpMessageRouterSolicitation<'a>, IpError> {
+        if data.len() >= 8 {
+            Ok(NdpMessageRouterSolicitation { data: &data[4..] })
+        } else {
+            Err("Not enough data for NDP Router Solicitation message".into())
+        }
+    }
+
+    fn iter_options(&self) -> NdpOptionIter<'a> {
+        NdpOptionIter {
+            data: &self.data[4..],
+        }
+    }
+}
+
+struct NdpMessageRouterAdvertisement<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpMessageRouterAdvertisement<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpMessageRouterAdvertisement<'a>, IpError> {
+        if data.len() >= 16 {
+            Ok(NdpMessageRouterAdvertisement { data: &data[4..] })
+        } else {
+            Err("Not enough data for NDP Router Advertisement message".into())
+        }
+    }
+
+    fn cur_hop_limit(&self) -> u8 {
+        self.data[0]
+    }
+
+    fn managed_address_bit(&self) -> bool {
+        const M_MASK: u8 = 1 << 7;
+        self.data[1] & M_MASK == M_MASK
+    }
+
+    fn other_configuration_bit(&self) -> bool {
+        const O_MASK: u8 = 1 << 6;
+        self.data[1] & O_MASK == O_MASK
+    }
+
+    fn router_lifetime(&self) -> u16 {
+        let mut reachable_time = [0u8; 2];
+        reachable_time.copy_from_slice(&self.data[2..4]);
+        u16::from_be_bytes(reachable_time)
+    }
+
+    fn reachable_time(&self) -> u32 {
+        let mut reachable_time = [0u8; 4];
+        reachable_time.copy_from_slice(&self.data[4..8]);
+        u32::from_be_bytes(reachable_time)
+    }
+
+    fn retransmission_timer(&self) -> u32 {
+        let mut retransmission_timer = [0u8; 4];
+        retransmission_timer.copy_from_slice(&self.data[8..12]);
+        u32::from_be_bytes(retransmission_timer)
+    }
+
+    fn iter_options(&self) -> NdpOptionIter<'a> {
+        NdpOptionIter {
+            data: &self.data[12..],
+        }
+    }
+}
+
+struct NdpMessageNeighborSolicitation<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpMessageNeighborSolicitation<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpMessageNeighborSolicitation<'a>, IpError> {
+        if data.len() >= 24 {
+            Ok(NdpMessageNeighborSolicitation { data: &data[4..] })
+        } else {
+            Err("Not enough data for NDP Neighbor Solicitation message".into())
+        }
+    }
+
+    fn target_address(&self) -> Ipv6Addr {
+        let mut target_address = [0u8; 16];
+        target_address.copy_from_slice(&self.data[4..20]);
+        Ipv6Addr::from_octets(target_address)
+    }
+
+    fn iter_options(&self) -> NdpOptionIter<'a> {
+        NdpOptionIter {
+            data: &self.data[20..],
+        }
+    }
+}
+
+struct NdpMessageNeighborAdvertisement<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpMessageNeighborAdvertisement<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpMessageNeighborAdvertisement<'a>, IpError> {
+        if data.len() >= 24 {
+            Ok(NdpMessageNeighborAdvertisement { data: &data[4..] })
+        } else {
+            Err("Not enough data for NDP Neighbor Advertisement message".into())
+        }
+    }
+
+    fn router_bit(&self) -> bool {
+        const R_MASK: u8 = 1 << 7;
+        self.data[0] & R_MASK == R_MASK
+    }
+
+    fn solicited_bit(&self) -> bool {
+        const S_MASK: u8 = 1 << 6;
+        self.data[0] & S_MASK == S_MASK
+    }
+
+    fn override_bit(&self) -> bool {
+        const O_MASK: u8 = 1 << 5;
+        self.data[0] & O_MASK == O_MASK
+    }
+
+    fn target_address(&self) -> Ipv6Addr {
+        let mut target_address = [0u8; 16];
+        target_address.copy_from_slice(&self.data[4..20]);
+        Ipv6Addr::from_octets(target_address)
+    }
+
+    fn iter_options(&self) -> NdpOptionIter<'a> {
+        NdpOptionIter {
+            data: &self.data[20..],
+        }
+    }
+}
+
+struct NdpMessageRedirect<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpMessageRedirect<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpMessageRedirect<'a>, IpError> {
+        if data.len() >= 40 {
+            Ok(NdpMessageRedirect { data: &data[4..] })
+        } else {
+            Err("Not enough data for NDP Redirect message".into())
+        }
+    }
+
+    fn target_address(&self) -> Ipv6Addr {
+        let mut target_address = [0u8; 16];
+        target_address.copy_from_slice(&self.data[4..20]);
+        Ipv6Addr::from_octets(target_address)
+    }
+
+    fn destination_address(&self) -> Ipv6Addr {
+        let mut target_address = [0u8; 16];
+        target_address.copy_from_slice(&self.data[20..36]);
+        Ipv6Addr::from_octets(target_address)
+    }
+
+    fn iter_options(&self) -> NdpOptionIter<'a> {
+        NdpOptionIter {
+            data: &self.data[36..],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NdpOptionType(u8);
+
+impl NdpOptionType {
+    pub const SOURCE_LINK_LAYER: NdpOptionType = NdpOptionType(1);
+    pub const TARGET_LINK_LAYER: NdpOptionType = NdpOptionType(2);
+    pub const PREFIX_INFORMATION: NdpOptionType = NdpOptionType(3);
+    pub const REDIRECTED_HEADER: NdpOptionType = NdpOptionType(4);
+    pub const MTU: NdpOptionType = NdpOptionType(5);
+
+    pub const NONCE: NdpOptionType = NdpOptionType(14);
+
+    fn from_u8(value: u8) -> NdpOptionType {
+        NdpOptionType(value)
+    }
+}
+
+impl fmt::Display for NdpOptionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::SOURCE_LINK_LAYER => write!(f, "Source Link-Layer Address"),
+            Self::TARGET_LINK_LAYER => write!(f, "Target Link-Layer Address"),
+            Self::PREFIX_INFORMATION => write!(f, "Prefix Information"),
+            Self::REDIRECTED_HEADER => write!(f, "Redirected Header"),
+            Self::MTU => write!(f, "MTU"),
+            Self::NONCE => write!(f, "Nonce"),
+            _ => write!(f, "Unknown NDP option type {}", self.0),
+        }
+    }
+}
+
+struct NdpOptionLinkLayerAddress<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpOptionLinkLayerAddress<'a> {
+    fn from_data(data: &'a [u8]) -> NdpOptionLinkLayerAddress<'a> {
+        NdpOptionLinkLayerAddress { data }
+    }
+
+    fn value(&self) -> &[u8] {
+        self.data
+    }
+}
+
+struct NdpOptionPrefixInformation<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpOptionPrefixInformation<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpOptionPrefixInformation<'a>, IpError> {
+        if data.len() != 32 - 2 {
+            Err("Prefix Information option should be exactly 32 bytes".into())
+        } else {
+            Ok(NdpOptionPrefixInformation { data })
+        }
+    }
+
+    fn prefix_length(&self) -> u8 {
+        self.data[0]
+    }
+
+    fn link_bit(&self) -> bool {
+        const L_MASK: u8 = 1 << 7;
+        self.data[1] & L_MASK == L_MASK
+    }
+
+    fn autonomous_bit(&self) -> bool {
+        const A_MASK: u8 = 1 << 6;
+        self.data[1] & A_MASK == A_MASK
+    }
+
+    fn valid_lifetime(&self) -> u32 {
+        let mut valid_lifetime = [0u8; 4];
+        valid_lifetime.copy_from_slice(&self.data[2..6]);
+        u32::from_be_bytes(valid_lifetime)
+    }
+
+    fn preferred_lifetime(&self) -> u32 {
+        let mut reserved_lifetime = [0u8; 4];
+        reserved_lifetime.copy_from_slice(&self.data[6..10]);
+        u32::from_be_bytes(reserved_lifetime)
+    }
+
+    fn prefix(&self) -> Ipv6Addr {
+        let mut prefix = [0u8; 16];
+        prefix.copy_from_slice(&self.data[14..30]);
+        Ipv6Addr::from_octets(prefix)
+    }
+}
+
+struct NdpOptionRedirectedHeader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpOptionRedirectedHeader<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpOptionRedirectedHeader<'a>, IpError> {
+        if data.len() < 6 {
+            Err("Not enough data in Redirected Header option".into())
+        } else {
+            Ok(NdpOptionRedirectedHeader { data })
+        }
+    }
+
+    fn original_packet(&self) -> &'a [u8] {
+        &self.data[6..]
+    }
+}
+
+struct NdpOptionMtu<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpOptionMtu<'a> {
+    fn from_data(data: &'a [u8]) -> Result<NdpOptionMtu<'a>, IpError> {
+        if data.len() != 8 - 2 {
+            Err("MTU option should be exactly 8 bytes".into())
+        } else {
+            Ok(NdpOptionMtu { data })
+        }
+    }
+
+    fn mtu(&self) -> u32 {
+        let mut mtu = [0u8; 4];
+        mtu.copy_from_slice(&self.data[2..6]);
+        u32::from_be_bytes(mtu)
+    }
+}
+
+struct NdpOptionUnknown<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpOptionUnknown<'a> {
+    fn from_data(data: &'a [u8]) -> NdpOptionUnknown<'a> {
+        NdpOptionUnknown { data }
+    }
+}
+
+enum NdpOption<'a> {
+    SourceLinkLayer(NdpOptionLinkLayerAddress<'a>),
+    TargetLinkLayer(NdpOptionLinkLayerAddress<'a>),
+    PrefixInformation(NdpOptionPrefixInformation<'a>),
+    RedirectedHeader(NdpOptionRedirectedHeader<'a>),
+    Mtu(NdpOptionMtu<'a>),
+    Unknown(NdpOptionUnknown<'a>),
+}
+
+impl NdpOption<'_> {
+    fn from_data(option_type: NdpOptionType, data: &[u8]) -> Result<NdpOption<'_>, IpError> {
+        match option_type {
+            NdpOptionType::SOURCE_LINK_LAYER => Ok(NdpOption::SourceLinkLayer(
+                NdpOptionLinkLayerAddress::from_data(data),
+            )),
+            NdpOptionType::TARGET_LINK_LAYER => Ok(NdpOption::TargetLinkLayer(
+                NdpOptionLinkLayerAddress::from_data(data),
+            )),
+            NdpOptionType::PREFIX_INFORMATION => Ok(NdpOption::PrefixInformation(
+                NdpOptionPrefixInformation::from_data(data)?,
+            )),
+            NdpOptionType::REDIRECTED_HEADER => Ok(NdpOption::RedirectedHeader(
+                NdpOptionRedirectedHeader::from_data(data)?,
+            )),
+            NdpOptionType::MTU => Ok(NdpOption::Mtu(NdpOptionMtu::from_data(data)?)),
+            _ => Ok(NdpOption::Unknown(NdpOptionUnknown::from_data(data))),
+        }
+    }
+}
+
+impl fmt::Display for NdpOption<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NdpOption::SourceLinkLayer(o) => write!(f, "SL={}", fmt_slice_hex(o.value())),
+            NdpOption::TargetLinkLayer(o) => write!(f, "TL={}", fmt_slice_hex(o.value())),
+            NdpOption::PrefixInformation(o) => {
+                write!(f, "PI=[")?;
+                if o.link_bit() {
+                    write!(f, "L")?;
+                }
+                if o.autonomous_bit() {
+                    write!(f, "A")?;
+                }
+                if o.link_bit() || o.autonomous_bit() {
+                    write!(
+                        f,
+                        " VL={}, PL={}, P={}/{}]",
+                        o.valid_lifetime(),
+                        o.preferred_lifetime(),
+                        o.prefix(),
+                        o.prefix_length()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "VL={}, PL={}, P={}/{}]",
+                        o.valid_lifetime(),
+                        o.preferred_lifetime(),
+                        o.prefix(),
+                        o.prefix_length()
+                    )
+                }
+            }
+            NdpOption::RedirectedHeader(o) => write!(f, "R={}", fmt_slice_hex(o.original_packet())),
+            NdpOption::Mtu(o) => write!(f, "MTU={}", o.mtu()),
+            NdpOption::Unknown(o) => write!(f, "Unknown={}", fmt_slice_hex(o.data)),
+        }
+    }
+}
+
+struct NdpOptionIter<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Iterator for NdpOptionIter<'a> {
+    type Item = Result<NdpOption<'a>, IpError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data.len() == 0 {
+            return None;
+        }
+        if self.data.len() < 2 {
+            warn!("Not enough data in ICMP NDP option");
+            return None;
+        }
+        let option_type = NdpOptionType::from_u8(self.data[0]);
+        let payload_length = self.data[1] as usize * 8;
+        if payload_length == 0 {
+            // RFC 4861 Section 4.6 states that 0-length payloads are invalid.
+            warn!("Invalid 0 length of ICMPv6 NDP option");
+            return None;
+        }
+        if self.data.len() < payload_length {
+            warn!("Payload overflow");
+            return None;
+        }
+        let ndp_option = NdpOption::from_data(option_type, &self.data[2..payload_length]);
+        self.data = &self.data[payload_length..];
+        Some(ndp_option)
     }
 }
 
