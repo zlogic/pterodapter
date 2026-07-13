@@ -362,11 +362,6 @@ impl fmt::Display for EtherType {
     }
 }
 
-enum L2TrafficMode {
-    Nat,
-    DirectVmnet,
-}
-
 struct PacketFilter {
     network: ip::Network,
     nat64_prefix: ip::Nat64Prefix,
@@ -375,7 +370,6 @@ struct PacketFilter {
     client_mac: Option<MacAddr>,
     vpn_real_ip: Option<IpAddr>,
     server_mac: MacAddr,
-    l2_traffic_mode: L2TrafficMode,
 }
 
 impl PacketFilter {
@@ -385,11 +379,6 @@ impl PacketFilter {
         server_mac: MacAddr,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> PacketFilter {
-        let l2_traffic_mode = if cfg!(target_os = "macos") {
-            L2TrafficMode::DirectVmnet
-        } else {
-            L2TrafficMode::Nat
-        };
         PacketFilter {
             network,
             nat64_prefix,
@@ -398,7 +387,6 @@ impl PacketFilter {
             client_mac: None,
             vpn_real_ip: None,
             server_mac,
-            l2_traffic_mode,
         }
     }
 
@@ -414,7 +402,7 @@ impl PacketFilter {
         self.network.set_icmp_unreachable(configuration.is_none());
         self.vpn_real_ip = internal_addr;
 
-        if matches!(self.l2_traffic_mode, L2TrafficMode::Nat) {
+        if !iface::L2Interface::use_ndp() {
             let client_ip = match client_ip {
                 Some(IpAddr::V6(client_ip)) => Some(client_ip),
                 Some(IpAddr::V4(_)) | None => None,
@@ -447,9 +435,10 @@ impl PacketFilter {
             );
             return Err("Received unsupported EtherType".into());
         }
-        let drop_frame = match self.l2_traffic_mode {
-            L2TrafficMode::Nat => dst_mac != self.server_mac,
-            L2TrafficMode::DirectVmnet => dst_mac != self.server_mac && !dst_mac.is_multicast(),
+        let drop_frame = if iface::L2Interface::use_ndp() {
+            dst_mac != self.server_mac && !dst_mac.is_multicast()
+        } else {
+            dst_mac != self.server_mac
         };
         if drop_frame {
             debug!(
@@ -492,10 +481,7 @@ impl PacketFilter {
             return Ok(RawRoutingAction::Drop);
         }
         // Register client MAC for additional authentication, and to send back replies.
-        if matches!(self.l2_traffic_mode, L2TrafficMode::Nat)
-            && self.client_ip.is_some()
-            && self.client_mac.is_none()
-        {
+        if !iface::L2Interface::use_ndp() && self.client_ip.is_some() && self.client_mac.is_none() {
             self.client_mac = Some(src_mac);
         }
         // TODO VMNET: detect client IP/MAC, perhaps from Router Advertisement?

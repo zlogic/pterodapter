@@ -254,6 +254,10 @@ impl super::Interface for Vmnet {
         self.iface.mac
     }
 
+    fn use_ndp() -> bool {
+        true
+    }
+
     fn set_nat64_filter(&self, _prefix: &ip::Nat64Prefix) -> Result<(), std::io::Error> {
         // macOS doesn't support low-level filtering.
         Ok(())
