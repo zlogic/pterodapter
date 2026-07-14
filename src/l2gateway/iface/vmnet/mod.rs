@@ -1,6 +1,7 @@
-use std::{error, ffi::CStr, fmt, task::Poll};
+use std::{error, fmt, task::Poll};
 
 use log::{debug, trace, warn};
+use rand::Rng as _;
 use tokio::sync::mpsc;
 
 use crate::{ip, l2gateway::MacAddr};
@@ -76,7 +77,7 @@ impl Vmnet {
                 ),
                 (
                     sys::vmnet_allocate_mac_address_key,
-                    sys::xpc_bool_create(true),
+                    sys::xpc_bool_create(false),
                 ),
                 (
                     sys::vmnet_enable_checksum_offload_key,
@@ -93,29 +94,10 @@ impl Vmnet {
         };
         let queue = unsafe { sys::dispatch_get_global_queue(0, 0) };
 
-        struct VmnetParams {
-            mac: Option<String>,
-        }
         let (tx, mut rx) = mpsc::channel(1);
         let block = block2::RcBlock::new(
-            move |status: sys::vmnet_return_t, params: sys::xpc_object_t| {
-                let status = VmnetResponse::from_code(status);
-                let res = if status.is_ok() {
-                    let mac = unsafe {
-                        let ptr =
-                            sys::xpc_dictionary_get_string(params, sys::vmnet_mac_address_key);
-                        if ptr.is_null() {
-                            None
-                        } else {
-                            CStr::from_ptr(ptr).to_str().ok().map(|str| str.to_owned())
-                        }
-                    };
-                    Ok(VmnetParams { mac })
-                } else {
-                    warn!("Failed vmnet_start_interface call, error code is {status}");
-                    Err("Failed vmnet_start_interface call")
-                };
-                let _ = tx.blocking_send(res);
+            move |status: sys::vmnet_return_t, _params: sys::xpc_object_t| {
+                let _ = tx.blocking_send(VmnetResponse::from_code(status));
             },
         );
         let raw_block = block2::RcBlock::into_raw(block).cast();
@@ -131,41 +113,31 @@ impl Vmnet {
         unsafe {
             sys::xpc_release(interface_desc);
         }
-        let res = match res {
-            Some(res) => res?,
-            None => return Err("vmnet_start_interface result channel closed".into()),
-        };
-        if let Some(mac_addr) = res.mac {
-            let mac = Self::parse_mac_from_string(&mac_addr)?;
-            Ok(Interface {
-                queue,
-                iface,
-                mac,
-                terminated: false,
-            })
-        } else {
-            Err("No MAC address assigned".into())
-        }
+        match res {
+            Some(VmnetResponse::VMNET_SUCCESS) => Ok(()),
+            Some(status) => {
+                warn!("Failed vmnet_start_interface call, error code is {status}");
+                Err("Failed vmnet_start_interface call")
+            }
+            None => Err("vmnet_start_interface result channel closed"),
+        }?;
+
+        let mac = Self::generate_mac();
+        debug!("Allocated MAC {mac} and IP {}", mac.to_linklocal_address());
+        Ok(Interface {
+            queue,
+            iface,
+            mac,
+            terminated: false,
+        })
     }
 
-    fn parse_mac_from_string(mac: &str) -> Result<MacAddr, InterfaceError> {
-        trace!("MAC address is {mac}");
-        let mut mac_bytes = [0u8; 6];
-        for (i, hex_part) in mac.split(':').enumerate() {
-            if i > 6 {
-                warn!("MAC address {mac} has too many parts");
-                return Err("Failed to parse MAC address".into());
-            }
-            let hex_part = match u8::from_str_radix(hex_part, 16) {
-                Ok(hex_part) => hex_part,
-                Err(err) => {
-                    warn!("Failed to parse hex segment {hex_part} in MAC address {mac}: {err}");
-                    return Err("Failed to parse MAC address".into());
-                }
-            };
-            mac_bytes[i] = hex_part;
-        }
-        Ok(MacAddr::from_data(&mac_bytes))
+    fn generate_mac() -> MacAddr {
+        let mut mac = [0u8; 6];
+        rand::rng().fill_bytes(&mut mac);
+        // Based on Apple Container DefaultNetworkService.
+        mac[0] = (mac[0] & 0x0c) | 0xf2;
+        MacAddr::from_data(&mac)
     }
 }
 

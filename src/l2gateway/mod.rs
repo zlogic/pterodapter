@@ -322,6 +322,35 @@ impl MacAddr {
     fn is_multicast(&self) -> bool {
         self.0[0] == 0x33 && self.0[1] == 0x33
     }
+
+    fn to_linklocal_address(&self) -> Ipv6Addr {
+        // EUI-64 link-local address, based on Apple Containerization MACAddress.
+        Ipv6Addr::from_octets([
+            0xfe,
+            0x80,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            self.0[0] ^ 0x02,
+            self.0[1],
+            self.0[2],
+            0xff,
+            0xfe,
+            self.0[3],
+            self.0[4],
+            self.0[5],
+        ])
+    }
+
+    fn to_solicited_node_multicast_address(&self) -> Ipv6Addr {
+        Ipv6Addr::from_octets([
+            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff,
+            self.0[3], self.0[4], self.0[5],
+        ])
+    }
 }
 
 impl fmt::Display for MacAddr {
@@ -473,6 +502,15 @@ impl PacketFilter {
             "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
         );
         let header = ip_packet.to_header();
+        // TODO VMNET: remove this debug code
+        {
+            if *header.dst_addr() == self.server_mac.to_solicited_node_multicast_address() {
+                println!("!!! Targeting multicast");
+            }
+            if *header.dst_addr() == self.server_mac.to_linklocal_address() {
+                println!("!!! Targeting link-local address");
+            }
+        }
         if !self.nat64_prefix.matches_addr(header.dst_addr()) {
             debug!(
                 "Packet destination {} doesn't match NAT64 prefix",
