@@ -3,7 +3,12 @@ use std::{error, ffi::CStr, fmt, task::Poll};
 use log::{debug, trace, warn};
 use tokio::sync::mpsc;
 
-use crate::{ip, l2gateway::MacAddr, sys};
+use crate::{ip, l2gateway::MacAddr};
+
+#[allow(dead_code, non_camel_case_types)]
+mod sys;
+#[link(kind = "framework", name = "vmnet")]
+unsafe extern "C" {}
 
 pub struct Vmnet {
     iface: Interface,
