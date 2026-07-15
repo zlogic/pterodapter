@@ -791,6 +791,50 @@ impl<'a> IcmpV6Message<'a> {
             }
         }
     }
+
+    pub fn translate_multicast(
+        &self,
+        packet: &Ipv6Packet<'a>,
+        eth_config: super::EthernetConfiguration,
+        dest: &mut [u8],
+    ) -> Result<IcmpTranslationAction, IpError> {
+        match self.ndp_message()? {
+            NdpMessage::NeighborSolicication(msg) => {
+                const ICMP_LEN: usize = 32;
+                let target_address = msg.target_address();
+                println!("!!! Got neighbor solicitation for {target_address}");
+                let start_offset = packet.write_icmp_response_header(
+                    packet.src_addr(),
+                    dest,
+                    ICMP_LEN,
+                    Some(255),
+                )?;
+                let mut checksum =
+                    Ipv6Packet::pseudo_checksum(dest, TransportProtocolType::IPV6_ICMP, ICMP_LEN);
+                let icmp_data = &mut dest[start_offset..start_offset + ICMP_LEN];
+                // Send Neighbor Advertisement response.
+                icmp_data[0] = 136;
+                icmp_data[1] = 0;
+                icmp_data[2..8].fill(0);
+                // Set flags=SO.
+                icmp_data[4] = (1 << 6) | (1 << 5);
+                icmp_data[8..24].copy_from_slice(&msg.target_address().octets());
+                // Target link-layer address.
+                icmp_data[24] = 2;
+                icmp_data[25] = 1;
+                icmp_data[26..32].copy_from_slice(&eth_config.server_mac);
+
+                checksum.add_slice(icmp_data);
+                checksum.fold();
+                icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
+                Ok(IcmpTranslationAction::Forward(start_offset + ICMP_LEN))
+            }
+            _ => {
+                debug!("Ignoring {} multicast ICMP packet", self.icmp_type());
+                Ok(IcmpTranslationAction::Drop)
+            }
+        }
+    }
 }
 
 impl Deref for IcmpV6Message<'_> {
@@ -924,7 +968,7 @@ impl IcmpErrorResponse {
                     .min(dest.len() - 40 - 8)
                     .min(ICMPV6_ORIGINAL_MESSAGE_LIMIT);
                 let start_offset =
-                    packet.write_icmp_response_header(src_addr, dest, 8 + available_bytes)?;
+                    packet.write_icmp_response_header(src_addr, dest, 8 + available_bytes, None)?;
 
                 let mut checksum = Ipv6Packet::pseudo_checksum(
                     dest,
@@ -1357,6 +1401,20 @@ impl<'a> NdpOptionMtu<'a> {
     }
 }
 
+struct NdpOptionNonce<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> NdpOptionNonce<'a> {
+    fn from_data(data: &'a [u8]) -> NdpOptionNonce<'a> {
+        NdpOptionNonce { data }
+    }
+
+    fn nonce(&self) -> &[u8] {
+        self.data
+    }
+}
+
 struct NdpOptionUnknown<'a> {
     data: &'a [u8],
 }
@@ -1373,6 +1431,7 @@ enum NdpOption<'a> {
     PrefixInformation(NdpOptionPrefixInformation<'a>),
     RedirectedHeader(NdpOptionRedirectedHeader<'a>),
     Mtu(NdpOptionMtu<'a>),
+    Nonce(NdpOptionNonce<'a>),
     Unknown(NdpOptionUnknown<'a>),
 }
 
@@ -1392,6 +1451,7 @@ impl NdpOption<'_> {
                 NdpOptionRedirectedHeader::from_data(data)?,
             )),
             NdpOptionType::MTU => Ok(NdpOption::Mtu(NdpOptionMtu::from_data(data)?)),
+            NdpOptionType::NONCE => Ok(NdpOption::Nonce(NdpOptionNonce::from_data(data))),
             _ => Ok(NdpOption::Unknown(NdpOptionUnknown::from_data(data))),
         }
     }
@@ -1432,6 +1492,7 @@ impl fmt::Display for NdpOption<'_> {
             }
             NdpOption::RedirectedHeader(o) => write!(f, "R={}", fmt_slice_hex(o.original_packet())),
             NdpOption::Mtu(o) => write!(f, "MTU={}", o.mtu()),
+            NdpOption::Nonce(o) => write!(f, "Nonce={}", fmt_slice_hex(o.nonce())),
             NdpOption::Unknown(o) => write!(f, "Unknown={}", fmt_slice_hex(o.data)),
         }
     }

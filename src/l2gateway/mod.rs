@@ -322,35 +322,6 @@ impl MacAddr {
     fn is_multicast(&self) -> bool {
         self.0[0] == 0x33 && self.0[1] == 0x33
     }
-
-    fn to_linklocal_address(&self) -> Ipv6Addr {
-        // EUI-64 link-local address, based on Apple Containerization MACAddress.
-        Ipv6Addr::from_octets([
-            0xfe,
-            0x80,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            self.0[0] ^ 0x02,
-            self.0[1],
-            self.0[2],
-            0xff,
-            0xfe,
-            self.0[3],
-            self.0[4],
-            self.0[5],
-        ])
-    }
-
-    fn to_solicited_node_multicast_address(&self) -> Ipv6Addr {
-        Ipv6Addr::from_octets([
-            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff,
-            self.0[3], self.0[4], self.0[5],
-        ])
-    }
 }
 
 impl fmt::Display for MacAddr {
@@ -457,6 +428,10 @@ impl PacketFilter {
         let dst_mac = MacAddr::from_data(&data[0..6]);
         let src_mac = MacAddr::from_data(&data[6..12]);
         let ether_type = EtherType::from_data(&data[12..14]);
+        if ether_type == EtherType::IPV4 {
+            debug!("Received IPv4 packet\n{}", fmt_slice_hex(data),);
+            return Ok(RawRoutingAction::Drop);
+        }
         if ether_type != EtherType::IPV6 {
             debug!(
                 "Received unsupported EtherType: {ether_type}\n{}",
@@ -464,12 +439,11 @@ impl PacketFilter {
             );
             return Err("Received unsupported EtherType".into());
         }
-        let drop_frame = if iface::L2Interface::use_ndp() {
-            dst_mac != self.server_mac && !dst_mac.is_multicast()
-        } else {
-            dst_mac != self.server_mac
-        };
-        if drop_frame {
+        let data = &data[L2_ETHERNET_HEADER_SIZE..];
+        if dst_mac.is_multicast() {
+            return self.process_multicast_packet(dst_mac, src_mac, ether_type, data, out_buf);
+        }
+        if dst_mac != self.server_mac {
             debug!(
                 "Ethernet frame has destination {dst_mac}, should be {}",
                 self.server_mac
@@ -483,7 +457,6 @@ impl PacketFilter {
             return Ok(RawRoutingAction::Drop);
         }
 
-        let data = &data[L2_ETHERNET_HEADER_SIZE..];
         if let Some(pcap_sender) = &mut self.pcap_sender {
             pcap_sender.send_packet(data);
         }
@@ -502,15 +475,6 @@ impl PacketFilter {
             "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
         );
         let header = ip_packet.to_header();
-        // TODO VMNET: remove this debug code
-        {
-            if *header.dst_addr() == self.server_mac.to_solicited_node_multicast_address() {
-                println!("!!! Targeting multicast");
-            }
-            if *header.dst_addr() == self.server_mac.to_linklocal_address() {
-                println!("!!! Targeting link-local address");
-            }
-        }
         if !self.nat64_prefix.matches_addr(header.dst_addr()) {
             debug!(
                 "Packet destination {} doesn't match NAT64 prefix",
@@ -522,7 +486,6 @@ impl PacketFilter {
         if !iface::L2Interface::use_ndp() && self.client_ip.is_some() && self.client_mac.is_none() {
             self.client_mac = Some(src_mac);
         }
-        // TODO VMNET: detect client IP/MAC, perhaps from Router Advertisement?
 
         match self
             .network
@@ -563,6 +526,66 @@ impl PacketFilter {
                 Err("Failed to NAT packet from client".into())
             }
         }
+    }
+
+    fn process_multicast_packet<'a>(
+        &mut self,
+        dst_mac: MacAddr,
+        src_mac: MacAddr,
+        ether_type: EtherType,
+        data: &'a [u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<RawRoutingAction<'a>, L2GatewayError> {
+        if !iface::L2Interface::use_ndp() {
+            debug!("L2 interface is not using NDP and doesn't support multicast");
+            return Ok(RawRoutingAction::Drop);
+        }
+        if let Some(pcap_sender) = &mut self.pcap_sender {
+            pcap_sender.send_packet(data);
+        }
+        let ip_packet = match ip::IpPacket::from_data(data) {
+            Ok(packet) => packet,
+            Err(err) => {
+                warn!(
+                    "Failed to parse IP packet from ethernet frame: {}\n{}",
+                    err,
+                    fmt_slice_hex(data),
+                );
+                return Err("Failed to parse IP packet from ethernet frame".into());
+            }
+        };
+        trace!(
+            "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
+        );
+        let header = ip_packet.to_header();
+        let eth_config = ip::EthernetConfiguration::new(self.server_mac.0, src_mac.0);
+        match self.network.translate_multicast_from_uplink(
+            ip_packet,
+            header,
+            eth_config,
+            &mut out_buf[L2_ETHERNET_HEADER_SIZE..],
+        ) {
+            Ok(ip::RoutingActionMulticast::ReturnToSender(buf, msg_len)) => {
+                if let Some(pcap_sender) = &mut self.pcap_sender {
+                    pcap_sender.send_packet(&buf[..msg_len]);
+                }
+                // Prepend Ethernet headers.
+                buf.copy_within(..msg_len, L2_ETHERNET_HEADER_SIZE);
+                buf[0..6].copy_from_slice(src_mac.as_slice());
+                buf[6..12].copy_from_slice(self.server_mac.as_slice());
+                buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
+                println!(
+                    "Returning to sender {}",
+                    fmt_slice_hex(&buf[..L2_ETHERNET_HEADER_SIZE + msg_len])
+                );
+                Ok(RawRoutingAction::ReturnToSender(
+                    &buf[..L2_ETHERNET_HEADER_SIZE + msg_len],
+                ))
+            }
+            Ok(ip::RoutingActionMulticast::Drop) => Ok(RawRoutingAction::Drop),
+            Err(err) => Err(err.into()),
+        }
+        // TODO VMNET: detect client IP/MAC, perhaps from Router Advertisement?
     }
 
     fn process_uplink_packet<'a>(

@@ -123,7 +123,7 @@ impl Vmnet {
         }?;
 
         let mac = Self::generate_mac();
-        debug!("Allocated MAC {mac} and IP {}", mac.to_linklocal_address());
+        debug!("Allocated MAC {mac}");
         Ok(Interface {
             queue,
             iface,
