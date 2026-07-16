@@ -244,6 +244,11 @@ pub(super) enum IcmpTranslationAction {
     Drop,
 }
 
+pub(super) enum IcmpMulticastTranslationAction {
+    SendResponse(usize, bool),
+    Drop,
+}
+
 pub(super) struct IcmpV4Message<'a>(&'a [u8]);
 
 impl IcmpV4Message<'_> {
@@ -797,41 +802,119 @@ impl<'a> IcmpV6Message<'a> {
         packet: &Ipv6Packet<'a>,
         eth_config: super::EthernetConfiguration,
         dest: &mut [u8],
-    ) -> Result<IcmpTranslationAction, IpError> {
+    ) -> Result<IcmpMulticastTranslationAction, IpError> {
         match self.ndp_message()? {
             NdpMessage::NeighborSolicication(msg) => {
                 const ICMP_LEN: usize = 32;
-                let target_address = msg.target_address();
-                println!("!!! Got neighbor solicitation for {target_address}");
-                let start_offset = packet.write_icmp_response_header(
-                    packet.src_addr(),
-                    dest,
-                    ICMP_LEN,
-                    Some(255),
-                )?;
+                if packet.src_addr().is_unspecified() {
+                    debug!(
+                        "Received Neighbor Solicitation with empty source address (duplicate address detection)"
+                    );
+                    return Ok(IcmpMulticastTranslationAction::Drop);
+                }
+                if packet.dst_addr() != eth_config.node_multicast_address() {
+                    debug!(
+                        "Received Neighbor Solicitation for {}, will only reply to {}",
+                        packet.dst_addr(),
+                        eth_config.node_multicast_address()
+                    );
+                    return Ok(IcmpMulticastTranslationAction::Drop);
+                }
+                let src_addr = eth_config.link_local_address();
+                {
+                    let ip_header = &mut dest[0..40];
+                    ip_header[0] = 0x60;
+                    ip_header[1..4].fill(0);
+                    ip_header[4..6].copy_from_slice(&(ICMP_LEN as u16).to_be_bytes());
+                    ip_header[6] = TransportProtocolType::IPV6_ICMP.to_u8();
+                    ip_header[7] = 255;
+                    ip_header[8..24].copy_from_slice(&src_addr.octets());
+                    ip_header[24..40].copy_from_slice(&packet.src_addr().octets());
+                }
                 let mut checksum =
                     Ipv6Packet::pseudo_checksum(dest, TransportProtocolType::IPV6_ICMP, ICMP_LEN);
-                let icmp_data = &mut dest[start_offset..start_offset + ICMP_LEN];
+                let icmp_data = &mut dest[40..40 + ICMP_LEN];
                 // Send Neighbor Advertisement response.
                 icmp_data[0] = 136;
                 icmp_data[1] = 0;
                 icmp_data[2..8].fill(0);
-                // Set flags=SO.
-                icmp_data[4] = (1 << 6) | (1 << 5);
+                icmp_data[4] = (1 << 6) | (1 << 5); // SO
                 icmp_data[8..24].copy_from_slice(&msg.target_address().octets());
                 // Target link-layer address.
                 icmp_data[24] = 2;
                 icmp_data[25] = 1;
-                icmp_data[26..32].copy_from_slice(&eth_config.server_mac);
+                icmp_data[26..32].copy_from_slice(&eth_config.mac);
 
                 checksum.add_slice(icmp_data);
                 checksum.fold();
                 icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
-                Ok(IcmpTranslationAction::Forward(start_offset + ICMP_LEN))
+                Ok(IcmpMulticastTranslationAction::SendResponse(
+                    40 + ICMP_LEN,
+                    false,
+                ))
+            }
+            NdpMessage::RouterAdvertisement(_) => {
+                const ICMP_LEN: usize = 64;
+                // TODO VMNET: send router adverisements independently from client (on a timer)
+                let src_addr = eth_config.link_local_address();
+                {
+                    let ip_header = &mut dest[0..40];
+                    ip_header[0] = 0x60;
+                    ip_header[1..4].fill(0);
+                    ip_header[4..6].copy_from_slice(&(ICMP_LEN as u16).to_be_bytes());
+                    ip_header[6] = TransportProtocolType::IPV6_ICMP.to_u8();
+                    ip_header[7] = 255;
+                    ip_header[8..24].copy_from_slice(&src_addr.octets());
+                    ip_header[24..40]
+                        .copy_from_slice(&super::ALL_IPV6_NODES_LINK_LOCAL_ADDRESS.octets());
+                }
+                let mut checksum =
+                    Ipv6Packet::pseudo_checksum(dest, TransportProtocolType::IPV6_ICMP, ICMP_LEN);
+                let icmp_data = &mut dest[40..40 + ICMP_LEN];
+                // Send unsolicited Router Advertisement.
+                icmp_data[0] = 134;
+                icmp_data[1] = 0;
+                icmp_data[2..4].fill(0);
+                icmp_data[4] = super::DEFAULT_RESPONSE_TTL;
+                icmp_data[5] = 0;
+                icmp_data[6..16].fill(0);
+                // Source link-layer address.
+                icmp_data[16] = 1;
+                icmp_data[17] = 1;
+                icmp_data[18..24].copy_from_slice(&eth_config.mac);
+                // MTU.
+                icmp_data[24] = 5;
+                icmp_data[25] = 1;
+                icmp_data[26..28].fill(0);
+                // TODO VMNET: provide MTU.
+                icmp_data[28..32].copy_from_slice(&1500u32.to_be_bytes());
+                // Prefix information.
+                icmp_data[32] = 3;
+                icmp_data[33] = 4;
+                // TODO VMNET: provide NAT64 prefix.
+                icmp_data[34] = 96;
+                icmp_data[35] = (1 << 7) | (1 << 6); // LA
+                // TODO VMNET: provide lifetimes (based on timer settings).
+                let valid_lifetime: u32 = 7 * 60 * 60 * 24;
+                icmp_data[36..40].copy_from_slice(&valid_lifetime.to_be_bytes());
+                let preferred_lifetime: u32 = 1 * 60 * 60 * 24;
+                icmp_data[40..44].copy_from_slice(&preferred_lifetime.to_be_bytes());
+                icmp_data[44..48].fill(0);
+                let nat64_prefix =
+                    Ipv6Addr::from_segments([0x64, 0xff9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                icmp_data[48..64].copy_from_slice(&nat64_prefix.octets());
+
+                checksum.add_slice(icmp_data);
+                checksum.fold();
+                icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
+                Ok(IcmpMulticastTranslationAction::SendResponse(
+                    40 + ICMP_LEN,
+                    true,
+                ))
             }
             _ => {
                 debug!("Ignoring {} multicast ICMP packet", self.icmp_type());
-                Ok(IcmpTranslationAction::Drop)
+                Ok(IcmpMulticastTranslationAction::Drop)
             }
         }
     }
@@ -968,7 +1051,7 @@ impl IcmpErrorResponse {
                     .min(dest.len() - 40 - 8)
                     .min(ICMPV6_ORIGINAL_MESSAGE_LIMIT);
                 let start_offset =
-                    packet.write_icmp_response_header(src_addr, dest, 8 + available_bytes, None)?;
+                    packet.write_icmp_response_header(src_addr, dest, 8 + available_bytes)?;
 
                 let mut checksum = Ipv6Packet::pseudo_checksum(
                     dest,

@@ -30,6 +30,8 @@ const L2_ETHERNET_HEADER_SIZE: usize = 6 + 6 + 2;
 const GSO_MAX_SIZE: usize = 65536;
 const GSO_MAX_FRAGMENTS: usize = GSO_MAX_SIZE / (PATH_MTU - 40 - 60) + 1;
 
+const MULTICAST_MAC: MacAddr = MacAddr([0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+
 pub struct Config {
     pub listen_interface: String,
     pub fix_mtu: bool,
@@ -558,20 +560,19 @@ impl PacketFilter {
             "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
         );
         let header = ip_packet.to_header();
-        let eth_config = ip::EthernetConfiguration::new(self.server_mac.0, src_mac.0);
-        match self.network.translate_multicast_from_uplink(
-            ip_packet,
-            header,
-            eth_config,
-            &mut out_buf[L2_ETHERNET_HEADER_SIZE..],
-        ) {
-            Ok(ip::RoutingActionMulticast::ReturnToSender(buf, msg_len)) => {
+        let eth_config = ip::EthernetConfiguration::new(self.server_mac.0);
+        match self
+            .network
+            .translate_multicast_from_uplink(ip_packet, header, eth_config, out_buf)
+        {
+            Ok(ip::RoutingActionMulticast::SendResponse(buf, msg_len, multicast)) => {
                 if let Some(pcap_sender) = &mut self.pcap_sender {
                     pcap_sender.send_packet(&buf[..msg_len]);
                 }
                 // Prepend Ethernet headers.
                 buf.copy_within(..msg_len, L2_ETHERNET_HEADER_SIZE);
-                buf[0..6].copy_from_slice(src_mac.as_slice());
+                let reply_mac = if multicast { MULTICAST_MAC } else { src_mac };
+                buf[0..6].copy_from_slice(reply_mac.as_slice());
                 buf[6..12].copy_from_slice(self.server_mac.as_slice());
                 buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
                 println!(

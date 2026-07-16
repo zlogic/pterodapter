@@ -1085,17 +1085,15 @@ impl<'a> Ipv6Packet<'a> {
         src_addr: Ipv6Addr,
         dest: &mut [u8],
         icmp_len: usize,
-        ttl: Option<u8>,
     ) -> Result<usize, IpError> {
         if dest.len() < 40 + icmp_len {
             return Err("Not enough space to write ICMPv6 response header".into());
         }
-        let ttl = ttl.unwrap_or(DEFAULT_RESPONSE_TTL);
         let ip_header = &mut dest[0..40];
         ip_header[0..4].copy_from_slice(&self.data[0..4]);
         ip_header[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
         ip_header[6] = TransportProtocolType::IPV6_ICMP.to_u8();
-        ip_header[7] = ttl;
+        ip_header[7] = DEFAULT_RESPONSE_TTL;
         ip_header[8..24].copy_from_slice(&src_addr.octets());
         ip_header[24..40].copy_from_slice(&self.data[8..24]);
 
@@ -2892,29 +2890,17 @@ impl Network {
             icmp::IcmpV6Message::from_data(packet.transport_protocol_data().full_data())?;
         trace!("Decoded ICMPv6 packet {icmp_packet}");
 
-        // TODO VMNET: remove this debug code
-        {
-            if *header.dst_addr() == eth_config.node_multicast_address() {
-                println!("!!! Targeting multicast");
-            }
-            if *header.dst_addr() == eth_config.link_local_address() {
-                println!("!!! Targeting link-local address");
-            }
-            if *header.dst_addr() == ALL_IPV6_NODES_LINK_LOCAL_ADDRESS {
-                println!("!!! Targeting all nodes link-local address");
-            }
-        }
         let translation = icmp_packet.translate_multicast(&packet, eth_config, out_buf)?;
         let action = match translation {
-            icmp::IcmpTranslationAction::Forward(length) => {
+            icmp::IcmpMulticastTranslationAction::SendResponse(length, multicast) => {
                 if log::log_enabled!(log::Level::Trace) {
                     let icmp_packet = icmp::IcmpV6Message::from_data(&out_buf[40..length])?;
                     trace!("Write ICMPv6 response for multicast: {icmp_packet}");
                 }
 
-                RoutingActionMulticast::ReturnToSender(out_buf, length)
+                RoutingActionMulticast::SendResponse(out_buf, length, multicast)
             }
-            icmp::IcmpTranslationAction::Drop => RoutingActionMulticast::Drop,
+            icmp::IcmpMulticastTranslationAction::Drop => RoutingActionMulticast::Drop,
         };
         Ok(action)
     }
@@ -2933,26 +2919,22 @@ pub enum RoutingActionUplink<'a> {
 }
 
 pub enum RoutingActionMulticast<'a> {
-    ReturnToSender(&'a mut [u8], usize),
+    SendResponse(&'a mut [u8], usize, bool),
     Drop,
 }
 
 pub struct EthernetConfiguration {
-    server_mac: [u8; 6],
-    src_mac: [u8; 6],
+    mac: [u8; 6],
 }
 
 impl EthernetConfiguration {
-    pub fn new(server_mac: [u8; 6], src_mac: [u8; 6]) -> EthernetConfiguration {
-        EthernetConfiguration {
-            server_mac,
-            src_mac,
-        }
+    pub fn new(mac: [u8; 6]) -> EthernetConfiguration {
+        EthernetConfiguration { mac }
     }
 
     fn link_local_address(&self) -> Ipv6Addr {
         // EUI-64 link-local address, based on Apple Containerization MACAddress.
-        let mac = &self.server_mac;
+        let mac = &self.mac;
         Ipv6Addr::from_octets([
             0xfe,
             0x80,
@@ -2975,7 +2957,7 @@ impl EthernetConfiguration {
 
     fn node_multicast_address(&self) -> Ipv6Addr {
         // Solicited-node address, defined in RFC 4291.
-        let mac = &self.server_mac;
+        let mac = &self.mac;
         Ipv6Addr::from_octets([
             0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, mac[3],
             mac[4], mac[5],
