@@ -454,25 +454,36 @@ impl PacketFilter {
             );
             return Err("Received unsupported EtherType".into());
         }
-        let data = &data[L2_ETHERNET_HEADER_SIZE..];
         if dst_mac.is_multicast() {
             debug!("Received multicast packet to {dst_mac}");
             return Ok(RawRoutingAction::Drop);
         }
-        if dst_mac != self.server_mac {
-            debug!(
-                "Ethernet frame has destination {dst_mac}, should be {}",
-                self.server_mac
-            );
-            return Ok(RawRoutingAction::Drop);
-        }
-        if let Some(client_mac) = &self.client_mac
-            && &src_mac != client_mac
-        {
-            debug!("Ethernet frame has source {src_mac}, should be {client_mac}");
-            return Ok(RawRoutingAction::Drop);
+        if iface::L2Interface::dedicated_connection() {
+            if dst_mac != self.server_mac {
+                debug!("Changing server MAC from {} to {dst_mac}", self.server_mac);
+                self.server_mac = dst_mac;
+            }
+            if self.client_mac != Some(src_mac) {
+                debug!("Updating client MAC to {src_mac}");
+                self.client_mac = Some(src_mac);
+            }
+        } else {
+            if dst_mac != self.server_mac {
+                debug!(
+                    "Ethernet frame has destination {dst_mac}, should be {}",
+                    self.server_mac
+                );
+                return Ok(RawRoutingAction::Drop);
+            }
+            if let Some(client_mac) = &self.client_mac
+                && &src_mac != client_mac
+            {
+                debug!("Ethernet frame has source {src_mac}, should be {client_mac}");
+                return Ok(RawRoutingAction::Drop);
+            }
         }
 
+        let data = &data[L2_ETHERNET_HEADER_SIZE..];
         if let Some(pcap_sender) = &mut self.pcap_sender {
             pcap_sender.send_packet(data);
         }
@@ -499,10 +510,17 @@ impl PacketFilter {
             return Ok(RawRoutingAction::Drop);
         }
         // Register client MAC for additional authentication, and to send back replies.
-        if !iface::L2Interface::dedicated_connection()
-            && self.client_ip.is_some()
-            && self.client_mac.is_none()
-        {
+        if iface::L2Interface::dedicated_connection() {
+            match *header.src_addr() {
+                IpAddr::V6(client_ip) => {
+                    if self.client_ip != Some(client_ip) {
+                        debug!("Updating client IP to {client_ip}");
+                        self.client_ip = Some(client_ip);
+                    }
+                }
+                IpAddr::V4(_) => {}
+            };
+        } else if self.client_ip.is_some() && self.client_mac.is_none() {
             self.client_mac = Some(src_mac);
         }
 
