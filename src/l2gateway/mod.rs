@@ -16,7 +16,11 @@ use crate::uplink::UplinkService as _;
 use crate::{ip, pcap, uplink};
 
 // Maximum ethernet frame size, the ethernet header will be reused for PPP headers.
-const MAX_PACKET_SIZE: usize = 1500;
+const MAX_PACKET_SIZE: usize = if cfg!(target_os = "macos") {
+    1600
+} else {
+    1500
+};
 // Limit the packet size, any packet that exceeds this size will be rejected with an
 // ICMPv6 Packet Too Big message.
 // This prevents jumbo frames which will be rejected by the uplink.
@@ -42,7 +46,7 @@ pub struct Server {
     fix_mtu: bool,
     dns64_domains: Vec<String>,
     nat64_prefix: ip::Nat64Prefix,
-    tso_refragmenter: ip::TsoRefragmenter<GSO_MAX_SIZE, GSO_MAX_FRAGMENTS>,
+    tso_refragmenter: Box<ip::TsoRefragmenter<GSO_MAX_SIZE, GSO_MAX_FRAGMENTS>>,
     raw_read_buffer: [u8; MAX_PACKET_SIZE],
     raw_write_buffer: [u8; MAX_PACKET_SIZE],
     uplink_read_buffer: [u8; MAX_PACKET_SIZE],
@@ -55,7 +59,8 @@ impl Server {
         let raw_write_buffer = [0u8; MAX_PACKET_SIZE];
         let uplink_read_buffer = [0u8; MAX_PACKET_SIZE];
         let uplink_write_buffer = [0u8; MAX_PACKET_SIZE];
-        let tso_refragmenter = ip::TsoRefragmenter::new(L2_ETHERNET_HEADER_SIZE + PATH_MTU);
+        let tso_refragmenter =
+            Box::new(ip::TsoRefragmenter::new(L2_ETHERNET_HEADER_SIZE + PATH_MTU));
         Server {
             listen_interface: config.listen_interface,
             fix_mtu: config.fix_mtu,
@@ -149,19 +154,27 @@ impl Server {
                     shutdown_requested =
                         shutdown_requested || shutdown_command.as_mut().poll(cx).is_ready();
                     if raw_packet.is_none() {
-                        raw_packet = match self.tso_refragmenter.poll_recv(
-                            cx,
-                            &mut self.raw_read_buffer,
-                            |cx, buf| match socket.poll_recv(cx, buf) {
-                                Poll::Ready(Ok(bytes_read)) => {
-                                    Poll::Ready(Ok(L2_ETHERNET_HEADER_SIZE..bytes_read))
-                                }
-                                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                                Poll::Pending => Poll::Pending,
-                            },
-                        ) {
-                            Poll::Ready(result) => Some(result),
-                            Poll::Pending => None,
+                        raw_packet = if iface::L2Interface::uses_tso() {
+                            match self.tso_refragmenter.poll_recv(
+                                cx,
+                                &mut self.raw_read_buffer,
+                                |cx, buf| match socket.poll_recv(cx, buf) {
+                                    Poll::Ready(Ok(bytes_read)) => {
+                                        Poll::Ready(Ok(L2_ETHERNET_HEADER_SIZE..bytes_read))
+                                    }
+                                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                                    Poll::Pending => Poll::Pending,
+                                },
+                            ) {
+                                Poll::Ready(result) => Some(result),
+                                Poll::Pending => None,
+                            }
+                        } else {
+                            match socket.poll_recv(cx, &mut self.raw_read_buffer) {
+                                Poll::Ready(Ok(bytes_read)) => Some(Ok(bytes_read)),
+                                Poll::Ready(Err(err)) => Some(Err(err.into())),
+                                Poll::Pending => None,
+                            }
                         }
                     }
                     if uplink_event.is_some() || raw_packet.is_some() || shutdown_requested {
@@ -340,6 +353,7 @@ struct EtherType(u16);
 impl EtherType {
     const IPV4: EtherType = EtherType(0x0800);
     const IPV6: EtherType = EtherType(0x86DD);
+    const ARP: EtherType = EtherType(0x0806);
 
     fn from_data(data: &[u8]) -> EtherType {
         let mut et = [0u8; 2];
@@ -357,6 +371,7 @@ impl fmt::Display for EtherType {
         match *self {
             Self::IPV4 => write!(f, "IPv4"),
             Self::IPV6 => write!(f, "IPv6"),
+            Self::ARP => write!(f, "ARP"),
             _ => write!(f, "Unknown EtherType {:#04x}", self.0),
         }
     }
@@ -402,7 +417,7 @@ impl PacketFilter {
         self.network.set_icmp_unreachable(configuration.is_none());
         self.vpn_real_ip = internal_addr;
 
-        if !iface::L2Interface::use_ndp() {
+        if !iface::L2Interface::dedicated_connection() {
             let client_ip = match client_ip {
                 Some(IpAddr::V6(client_ip)) => Some(client_ip),
                 Some(IpAddr::V4(_)) | None => None,
@@ -484,7 +499,10 @@ impl PacketFilter {
             return Ok(RawRoutingAction::Drop);
         }
         // Register client MAC for additional authentication, and to send back replies.
-        if !iface::L2Interface::use_ndp() && self.client_ip.is_some() && self.client_mac.is_none() {
+        if !iface::L2Interface::dedicated_connection()
+            && self.client_ip.is_some()
+            && self.client_mac.is_none()
+        {
             self.client_mac = Some(src_mac);
         }
 

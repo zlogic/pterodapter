@@ -209,7 +209,11 @@ impl super::Interface for RawSocket {
         self.mac
     }
 
-    fn use_ndp() -> bool {
+    fn uses_tso() -> bool {
+        true
+    }
+
+    fn dedicated_connection() -> bool {
         true
     }
 

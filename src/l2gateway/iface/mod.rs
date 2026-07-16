@@ -18,11 +18,12 @@ pub(super) type InterfaceError = rawsocket::InterfaceError;
 #[cfg(target_os = "macos")]
 pub(super) type InterfaceError = vmnet::InterfaceError;
 
-// TODO VMNET: enforce contract via this trait, add a new method
 pub trait Interface {
     fn if_mac(&self) -> MacAddr;
 
-    fn use_ndp() -> bool;
+    fn uses_tso() -> bool;
+
+    fn dedicated_connection() -> bool;
 
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error>;
 

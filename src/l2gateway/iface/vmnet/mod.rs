@@ -227,7 +227,11 @@ impl super::Interface for Vmnet {
         self.iface.mac
     }
 
-    fn use_ndp() -> bool {
+    fn uses_tso() -> bool {
+        false
+    }
+
+    fn dedicated_connection() -> bool {
         true
     }
 
