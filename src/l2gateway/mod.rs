@@ -30,8 +30,6 @@ const L2_ETHERNET_HEADER_SIZE: usize = 6 + 6 + 2;
 const GSO_MAX_SIZE: usize = 65536;
 const GSO_MAX_FRAGMENTS: usize = GSO_MAX_SIZE / (PATH_MTU - 40 - 60) + 1;
 
-const MULTICAST_MAC: MacAddr = MacAddr([0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
-
 pub struct Config {
     pub listen_interface: String,
     pub fix_mtu: bool,
@@ -431,7 +429,7 @@ impl PacketFilter {
         let src_mac = MacAddr::from_data(&data[6..12]);
         let ether_type = EtherType::from_data(&data[12..14]);
         if ether_type == EtherType::IPV4 {
-            debug!("Received IPv4 packet\n{}", fmt_slice_hex(data),);
+            debug!("Dropping IPv4 packet");
             return Ok(RawRoutingAction::Drop);
         }
         if ether_type != EtherType::IPV6 {
@@ -443,7 +441,8 @@ impl PacketFilter {
         }
         let data = &data[L2_ETHERNET_HEADER_SIZE..];
         if dst_mac.is_multicast() {
-            return self.process_multicast_packet(dst_mac, src_mac, ether_type, data, out_buf);
+            debug!("Received multicast packet to {dst_mac}");
+            return Ok(RawRoutingAction::Drop);
         }
         if dst_mac != self.server_mac {
             debug!(
@@ -528,65 +527,6 @@ impl PacketFilter {
                 Err("Failed to NAT packet from client".into())
             }
         }
-    }
-
-    fn process_multicast_packet<'a>(
-        &mut self,
-        dst_mac: MacAddr,
-        src_mac: MacAddr,
-        ether_type: EtherType,
-        data: &'a [u8],
-        out_buf: &'a mut [u8],
-    ) -> Result<RawRoutingAction<'a>, L2GatewayError> {
-        if !iface::L2Interface::use_ndp() {
-            debug!("L2 interface is not using NDP and doesn't support multicast");
-            return Ok(RawRoutingAction::Drop);
-        }
-        if let Some(pcap_sender) = &mut self.pcap_sender {
-            pcap_sender.send_packet(data);
-        }
-        let ip_packet = match ip::IpPacket::from_data(data) {
-            Ok(packet) => packet,
-            Err(err) => {
-                warn!(
-                    "Failed to parse IP packet from ethernet frame: {}\n{}",
-                    err,
-                    fmt_slice_hex(data),
-                );
-                return Err("Failed to parse IP packet from ethernet frame".into());
-            }
-        };
-        trace!(
-            "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
-        );
-        let header = ip_packet.to_header();
-        let eth_config = ip::EthernetConfiguration::new(self.server_mac.0);
-        match self
-            .network
-            .translate_multicast_from_uplink(ip_packet, header, eth_config, out_buf)
-        {
-            Ok(ip::RoutingActionMulticast::SendResponse(buf, msg_len, multicast)) => {
-                if let Some(pcap_sender) = &mut self.pcap_sender {
-                    pcap_sender.send_packet(&buf[..msg_len]);
-                }
-                // Prepend Ethernet headers.
-                buf.copy_within(..msg_len, L2_ETHERNET_HEADER_SIZE);
-                let reply_mac = if multicast { MULTICAST_MAC } else { src_mac };
-                buf[0..6].copy_from_slice(reply_mac.as_slice());
-                buf[6..12].copy_from_slice(self.server_mac.as_slice());
-                buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
-                println!(
-                    "Returning to sender {}",
-                    fmt_slice_hex(&buf[..L2_ETHERNET_HEADER_SIZE + msg_len])
-                );
-                Ok(RawRoutingAction::ReturnToSender(
-                    &buf[..L2_ETHERNET_HEADER_SIZE + msg_len],
-                ))
-            }
-            Ok(ip::RoutingActionMulticast::Drop) => Ok(RawRoutingAction::Drop),
-            Err(err) => Err(err.into()),
-        }
-        // TODO VMNET: detect client IP/MAC, perhaps from Router Advertisement?
     }
 
     fn process_uplink_packet<'a>(
