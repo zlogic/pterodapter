@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Dmitrii Zolotukhin <contact@3d-net.nl>"]
 repository = "https://github.com/zlogic/pterodapter"
 license = "Apache-2.0"
-rust-version = "1.96"
+rust-version = "1.97"
 
 [dependencies]
 log = { version = "0.4", default-features = false }
