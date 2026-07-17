@@ -443,8 +443,8 @@ impl PacketFilter {
         let dst_mac = MacAddr::from_data(&data[0..6]);
         let src_mac = MacAddr::from_data(&data[6..12]);
         let ether_type = EtherType::from_data(&data[12..14]);
-        if ether_type == EtherType::IPV4 {
-            debug!("Dropping IPv4 packet");
+        if ether_type == EtherType::IPV4 || ether_type == EtherType::ARP {
+            debug!("Dropping {ether_type} packet");
             return Ok(RawRoutingAction::Drop);
         }
         if ether_type != EtherType::IPV6 {
