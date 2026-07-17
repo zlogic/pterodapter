@@ -1,4 +1,8 @@
-use std::{error, fmt, task::Poll};
+use std::{
+    error, fmt,
+    net::{Ipv4Addr, Ipv6Addr},
+    task::Poll,
+};
 
 use log::{debug, trace, warn};
 use rand::Rng as _;
@@ -69,6 +73,64 @@ impl Vmnet {
     }
 
     async fn start_interface(mtu: Option<usize>) -> Result<Interface, InterfaceError> {
+        let mut status = VmnetResponse::VMNET_SUCCESS;
+        let net_config =
+            unsafe { sys::vmnet_network_configuration_create(sys::VMNET_HOST_MODE, &mut status.0) };
+        if status.is_err() {
+            warn!("Failed to create network configuration: {status}");
+            return Err("Failed to create network configuration".into());
+        }
+        unsafe {
+            //sys::vmnet_network_configuration_disable_nat44(net_config);
+            //sys::vmnet_network_configuration_disable_nat66(net_config);
+            sys::vmnet_network_configuration_disable_dhcp(net_config);
+            //sys::vmnet_network_configuration_disable_dns_proxy(net_config);
+            //sys::vmnet_network_configuration_disable_router_advertisement(net_config);
+            /*
+            if let Some(mtu) = mtu {
+                let result = VmnetResponse(sys::vmnet_network_configuration_set_mtu(
+                    net_config, mtu as u32,
+                ));
+                if result.is_err() {
+                    warn!("Failed to set network MTU {mtu}: {result}");
+                    return Err("Failed to set network MTU".into());
+                }
+            }
+            */
+
+            let mut prefix = sys::in6_addr {
+                __u6_addr: std::mem::zeroed(),
+            };
+            prefix.__u6_addr.__u6_addr8.as_mut().copy_from_slice(
+                &Ipv6Addr::new(0xfe80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00).octets(),
+            );
+            let result = VmnetResponse(sys::vmnet_network_configuration_set_ipv6_prefix(
+                net_config, &prefix, 64,
+            ));
+            if result.is_err() {
+                warn!("Failed to set network IPv6 prefix: {result}");
+                return Err("Failed to set network IPv6 prefix".into());
+            }
+            let subnet = sys::in_addr {
+                s_addr: u32::from_ne_bytes(Ipv4Addr::new(192, 168, 128, 1).octets()),
+            };
+            let mask = sys::in_addr {
+                s_addr: u32::from_ne_bytes(Ipv4Addr::new(255, 255, 255, 0).octets()),
+            };
+            let result = VmnetResponse(sys::vmnet_network_configuration_set_ipv4_subnet(
+                net_config, &subnet, &mask,
+            ));
+            if result.is_err() {
+                warn!("Failed to set network IPv4 subnet: {result}");
+                return Err("Failed to set network IPv4 subnet".into());
+            }
+        };
+        let mut status = VmnetResponse::VMNET_SUCCESS;
+        let network = unsafe { sys::vmnet_network_create(net_config, &mut status.0) };
+        if network.is_null() || status.is_err() {
+            warn!("Failed to create network: {status}");
+            return Err("Failed to create network".into());
+        }
         let interface_desc = unsafe {
             let mut dict = vec![
                 (
@@ -102,7 +164,9 @@ impl Vmnet {
         );
         let raw_block = block2::RcBlock::into_raw(block).cast();
 
-        let iface = unsafe { sys::vmnet_start_interface(interface_desc, queue, raw_block) };
+        let iface = unsafe {
+            sys::vmnet_interface_start_with_network(network, interface_desc, queue, raw_block)
+        };
         if iface.is_null() {
             unsafe {
                 sys::xpc_release(interface_desc);
