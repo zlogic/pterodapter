@@ -108,7 +108,7 @@ impl Server {
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
         let mtu = if self.fix_mtu {
-            Some(MAX_PACKET_SIZE)
+            Some(L2_ETHERNET_HEADER_SIZE + PATH_MTU)
         } else {
             None
         };
