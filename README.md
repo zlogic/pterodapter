@@ -47,14 +47,16 @@ To create an image with Apple Silicon optimizations, run `container build --buil
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-interface=<iface>] [--fix-mtu] --fortivpn=<hostport> --nat64-prefix=<ip6prefix> [--dns64-tunnel-suffix=<domain>] [--pcap=<filename>] l2gateway
+pterotapter [--log-level=<level>] [--listen-interface=<iface>] [--fix-mtu] [--process-tso] --fortivpn=<hostport> --nat64-prefix=<ip6prefix> [--dns64-tunnel-suffix=<domain>] [--pcap=<filename>] l2gateway
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
 
 `--listen-interface=<ip-address>` specifies the network interface which the gateway should be listening on, for example `--listen-interface=eth0`.
 
-`--fix-mtu` is an optional argument indicating that the network interface (specified in `--listen-interface`) should have its MTU increased to 1500.
+`--fix-mtu` is an optional argument indicating that the network interface (specified in `--listen-interface`) should have its MTU increased to 1500. Enabled by default in macOS.
+
+`--process-tso` is an optional argument indicating that incoming TCP traffic uses TSO (TCP segmentation offloading) and that additional processing is needed: refragmentation of TCP packets and recalculation of checksums. Enable if TCP uploads are unusually slow (1 Mbit/s or less); not needed on macOS.
 
 `--fortivpn=<hostport>` specifies the FortiVPN connection address, for example `--fortivpn=fortivpn.example.com:443`.
 

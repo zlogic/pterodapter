@@ -209,10 +209,6 @@ impl super::Interface for RawSocket {
         self.mac
     }
 
-    fn uses_tso() -> bool {
-        true
-    }
-
     fn dedicated_connection() -> bool {
         true
     }

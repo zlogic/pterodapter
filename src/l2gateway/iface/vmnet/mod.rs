@@ -123,7 +123,7 @@ impl Vmnet {
         }?;
 
         let mac = Self::generate_mac();
-        debug!("Allocated MAC {mac}");
+        debug!("Generated MAC {mac}");
         Ok(Interface {
             queue,
             iface,
@@ -227,10 +227,6 @@ impl super::Interface for Vmnet {
         self.iface.mac
     }
 
-    fn uses_tso() -> bool {
-        false
-    }
-
     fn dedicated_connection() -> bool {
         true
     }
@@ -318,10 +314,6 @@ impl VmnetResponse {
 
     fn from_code(code: sys::vmnet_return_t) -> VmnetResponse {
         VmnetResponse(code)
-    }
-
-    fn is_ok(&self) -> bool {
-        *self == Self::VMNET_SUCCESS
     }
 
     fn is_err(&self) -> bool {

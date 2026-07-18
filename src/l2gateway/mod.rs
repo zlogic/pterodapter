@@ -37,6 +37,7 @@ const GSO_MAX_FRAGMENTS: usize = GSO_MAX_SIZE / (PATH_MTU - 40 - 60) + 1;
 pub struct Config {
     pub listen_interface: String,
     pub fix_mtu: bool,
+    pub process_tso: bool,
     pub nat64_prefix: Ipv6Addr,
     pub dns64_domains: Vec<String>,
 }
@@ -46,7 +47,7 @@ pub struct Server {
     fix_mtu: bool,
     dns64_domains: Vec<String>,
     nat64_prefix: ip::Nat64Prefix,
-    tso_refragmenter: Box<ip::TsoRefragmenter<GSO_MAX_SIZE, GSO_MAX_FRAGMENTS>>,
+    tso_refragmenter: Option<Box<ip::TsoRefragmenter<GSO_MAX_SIZE, GSO_MAX_FRAGMENTS>>>,
     raw_read_buffer: [u8; MAX_PACKET_SIZE],
     raw_write_buffer: [u8; MAX_PACKET_SIZE],
     uplink_read_buffer: [u8; MAX_PACKET_SIZE],
@@ -59,8 +60,13 @@ impl Server {
         let raw_write_buffer = [0u8; MAX_PACKET_SIZE];
         let uplink_read_buffer = [0u8; MAX_PACKET_SIZE];
         let uplink_write_buffer = [0u8; MAX_PACKET_SIZE];
-        let tso_refragmenter =
-            Box::new(ip::TsoRefragmenter::new(L2_ETHERNET_HEADER_SIZE + PATH_MTU));
+        let tso_refragmenter = if config.process_tso {
+            Some(Box::new(ip::TsoRefragmenter::new(
+                L2_ETHERNET_HEADER_SIZE + PATH_MTU,
+            )))
+        } else {
+            None
+        };
         Server {
             listen_interface: config.listen_interface,
             fix_mtu: config.fix_mtu,
@@ -154,8 +160,8 @@ impl Server {
                     shutdown_requested =
                         shutdown_requested || shutdown_command.as_mut().poll(cx).is_ready();
                     if raw_packet.is_none() {
-                        raw_packet = if iface::L2Interface::uses_tso() {
-                            match self.tso_refragmenter.poll_recv(
+                        raw_packet = if let Some(tso_refragmenter) = &mut self.tso_refragmenter {
+                            match tso_refragmenter.poll_recv(
                                 cx,
                                 &mut self.raw_read_buffer,
                                 |cx, buf| match socket.poll_recv(cx, buf) {

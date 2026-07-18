@@ -57,8 +57,9 @@ Options:\
 > pterodapter [OPTIONS] l2gateway\n\
 Options:\
 \n      --log-level=<LOG_LEVEL>         Log level [default: info]\
-\n      --listen-interface=<IFACE>      Listen interface, e.g. eth0\
-\n      --fix-mtu                       Increase MTU of the listen interface and disable GRO (if necessary)\
+\n      --listen-interface=<IFACE>      Listen interface, e.g. eth0 (not required in macOS)\
+\n      --fix-mtu                       Increase MTU of the listen interface (enabled by default in macOS)\
+\n      --process-tso                   Apply TSO processing: fragment TCP and calculate checksums (not needed in macOS)\
 \n      --fortivpn=<HOSTPORT>           Destination FortiVPN address, e.g. sslvpn.example.com:443\
 \n      --nat64-prefix=<IP6>            Specify NAT64 prefix and use the specified /96 IPv6 prefix to remap IPv4 addresses, e.g. 64:ff9b::\
 \n      --dns64-tunnel-suffix=<DOMAIN>  (Optional) Forward specified domain and subdomains through NAT64; can be specified multiple times\
@@ -108,8 +109,9 @@ impl Args {
         let mut fortivpn_hostport = None;
 
         let mut listen_ips = vec![];
-        let mut listen_interace = None;
-        let mut fix_mtu = false;
+        let mut listen_interface = None;
+        let mut fix_mtu = cfg!(target_os = "macos");
+        let mut process_tso = false;
         let mut ike_port = 500u16;
         let mut nat_port = 4500u16;
         let mut id_hostname: Option<String> = None;
@@ -139,6 +141,10 @@ impl Args {
         {
             if action_type == ActionType::L2Gateway && arg == "--fix-mtu" {
                 fix_mtu = true;
+                continue;
+            }
+            if action_type == ActionType::L2Gateway && arg == "--process-tso" {
+                process_tso = true;
                 continue;
             }
 
@@ -205,8 +211,11 @@ impl Args {
                         format_args!("Failed to parse IP address: {err}"),
                     ),
                 };
-            } else if action_type == ActionType::L2Gateway && name == "--listen-interface" {
-                listen_interace = Some(value.to_string());
+            } else if action_type == ActionType::L2Gateway
+                && name == "--listen-interface"
+                && cfg!(target_os = "linux")
+            {
+                listen_interface = Some(value.to_string());
             } else if action_type == ActionType::IkeV2 && name == "--ike-port" {
                 match u16::from_str(value) {
                     Ok(port) => ike_port = port,
@@ -339,28 +348,32 @@ impl Args {
                         process::exit(2);
                     }
                 };
-                let listen_interface = match listen_interace {
+                let listen_interface = match listen_interface {
                     Some(listen_interface) => listen_interface,
                     None => {
-                        eprintln!("--listen-interface is required when using l2gateway mode");
-                        println!("{USAGE_INSTRUCTIONS}");
-                        process::exit(2);
+                        if cfg!(target_os = "linux") {
+                            eprintln!("--listen-interface is required when using l2gateway mode");
+                            println!("{USAGE_INSTRUCTIONS}");
+                            process::exit(2);
+                        } else {
+                            String::new()
+                        }
                     }
                 };
-                {
-                    let l2gateway_config = l2gateway::Config {
-                        listen_interface,
-                        fix_mtu,
-                        nat64_prefix,
-                        dns64_domains,
-                    };
-                    let action = Action::L2Gateway(L2GatewayConfig {
-                        l2gateway: l2gateway_config,
-                        uplink: uplink_config,
-                        pcap: pcap_file,
-                    });
-                    Args { log_level, action }
-                }
+
+                let l2gateway_config = l2gateway::Config {
+                    listen_interface,
+                    fix_mtu,
+                    process_tso,
+                    nat64_prefix,
+                    dns64_domains,
+                };
+                let action = Action::L2Gateway(L2GatewayConfig {
+                    l2gateway: l2gateway_config,
+                    uplink: uplink_config,
+                    pcap: pcap_file,
+                });
+                Args { log_level, action }
             }
         }
     }
