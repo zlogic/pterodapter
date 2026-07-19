@@ -6,13 +6,13 @@
 
 pterodapter is a userspace IKEv2-to-FortiVPN adapter that acts as an L3 IKEv2 VPN server (a subset of [RFC 7296](https://datatracker.ietf.org/doc/html/rfc7296) is implemented) and forwards traffic to a FortiVPN network.
 
-![Connection diagram](diagram.svg)
-
 Previous versions also supported a proxy mode, which was deprecated once IKEv2 improved support for DNS-based split routing (NAT64 SIIT with split-horizon DNS64).
 
 The last version supporting proxy mode is [0.5.0](https://github.com/zlogic/pterodapter/tree/0.5.0).
 
 ## IKEv2 VPN mode
+
+![IKEv2 connection diagram](ikev2.svg)
 
 Root permissions are not required, but unfortunately most IKEv2 clients can only use standard ports 500 and 4500.
 Listening on port 500 requires elevated permissions or port-forwarding; the IKEv2 server needs to run externally to prevent port conflicts.
@@ -27,20 +27,22 @@ To run pterodapter locally, use WSL on Windows, or [add firewall redirection](do
 
 ## L2 Gateway mode
 
-The L2 Gateway mode is an experimental mode, acting as a regular L2 gateway/router.
+![L2 Gateway connection diagram](l2gateway.svg)
+
+The L2 Gateway mode acts as a regular L2 gateway/router.
 Instead of IKEv2, pterodapter listens to L2 ethernet frames matching the NAT64 prefix, and acts just like a regular network gateway router.
 
-For example it's possible to run pterodapter in a container with bridged networking, e.g. in [Apple container](https://github.com/apple/container).
+* On macOS, pterodapter uses the [vmnet framework](https://developer.apple.com/documentation/vmnet) to create a dedicated bridge adapter, similar to a TAP adapter.
+  This works without root permissions in macOS 26+.
 
-⚠️ This mode has more overhead than IKEv2, as IP packets need a lot more processing, and have to pass between the host OS and the container VM. Linux applies [segmentation offloading](https://docs.kernel.org/networking/segmentation-offloads.html) such as GSO/GRO, which requires additional processing in software. Network speed is about 40% lower than IKEv2.
+* In Linux (on a real Linux system or a Linux container), the raw socket API is used.
+  ⚠️ In some cases Linux applies [segmentation offloading](https://docs.kernel.org/networking/segmentation-offloads.html) such as GSO/GRO, which requires additional processing in software. Network speed is about 40% lower than IKEv2.
 
 # How to use it
 
 ## Building the Docker container
 
 Run `docker build .` or a similar build command for `podman`, `container` or your build system.
-
-To create an image with Apple Silicon optimizations, run `container build --build-arg=RUSTFLAGS="-C target-cpu=apple-m4" .`
 
 ## L2 Gateway mode
 
@@ -75,6 +77,8 @@ If no `--dns64-tunnel-suffix` arguments are specified, DNS64 won't be used, but 
 
 ### Network permissions
 
+#### Linux
+
 To use the `l2gateway` mode, pterodapter needs to be running in Linux (or a Linux-based container) and needs `CAP_NET_RAW` permissions:
 
 ```shell
@@ -89,17 +93,25 @@ setcap cap_net_raw,cap_net_admin+eip pterodapter
 
 ⚠️ It's best to run the `l2gateway` mode in a container, as a non-root user and with the minimum available permissions.
 
-In Apple container, add `--cap-add CAP_NET_RAW --cap-add CAP_NET_ADMIN` to ensure that pterodapter has the necessary permissions.
+If uploads are unusually slow, try using the `--process-tso` flag to see if Linux is returning packets without full checksums, or if TCP packets exceed the MTU (the kernel sends unfragmented packets).
+Or alternatively see if there's an option to disable GSO/GRO/TSO.
+
+#### macOS
+
+On macOS 26+, no additional permissions are required.
+Use the `macos/sign.sh` script to add the `com.apple.security.virtualization` entitlement; it's self-signed and works even without an Apple Developer account.
 
 ### Routing traffic to the VPN
 
-To send traffic to the VPN, simply add the container's IPv6 address as a route:
+In macOS, starting pterodapter in `l2gateway` mode will create a new bridge interface, typically `bridge100` (if Apple Container is not running) or `bridge101`.
+Check to see what's the interface name by running `ifconfig -l` before and after starting pterodapter.
+
+To send traffic to the VPN, simply add the new bridge interface as a route:
 
 ```shell
-CONTAINER_NAME=pterodapter
-CONTAINER_IP=$(container inspect $CONTAINER_NAME | jq -r '.[0].status.networks[0].ipv6Address|split("/").[0]')
+BRIDGE_INTERFACE=bridge100
 # Add a route for the NAT64 prefix
-sudo route add -inet6 64:ff9b::/64 ${CONTAINER_IP}%bridge100
+sudo route add -inet6 64:ff9b::/64 -interface $BRIDGE_INTERFACE
 # Route DNS for gitlab.example.com to the container's DNS64 address
 cat << EOF | sudo tee /etc/resolver/gitlab.example.com
 nameserver 64:ff9b::808:808
@@ -109,19 +121,6 @@ EOF
 ```
 
 macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
-
-To authenticate with FortiVPN SSO, run the following script to open a browser, wait for a token and forward it into the pterodapter container:
-
-```shell
-CONTAINER_NAME=pterodapter
-CONTAINER_IP=$(container inspect $CONTAINER_NAME | jq -r '.[0].status.networks[0].ipv6Address|split("/").[0]')
-# Replace fortivpn.example.com with the actual server name
-open 'https://fortivpn.example.com/remote/saml/start?redirect=1'
-
-mkfifo .netcat
-nc -l 127.0.0.1 8020 < .netcat | nc $CONTAINER_IP 8020 > .netcat
-rm .netcat
-```
 
 ## IKEv2 VPN
 
