@@ -26,7 +26,7 @@ struct Interface {
 
 impl Vmnet {
     pub async fn new(_listen_interface: &str, mtu: Option<usize>) -> Result<Self, InterfaceError> {
-        let iface = Self::start_interface(mtu).await?;
+        let mut iface = Self::start_interface(mtu).await?;
 
         let (notify_packets, packets_available) = mpsc::channel(1);
         let callback = block2::RcBlock::new(
@@ -60,6 +60,15 @@ impl Vmnet {
             warn!("Failed to enable notifications for new packets: {res}");
             return Err("Failed to enable notifications for new packets".into());
         }
+
+        let mut test_buf = vec![0u8; super::super::MAX_PACKET_SIZE];
+        if let Err(err) = iface.read(&mut test_buf) {
+            warn!("Failed to read test packet from vmnet: {err}");
+            if let Err(err) = iface.terminate().await {
+                warn!("Failed to terminate interface: {err}");
+            }
+            return Err("Failed to read test packet from vmnet".into());
+        };
 
         Ok(Vmnet {
             iface,
