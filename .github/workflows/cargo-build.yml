@@ -120,7 +120,9 @@ jobs:
       run: rustup target add ${{ matrix.arch }}-apple-darwin
 
     - name: Build
-      run: cargo build --target=${{ matrix.arch }}-apple-darwin --release
+      run: |
+        cargo build --target=${{ matrix.arch }}-apple-darwin --release
+        ./macos/sign.sh target/${{ matrix.arch }}-apple-darwin/release/pterodapter
 
     - name: Package application
       run: tar -cvjf pterodapter-${{ runner.os }}-${{ matrix.arch }}.tar.bz2 -C target/${{ matrix.arch }}-apple-darwin/release pterodapter
