@@ -107,11 +107,7 @@ impl Server {
         network: ip::Network,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> Result<(), L2GatewayError> {
-        let mtu = if self.fix_mtu {
-            Some(L2_ETHERNET_HEADER_SIZE + PATH_MTU)
-        } else {
-            None
-        };
+        let mtu = if self.fix_mtu { Some(PATH_MTU) } else { None };
         let mut socket = match iface::L2Interface::new(self.listen_interface.as_str(), mtu).await {
             Ok(socket) => socket,
             Err(err) => {

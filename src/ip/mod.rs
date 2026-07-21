@@ -2516,7 +2516,7 @@ impl Network {
         };
         if self.icmp_unreachable {
             if !self.icmp_rate_limiter.can_send() {
-                debug!("ICMP rate limit reached, dropping response");
+                debug!("ICMP rate limit reached, dropping unreachable response");
                 return Ok(RoutingActionClient::Drop);
             }
             let length = icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(
@@ -2542,7 +2542,7 @@ impl Network {
         if let Some(mtu) = mtu_exceeded {
             debug!("Received packet that's truncated or exceeds MTU: {header}");
             if !self.icmp_rate_limiter.can_send() {
-                info!("ICMP rate limit reached, dropping response");
+                info!("ICMP rate limit reached, dropping MTU exceeded response");
                 return Ok(RoutingActionClient::Drop);
             }
             let length = icmp::ICMP_ERROR_MTU_EXCEEDED.write_error_response(
@@ -2559,7 +2559,7 @@ impl Network {
                     // Hop limit will be reduced to 0 - will be dropped by the next hop.
                     warn!("Received packet with expired Hop limit from client: {header}");
                     if !self.icmp_rate_limiter.can_send() {
-                        info!("ICMP rate limit reached, dropping response");
+                        info!("ICMP rate limit reached, dropping TTL hop limit response");
                         return Ok(RoutingActionClient::Drop);
                     }
                     let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT.write_error_response(
@@ -2592,7 +2592,7 @@ impl Network {
                     // TTL limit will be reduced to 0 - will be dropped by the next hop.
                     warn!("Received packet with expired TTL: {header}");
                     if !self.icmp_rate_limiter.can_send() {
-                        info!("ICMP rate limit reached, dropping response");
+                        info!("ICMP rate limit reached, dropping TTL hop limit response");
                         return Ok(RoutingActionClient::Drop);
                     }
                     let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT.write_error_response(
@@ -2630,7 +2630,7 @@ impl Network {
         if !header.is_dns_request() {
             warn!("Dropping non-standard packet to DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
-                info!("ICMP rate limit reached, dropping response");
+                info!("ICMP rate limit reached, dropping DNS port unreachable response");
                 return Ok(RoutingActionClient::Drop);
             }
             let length = icmp::ICMP_ERROR_PORT_UNREACHABLE.write_error_response(
@@ -2760,7 +2760,7 @@ impl Network {
             // TTL limit will be reduced to 0 - will be dropped by the next hop.
             warn!("Received packet with expired TTL: {header}");
             if !self.icmp_rate_limiter.can_send() {
-                info!("ICMP rate limit reached, dropping response");
+                info!("ICMP rate limit reached, dropping TTL hop limit response");
                 return Ok(RoutingActionUplink::Drop);
             }
             let length = icmp::ICMP_ERROR_TTL_HOP_LIMIT.write_error_response(
@@ -2802,7 +2802,7 @@ impl Network {
         if !header.is_dns_response() {
             warn!("Dropping non-standard packet from DNS server {header}");
             if !self.icmp_rate_limiter.can_send() {
-                info!("ICMP rate limit reached, dropping response");
+                info!("ICMP rate limit reached, dropping DNS port unreachable response");
                 return Ok(RoutingActionUplink::Drop);
             }
             let length = icmp::ICMP_ERROR_COMMUNICATION_PROHIBITED.write_error_response(
