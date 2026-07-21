@@ -170,7 +170,16 @@ impl<'a> Ipv4Packet<'a> {
             Err("IPv4 protocol is 0".into())
         } else {
             let transport_data = &data[header_length..];
-            let transport_data = TransportData::from_data(protocol_type, transport_data)?;
+            // TransportData needs to know if fragment is shifted in advance.
+            let is_fragment_shifted = {
+                let mut fragment_offset = [0u8; 2];
+                fragment_offset.copy_from_slice(&data[6..8]);
+                let fragment = u16::from_be_bytes(fragment_offset);
+                let fragment_offset = fragment & Self::FRAGMENT_OFFSET_MASK;
+                fragment_offset != 0
+            };
+            let transport_data =
+                TransportData::from_data(protocol_type, transport_data, is_fragment_shifted)?;
             Ok(Ipv4Packet {
                 data,
                 transport_data,
@@ -830,8 +839,21 @@ impl<'a> Ipv6Packet<'a> {
             return Err("IPv6 packet has no payload".into());
         };
 
-        let transport_data =
-            TransportData::from_data(last_payload.protocol_type, last_payload.data)?;
+        // TransportData needs to know if fragment is shifted in advance.
+        let is_fragment_shifted = if let Some(fragment_extension_data) = fragment_extension_data {
+            let mut fragment_offset = [0u8; 2];
+            fragment_offset.copy_from_slice(&fragment_extension_data[2..4]);
+            let fragment_offset = u16::from_be_bytes(fragment_offset);
+            let fragment_offset = (fragment_offset >> 3) & Self::FRAGMENT_OFFSET_MASK;
+            fragment_offset != 0
+        } else {
+            false
+        };
+        let transport_data = TransportData::from_data(
+            last_payload.protocol_type,
+            last_payload.data,
+            is_fragment_shifted,
+        )?;
 
         Ok(Ipv6Packet {
             data,
@@ -896,7 +918,6 @@ impl<'a> Ipv6Packet<'a> {
     fn fragment_offset(&self) -> Option<u16> {
         let mut fragment_offset = [0u8; 2];
         fragment_offset.copy_from_slice(&self.fragment_extension_data?[2..4]);
-        fragment_offset.copy_from_slice(&self.data[6..8]);
         let fragment = u16::from_be_bytes(fragment_offset);
         let more_fragments = fragment & Self::FRAGMENT_MF_MASK == Self::FRAGMENT_MF_MASK;
         let fragment_offset = (fragment >> 3) & Self::FRAGMENT_OFFSET_MASK;
@@ -2187,15 +2208,16 @@ impl TransportData<'_> {
     fn from_data(
         protocol: TransportProtocolType,
         data: &[u8],
+        is_fragment_shifted: bool,
     ) -> Result<TransportData<'_>, IpError> {
-        match protocol {
-            TransportProtocolType::UDP => {
+        match (protocol, is_fragment_shifted) {
+            (TransportProtocolType::UDP, false) => {
                 Ok(TransportData::Udp(TransportDataUdp::from_data(data)?))
             }
-            TransportProtocolType::TCP => {
+            (TransportProtocolType::TCP, false) => {
                 Ok(TransportData::Tcp(TransportDataTcp::from_data(data)?))
             }
-            generic => Ok(TransportData::Generic(generic, data)),
+            (generic, _) => Ok(TransportData::Generic(generic, data)),
         }
     }
 
