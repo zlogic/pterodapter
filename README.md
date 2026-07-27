@@ -49,7 +49,7 @@ Run `docker build .` or a similar build command for `podman`, `container` or you
 Run pterodapter with the following arguments:
 
 ```shell
-pterotapter [--log-level=<level>] [--listen-interface=<iface>] [--fix-mtu] [--process-tso] --fortivpn=<hostport> --nat64-prefix=<ip6prefix> [--dns64-tunnel-suffix=<domain>] [--pcap=<filename>] l2gateway
+pterodapter [--log-level=<level>] [--listen-interface=<iface>] [--fix-mtu] [--process-tso] --fortivpn=<hostport> --nat64-prefix=<ip6prefix> [--dns64-tunnel-suffix=<domain>] [--pcap=<filename>] l2gateway
 ```
 
 `--log-level=<level>` is an optional argument to specify the log level, for example `--log-level=debug`.
@@ -100,6 +100,8 @@ Or alternatively see if there's an option to disable GSO/GRO/TSO.
 
 On macOS 26+, no additional permissions are required.
 Use the `macos/sign.sh` script to add the `com.apple.security.virtualization` entitlement; it's self-signed and works even without an Apple Developer account.
+
+⚠️ Sometimes copying/moving the binary will lose its signature, and re-running `macos/sign.sh` might be necessary.
 
 ### Routing traffic to the VPN
 
