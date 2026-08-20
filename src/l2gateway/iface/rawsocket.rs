@@ -359,9 +359,12 @@ struct BpfFilter {
 
 impl BpfFilter {
     fn new_program(prog: &[BpfFilterOp]) -> BpfFilter {
+        const BPF_FILTER_OP_SIZE: usize = std::mem::size_of::<BpfFilterOp>();
         let mut program_data = vec![0u8; std::mem::size_of_val(prog)];
         program_data
-            .chunks_exact_mut(std::mem::size_of::<BpfFilterOp>())
+            .as_chunks_mut::<BPF_FILTER_OP_SIZE>()
+            .0
+            .iter_mut()
             .zip(prog.iter())
             .for_each(|(data, op)| data.copy_from_slice(op.as_slice()));
         BpfFilter {

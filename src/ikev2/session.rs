@@ -1595,7 +1595,7 @@ impl IKEv2Session {
                     _ => return Err("Security Association has unsupported remote SPI type".into()),
                 };
             let session_id = SessionID::new(remote_spi, local_spi);
-            let child_sas = self.child_sas.drain().collect::<HashSet<_>>();
+            let child_sas = std::mem::take(&mut self.child_sas);
             let new_session = IKEv2Session {
                 session_id,
                 remote_addr: self.remote_addr,
@@ -1643,7 +1643,7 @@ impl IKEv2Session {
     }
 
     pub fn take_pending_actions(&mut self) -> Vec<IKEv2PendingAction> {
-        self.pending_actions.drain(..).collect::<Vec<_>>()
+        std::mem::take(&mut self.pending_actions)
     }
 
     pub fn is_deleting_request(&mut self) -> bool {

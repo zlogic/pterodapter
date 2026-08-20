@@ -2932,12 +2932,13 @@ impl Checksum {
         // Using the following complier args:
         // "-O -C target-cpu=x86-64-v3" for x86
         // "-O --target=aarch64-apple-darwin -C target-cpu=apple-m4" for ARM64
-        let mut iter = add.chunks_exact(2);
-        let full_sum = iter
+        let (full, remainder) = add.as_chunks::<2>();
+        let full_sum = full
+            .iter()
             .by_ref()
             .map(|bytes| ((bytes[0] as u32) << 8) | (bytes[1] as u32))
             .sum::<u32>();
-        let remain_sum = match *iter.remainder() {
+        let remain_sum = match *remainder {
             [high] => (high as u32) << 8,
             [] => 0u32,
             _ => panic!("Checksum chunks_exact returned unexpected slice size"),
