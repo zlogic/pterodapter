@@ -1,4 +1,4 @@
-use std::{error, ffi::CStr, fmt, net::Ipv6Addr, task::Poll};
+use std::{error, fmt, net::Ipv6Addr, task::Poll};
 
 use log::{debug, trace, warn};
 use rand::Rng as _;
@@ -105,12 +105,7 @@ impl Vmnet {
 
         let (tx, mut rx) = mpsc::channel(1);
         let block = block2::RcBlock::new(
-            move |status: sys::vmnet_return_t, params: sys::xpc_object_t| {
-                unsafe {
-                    let params =
-                        CStr::from_ptr(sys::xpc_copy_description(params)).to_string_lossy();
-                    println!("Got params object: {params}");
-                }
+            move |status: sys::vmnet_return_t, _params: sys::xpc_object_t| {
                 let _ = tx.blocking_send(VmnetResponse::from_code(status));
             },
         );

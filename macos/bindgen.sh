@@ -28,7 +28,6 @@ xcrun bindgen \
   --allowlist-function xpc_dictionary_get_string\
   --allowlist-function xpc_dictionary_get_uint64\
   --allowlist-function dispatch_get_global_queue\
-  --allowlist-function xpc_copy_description\
   $INCLUDE_FILE \
   > src/l2gateway/iface/vmnet/sys.rs
 rm "$INCLUDE_FILE"
