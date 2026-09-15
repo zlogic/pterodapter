@@ -22,11 +22,6 @@ const TTL_HOP_DECREMENT: u8 = 1;
 
 const DEFAULT_RESPONSE_TTL: u8 = 64;
 
-// All nodes multicast address, defined in RFC 4291.
-const ALL_IPV6_NODES_LINK_LOCAL_ADDRESS: Ipv6Addr = Ipv6Addr::from_segments([
-    0xff02, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0001,
-]);
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TransportProtocolType(u8);
 
