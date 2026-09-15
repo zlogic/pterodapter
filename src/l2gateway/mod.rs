@@ -421,15 +421,14 @@ impl PacketFilter {
         self.network.set_icmp_unreachable(configuration.is_none());
         self.vpn_real_ip = internal_addr;
 
-        if !iface::L2Interface::dedicated_connection() {
-            let client_ip = match client_ip {
-                Some(IpAddr::V6(client_ip)) => Some(client_ip),
-                Some(IpAddr::V4(_)) | None => None,
-            };
-            if client_ip != self.client_ip {
-                self.client_ip = client_ip;
-                self.client_mac = None;
-            }
+        let client_ip = match client_ip {
+            Some(IpAddr::V6(client_ip)) => Some(client_ip),
+            Some(IpAddr::V4(_)) | None => None,
+        };
+        if client_ip != self.client_ip && client_ip.is_none_or(|addr| !addr.is_loopback()) {
+            // Only non-localhost IPs should set the client IP filter.
+            self.client_ip = client_ip;
+            self.client_mac = None;
         }
     }
 
@@ -462,29 +461,18 @@ impl PacketFilter {
         if dst_mac.is_multicast() {
             return self.process_multicast_packet(dst_mac, src_mac, ether_type, data, out_buf);
         }
-        if iface::L2Interface::dedicated_connection() {
-            if dst_mac != self.server_mac {
-                debug!("Changing server MAC from {} to {dst_mac}", self.server_mac);
-                self.server_mac = dst_mac;
-            }
-            if self.client_mac != Some(src_mac) {
-                debug!("Updating client MAC to {src_mac}");
-                self.client_mac = Some(src_mac);
-            }
-        } else {
-            if dst_mac != self.server_mac {
-                debug!(
-                    "Ethernet frame has destination {dst_mac}, should be {}",
-                    self.server_mac
-                );
-                return Ok(RawRoutingAction::Drop);
-            }
-            if let Some(client_mac) = &self.client_mac
-                && &src_mac != client_mac
-            {
-                debug!("Ethernet frame has source {src_mac}, should be {client_mac}");
-                return Ok(RawRoutingAction::Drop);
-            }
+        if dst_mac != self.server_mac {
+            debug!(
+                "Ethernet frame has destination {dst_mac}, should be {}",
+                self.server_mac
+            );
+            return Ok(RawRoutingAction::Drop);
+        }
+        if let Some(client_mac) = &self.client_mac
+            && &src_mac != client_mac
+        {
+            debug!("Ethernet frame has source {src_mac}, should be {client_mac}");
+            return Ok(RawRoutingAction::Drop);
         }
 
         if let Some(pcap_sender) = &mut self.pcap_sender {
@@ -513,17 +501,7 @@ impl PacketFilter {
             return Ok(RawRoutingAction::Drop);
         }
         // Register client MAC for additional authentication, and to send back replies.
-        if iface::L2Interface::dedicated_connection() {
-            match *header.src_addr() {
-                IpAddr::V6(client_ip) => {
-                    if self.client_ip != Some(client_ip) {
-                        debug!("Updating client IP to {client_ip}");
-                        self.client_ip = Some(client_ip);
-                    }
-                }
-                IpAddr::V4(_) => {}
-            };
-        } else if self.client_ip.is_some() && self.client_mac.is_none() {
+        if self.client_ip.is_some() && self.client_mac.is_none() {
             self.client_mac = Some(src_mac);
         }
 
@@ -576,10 +554,6 @@ impl PacketFilter {
         data: &'a [u8],
         out_buf: &'a mut [u8],
     ) -> Result<RawRoutingAction<'a>, L2GatewayError> {
-        if !iface::L2Interface::dedicated_connection() {
-            debug!("L2 interface is not using NDP and doesn't support multicast");
-            return Ok(RawRoutingAction::Drop);
-        }
         if let Some(pcap_sender) = &mut self.pcap_sender {
             pcap_sender.send_packet(data);
         }
@@ -598,12 +572,27 @@ impl PacketFilter {
             "Decoded IP packet from {ether_type} ethernet frame {src_mac} -> {dst_mac} {ip_packet}"
         );
         let header = ip_packet.to_header();
+        let client_ip = match header.src_addr() {
+            IpAddr::V6(client_ip) => Some(*client_ip),
+            IpAddr::V4(_) => None,
+        };
         let eth_config = ip::EthernetConfiguration::new(self.server_mac.0);
         match self
             .network
             .translate_multicast_from_uplink(ip_packet, header, eth_config, out_buf)
         {
             Ok(ip::RoutingActionMulticast::SendResponse(buf, msg_len, multicast)) => {
+                if self.client_mac != Some(src_mac) {
+                    debug!("Updating client MAC to {src_mac}");
+                    self.client_mac = Some(src_mac);
+                }
+                if let Some(client_ip) = client_ip
+                    && self.client_ip != Some(client_ip)
+                {
+                    debug!("Updating client IP to {client_ip}");
+                    self.client_ip = Some(client_ip);
+                };
+
                 if let Some(pcap_sender) = &mut self.pcap_sender {
                     pcap_sender.send_packet(&buf[..msg_len]);
                 }
@@ -620,7 +609,6 @@ impl PacketFilter {
             Ok(ip::RoutingActionMulticast::Drop) => Ok(RawRoutingAction::Drop),
             Err(err) => Err(err.into()),
         }
-        // TODO VMNET: detect client IP/MAC, perhaps from Router Advertisement?
     }
 
     fn process_uplink_packet<'a>(

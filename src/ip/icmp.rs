@@ -812,8 +812,6 @@ impl<'a> IcmpV6Message<'a> {
                     );
                     return Ok(IcmpMulticastTranslationAction::Drop);
                 }
-                // TODO VMNET: accept any IPv6 IP, or print which IP needs to be added as a gateway?
-                /*
                 if packet.dst_addr() != eth_config.node_multicast_address() {
                     debug!(
                         "Received Neighbor Solicitation for {}, will only reply to {}",
@@ -822,7 +820,6 @@ impl<'a> IcmpV6Message<'a> {
                     );
                     return Ok(IcmpMulticastTranslationAction::Drop);
                 }
-                */
                 let src_addr = eth_config.link_local_address();
                 {
                     let ip_header = &mut dest[0..40];

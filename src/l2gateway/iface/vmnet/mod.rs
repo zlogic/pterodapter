@@ -132,7 +132,12 @@ impl Vmnet {
         }?;
 
         let mac = Self::generate_mac();
-        debug!("Generated MAC {mac}");
+        let ip = ip::EthernetConfiguration::new(mac.0).link_local_address();
+        // TODO VMNET: fill in the real NAT64 prefix here
+        println!(
+            "To route NAT64 traffic, run the following command:\nsudo route add 64:ff9b::/64 {ip}%bridge100"
+        );
+
         Ok(Interface {
             queue,
             iface,
@@ -234,10 +239,6 @@ impl Interface {
 impl super::Interface for Vmnet {
     fn if_mac(&self) -> crate::l2gateway::MacAddr {
         self.iface.mac
-    }
-
-    fn dedicated_connection() -> bool {
-        true
     }
 
     fn set_nat64_filter(&self, _prefix: &ip::Nat64Prefix) -> Result<(), std::io::Error> {

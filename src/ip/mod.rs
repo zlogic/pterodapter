@@ -2949,7 +2949,7 @@ impl EthernetConfiguration {
         EthernetConfiguration { mac }
     }
 
-    fn link_local_address(&self) -> Ipv6Addr {
+    pub fn link_local_address(&self) -> Ipv6Addr {
         // EUI-64 link-local address, based on Apple Containerization MACAddress.
         let mac = &self.mac;
         Ipv6Addr::from_octets([

@@ -21,8 +21,6 @@ pub(super) type InterfaceError = vmnet::InterfaceError;
 pub trait Interface {
     fn if_mac(&self) -> MacAddr;
 
-    fn dedicated_connection() -> bool;
-
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error>;
 
     fn poll_recv(

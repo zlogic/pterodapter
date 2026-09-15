@@ -209,10 +209,6 @@ impl super::Interface for RawSocket {
         self.mac
     }
 
-    fn dedicated_connection() -> bool {
-        true
-    }
-
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {
         // See https://docs.kernel.org/networking/filter.html for more information.
         let mut filter_data = BpfFilter::new_nat64_filter(&self.mac, prefix);
