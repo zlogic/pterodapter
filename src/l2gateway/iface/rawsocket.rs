@@ -219,6 +219,10 @@ impl super::Interface for RawSocket {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, &filter)
     }
 
+    fn print_route_instructions(&self, _prefix: &ip::Nat64Prefix) {
+        // Linux routes can be used in any OS, do not print anything.
+    }
+
     fn poll_recv(
         &mut self,
         cx: &mut std::task::Context<'_>,

@@ -1,4 +1,4 @@
-use std::{error, fmt, task::Poll};
+use std::{error, fmt, net::Ipv6Addr, task::Poll};
 
 use log::{debug, trace, warn};
 use rand::Rng as _;
@@ -132,11 +132,6 @@ impl Vmnet {
         }?;
 
         let mac = Self::generate_mac();
-        let ip = ip::EthernetConfiguration::new(mac.0).link_local_address();
-        // TODO VMNET: fill in the real NAT64 prefix here
-        println!(
-            "To route NAT64 traffic, run the following command:\nsudo route add 64:ff9b::/64 {ip}%bridge100"
-        );
 
         Ok(Interface {
             queue,
@@ -244,6 +239,17 @@ impl super::Interface for Vmnet {
     fn set_nat64_filter(&self, _prefix: &ip::Nat64Prefix) -> Result<(), std::io::Error> {
         // macOS doesn't support low-level filtering.
         Ok(())
+    }
+
+    fn print_route_instructions(&self, prefix: &ip::Nat64Prefix) {
+        let ip = ip::EthernetConfiguration::new(self.iface.mac.0).link_local_address();
+        let mut nat64_ip = [0u8; 16];
+        nat64_ip[0..12].copy_from_slice(prefix);
+        let nat64_ip = Ipv6Addr::from_octets(nat64_ip);
+
+        println!(
+            "To route NAT64 traffic to pterodapter, run the following command:\nsudo route add -inet6 {nat64_ip}/96 {ip}%bridge100"
+        );
     }
 
     fn poll_recv(
