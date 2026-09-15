@@ -613,10 +613,6 @@ impl PacketFilter {
                 buf[0..6].copy_from_slice(reply_mac.as_slice());
                 buf[6..12].copy_from_slice(self.server_mac.as_slice());
                 buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
-                println!(
-                    "Returning to sender {}",
-                    fmt_slice_hex(&buf[..L2_ETHERNET_HEADER_SIZE + msg_len])
-                );
                 Ok(RawRoutingAction::ReturnToSender(
                     &buf[..L2_ETHERNET_HEADER_SIZE + msg_len],
                 ))
