@@ -236,12 +236,9 @@ impl super::Interface for Vmnet {
         self.iface.mac
     }
 
-    fn set_nat64_filter(&self, _prefix: &ip::Nat64Prefix) -> Result<(), std::io::Error> {
+    fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), std::io::Error> {
         // macOS doesn't support low-level filtering.
-        Ok(())
-    }
-
-    fn print_route_instructions(&self, prefix: &ip::Nat64Prefix) {
+        // Instead, print instructions how to update the route table.
         let ip = ip::EthernetConfiguration::new(self.iface.mac.0).link_local_address();
         let mut nat64_ip = [0u8; 16];
         nat64_ip[0..12].copy_from_slice(prefix);
@@ -250,6 +247,7 @@ impl super::Interface for Vmnet {
         println!(
             "To route NAT64 traffic to pterodapter, run the following command:\nsudo route add -inet6 {nat64_ip}/96 {ip}%bridge100"
         );
+        Ok(())
     }
 
     fn poll_recv(

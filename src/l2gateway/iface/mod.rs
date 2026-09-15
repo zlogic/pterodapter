@@ -23,8 +23,6 @@ pub trait Interface {
 
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error>;
 
-    fn print_route_instructions(&self, prefix: &ip::Nat64Prefix);
-
     fn poll_recv(
         &mut self,
         cx: &mut std::task::Context<'_>,

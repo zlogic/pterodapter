@@ -120,7 +120,6 @@ impl Server {
         if let Err(err) = socket.set_nat64_filter(&self.nat64_prefix) {
             warn!("Failed to enable BPF filter, will rely on a less efficient packet filter: {err}")
         }
-        socket.print_route_instructions(&self.nat64_prefix);
 
         let mut packet_filter =
             PacketFilter::new(network, self.nat64_prefix, socket.if_mac(), pcap_sender);
