@@ -111,9 +111,10 @@ Check to see what's the interface name by running `ifconfig -l` before and after
 To send traffic to the VPN, simply add the new bridge interface as a route:
 
 ```shell
+# Specify the bridge interface added after starting pterodapter
 BRIDGE_INTERFACE=bridge100
-# Add a route for the NAT64 prefix
-sudo route add -inet6 64:ff9b::/64 -interface $BRIDGE_INTERFACE
+# Run the "sudo route add ..." command printed by pterodapter, for example:
+# sudo route add -inet6 64:ff9b::/96 fe80::f467:d9ff:fe25:144b%${BRIDGE_INTERFACE}
 # Route DNS for gitlab.example.com to the container's DNS64 address
 cat << EOF | sudo tee /etc/resolver/gitlab.example.com
 nameserver 64:ff9b::808:808
@@ -123,6 +124,9 @@ EOF
 ```
 
 macOS _Limit IP address tracking_ needs to be disabled for DNS64 to work (even when iCloud Private Relay is not enabled).
+
+It is possible that pterodapter might attach to an existing `bridge...` interface, in that case it might help to try use
+`ping6 fe80::..%bridge100`, `ping6 fe80::..%bridge101` and so on - in order to find which `bridge...` pterodapter is attached to.
 
 ## IKEv2 VPN
 

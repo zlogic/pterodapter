@@ -1,5 +1,5 @@
 use crate::ip;
-use std::{io, task::Poll};
+use std::{io, net::Ipv6Addr, task::Poll};
 
 use super::MacAddr;
 
@@ -20,6 +20,8 @@ pub(super) type InterfaceError = vmnet::InterfaceError;
 
 pub trait Interface {
     fn if_mac(&self) -> MacAddr;
+
+    fn phantom_addr(&self) -> Option<Ipv6Addr>;
 
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error>;
 

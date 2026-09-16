@@ -2885,11 +2885,52 @@ impl Network {
         Ok(action)
     }
 
-    pub fn translate_multicast_from_uplink<'a>(
+    pub fn translate_phantom_from_client<'a>(
         &mut self,
         packet: IpPacket<'a>,
         header: IpHeader,
-        eth_config: EthernetConfiguration,
+        out_buf: &'a mut [u8],
+    ) -> Result<RoutingActionPhantom<'a>, IpError> {
+        let packet = match packet {
+            IpPacket::V6(packet) => packet,
+            IpPacket::V4(_) => return Err("Cannot process IPv4 packet to phantom address".into()),
+        };
+        if header.transport_protocol() != TransportProtocolType::IPV6_ICMP {
+            debug!(
+                "Phantom packet handler only handles ICMPv6, {} is unsupported",
+                header.transport_protocol()
+            );
+            return Ok(RoutingActionPhantom::Drop);
+        }
+        if !self.icmp_rate_limiter.can_send() {
+            info!("ICMP rate limit reached, dropping packet to phantom address");
+            return Ok(RoutingActionPhantom::Drop);
+        }
+        let icmp_packet =
+            icmp::IcmpV6Message::from_data(packet.transport_protocol_data().full_data())?;
+        trace!("Decoded ICMPv6 packet {icmp_packet}");
+
+        let translation = icmp_packet.translate_phantom(&packet, out_buf)?;
+        let action = match translation {
+            icmp::IcmpPhantomTranslationAction::SendResponse(length) => {
+                if log::log_enabled!(log::Level::Trace) {
+                    let icmp_packet = icmp::IcmpV6Message::from_data(&out_buf[40..length])?;
+                    trace!("Write ICMPv6 response for phantom address: {icmp_packet}");
+                }
+
+                RoutingActionPhantom::SendResponse(out_buf, length)
+            }
+            icmp::IcmpPhantomTranslationAction::Drop => RoutingActionPhantom::Drop,
+        };
+        Ok(action)
+    }
+
+    pub fn translate_multicast_from_client<'a>(
+        &mut self,
+        packet: IpPacket<'a>,
+        header: IpHeader,
+        mac: MacAddr,
+        phantom: Ipv6Addr,
         out_buf: &'a mut [u8],
     ) -> Result<RoutingActionMulticast<'a>, IpError> {
         let packet = match packet {
@@ -2903,11 +2944,15 @@ impl Network {
             );
             return Ok(RoutingActionMulticast::Drop);
         }
+        if !self.icmp_rate_limiter.can_send() {
+            info!("ICMP rate limit reached, dropping multicast packet");
+            return Ok(RoutingActionMulticast::Drop);
+        }
         let icmp_packet =
             icmp::IcmpV6Message::from_data(packet.transport_protocol_data().full_data())?;
         trace!("Decoded ICMPv6 packet {icmp_packet}");
 
-        let translation = icmp_packet.translate_multicast(&packet, eth_config, out_buf)?;
+        let translation = icmp_packet.translate_multicast(&packet, mac, phantom, out_buf)?;
         let action = match translation {
             icmp::IcmpMulticastTranslationAction::SendResponse(length, multicast) => {
                 if log::log_enabled!(log::Level::Trace) {
@@ -2935,51 +2980,25 @@ pub enum RoutingActionUplink<'a> {
     Drop,
 }
 
+pub enum RoutingActionPhantom<'a> {
+    SendResponse(&'a mut [u8], usize),
+    Drop,
+}
+
 pub enum RoutingActionMulticast<'a> {
     SendResponse(&'a mut [u8], usize, bool),
     Drop,
 }
 
-pub struct EthernetConfiguration {
-    mac: [u8; 6],
-}
+pub type MacAddr = [u8; 6];
 
-impl EthernetConfiguration {
-    pub fn new(mac: [u8; 6]) -> EthernetConfiguration {
-        EthernetConfiguration { mac }
-    }
-
-    pub fn link_local_address(&self) -> Ipv6Addr {
-        // EUI-64 link-local address, based on Apple Containerization MACAddress.
-        let mac = &self.mac;
-        Ipv6Addr::from_octets([
-            0xfe,
-            0x80,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            mac[0] ^ 0x02,
-            mac[1],
-            mac[2],
-            0xff,
-            0xfe,
-            mac[3],
-            mac[4],
-            mac[5],
-        ])
-    }
-
-    fn node_multicast_address(&self) -> Ipv6Addr {
-        // Solicited-node address, defined in RFC 4291.
-        let mac = &self.mac;
-        Ipv6Addr::from_octets([
-            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, mac[3],
-            mac[4], mac[5],
-        ])
-    }
+fn solicited_node_multicast_address(addr: &Ipv6Addr) -> Ipv6Addr {
+    // Solicited-node address, defined in RFC 4291.
+    let octets = addr.octets();
+    Ipv6Addr::from_octets([
+        0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, octets[13],
+        octets[14], octets[15],
+    ])
 }
 
 #[derive(Clone, Copy)]

@@ -1,5 +1,4 @@
-use std::{error, fmt};
-use std::{io, os::fd::AsRawFd, task::Poll};
+use std::{error, fmt, io, net::Ipv6Addr, os::fd::AsRawFd, task::Poll};
 
 use log::{debug, info, warn};
 use tokio::io::unix::AsyncFd;
@@ -207,6 +206,14 @@ impl RawSocket {
 impl super::Interface for RawSocket {
     fn if_mac(&self) -> MacAddr {
         self.mac
+    }
+
+    fn phantom_addr(&self) -> Option<Ipv6Addr> {
+        // Linux raw sockets are attached to a real interface, packets like ICMPv6 are handled by
+        // the kernel.
+        // Neighbor discovery and ICMPv6 pings don't need a phantom address, this would only cause
+        // confusion.
+        None
     }
 
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), io::Error> {

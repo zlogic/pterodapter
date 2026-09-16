@@ -244,6 +244,11 @@ pub(super) enum IcmpTranslationAction {
     Drop,
 }
 
+pub(super) enum IcmpPhantomTranslationAction {
+    SendResponse(usize),
+    Drop,
+}
+
 pub(super) enum IcmpMulticastTranslationAction {
     SendResponse(usize, bool),
     Drop,
@@ -797,10 +802,52 @@ impl<'a> IcmpV6Message<'a> {
         }
     }
 
+    pub fn translate_phantom(
+        &self,
+        packet: &Ipv6Packet<'a>,
+        dest: &mut [u8],
+    ) -> Result<IcmpPhantomTranslationAction, IpError> {
+        match self.icmp_type() {
+            IcmpV6::EchoRequest => {
+                let icmp_len = packet.payload_length_header() as usize;
+                if 40 + icmp_len > dest.len() {
+                    return Err("Not enough space to copy ICMP echo reply data".into());
+                }
+                {
+                    let ip_header = &mut dest[0..40];
+                    ip_header[0] = 0x60;
+                    ip_header[1..4].fill(0);
+                    ip_header[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
+                    ip_header[6] = TransportProtocolType::IPV6_ICMP.to_u8();
+                    ip_header[7] = 255;
+                    ip_header[8..24].copy_from_slice(&packet.dst_addr().octets());
+                    ip_header[24..40].copy_from_slice(&packet.src_addr().octets());
+                }
+                let mut checksum =
+                    Ipv6Packet::pseudo_checksum(dest, TransportProtocolType::IPV6_ICMP, icmp_len);
+                let icmp_data = &mut dest[40..40 + icmp_len];
+                icmp_data[0] = 129;
+                icmp_data[1..4].fill(0);
+                icmp_data[4..icmp_len]
+                    .copy_from_slice(&packet.transport_data.full_data()[4..icmp_len]);
+
+                checksum.add_slice(icmp_data);
+                checksum.fold();
+                icmp_data[2..4].copy_from_slice(&checksum.value().to_be_bytes());
+                Ok(IcmpPhantomTranslationAction::SendResponse(40 + icmp_len))
+            }
+            icmp_type => {
+                debug!("Ignoring {icmp_type} ICMP packet to phantom address");
+                Ok(IcmpPhantomTranslationAction::Drop)
+            }
+        }
+    }
+
     pub fn translate_multicast(
         &self,
         packet: &Ipv6Packet<'a>,
-        eth_config: super::EthernetConfiguration,
+        mac: super::MacAddr,
+        phantom_addr: Ipv6Addr,
         dest: &mut [u8],
     ) -> Result<IcmpMulticastTranslationAction, IpError> {
         match self.ndp_message()? {
@@ -812,15 +859,14 @@ impl<'a> IcmpV6Message<'a> {
                     );
                     return Ok(IcmpMulticastTranslationAction::Drop);
                 }
-                if packet.dst_addr() != eth_config.node_multicast_address() {
+                let multicast_addr = super::solicited_node_multicast_address(&phantom_addr);
+                if packet.dst_addr() != multicast_addr {
                     debug!(
-                        "Received Neighbor Solicitation for {}, will only reply to {}",
+                        "Received Neighbor Solicitation for {}, will only reply to {multicast_addr}",
                         packet.dst_addr(),
-                        eth_config.node_multicast_address()
                     );
                     return Ok(IcmpMulticastTranslationAction::Drop);
                 }
-                let src_addr = eth_config.link_local_address();
                 {
                     let ip_header = &mut dest[0..40];
                     ip_header[0] = 0x60;
@@ -828,7 +874,7 @@ impl<'a> IcmpV6Message<'a> {
                     ip_header[4..6].copy_from_slice(&(ICMP_LEN as u16).to_be_bytes());
                     ip_header[6] = TransportProtocolType::IPV6_ICMP.to_u8();
                     ip_header[7] = 255;
-                    ip_header[8..24].copy_from_slice(&src_addr.octets());
+                    ip_header[8..24].copy_from_slice(&phantom_addr.octets());
                     ip_header[24..40].copy_from_slice(&packet.src_addr().octets());
                 }
                 let mut checksum =
@@ -843,7 +889,7 @@ impl<'a> IcmpV6Message<'a> {
                 // Target link-layer address.
                 icmp_data[24] = 2;
                 icmp_data[25] = 1;
-                icmp_data[26..32].copy_from_slice(&eth_config.mac);
+                icmp_data[26..32].copy_from_slice(&mac);
 
                 checksum.add_slice(icmp_data);
                 checksum.fold();

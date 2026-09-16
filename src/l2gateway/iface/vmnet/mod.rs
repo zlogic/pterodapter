@@ -148,6 +148,29 @@ impl Vmnet {
         mac[0] = (mac[0] & 0x0c) | 0xf2;
         MacAddr::from_data(&mac)
     }
+
+    fn link_local_addr(&self) -> Ipv6Addr {
+        // EUI-64 link-local address, based on Apple Containerization MACAddress.
+        let mac = self.iface.mac.as_slice();
+        Ipv6Addr::from_octets([
+            0xfe,
+            0x80,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            mac[0] ^ 0x02,
+            mac[1],
+            mac[2],
+            0xff,
+            0xfe,
+            mac[3],
+            mac[4],
+            mac[5],
+        ])
+    }
 }
 
 impl Interface {
@@ -236,16 +259,20 @@ impl super::Interface for Vmnet {
         self.iface.mac
     }
 
+    fn phantom_addr(&self) -> Option<Ipv6Addr> {
+        Some(self.link_local_addr())
+    }
+
     fn set_nat64_filter(&self, prefix: &ip::Nat64Prefix) -> Result<(), std::io::Error> {
         // macOS doesn't support low-level filtering.
         // Instead, print instructions how to update the route table.
-        let ip = ip::EthernetConfiguration::new(self.iface.mac.0).link_local_address();
+        let ip = self.link_local_addr();
         let mut nat64_ip = [0u8; 16];
         nat64_ip[0..12].copy_from_slice(prefix);
         let nat64_ip = Ipv6Addr::from_octets(nat64_ip);
 
         println!(
-            "To route NAT64 traffic to pterodapter, run the following command:\nsudo route add -inet6 {nat64_ip}/96 {ip}%bridge100"
+            "To route NAT64 traffic to pterodapter, run the following command:\nsudo route add -inet6 {nat64_ip}/96 {ip}%${{BRIDGE_INTERFACE}}"
         );
         Ok(())
     }

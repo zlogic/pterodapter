@@ -10,6 +10,7 @@ use std::{future, io};
 use log::{debug, info, trace, warn};
 use tokio::{runtime, sync::oneshot};
 
+use crate::ip::{IpHeader, IpPacket};
 use crate::l2gateway::iface::Interface as _;
 use crate::logger::fmt_slice_hex;
 use crate::uplink::UplinkService as _;
@@ -121,8 +122,13 @@ impl Server {
             warn!("Failed to enable BPF filter, will rely on a less efficient packet filter: {err}")
         }
 
-        let mut packet_filter =
-            PacketFilter::new(network, self.nat64_prefix, socket.if_mac(), pcap_sender);
+        let mut packet_filter = PacketFilter::new(
+            network,
+            self.nat64_prefix,
+            socket.if_mac(),
+            socket.phantom_addr(),
+            pcap_sender,
+        );
 
         info!("Started server");
 
@@ -389,6 +395,7 @@ struct PacketFilter {
     client_mac: Option<MacAddr>,
     vpn_real_ip: Option<IpAddr>,
     server_mac: MacAddr,
+    phantom_addr: Option<Ipv6Addr>,
 }
 
 impl PacketFilter {
@@ -396,6 +403,7 @@ impl PacketFilter {
         network: ip::Network,
         nat64_prefix: ip::Nat64Prefix,
         server_mac: MacAddr,
+        phantom_addr: Option<Ipv6Addr>,
         pcap_sender: Option<pcap::PcapSender>,
     ) -> PacketFilter {
         PacketFilter {
@@ -406,6 +414,7 @@ impl PacketFilter {
             client_mac: None,
             vpn_real_ip: None,
             server_mac,
+            phantom_addr,
         }
     }
 
@@ -494,11 +503,17 @@ impl PacketFilter {
         );
         let header = ip_packet.to_header();
         if !self.nat64_prefix.matches_addr(header.dst_addr()) {
-            debug!(
-                "Packet destination {} doesn't match NAT64 prefix",
-                header.dst_addr()
-            );
-            return Ok(RawRoutingAction::Drop);
+            if let Some(phantom_addr) = self.phantom_addr
+                && &IpAddr::V6(phantom_addr) == header.dst_addr()
+            {
+                return self.process_phantom_packet(src_mac, ip_packet, header, out_buf);
+            } else {
+                debug!(
+                    "Packet destination {} doesn't match NAT64 prefix",
+                    header.dst_addr()
+                );
+                return Ok(RawRoutingAction::Drop);
+            };
         }
         // Register client MAC for additional authentication, and to send back replies.
         if self.client_ip.is_some() && self.client_mac.is_none() {
@@ -546,6 +561,35 @@ impl PacketFilter {
         }
     }
 
+    fn process_phantom_packet<'a>(
+        &mut self,
+        src_mac: MacAddr,
+        ip_packet: IpPacket<'a>,
+        header: IpHeader,
+        out_buf: &'a mut [u8],
+    ) -> Result<RawRoutingAction<'a>, L2GatewayError> {
+        match self
+            .network
+            .translate_phantom_from_client(ip_packet, header, out_buf)
+        {
+            Ok(ip::RoutingActionPhantom::SendResponse(buf, msg_len)) => {
+                if let Some(pcap_sender) = &mut self.pcap_sender {
+                    pcap_sender.send_packet(&buf[..msg_len]);
+                }
+                // Prepend Ethernet headers.
+                buf.copy_within(..msg_len, L2_ETHERNET_HEADER_SIZE);
+                buf[0..6].copy_from_slice(src_mac.as_slice());
+                buf[6..12].copy_from_slice(self.server_mac.as_slice());
+                buf[12..14].copy_from_slice(&EtherType::IPV6.to_u16().to_be_bytes());
+                Ok(RawRoutingAction::ReturnToSender(
+                    &buf[..L2_ETHERNET_HEADER_SIZE + msg_len],
+                ))
+            }
+            Ok(ip::RoutingActionPhantom::Drop) => Ok(RawRoutingAction::Drop),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn process_multicast_packet<'a>(
         &mut self,
         dst_mac: MacAddr,
@@ -576,10 +620,16 @@ impl PacketFilter {
             IpAddr::V6(client_ip) => Some(*client_ip),
             IpAddr::V4(_) => None,
         };
-        let eth_config = ip::EthernetConfiguration::new(self.server_mac.0);
+        let server_mac = self.server_mac.0;
+        let server_ip = if let Some(server_ip) = self.phantom_addr {
+            server_ip
+        } else {
+            trace!("No phantom server address specified, dropping packet");
+            return Ok(RawRoutingAction::Drop);
+        };
         match self
             .network
-            .translate_multicast_from_uplink(ip_packet, header, eth_config, out_buf)
+            .translate_multicast_from_client(ip_packet, header, server_mac, server_ip, out_buf)
         {
             Ok(ip::RoutingActionMulticast::SendResponse(buf, msg_len, multicast)) => {
                 if self.client_mac != Some(src_mac) {
