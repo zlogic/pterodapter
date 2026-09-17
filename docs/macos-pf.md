@@ -13,9 +13,8 @@ This document explains how to set up a rule so that `192.0.2.40:500` is redirect
 
 This document explains how to set up a rule so that `192.0.2.40:500` is redirected to `127.0.0.1:9500`, and `192.0.2.40:4500` is redirected to `127.0.0.1:9501`; this way, a local copy of pterodapter will look like it's running at `192.0.2.40`.
 
-⚠️ Starting [Apple container](https://github.com/apple/container) enables network sharing and makes firewall rules unreliable.
-Unfortunately the only working solution is running pterodapter externally; container 0.9 works for some time and stops processing traffic.
-Maybe this will be fixed in the future.
+⚠️ In macOS 26, starting [Apple container](https://github.com/apple/container) enables network sharing and makes firewall rules unreliable.
+The issue is fixed in macOS 27.
 
 ## Simple PF rule
 
@@ -24,9 +23,10 @@ Run pterodapter on ports 9500 + 9501 - and specify 192.0.2.40 as the destination
 ```shell
 CONTAINER_SUBNET=192.0.2.40
 cat << EOF | sudo pfctl -Ef -
-rdr pass proto udp from any to $CONTAINER_SUBNET port 500 -> 127.0.0.1 port 9500
-rdr pass proto udp from any to $CONTAINER_SUBNET port 4500 -> 127.0.0.1 port 9501
-pass out quick route-to (lo0 127.0.0.1) proto udp from any to $CONTAINER_SUBNET port {500, 4500}
+rdr pass proto udp from port 500 to $CONTAINER_SUBNET port 500 -> 127.0.0.1 port 9500
+rdr pass proto udp from port 4500 to $CONTAINER_SUBNET port 4500 -> 127.0.0.1 port 9501
+pass out quick on en0 route-to (lo0 127.0.0.1) proto udp from port 500 to $CONTAINER_SUBNET port 500 no state
+pass out quick on en0 route-to (lo0 127.0.0.1) proto udp from port 4500 to $CONTAINER_SUBNET port 4500 no state
 EOF
 ```
 
@@ -51,9 +51,10 @@ and add an achor:
 ```shell
 CONTAINER_SUBNET=192.0.2.40
 cat << EOF | sudo pfctl -a com.apple/pterodapter -f -
-rdr pass proto udp from any to $CONTAINER_SUBNET port 500 -> 127.0.0.1 port 9500
-rdr pass proto udp from any to $CONTAINER_SUBNET port 4500 -> 127.0.0.1 port 9501
-pass out quick route-to (lo0 127.0.0.1) proto udp from any to $CONTAINER_SUBNET port {500, 4500}
+rdr pass proto udp from port 500 to $CONTAINER_SUBNET port 500 -> 127.0.0.1 port 9500
+rdr pass proto udp from port 4500 to $CONTAINER_SUBNET port 4500 -> 127.0.0.1 port 9501
+pass out quick on en0 route-to (lo0 127.0.0.1) proto udp from port 500 to $CONTAINER_SUBNET port 500 no state
+pass out quick on en0 route-to (lo0 127.0.0.1) proto udp from port 4500 to $CONTAINER_SUBNET port 4500 no state
 EOF
 ```
 
