@@ -390,7 +390,7 @@ impl<'a> Ipv4Packet<'a> {
         }
         let fragmentation_extension = self.is_fragmented();
         let header_len = if fragmentation_extension { 48 } else { 40 };
-        if dest.len() < 20 + transport_data.len() {
+        if dest.len() < header_len + transport_data.len() {
             // RFC 7915, Section 1.4 states that a Packet Too Big should be sent here.
             // As there's enough extra space in buffers, this shouldn't be a big problem.
             return Err("Not enough space to translate from IPv4 to IPv6".into());
