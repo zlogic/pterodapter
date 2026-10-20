@@ -1,7 +1,7 @@
 use std::{error, fmt, io, net::Ipv6Addr, os::fd::AsRawFd, task::Poll};
 
 use log::{debug, info, warn};
-use tokio::io::unix::AsyncFd;
+use tokio::io::unix::{AsyncFd, AsyncFdRegisterError};
 
 use crate::ip;
 
@@ -37,7 +37,7 @@ impl RawSocket {
                 }
             }
         }
-        let socket = AsyncFd::new(socket)?;
+        let socket = unsafe { AsyncFd::register(socket)? };
         let socket = RawSocket {
             socket,
             mac,
@@ -415,6 +415,7 @@ impl BpfFilter {
 pub enum InterfaceError {
     Internal(&'static str),
     Io(io::Error),
+    AsyncFdRegister(AsyncFdRegisterError<std::os::unix::io::RawFd>),
 }
 
 impl fmt::Display for InterfaceError {
@@ -422,6 +423,7 @@ impl fmt::Display for InterfaceError {
         match self {
             Self::Internal(msg) => f.write_str(msg),
             Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::AsyncFdRegister(e) => write!(f, "Async FS registration error: {e}"),
         }
     }
 }
@@ -431,6 +433,7 @@ impl error::Error for InterfaceError {
         match self {
             Self::Internal(_msg) => None,
             Self::Io(err) => Some(err),
+            Self::AsyncFdRegister(err) => Some(err),
         }
     }
 }
@@ -444,5 +447,11 @@ impl From<&'static str> for InterfaceError {
 impl From<io::Error> for InterfaceError {
     fn from(err: io::Error) -> InterfaceError {
         Self::Io(err)
+    }
+}
+
+impl From<AsyncFdRegisterError<std::os::unix::io::RawFd>> for InterfaceError {
+    fn from(err: AsyncFdRegisterError<std::os::unix::io::RawFd>) -> InterfaceError {
+        Self::AsyncFdRegister(err)
     }
 }
